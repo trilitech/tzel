@@ -1,0 +1,32 @@
+[package]
+name = "starkprivacy"
+version = "0.1.0"
+edition = "2025_12"
+
+[[target.executable]]
+name = "step_shield"
+function = "starkprivacy::step_shield::main"
+
+[[target.executable]]
+name = "step_unshield"
+function = "starkprivacy::step_unshield::main"
+
+[[target.executable]]
+name = "step_join"
+function = "starkprivacy::step_join::main"
+
+[[target.executable]]
+name = "step_split"
+function = "starkprivacy::step_split::main"
+
+[cairo]
+enable-gas = false
+
+[features]
+depth16 = []
+depth32 = []
+depth48 = []
+default = ["depth48"]
+
+[dependencies]
+cairo_execute = "2.16.1"

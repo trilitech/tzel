@@ -1,0 +1,49 @@
+[package]
+name = "starkprivacy-reprover"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "reprove"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.98"
+clap = { version = "4", features = ["derive"] }
+itertools = { version = "0.12", default-features = false, features = ["use_alloc"] }
+serde_json = "1.0"
+starknet-types-core = "=0.2.4"
+tempfile = "3.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.13"
+
+# cairo-vm
+cairo-vm = { version = "=3.2.0", features = ["extensive_hints", "mod_builtin"] }
+
+# proving-utils
+cairo-program-runner-lib = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
+privacy-prove = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
+privacy-circuit-verify = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
+
+serde = { version = "1.0", features = ["derive"] }
+
+# stwo cairo (same revs as proving-utils v1.2.2)
+cairo-air = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
+stwo-cairo-adapter = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
+stwo-cairo-prover = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
+stwo-cairo-serialize = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
+stwo-cairo-common = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c", features = ["parallel", "prover"] }
+
+# stwo circuits (same rev as proving-utils v1.2.2)
+circuit-cairo-air = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuit-air = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuit-common = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuit-prover = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+
+[profile.release]
+opt-level = 3
