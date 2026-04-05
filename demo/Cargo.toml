@@ -1,0 +1,11 @@
+[package]
+name = "starkprivacy-demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+blake2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
