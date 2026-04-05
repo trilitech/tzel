@@ -1,0 +1,4 @@
+
+[[target.executable]]
+name = "step_testvec"
+function = "starkprivacy::step_testvec::main"

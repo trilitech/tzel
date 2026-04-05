@@ -1,96 +1,90 @@
 /// Shared test note data for all step executables.
 ///
-/// Each step executable (step_shield, step_unshield, step_join, step_split)
-/// needs to construct witnesses with consistent note data. This module
-/// provides deterministic keys and notes so each step can independently
-/// reconstruct the tree state it needs.
+/// # Key hierarchy (Sapling-style delegated proving)
 ///
-/// WARNING: These are TEST keys and nonces — hardcoded and publicly known.
-/// A production system must use cryptographically random sk, rho, and r.
+/// ```text
+///   master_sk
+///   ├── nsk_i = H("nsk", master_sk, i)   — nullifier secret key (per-note, given to prover)
+///   │   └── pk_i = H(nsk_i)              — paying key (public)
+///   └── ask_i = H("ask", master_sk, i)   — authorization signing key (per-note, NEVER shared)
+///       └── ak_i = H(ask_i)              — authorization verifying key (public, in proof output)
+/// ```
+///
+/// The commitment binds to both keys: cm = H(H(pk, ak), v, rho, r).
+/// The prover sees (nsk, ak) but not (ask, master_sk).
+///
+/// In these tests, we derive per-note keys from a master key using
+/// domain-separated hashing. In production, the wallet does this
+/// automatically for each new note.
+///
+/// WARNING: Test keys are hardcoded and publicly known.
 
 use starkprivacy::blake_hash as hash;
 
 /// A note with all its secret and public data.
 #[derive(Drop, Copy)]
 pub struct Note {
-    pub sk: felt252,   // Spending key (secret)
-    pub pk: felt252,   // Paying key = H(sk) (public)
+    pub nsk: felt252,  // Nullifier secret key (given to prover)
+    pub pk: felt252,   // Paying key = H(nsk) (public)
+    pub ask: felt252,  // Authorization signing key (NEVER given to prover)
+    pub ak: felt252,   // Authorization verifying key = H(ask) (public)
     pub v: u64,        // Amount
     pub rho: felt252,  // Random nonce (unique per note)
     pub r: felt252,    // Blinding factor
-    pub cm: felt252,   // Commitment = H(pk, v, rho, r)
+    pub cm: felt252,   // Commitment = H(H(pk, ak), v, rho, r)
 }
 
-/// Return test keys for three parties: Alice, Bob, and a dummy identity.
-pub fn keys() -> (felt252, felt252, felt252, felt252, felt252, felt252) {
-    let sk_alice: felt252 = 0xA11CE;
-    let sk_bob: felt252 = 0xB0B;
-    let sk_dummy: felt252 = 0xDEAD;
-    let pk_alice = hash::derive_pk(sk_alice);
-    let pk_bob = hash::derive_pk(sk_bob);
-    let pk_dummy = hash::derive_pk(sk_dummy);
-    (sk_alice, pk_alice, sk_bob, pk_bob, sk_dummy, pk_dummy)
+/// Derive per-note keys from a master secret and a note index.
+///
+/// nsk = H("nsk" as felt, master_sk, index)  — for nullifier computation
+/// ask = H("ask" as felt, master_sk, index)  — for spend authorization
+///
+/// The prover receives nsk (to compute pk and nf inside the circuit)
+/// and ak = H(ask) (included in the commitment). They never receive ask.
+fn derive_note_keys(master_sk: felt252, index: felt252) -> (felt252, felt252, felt252, felt252) {
+    // Domain-separated derivation using hash2.
+    // "nsk" and "ask" are encoded as small felt constants for domain tags.
+    // Key derivation uses the generic (unpersonalized) hash2, NOT the Merkle-
+    // personalized hash2. This matches the Rust demo's hash_two.
+    let nsk = hash::hash2_generic(hash::hash2_generic(0x6E736B, master_sk), index); // 0x6E736B = "nsk"
+    let ask = hash::hash2_generic(hash::hash2_generic(0x61736B, master_sk), index); // 0x61736B = "ask"
+    let pk = hash::derive_pk(nsk);
+    let ak = hash::derive_ak(ask);
+    (nsk, pk, ask, ak)
 }
+
+/// Build a note from a master key, note index, value, nonce, and blinding factor.
+fn make_note(master_sk: felt252, index: felt252, v: u64, rho: felt252, r: felt252) -> Note {
+    let (nsk, pk, ask, ak) = derive_note_keys(master_sk, index);
+    let cm = hash::commit(pk, ak, v, rho, r);
+    Note { nsk, pk, ask, ak, v, rho, r, cm }
+}
+
+// ── Test master keys ─────────────────────────────────────────────────
+//
+// Three identities for the test scenario. Each has a master_sk from
+// which all per-note keys are derived.
+
+const MASTER_ALICE: felt252 = 0xA11CE;
+const MASTER_BOB: felt252 = 0xB0B;
+const MASTER_DUMMY: felt252 = 0xDEAD;
 
 // ── Test scenario notes ──────────────────────────────────────────────
 //
-// The test scenario is a sequence of four operations on a growing tree:
+// The test scenario is a sequence of four operations:
 //
-//   Step 1 (shield):   deposit 1000 → note A (Alice)           tree: [A]
-//   Step 2 (unshield): withdraw note A → 1000 to recipient     tree: [A]
-//   Step 3 (join):     A(1000) + B(500) → C(1500) + W(0)      tree: [A, B, Z]
+//   Step 1 (shield):   deposit 1000 → note A (Alice, index 0)
+//   Step 2 (unshield): withdraw note A → 1000 to recipient
+//   Step 3 (join):     A(1000) + B(500) → C(1500) + W(0)
 //                      also shields dummy note Z for later use
-//   Step 4 (split):    C(1500) + Z(0) → D(800) + E(700)       tree: [A, B, Z, C, W]
+//   Step 4 (split):    C(1500) + Z(0) → D(800) + E(700)
 //
-// Each note has a unique (rho, r) pair. Rho uniqueness is critical for
-// nullifier uniqueness — reusing rho across notes would allow linking
-// their nullifiers.
+// Each note has a unique index, producing unique (nsk, ask, pk, ak).
 
-/// Note A: 1000 to Alice (shielded in step 1, spent in step 3)
-pub fn note_a() -> Note {
-    let (sk_alice, pk_alice, _, _, _, _) = keys();
-    let (rho, r, v) = (0x1001, 0x2001, 1000_u64);
-    Note { sk: sk_alice, pk: pk_alice, v, rho, r, cm: hash::commit(pk_alice, v, rho, r) }
-}
-
-/// Note B: 500 to Alice (shielded off-screen, spent in step 3)
-pub fn note_b() -> Note {
-    let (sk_alice, pk_alice, _, _, _, _) = keys();
-    let (rho, r, v) = (0x1002, 0x2002, 500_u64);
-    Note { sk: sk_alice, pk: pk_alice, v, rho, r, cm: hash::commit(pk_alice, v, rho, r) }
-}
-
-/// Note Z: 0-value dummy (shielded in step 3, spent as padding in step 4)
-pub fn note_z() -> Note {
-    let (_, _, _, _, sk_dummy, pk_dummy) = keys();
-    let (rho, r, v) = (0x1003, 0x2003, 0_u64);
-    Note { sk: sk_dummy, pk: pk_dummy, v, rho, r, cm: hash::commit(pk_dummy, v, rho, r) }
-}
-
-/// Note C: 1500 to Bob (created in step 3 join, spent in step 4 split)
-pub fn note_c() -> Note {
-    let (_, _, sk_bob, pk_bob, _, _) = keys();
-    let (rho, r, v) = (0x1004, 0x2004, 1500_u64);
-    Note { sk: sk_bob, pk: pk_bob, v, rho, r, cm: hash::commit(pk_bob, v, rho, r) }
-}
-
-/// Note W: 0-value dummy (created in step 3 join as waste output)
-pub fn note_w() -> Note {
-    let (_, _, _, _, sk_dummy, pk_dummy) = keys();
-    let (rho, r, v) = (0x1005, 0x2005, 0_u64);
-    Note { sk: sk_dummy, pk: pk_dummy, v, rho, r, cm: hash::commit(pk_dummy, v, rho, r) }
-}
-
-/// Note D: 800 to Alice (created in step 4 split)
-pub fn note_d() -> Note {
-    let (sk_alice, pk_alice, _, _, _, _) = keys();
-    let (rho, r, v) = (0x1006, 0x2006, 800_u64);
-    Note { sk: sk_alice, pk: pk_alice, v, rho, r, cm: hash::commit(pk_alice, v, rho, r) }
-}
-
-/// Note E: 700 to Bob (created in step 4 split)
-pub fn note_e() -> Note {
-    let (_, _, sk_bob, pk_bob, _, _) = keys();
-    let (rho, r, v) = (0x1007, 0x2007, 700_u64);
-    Note { sk: sk_bob, pk: pk_bob, v, rho, r, cm: hash::commit(pk_bob, v, rho, r) }
-}
+pub fn note_a() -> Note { make_note(MASTER_ALICE, 0, 1000, 0x1001, 0x2001) }
+pub fn note_b() -> Note { make_note(MASTER_ALICE, 1, 500,  0x1002, 0x2002) }
+pub fn note_z() -> Note { make_note(MASTER_DUMMY, 0, 0,    0x1003, 0x2003) }
+pub fn note_c() -> Note { make_note(MASTER_BOB,   0, 1500, 0x1004, 0x2004) }
+pub fn note_w() -> Note { make_note(MASTER_DUMMY, 1, 0,    0x1005, 0x2005) }
+pub fn note_d() -> Note { make_note(MASTER_ALICE, 2, 800,  0x1006, 0x2006) }
+pub fn note_e() -> Note { make_note(MASTER_BOB,   1, 700,  0x1007, 0x2007) }

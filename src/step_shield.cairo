@@ -1,7 +1,7 @@
-/// Test executable: Shield 1000 to Alice.
+/// Test executable: Shield 1000 to Alice (note A, index 0).
 ///
-/// Proves that cm_a is a valid commitment to (pk_alice, 1000, rho, r).
-/// The on-chain effect would be: deduct 1000 from sender, append cm_a to T.
+/// The proof outputs [v_pub, cm_new, ak, sender]. The contract verifies
+/// the STARK proof and a signature over the outputs under ak.
 ///
 /// Tree state: [] → [cm_a]
 
@@ -10,6 +10,6 @@ use starkprivacy::{common, shield};
 #[executable]
 fn main() -> Array<felt252> {
     let a = common::note_a();
-    let sender: felt252 = 0xA11CE_ADD8; // Alice's public address (test value)
-    shield::verify(a.v, a.cm, sender, a.pk, a.rho, a.r)
+    let sender: felt252 = 0xA11CE_ADD8;
+    shield::verify(a.v, a.cm, a.ak, sender, a.pk, a.rho, a.r)
 }
