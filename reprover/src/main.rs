@@ -1,3 +1,21 @@
+//! StarkPrivacy proof generator.
+//!
+//! Takes a compiled Cairo executable (.executable.json) and produces a
+//! zero-knowledge STARK proof via two-level recursive proving:
+//!
+//!   1. Run the program through the privacy bootloader (Cairo VM)
+//!   2. Generate a first-level Stwo proof of the execution (Cairo AIR)
+//!   3. Verify that proof inside an Stwo circuit, producing a second-level
+//!      circuit proof with ZK blinding (~290 KB, 96-bit security)
+//!
+//! The circuit proof is the final artifact — it reveals nothing about the
+//! private witness (sk, rho, r, values, Merkle paths). The first-level
+//! Cairo proof is an intermediate artifact that is never exposed.
+//!
+//! A `--debug-single-level` flag is available for benchmarking, but its
+//! output is NOT zero-knowledge and must never be used for real privacy
+//! transactions.
+
 mod custom_circuit;
 
 use std::fs::{self, read_to_string};
@@ -26,29 +44,44 @@ use crate::custom_circuit::custom_recursive_prove;
 #[derive(Parser)]
 #[command(name = "reprove", about = "Generate privacy proofs for StarkPrivacy executables")]
 struct Cli {
-    /// Path to a .executable.json file (Cairo 1 executable)
+    /// Path to a .executable.json file (Cairo 1 executable built by scarb)
     executable: PathBuf,
 
     /// Write compressed proof to this file
     #[arg(long, short)]
     output: Option<PathBuf>,
 
-    /// DEBUG ONLY: single-level Stwo proof (NOT zero-knowledge, leaks witness data)
+    /// DEBUG ONLY: produce a single-level Stwo proof instead of the recursive
+    /// circuit proof. WARNING: single-level proofs are NOT zero-knowledge —
+    /// FRI query responses leak information about the private witness.
     #[arg(long)]
     debug_single_level: bool,
 }
 
+/// Execute a Cairo 1 executable through the privacy bootloader.
+///
+/// The privacy bootloader (a compiled Cairo 0 program from StarkWare's
+/// proving-utils) wraps our executable and produces:
+///   - A ProverInput (execution trace in Stwo-compatible format)
+///   - An output_preimage (the program's public outputs, needed for
+///     the circuit proof's public data)
+///
+/// The bootloader hashes our program with Blake2s and commits to it,
+/// ensuring the proof is bound to the specific program being executed.
 fn run_privacy_bootloader_cairo1(
     executable_path: &PathBuf,
 ) -> Result<(stwo_cairo_adapter::ProverInput, Vec<Felt>)> {
+    // Load the .executable.json as a Cairo 1 task.
     let task = create_cairo1_program_task(executable_path, None, None)
         .map_err(|e| anyhow!("{e}"))?;
 
     let task_spec = TaskSpec {
         task: Rc::new(task),
+        // The bootloader uses Blake2s to hash the program for commitment.
         program_hash_function: HashFunc::Blake,
     };
 
+    // The bootloader writes the output preimage to a temp file.
     let output_preimage_file = NamedTempFile::new()?;
     let output_preimage_path = output_preimage_file.path().to_path_buf();
 
@@ -72,17 +105,22 @@ fn run_privacy_bootloader_cairo1(
         None,
     ).map_err(|e| anyhow!("{e}"))?;
 
+    // Read the output preimage — this contains the program's public outputs
+    // (e.g., [v_pub, cm_new, sender] for shield). The circuit proof commits
+    // to a hash of this preimage so the on-chain verifier can extract the
+    // public values.
     info!("Reading bootloader output preimage");
     let output_preimage_content = read_to_string(&output_preimage_path)?;
     let output_preimage: Vec<Felt> = from_str(&output_preimage_content)?;
 
+    // Convert the Cairo VM execution trace into Stwo prover input format.
     info!("Adapting runner output for prover");
     let prover_input = adapt(&runner).map_err(|e| anyhow!("{e}"))?;
 
     Ok((prover_input, output_preimage))
 }
 
-/// Read peak RSS from /proc/self/status (Linux only).
+/// Read peak resident set size from /proc/self/status (Linux only).
 fn get_peak_memory_kb() -> Option<u64> {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -99,16 +137,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     eprintln!("Loading executable from {:?}", cli.executable);
-
     let t_total = Instant::now();
 
-    // Run through privacy bootloader
+    // Step 1: Run the program through the privacy bootloader to get the
+    // execution trace (prover_input) and public outputs (output_preimage).
     let (prover_input, output_preimage) = run_privacy_bootloader_cairo1(&cli.executable)?;
 
     if cli.debug_single_level {
-        // WARNING: Single-level Stwo proofs are NOT zero-knowledge.
-        // The FRI query responses leak information about the witness trace.
-        // Use only for debugging/benchmarking, never for real privacy transactions.
+        // ── Debug mode: single-level proof (NOT zero-knowledge) ──────
         eprintln!("WARNING: single-level mode is NOT zero-knowledge — witness data may leak");
         eprintln!("Generating Stwo proof...");
         let t_prove = Instant::now();
@@ -129,7 +165,7 @@ fn main() -> Result<()> {
         println!("prove_ms={}", prove_ms);
         println!("proof_zstd_bytes={}", compressed.len());
     } else {
-        // Recursive proving: Cairo proof → circuit proof (zero-knowledge)
+        // ── Production mode: two-level recursive proof (zero-knowledge) ──
         eprintln!("Running recursive prove...");
         let t_prove = Instant::now();
         let proof_output = custom_recursive_prove(prover_input, output_preimage)?;

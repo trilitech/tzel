@@ -1,7 +1,49 @@
-//! Custom circuit reprover for our privacy programs.
+//! Two-level recursive proof generation for StarkPrivacy.
 //!
-//! Builds a circuit verifier config matching the actual proof's component structure,
-//! then proves the circuit.
+//! # Architecture
+//!
+//! The proving pipeline has two levels:
+//!
+//! ```text
+//!   Cairo program ──→ [Privacy Bootloader] ──→ Execution trace
+//!        │                                           │
+//!        │                   Level 1: Cairo AIR proof (Stwo)
+//!        │                   ~480 KB, NOT zero-knowledge
+//!        │                                           │
+//!        │                   Level 2: Circuit proof (Stwo circuits)
+//!        │                   ~290 KB, zero-knowledge (ZK blinding added)
+//!        ▼                                           ▼
+//!   .executable.json                          compressed proof + output_preimage
+//! ```
+//!
+//! The first-level Cairo proof proves correct execution of the program.
+//! The second-level circuit proof proves that the first-level proof
+//! verified correctly. ZK blinding is added at the circuit level,
+//! ensuring that the final proof leaks no information about the private
+//! witness (spending keys, note values, Merkle paths, etc.).
+//!
+//! # Why two levels?
+//!
+//! Stwo's Cairo prover (level 1) produces proofs in the Circle STARK
+//! framework. These proofs are valid but:
+//!   - Large (~480 KB compressed)
+//!   - NOT zero-knowledge (FRI query responses expose witness trace values)
+//!
+//! The circuit reprover (level 2) compresses the proof and adds ZK
+//! blinding in a single step, producing a ~290 KB zero-knowledge proof.
+//!
+//! # Dynamic component detection
+//!
+//! Unlike StarkWare's hardcoded privacy prover (57 components), we
+//! dynamically detect which Cairo AIR components are active in our proof
+//! by reading the claim's `component_enable_bits`. This lets us handle
+//! any Cairo program without hardcoding component sets.
+//!
+//! # Security
+//!
+//! Both proof levels target 96-bit security:
+//!   - Level 1: pow_bits=27 + log_blowup(3) * n_queries(23) = 96 bits
+//!   - Level 2: pow_bits=26 + log_blowup(2) * n_queries(35) = 96 bits
 
 use std::cmp::max;
 use std::sync::Arc;
@@ -47,7 +89,15 @@ use stwo_cairo_prover::prover::{ChannelHash, ProverParameters, prove_cairo_with_
 use stwo_cairo_prover::witness::preprocessed_trace::gen_trace;
 use tracing::{Level, info, span};
 
-/// Build a ProofConfig matching the actual proof by using the claim's enable bits.
+// ── Configuration ────────────────────────────────────────────────────
+
+/// Build a ProofConfig that matches the actual proof's column structure.
+///
+/// The Stwo Cairo AIR defines ~81 possible components (opcodes, builtins,
+/// memory, range checks, etc.). Our programs only activate a subset (~46).
+/// Components that are disabled (claim says `None`) get replaced with
+/// `EmptyComponent` which has 0 trace/interaction columns. This makes the
+/// ProofConfig's column counts match the actual proof structure.
 fn build_proof_config_from_enable_bits(enable_bits: &[bool]) -> ProofConfig {
     let all = all_components::<QM31>();
     assert_eq!(all.len(), enable_bits.len());
@@ -66,6 +116,8 @@ fn build_proof_config_from_enable_bits(enable_bits: &[bool]) -> ProofConfig {
     )
 }
 
+/// Level 2 (circuit) FRI configuration.
+/// Security: pow_bits(26) + log_blowup(2) * n_queries(35) = 96 bits.
 const CIRCUIT_FRI_CONFIG: FriConfig = FriConfig {
     log_blowup_factor: 2,
     log_last_layer_degree_bound: 0,
@@ -73,6 +125,9 @@ const CIRCUIT_FRI_CONFIG: FriConfig = FriConfig {
     fold_step: 4,
 };
 
+/// Level 1 (Cairo) PCS configuration.
+/// Security: pow_bits(27) + log_blowup(3) * n_queries(23) = 96 bits.
+/// lifting_log_size = 23 means the FRI evaluation domain is 2^23 (= 2^20 trace * 2^3 blowup).
 const CAIRO_PCS_CONFIG: PcsConfig = PcsConfig {
     pow_bits: 27,
     fri_config: FriConfig {
@@ -84,9 +139,16 @@ const CAIRO_PCS_CONFIG: PcsConfig = PcsConfig {
     lifting_log_size: Some(23),
 };
 
-/// Custom prover params: CanonicalSmall with all preprocessed columns included.
-/// Uses the same params as the privacy prover for now.
-/// TODO: build a custom preprocessed trace without Pedersen columns for further optimization.
+/// Level 1 prover parameters.
+///
+/// Uses CanonicalSmall preprocessed trace (lookup tables for all builtins
+/// including Pedersen, even though we don't use it). The `include_all_
+/// preprocessed_columns = true` flag includes OODS samples for all
+/// preprocessed columns in the proof — this is required for the circuit
+/// verifier to check all commitments.
+///
+/// TODO: Build a custom preprocessed trace without Pedersen columns to
+/// reduce the commitment size and potentially shrink the proof further.
 const CUSTOM_PROVER_PARAMS: ProverParameters = ProverParameters {
     channel_hash: ChannelHash::Blake2sM31,
     pcs_config: CAIRO_PCS_CONFIG,
@@ -96,35 +158,62 @@ const CUSTOM_PROVER_PARAMS: ProverParameters = ProverParameters {
     include_all_preprocessed_columns: true,
 };
 
+// ── Helpers ──────────────────────────────────────────────────────────
+
+/// Compute the bootloader output hash from the output preimage.
+///
+/// The privacy bootloader writes the program's public outputs as a list
+/// of Felt values. This function hashes them with Blake2s to produce the
+/// 28-limb M31 representation that the circuit embeds as public data.
 fn compute_output(output_preimage: &[Felt]) -> [M31; MEMORY_VALUES_LIMBS] {
     let output = Blake2Felt252::encode_felt252_data_and_calc_blake_hash(output_preimage);
     Felt252::from(output).get_limbs()
 }
 
+// ── Public API ───────────────────────────────────────────────────────
+
 pub struct CustomProofOutput {
-    /// Compressed circuit proof (zstd).
+    /// Compressed circuit proof (zstd). This is the final zero-knowledge
+    /// artifact that can be verified on-chain.
     pub proof: Vec<u8>,
-    /// Bootloader output preimage — the on-chain verifier needs this to
+
+    /// Bootloader output preimage. The on-chain verifier needs this to
     /// extract the program's public outputs (v_pub, cm, root, nf, etc.).
+    /// The circuit proof commits to a Blake2s hash of this preimage, so
+    /// providing a wrong preimage will fail verification.
     pub output_preimage: Vec<Felt>,
+
+    // Timing breakdowns for benchmarking.
     pub cairo_prove_ms: u128,
     pub circuit_prove_ms: u128,
     pub verify_ms: u128,
 }
 
-/// One-shot recursive prove: generates Cairo proof, then proves it inside a circuit.
-/// No precomputation — simpler but slower per proof.
+/// Generate a two-level recursive zero-knowledge proof.
+///
+/// This is the main entry point for proof generation. It:
+///   1. Generates a first-level Cairo AIR proof (NOT zero-knowledge)
+///   2. Dynamically detects which components are active
+///   3. Builds a circuit that verifies the Cairo proof
+///   4. Adds ZK blinding to the circuit (making it zero-knowledge)
+///   5. Proves the circuit execution with Stwo
+///   6. Verifies both proofs for correctness
+///   7. Serializes and compresses the circuit proof (~290 KB)
 pub fn custom_recursive_prove(
     prover_input: ProverInput,
     output_preimage: Vec<Felt>,
 ) -> Result<CustomProofOutput> {
     let _span = span!(Level::INFO, "custom_recursive_prove").entered();
-
     let base_column_pool = BaseColumnPool::<SimdBackend>::new();
+
+    // ── Level 1: Generate Cairo AIR proof ────────────────────────────
+    // This proves correct execution of the Cairo program. The proof is
+    // ~480 KB and includes FRI query responses that leak witness data.
+    // It will be consumed by the circuit prover and never exposed.
 
     let t_cairo = Instant::now();
 
-    // Precompute Cairo side
+    // Build the preprocessed trace (static lookup tables shared by all proofs).
     info!("Preparing Cairo preprocessed trace");
     let cairo_preprocessed_trace = Arc::new(
         CUSTOM_PROVER_PARAMS.preprocessed_trace.to_preprocessed_trace(),
@@ -133,6 +222,9 @@ pub fn custom_recursive_prove(
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(cairo_lifting).circle_domain().half_coset,
     );
+
+    // Commit to the preprocessed trace in a Merkle tree. This commitment
+    // is the first thing mixed into the Fiat-Shamir channel.
     let cairo_pp_polys =
         SimdBackend::interpolate_columns(gen_trace(cairo_preprocessed_trace.clone()), &twiddles);
     let cairo_pp_tree = CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
@@ -144,7 +236,7 @@ pub fn custom_recursive_prove(
         &base_column_pool,
     );
 
-    // Generate Cairo proof
+    // Run the Stwo prover on the execution trace.
     info!("Generating Cairo proof");
     let cairo_proof = prove_cairo_with_precompute(
         &base_column_pool,
@@ -159,7 +251,13 @@ pub fn custom_recursive_prove(
     let cairo_prove_ms = t_cairo.elapsed().as_millis();
     info!("Cairo proof generated in {}ms", cairo_prove_ms);
 
-    // Extract enable bits from the actual proof claim
+    // ── Dynamic component detection ──────────────────────────────────
+    // The Cairo AIR has ~81 possible components. Our programs activate a
+    // subset (e.g., 46 for all-Blake programs without Poseidon). We read
+    // the claim's enable bits to build a ProofConfig that matches the
+    // actual proof structure — this is what makes our circuit reprover
+    // work for any Cairo program, not just a hardcoded component set.
+
     let FlatClaim { component_enable_bits, .. } = cairo_proof.claim.flatten_claim();
     info!(
         "Proof has {} enabled components out of {}",
@@ -167,22 +265,27 @@ pub fn custom_recursive_prove(
         component_enable_bits.len()
     );
 
-    // Build ProofConfig matching this proof's structure
     let cairo_proof_config = build_proof_config_from_enable_bits(&component_enable_bits);
 
-    // Verify column counts match
+    // Sanity check: the ProofConfig's column counts must exactly match
+    // what's in the proof. A mismatch means the circuit verifier would
+    // index out of bounds.
     let sampled = &cairo_proof.extended_stark_proof.proof.sampled_values;
     let config_cols: Vec<usize> = cairo_proof_config.n_columns_per_trace().to_vec();
     let proof_cols: Vec<usize> = sampled.0.iter().map(|t| t.len()).collect();
-    info!("Config columns per trace: {:?}", config_cols);
-    info!("Proof columns per trace: {:?}", proof_cols);
     assert_eq!(config_cols, proof_cols, "Column count mismatch between config and proof");
 
-    // Build CairoVerifierConfig
+    // ── Build the Cairo verifier configuration ───────────────────────
+    // The CairoVerifierConfig tells the circuit what program was executed,
+    // how many outputs to expect, and what the preprocessed trace root is.
+
     let bootloader_program = get_privacy_bootloader_program().map_err(|e| anyhow!("{e}"))?;
     let mut program = vec![];
     for value in bootloader_program.iter_data() {
-        program.push(Felt252::from(value.get_int().ok_or_else(|| anyhow!("bad program data"))?).get_limbs());
+        program.push(
+            Felt252::from(value.get_int().ok_or_else(|| anyhow!("bad program data"))?)
+                .get_limbs(),
+        );
     }
     let cairo_lifting_log_size = cairo_proof_config.fri.log_evaluation_domain_size() as u32;
     let cairo_verifier_config = CairoVerifierConfig {
@@ -192,14 +295,21 @@ pub fn custom_recursive_prove(
         preprocessed_root: get_preprocessed_root(cairo_lifting_log_size),
     };
 
-    // Prepare proof for circuit verifier
+    // ── Transform the Cairo proof for circuit consumption ────────────
+    // This converts the Stwo STARK proof into a format the circuit
+    // verifier can process: Merkle roots, OODS evaluations, FRI layers.
+
     info!("Preparing Cairo proof for circuit verifier");
     let (proof, public_data) = prepare_cairo_proof_for_circuit_verifier(
         &cairo_proof,
         &cairo_verifier_config.proof_config,
     );
 
-    // Build circuit context
+    // ── Build and evaluate the circuit ──���────────────────────────────
+    // The circuit is a fixed-topology computation that verifies the Cairo
+    // proof. It replays the verifier's logic: check commitments, evaluate
+    // constraints at the OODS point, verify FRI, check proof-of-work.
+
     info!("Building circuit verifier context");
     let (public_claim, _outputs, _program) = public_data.pack_into_u32s();
     let outputs = compute_output(&output_preimage);
@@ -210,19 +320,33 @@ pub fn custom_recursive_prove(
         vec![outputs],
     );
 
+    // The circuit context now holds the full execution trace of the
+    // verifier. Check that all constraints are satisfied.
     if !context.is_circuit_valid() {
-        return Err(anyhow!("Circuit verification failed"));
+        return Err(anyhow!("Circuit verification failed — the Cairo proof may be invalid"));
     }
 
-    // Add ZK blinding and finalize
+    // ── Add ZK blinding ──────────────────────────────────────────────
+    // This is what makes the final proof zero-knowledge. Random values
+    // are injected into the circuit's qm31_ops and eq components,
+    // masking the witness trace so FRI queries reveal nothing.
+    // The seed is derived from the Cairo proof's trace commitment,
+    // making it deterministic but unpredictable to an adversary.
+
     let zk_blinding_seed = cairo_proof.extended_stark_proof.proof.commitments.0[1].0;
     add_zk_blinding(&mut context, zk_blinding_seed, CIRCUIT_FRI_CONFIG.n_queries);
     finalize_context(&mut context);
     let context_values = context.values();
 
-    // Build circuit preprocessed data
+    // ── Level 2: Prove the circuit ───────────────────────────────────
+    // Now we prove the circuit execution itself with Stwo, producing
+    // a second STARK proof. This proof is zero-knowledge (due to the
+    // blinding added above) and much smaller than the first-level proof.
+
     info!("Building circuit preprocessed trace");
     let preprocessed_circuit = {
+        // Build the circuit topology with NoValue types to get the
+        // preprocessed trace (lookup tables for the circuit itself).
         let mut nv = circuit_cairo_air::verify::build_cairo_verifier_circuit(&cairo_verifier_config);
         add_zk_blinding(&mut nv, [0; 32], CIRCUIT_FRI_CONFIG.n_queries);
         PreprocessedCircuit::preprocess_circuit(&mut nv)
@@ -231,12 +355,14 @@ pub fn custom_recursive_prove(
     let circuit_lifting = circuit_trace_log_size + CIRCUIT_FRI_CONFIG.log_blowup_factor;
     info!("Circuit trace log_size: {}, lifting: {}", circuit_trace_log_size, circuit_lifting);
 
-    // Need bigger twiddles if circuit is larger
+    // The circuit may need a larger domain than the Cairo proof.
+    // Recompute twiddles for the maximum of both.
     let max_domain = max(cairo_lifting, circuit_lifting);
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(max_domain).circle_domain().half_coset,
     );
 
+    // Commit to the circuit's preprocessed trace.
     let circuit_pp_trace = preprocessed_circuit.preprocessed_trace.get_trace::<SimdBackend>();
     let circuit_pp_polys = SimdBackend::interpolate_columns(circuit_pp_trace, &twiddles);
     let circuit_pp_tree = CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
@@ -258,10 +384,11 @@ pub fn custom_recursive_prove(
         output_addresses: preprocessed_circuit.params.output_addresses.clone(),
         n_blake_gates: preprocessed_circuit.params.n_blake_gates,
         preprocessed_column_ids: preprocessed_circuit.preprocessed_trace.ids(),
+        // The preprocessed root is the Merkle root of the circuit's own
+        // preprocessed trace — it's a public parameter of the circuit.
         preprocessed_root: circuit_pp_tree.commitment.root().into(),
     };
 
-    // Build circuit proof config
     let circuit_proof_config = {
         use circuit_air::statement::all_circuit_components;
         ProofConfig::from_components(
@@ -272,7 +399,7 @@ pub fn custom_recursive_prove(
         )
     };
 
-    // Prove circuit
+    // Run the Stwo prover on the circuit trace.
     let t_circuit = Instant::now();
     info!("Proving circuit");
     let circuit_proof = prove_circuit_with_precompute(
@@ -283,11 +410,10 @@ pub fn custom_recursive_prove(
         context_values,
         circuit_config.config,
     );
-
     let circuit_prove_ms = t_circuit.elapsed().as_millis();
     info!("Circuit proof generated in {}ms", circuit_prove_ms);
 
-    // Serialize circuit proof
+    // ── Serialize and compress ────────────────────────────────────────
     info!("Serializing circuit proof");
     let (proof_qm31s, circuit_public_data) =
         prepare_circuit_proof_for_circuit_verifier(circuit_proof, &circuit_proof_config);
@@ -295,7 +421,10 @@ pub fn custom_recursive_prove(
     proof_qm31s.serialize(&mut proof_bytes);
     let compressed = zstd::encode_all(&proof_bytes[..], 3)?;
 
-    // Verify both proofs
+    // ── Verify both proofs ───────────────────────────────────────────
+    // We verify as a sanity check. In production the on-chain verifier
+    // only sees the circuit proof, but checking both here catches bugs.
+
     let t_verify = Instant::now();
 
     info!("Verifying Cairo proof");
