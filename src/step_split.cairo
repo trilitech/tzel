@@ -1,8 +1,8 @@
-/// Step 4: Split C(1500) + Z(0) → D(800, alice) + E(700, bob).
+/// Step 4: Split C(1500) → D(800, alice) + E(700, bob) using N=1 transfer.
 /// Tree: [cm_a, cm_b, cm_z, cm_c, cm_w]
 ///
-/// C belongs to Bob, Z belongs to Dummy — different accounts, different nk.
-/// The v2 transfer circuit takes per-input nk, supporting cross-account inputs.
+/// This demonstrates N=1: a single input split into two outputs.
+/// No dummy notes needed — the N→2 circuit supports N=1 natively.
 
 use starkprivacy::{common, transfer, tree};
 
@@ -19,17 +19,22 @@ fn main() -> Array<felt252> {
     let zh = tree::zero_hashes();
     let leaves: Array<felt252> = array![a.cm, b.cm, z.cm, c.cm, w.cm];
     let (sib_c, idx_c, root) = tree::auth_path(leaves.span(), 3, zh.span());
-    let (sib_z, idx_z, _) = tree::auth_path(leaves.span(), 2, zh.span());
 
     let (_, ak_c) = common::derive_ask(common::bob_account().ask_base, 0);
-    let (_, ak_z) = common::derive_ask(common::dummy_account().ask_base, 0);
 
+    // N=1: single-element arrays. No dummy note needed!
     transfer::verify(
-        root, c.nf, z.nf, d.cm, e.cm,
-        // input C (Bob's nk)
-        c.nk, ak_c, c.d_j, c.v, c.rseed, sib_c.span(), idx_c,
-        // input Z (Dummy's nk — different account!)
-        z.nk, ak_z, z.d_j, z.v, z.rseed, sib_z.span(), idx_z,
+        root,
+        array![c.nf].span(),
+        d.cm, e.cm,
+        // per-input (N=1)
+        array![c.nk].span(),
+        array![ak_c].span(),
+        array![c.d_j].span(),
+        array![c.v].span(),
+        array![c.rseed].span(),
+        sib_c.span(),
+        array![idx_c].span(),
         // output D (Alice), output E (Bob)
         d.d_j, d.v, d.rseed, d.ak,
         e.d_j, e.v, e.rseed, e.ak,

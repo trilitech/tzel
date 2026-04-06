@@ -56,6 +56,11 @@ const ZERO: F = [0u8; 32];
 /// Detection tag precision: 10-bit tag → ~1/1024 false positive rate.
 const DETECT_K: usize = 10;
 
+/// User memo size: 1024 bytes for arbitrary data (payment refs, messages, etc.).
+/// Padded with zeros if the sender provides less. Set to 0xF6 || zeros for "no memo"
+/// (following the Zcash convention from ZIP 302).
+const MEMO_SIZE: usize = 1024;
+
 /// BLAKE2s-256 with personalization, truncated to 251 bits.
 fn blake2s(personal: &[u8; 8], data: &[u8]) -> F {
     let digest = Params::new()
@@ -218,33 +223,58 @@ fn kem_gen() -> (Ek, Dk) {
     (ek, dk)
 }
 
-/// An encrypted note posted on-chain: detection ciphertext + tag + memo.
+/// An encrypted note posted on-chain alongside its commitment.
+///
+/// On-chain layout per output note:
+///   ct_d:           1088 bytes  ML-KEM detection ciphertext
+///   tag:               2 bytes  k-bit detection tag
+///   ct_v:           1088 bytes  ML-KEM memo ciphertext
+///   encrypted_data: 1080 bytes  ChaCha20-Poly1305(v || rseed || user_memo) + 16-byte tag
+///                  ────────────
+///                   3258 bytes  (~3.2 KB per output note)
 #[derive(Clone)]
 struct EncryptedNote {
-    ct_d: Vec<u8>,   // ML-KEM detection ciphertext (~1088 bytes)
-    tag: u16,        // k-bit detection tag
-    ct_v: Vec<u8>,   // ML-KEM memo ciphertext (~1088 bytes)
-    memo: Vec<u8>,   // ChaCha20-Poly1305 encrypted (v || rseed) (56 bytes)
+    ct_d: Vec<u8>,           // ML-KEM detection ciphertext (~1088 bytes)
+    tag: u16,                // k-bit detection tag
+    ct_v: Vec<u8>,           // ML-KEM memo ciphertext (~1088 bytes)
+    encrypted_data: Vec<u8>, // AEAD(v:8 || rseed:32 || user_memo:1024) + 16 auth tag
 }
 
-/// Encrypt a note for the recipient. Creates both detection and memo ciphertexts.
-fn encrypt_note(v: u64, rseed: &F, ek_v: &Ek, ek_d: &Ek) -> EncryptedNote {
+/// Encrypt a note for the recipient. The `user_memo` is an arbitrary 1 KB
+/// payload (payment references, messages, return addresses, etc.).
+/// If shorter than 1024 bytes, it's zero-padded. If None, the memo field
+/// is set to 0xF6 followed by zeros (Zcash "no memo" convention).
+fn encrypt_note(v: u64, rseed: &F, user_memo: Option<&[u8]>, ek_v: &Ek, ek_d: &Ek) -> EncryptedNote {
     // Detection: encapsulate under ek_d, compute k-bit tag from shared secret.
     let (ct_d, ss_d): (ml_kem_768::Ciphertext, _) = ek_d.encapsulate();
     let tag_hash = hash(ss_d.as_slice());
     let tag = u16::from_le_bytes([tag_hash[0], tag_hash[1]]) & ((1 << DETECT_K) - 1);
 
-    // Memo: encapsulate under ek_v, derive symmetric key, encrypt note data.
+    // Build plaintext: v (8 bytes) || rseed (32 bytes) || user_memo (1024 bytes).
+    let mut plaintext = Vec::with_capacity(8 + 32 + MEMO_SIZE);
+    plaintext.extend_from_slice(&v.to_le_bytes());
+    plaintext.extend_from_slice(rseed);
+    // Append user memo, padded to MEMO_SIZE.
+    let mut memo_padded = vec![0u8; MEMO_SIZE];
+    match user_memo {
+        Some(m) => {
+            let len = m.len().min(MEMO_SIZE);
+            memo_padded[..len].copy_from_slice(&m[..len]);
+        }
+        None => {
+            memo_padded[0] = 0xF6; // "no memo" marker (ZIP 302 convention)
+        }
+    }
+    plaintext.extend_from_slice(&memo_padded);
+
+    // Encrypt with ChaCha20-Poly1305. Key from fresh ML-KEM encapsulation.
     let (ct_v, ss_v): (ml_kem_768::Ciphertext, _) = ek_v.encapsulate();
     let key = hash(ss_v.as_slice());
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    let mut plaintext = Vec::with_capacity(40);
-    plaintext.extend_from_slice(&v.to_le_bytes());
-    plaintext.extend_from_slice(rseed);
     // Nonce is zero because the key is single-use (fresh KEM encapsulation).
-    let memo = cipher.encrypt(Nonce::from_slice(&[0u8; 12]), plaintext.as_slice()).unwrap();
+    let encrypted_data = cipher.encrypt(Nonce::from_slice(&[0u8; 12]), plaintext.as_slice()).unwrap();
 
-    EncryptedNote { ct_d: ct_d.to_vec(), tag, ct_v: ct_v.to_vec(), memo }
+    EncryptedNote { ct_d: ct_d.to_vec(), tag, ct_v: ct_v.to_vec(), encrypted_data }
 }
 
 /// Detection: fast check if this note MIGHT be for us.
@@ -259,19 +289,20 @@ fn detect(enc: &EncryptedNote, dk_d: &Dk) -> bool {
     computed == enc.tag
 }
 
-/// Decrypt a memo: recover (v, rseed) from the ML-KEM + AEAD layers.
+/// Decrypt a note: recover (v, rseed, user_memo) from ML-KEM + AEAD layers.
 /// Returns None if decryption fails (wrong key or tampered ciphertext).
-fn decrypt_memo(enc: &EncryptedNote, dk_v: &Dk) -> Option<(u64, F)> {
+fn decrypt_memo(enc: &EncryptedNote, dk_v: &Dk) -> Option<(u64, F, Vec<u8>)> {
     let ct = ml_kem_768::Ciphertext::try_from(enc.ct_v.as_slice()).unwrap();
     let ss = dk_v.try_decapsulate(&ct).ok()?;
     let key = hash(ss.as_slice());
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    let pt = cipher.decrypt(Nonce::from_slice(&[0u8; 12]), enc.memo.as_slice()).ok()?;
-    if pt.len() != 40 { return None; }
+    let pt = cipher.decrypt(Nonce::from_slice(&[0u8; 12]), enc.encrypted_data.as_slice()).ok()?;
+    if pt.len() != 8 + 32 + MEMO_SIZE { return None; }
     let v = u64::from_le_bytes(pt[..8].try_into().unwrap());
     let mut rseed = ZERO;
     rseed.copy_from_slice(&pt[8..40]);
-    Some((v, rseed))
+    let user_memo = pt[40..].to_vec();
+    Some((v, rseed, user_memo))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -418,8 +449,8 @@ impl Wallet {
             if !detect(enc, &self.dk_d) { continue; }
             detected += 1;
 
-            // Stage 2: memo decryption — authenticate and recover note data.
-            let Some((v, rseed)) = decrypt_memo(enc, &self.dk_v) else { continue; };
+            // Stage 2: memo decryption — authenticate and recover note data + user memo.
+            let Some((v, rseed, _user_memo)) = decrypt_memo(enc, &self.dk_v) else { continue; };
             decrypted += 1;
 
             // Stage 3: try each address to find which d_j + ak produces this cm.
@@ -475,7 +506,7 @@ impl Chain {
     fn snapshot_root(&mut self) { self.valid_roots.insert(self.tree.root()); }
 
     /// Shield: deposit public tokens into a private note.
-    fn shield(&mut self, sender: &str, v: u64, d_j: &F, ak: &F, ek_v: &Ek, ek_d: &Ek) -> Result<(), String> {
+    fn shield(&mut self, sender: &str, v: u64, d_j: &F, ak: &F, memo: Option<&[u8]>, ek_v: &Ek, ek_d: &Ek) -> Result<(), String> {
         let bal = self.balances.get(sender).copied().unwrap_or(0);
         if bal < v { return Err("insufficient balance".into()); }
         let mut rng = rand::rng();
@@ -485,58 +516,111 @@ impl Chain {
         *self.balances.get_mut(sender).unwrap() -= v;
         let index = self.tree.append(cm);
         self.snapshot_root();
-        self.memos.push((cm, encrypt_note(v, &rseed, ek_v, ek_d)));
+        self.memos.push((cm, encrypt_note(v, &rseed, memo, ek_v, ek_d)));
         println!("    cm={} index={}", short(&cm), index);
         Ok(())
     }
 
-    /// Unshield: withdraw a private note to a public address.
-    fn unshield(&mut self, note: &Note, recipient: &str) -> Result<(), String> {
-        let rcm = derive_rcm(&note.rseed);
-        let cm = commit(&note.d_j, note.v, &rcm, &note.ak);
-        let (siblings, root) = self.tree.auth_path(note.index);
-        let nf = nullifier(&note.nk, &cm);
-        assert_eq!(cm, note.cm, "commitment recomputation failed");
-        verify_merkle(&cm, &root, &siblings, note.index);
-        if self.nullifiers.contains(&nf) { return Err("nullifier already spent".into()); }
+    /// Unshield: spend N notes → public withdrawal + optional private change.
+    /// Mirrors the Cairo N→change+withdrawal circuit.
+    fn unshield(
+        &mut self, inputs: &[Note], v_pub: u64, recipient: &str,
+        change: Option<(&F, &F, &Ek, &Ek)>, // (d_j, ak, ek_v, ek_d) for change output
+    ) -> Result<(), String> {
+        assert!(!inputs.is_empty() && inputs.len() <= 16);
+        let root = self.tree.root();
+
+        // Verify all inputs, compute nullifiers, sum values.
+        let mut sum_in: u128 = 0;
+        let mut nfs = vec![];
+        for note in inputs {
+            let (siblings, r) = self.tree.auth_path(note.index);
+            assert_eq!(r, root, "root mismatch across inputs");
+            verify_merkle(&note.cm, &root, &siblings, note.index);
+            let nf = nullifier(&note.nk, &note.cm);
+            if self.nullifiers.contains(&nf) { return Err("nullifier spent".into()); }
+            nfs.push(nf);
+            sum_in += note.v as u128;
+        }
         if !self.valid_roots.contains(&root) { return Err("invalid root".into()); }
-        self.nullifiers.insert(nf);
-        *self.balances.entry(recipient.into()).or_default() += note.v;
-        println!("    nf={} v={}", short(&nf), note.v);
+
+        // Pairwise nullifier distinctness.
+        for i in 0..nfs.len() {
+            for j in i+1..nfs.len() {
+                assert_ne!(nfs[i], nfs[j], "duplicate nullifier");
+            }
+        }
+
+        // Balance: sum_in = v_pub + v_change
+        let v_change = sum_in - v_pub as u128;
+
+        // Create change output if requested.
+        if let Some((d_j, ak, ek_v, ek_d)) = change {
+            assert!(v_change <= u64::MAX as u128);
+            let mut rng = rand::rng();
+            let rseed: F = rng.random();
+            let rcm = derive_rcm(&rseed);
+            let cm = commit(d_j, v_change as u64, &rcm, ak);
+            let index = self.tree.append(cm);
+            self.memos.push((cm, encrypt_note(v_change as u64, &rseed, None, ek_v, ek_d)));
+            println!("    change cm={} v={} index={}", short(&cm), v_change, index);
+        } else {
+            assert_eq!(v_change, 0, "no change output but value remains");
+        }
+
+        // State updates.
+        for nf in &nfs { self.nullifiers.insert(*nf); }
+        *self.balances.entry(recipient.into()).or_default() += v_pub;
+        self.snapshot_root();
+        println!("    withdrawn v_pub={} to {} ({} inputs)", v_pub, recipient, inputs.len());
         Ok(())
     }
 
-    /// Transfer: spend two notes, create two new notes. Value conserved.
+    /// Transfer: spend N notes → 2 private outputs. Value conserved.
+    /// Mirrors the Cairo N→2 transfer circuit.
     fn transfer(
-        &mut self, in_a: &Note, in_b: &Note,
-        d1: &F, ak1: &F, v1: u64, ev1: &Ek, ed1: &Ek,
-        d2: &F, ak2: &F, v2: u64, ev2: &Ek, ed2: &Ek,
+        &mut self, inputs: &[Note],
+        d1: &F, ak1: &F, v1: u64, memo1: Option<&[u8]>, ev1: &Ek, ed1: &Ek,
+        d2: &F, ak2: &F, v2: u64, memo2: Option<&[u8]>, ev2: &Ek, ed2: &Ek,
     ) -> Result<(), String> {
-        // Verify both inputs.
-        let (sib_a, root) = self.tree.auth_path(in_a.index);
-        let (sib_b, _) = self.tree.auth_path(in_b.index);
-        verify_merkle(&in_a.cm, &root, &sib_a, in_a.index);
-        verify_merkle(&in_b.cm, &root, &sib_b, in_b.index);
-        let nf_a = nullifier(&in_a.nk, &in_a.cm);
-        let nf_b = nullifier(&in_b.nk, &in_b.cm);
-        assert_ne!(nf_a, nf_b, "duplicate nullifier");
-        assert_eq!(in_a.v as u128 + in_b.v as u128, v1 as u128 + v2 as u128, "balance mismatch");
-        if self.nullifiers.contains(&nf_a) { return Err("nf_a spent".into()); }
-        if self.nullifiers.contains(&nf_b) { return Err("nf_b spent".into()); }
+        assert!(!inputs.is_empty() && inputs.len() <= 16);
+        let root = self.tree.root();
+
+        // Verify all inputs.
+        let mut sum_in: u128 = 0;
+        let mut nfs = vec![];
+        for note in inputs {
+            let (siblings, r) = self.tree.auth_path(note.index);
+            assert_eq!(r, root, "root mismatch");
+            verify_merkle(&note.cm, &root, &siblings, note.index);
+            let nf = nullifier(&note.nk, &note.cm);
+            if self.nullifiers.contains(&nf) { return Err(format!("nf {} spent", short(&nf))); }
+            nfs.push(nf);
+            sum_in += note.v as u128;
+        }
         if !self.valid_roots.contains(&root) { return Err("invalid root".into()); }
 
-        // Create output notes.
+        // Pairwise nullifier distinctness.
+        for i in 0..nfs.len() {
+            for j in i+1..nfs.len() {
+                assert_ne!(nfs[i], nfs[j], "duplicate nullifier");
+            }
+        }
+
+        // Balance conservation.
+        assert_eq!(sum_in, v1 as u128 + v2 as u128, "balance mismatch");
+
+        // Create two output notes.
         let mut rng = rand::rng();
-        for (d, ak, v, ev, ed) in [(d1, ak1, v1, ev1, ed1), (d2, ak2, v2, ev2, ed2)] {
+        for (d, ak, v, memo, ev, ed) in [(d1, ak1, v1, memo1, ev1, ed1), (d2, ak2, v2, memo2, ev2, ed2)] {
             let rseed: F = rng.random();
             let rcm = derive_rcm(&rseed);
             let cm = commit(d, v, &rcm, ak);
             let index = self.tree.append(cm);
-            self.memos.push((cm, encrypt_note(v, &rseed, ev, ed)));
+            self.memos.push((cm, encrypt_note(v, &rseed, memo, ev, ed)));
             println!("    output cm={} v={} index={}", short(&cm), v, index);
         }
-        self.nullifiers.insert(nf_a);
-        self.nullifiers.insert(nf_b);
+        for nf in &nfs { self.nullifiers.insert(*nf); }
         self.snapshot_root();
         Ok(())
     }
@@ -561,59 +645,87 @@ fn main() {
     let (da1, ak_a1) = alice.next_address();
     let (da2, ak_a2) = alice.next_address();
     println!("[2] Shield 1500");
-    chain.shield("alice", 1500, &da1, &ak_a1, &alice.ek_v, &alice.ek_d).unwrap();
+    chain.shield("alice", 1500, &da1, &ak_a1, None, &alice.ek_v, &alice.ek_d).unwrap();
     println!("[3] Shield 500");
-    chain.shield("alice", 500, &da2, &ak_a2, &alice.ek_v, &alice.ek_d).unwrap();
+    chain.shield("alice", 500, &da2, &ak_a2, None, &alice.ek_v, &alice.ek_d).unwrap();
 
     // 4. Alice scans: detection → decryption → address matching.
     println!("[4] Alice scans:");
     alice.scan(&chain);
     println!("    public={} private={}", chain.balances["alice"], alice.balance());
 
-    // 5. Transfer: Alice(1500+500) → Bob(1200) + Alice(800 change).
+    // 5. Transfer N=2: Alice(1500+500) → Bob(1200) + Alice(800 change).
     let (db1, ak_b1) = bob.next_address();
     let (da3, ak_a3) = alice.next_address();
-    println!("[5] Transfer: alice(1500+500) -> bob(1200) + alice(800)");
-    let (a, b) = (alice.notes[0].clone(), alice.notes[1].clone());
+    println!("[5] Transfer (N=2): alice(1500+500) -> bob(1200) + alice(800)");
+    println!("    (with memo: 'Payment for mass relay parts')");
+    let inputs: Vec<Note> = alice.notes.clone();
     chain.transfer(
-        &a, &b,
-        &db1, &ak_b1, 1200, &bob.ek_v, &bob.ek_d,
-        &da3, &ak_a3, 800, &alice.ek_v, &alice.ek_d,
+        &inputs,
+        &db1, &ak_b1, 1200, Some(b"Payment for mass relay parts"), &bob.ek_v, &bob.ek_d,
+        &da3, &ak_a3, 800, None, &alice.ek_v, &alice.ek_d,
     ).unwrap();
     alice.spend(&[0, 1]);
 
-    // 6. Both scan for new notes.
+    // 6. Both scan.
     println!("[6] Scan:");
     alice.scan(&chain);
     bob.scan(&chain);
     println!("    alice={} bob={}", alice.balance(), bob.balance());
 
-    // 7. Bob unshields to public address.
-    println!("[7] Unshield: bob withdraws 1200");
-    let note = bob.notes[0].clone();
-    chain.unshield(&note, "bob").unwrap();
+    // 7. Split N=1: Bob(1200) → Carol(500) + Bob(700 change).
+    //    Demonstrates N=1 transfer — no dummy notes needed!
+    let mut carol = Wallet::new();
+    let (dc1, ak_c1) = carol.next_address();
+    let (db2, ak_b2) = bob.next_address();
+    println!("[7] Split (N=1): bob(1200) -> carol(500) + bob(700)");
+    chain.transfer(
+        &[bob.notes[0].clone()], // N=1: single input
+        &dc1, &ak_c1, 500, None, &carol.ek_v, &carol.ek_d,
+        &db2, &ak_b2, 700, None, &bob.ek_v, &bob.ek_d,
+    ).unwrap();
     bob.spend(&[0]);
 
-    // 8. Double-spend rejected.
-    print!("[8] Double-spend: ");
-    match chain.unshield(&note, "bob") {
+    println!("[8] Scan:");
+    bob.scan(&chain);
+    carol.scan(&chain);
+    println!("    bob={} carol={}", bob.balance(), carol.balance());
+
+    // 9. Unshield N=1 with change: Carol withdraws 200, keeps 300 private.
+    let (dc2, ak_c2) = carol.next_address();
+    println!("[9] Unshield (N=1 + change): carol withdraws 200, keeps 300");
+    chain.unshield(
+        &[carol.notes[0].clone()], 200, "carol",
+        Some((&dc2, &ak_c2, &carol.ek_v, &carol.ek_d)),
+    ).unwrap();
+    carol.spend(&[0]);
+    carol.scan(&chain);
+    println!("    carol public={} private={}", chain.balances.get("carol").unwrap_or(&0), carol.balance());
+
+    // 10. Double-spend rejected: try to re-spend Alice's notes (already spent in step 5).
+    print!("[10] Double-spend (alice's notes from step 5): ");
+    match chain.transfer(
+        &inputs, // alice's notes, already spent in step 5
+        &db1, &ak_b1, 1200, None, &bob.ek_v, &bob.ek_d,
+        &da3, &ak_a3, 800, None, &alice.ek_v, &alice.ek_d,
+    ) {
         Err(e) => println!("REJECTED ({})", e),
         Ok(()) => println!("BUG!"),
     }
 
     // Value conservation check.
     println!("\n=== Final State ===");
-    let total = chain.balances.values().sum::<u64>() + alice.balance() + bob.balance();
-    println!(
-        "Tree: {} commitments, Nullifiers: {} spent",
-        chain.tree.leaves.len(), chain.nullifiers.len()
-    );
-    println!(
-        "Public: alice={} bob={}  Private: alice={} bob={}  Total: {}",
+    let total = chain.balances.values().sum::<u64>()
+        + alice.balance() + bob.balance() + carol.balance();
+    println!("Tree: {} commitments, Nullifiers: {} spent",
+        chain.tree.leaves.len(), chain.nullifiers.len());
+    println!("Public:  alice={} bob={} carol={}",
         chain.balances.get("alice").unwrap_or(&0),
         chain.balances.get("bob").unwrap_or(&0),
-        alice.balance(), bob.balance(), total
-    );
+        chain.balances.get("carol").unwrap_or(&0));
+    println!("Private: alice={} bob={} carol={}",
+        alice.balance(), bob.balance(), carol.balance());
+    println!("Total:   {} (invariant: 2000)", total);
     assert_eq!(total, 2000, "value conservation violated!");
 }
 
@@ -635,10 +747,10 @@ mod tests {
         let (mut c, mut a, _) = setup();
         c.fund("a", 1000);
         let (d, ak) = a.next_address();
-        c.shield("a", 1000, &d, &ak, &a.ek_v, &a.ek_d).unwrap();
+        c.shield("a", 1000, &d, &ak, None, &a.ek_v, &a.ek_d).unwrap();
         a.scan(&c);
         assert_eq!(a.balance(), 1000);
-        c.unshield(&a.notes[0].clone(), "a").unwrap();
+        c.unshield(&[a.notes[0].clone()], 1000, "a", None).unwrap();
         assert_eq!(c.balances["a"], 1000);
     }
 
@@ -648,40 +760,69 @@ mod tests {
         let (mut c, mut a, _) = setup();
         c.fund("a", 500);
         let (d, ak) = a.next_address();
-        c.shield("a", 500, &d, &ak, &a.ek_v, &a.ek_d).unwrap();
+        c.shield("a", 500, &d, &ak, None, &a.ek_v, &a.ek_d).unwrap();
         a.scan(&c);
         let n = a.notes[0].clone();
-        c.unshield(&n, "a").unwrap();
-        assert!(c.unshield(&n, "a").is_err());
+        c.unshield(&[n.clone()], 500, "a", None).unwrap();
+        assert!(c.unshield(&[n], 500, "a", None).is_err());
     }
 
-    /// Total value (public + private) is conserved across transfers.
+    /// N=2 transfer conserves value.
     #[test]
-    fn test_conservation() {
+    fn test_transfer_n2() {
         let (mut c, mut a, mut b) = setup();
         c.fund("a", 1000);
         let (d1, ak1) = a.next_address();
         let (d2, ak2) = a.next_address();
-        c.shield("a", 600, &d1, &ak1, &a.ek_v, &a.ek_d).unwrap();
-        c.shield("a", 400, &d2, &ak2, &a.ek_v, &a.ek_d).unwrap();
+        c.shield("a", 600, &d1, &ak1, None, &a.ek_v, &a.ek_d).unwrap();
+        c.shield("a", 400, &d2, &ak2, None, &a.ek_v, &a.ek_d).unwrap();
         a.scan(&c);
         let (db, akb) = b.next_address();
         let (da, aka) = a.next_address();
-        let (x, y) = (a.notes[0].clone(), a.notes[1].clone());
-        c.transfer(&x, &y, &db, &akb, 700, &b.ek_v, &b.ek_d, &da, &aka, 300, &a.ek_v, &a.ek_d).unwrap();
-        a.spend(&[0, 1]);
-        a.scan(&c);
-        b.scan(&c);
+        let inputs: Vec<Note> = a.notes.clone();
+        c.transfer(&inputs, &db, &akb, 700, None, &b.ek_v, &b.ek_d, &da, &aka, 300, None, &a.ek_v, &a.ek_d).unwrap();
+        a.spend(&[0, 1]); a.scan(&c); b.scan(&c);
         assert_eq!(c.balances.values().sum::<u64>() + a.balance() + b.balance(), 1000);
     }
 
-    /// Bob's detection server doesn't flag Alice's notes (different ML-KEM keys).
+    /// N=1 split: one input → two outputs, no dummies needed.
+    #[test]
+    fn test_split_n1() {
+        let (mut c, mut a, mut b) = setup();
+        c.fund("a", 1000);
+        let (d, ak) = a.next_address();
+        c.shield("a", 1000, &d, &ak, None, &a.ek_v, &a.ek_d).unwrap();
+        a.scan(&c);
+        let (db, akb) = b.next_address();
+        let (da, aka) = a.next_address();
+        c.transfer(&[a.notes[0].clone()], &db, &akb, 400, None, &b.ek_v, &b.ek_d, &da, &aka, 600, None, &a.ek_v, &a.ek_d).unwrap();
+        a.spend(&[0]); a.scan(&c); b.scan(&c);
+        assert_eq!(a.balance(), 600);
+        assert_eq!(b.balance(), 400);
+    }
+
+    /// Unshield with change: spend 1 note, withdraw part, keep rest private.
+    #[test]
+    fn test_unshield_with_change() {
+        let (mut c, mut a, _) = setup();
+        c.fund("a", 1000);
+        let (d, ak) = a.next_address();
+        c.shield("a", 1000, &d, &ak, None, &a.ek_v, &a.ek_d).unwrap();
+        a.scan(&c);
+        let (dc, akc) = a.next_address();
+        c.unshield(&[a.notes[0].clone()], 300, "a", Some((&dc, &akc, &a.ek_v, &a.ek_d))).unwrap();
+        a.spend(&[0]); a.scan(&c);
+        assert_eq!(c.balances["a"], 300);  // 300 withdrawn to public
+        assert_eq!(a.balance(), 700);       // 700 kept private as change
+    }
+
+    /// Detection: Bob's detector doesn't flag Alice's notes.
     #[test]
     fn test_detection_filters() {
         let (mut c, mut a, mut b) = setup();
         c.fund("a", 100);
         let (d, ak) = a.next_address();
-        c.shield("a", 100, &d, &ak, &a.ek_v, &a.ek_d).unwrap();
+        c.shield("a", 100, &d, &ak, None, &a.ek_v, &a.ek_d).unwrap();
         b.scan(&c);
         assert_eq!(b.balance(), 0);
         a.scan(&c);

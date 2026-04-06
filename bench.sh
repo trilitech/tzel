@@ -31,7 +31,7 @@ if [ ! -f reprover/target/release/reprove ]; then
 fi
 
 STEPS=("step_shield" "step_unshield" "step_join" "step_split")
-LABELS=("Shield" "Unshield" "Join (2→2)" "Split (2→2)")
+LABELS=("Shield" "Unshield (N=1)" "Join (N=2)" "Split (N=1)")
 
 # Format bytes as KB (integer)
 fmt_kb() { echo "$(( $1 / 1024 ))"; }

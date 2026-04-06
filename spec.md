@@ -86,32 +86,42 @@ The commitment binds to the diversified address and value. It does NOT contain s
 
 **State changes:** deduct `v_pub` from sender, append `cm_new` to T.
 
-### Unshield (private → public)
+### Transfer (N→2, where 1 ≤ N ≤ 16)
 
-**Public outputs:** `[root, nf, v_pub, ak_j, recipient]`
+Consumes N private notes and creates exactly 2 new private notes. Handles splits (N=1), standard transfers (N=2), and consolidations (N>2) with a single circuit. N is a runtime parameter, not a program parameter — the program hash is the same for all N.
 
-**Circuit constraints:**
-1. `rcm = H("rcm", rseed)`
-2. `cm = H_commit(d_j, v_pub, rcm, ak)`
-3. `cm` in T under `root`
-4. `nf = H_null(nk, cm)`
+**N is not private.** The number of published nullifiers reveals the input count. This is inherent to per-input nullifier publication.
 
-**Contract checks:** proof valid, signature under `ak_j`, root ∈ valid_roots, nf ∉ NF_set.
-
-**State changes:** add nf to NF_set, credit `v_pub` to recipient.
-
-### Transfer (2-in-2-out JoinSplit)
-
-**Public outputs:** `[root, nf_a, nf_b, cm_1, cm_2, ak_a, ak_b]`
+**Public outputs:** `[root, nf_0, ..., nf_{N-1}, cm_1, cm_2, ak_0, ..., ak_{N-1}]`
 
 **Circuit constraints:**
-1. For each input: `rcm = H("rcm", rseed)`, `cm = H_commit(d_j, v, rcm, ak)`, Merkle membership, `nf = H_null(nk, cm)`
-2. `nf_a ≠ nf_b`
-3. For each output: `rcm = H("rcm", rseed)`, `cm = H_commit(d_j, v, rcm, ak)`
-4. `v_a + v_b = v_1 + v_2` (in u128)
+1. For each input i (0..N): `rcm = H("rcm", rseed)`, `cm = H_commit(d_j, v, rcm, ak)`, Merkle membership, `nf = H_null(nk, cm)`
+2. All nullifiers pairwise distinct
+3. For both outputs: `rcm = H("rcm", rseed)`, `cm = H_commit(d_j, v, rcm, ak)`
+4. `sum(v_inputs) = v_1 + v_2` (in u128)
 5. All values are u64 (implicit range check)
 
-Each input has its own `nk` (supporting cross-account inputs). The contract verifies signatures under both `ak_a` and `ak_b`.
+Each input has its own `nk` (supporting cross-account inputs). The contract verifies N signatures (one per `ak_i`).
+
+### Unshield (N→withdrawal + optional change, where 1 ≤ N ≤ 16)
+
+Consumes N private notes, releases `v_pub` to a public address, and optionally creates one private change note.
+
+**Public outputs:** `[root, nf_0, ..., nf_{N-1}, v_pub, ak_0, ..., ak_{N-1}, recipient, cm_change]`
+
+`cm_change` is 0 if no change output.
+
+**Circuit constraints:**
+1. Same per-input verification as Transfer
+2. All nullifiers pairwise distinct
+3. If change: `cm_change = H_commit(d_j_c, v_change, rcm_c, ak_c)`
+4. `sum(v_inputs) = v_pub + v_change`
+
+The contract verifies N signatures, credits `v_pub` to `recipient`, and appends `cm_change` to T (if nonzero).
+
+### Why N→2 eliminates dummy notes
+
+With N=1 supported natively, there is no second input slot to fill. The only "dummies" are zero-value *outputs* (when change is exactly zero), which are fresh commitments created on the fly — no pre-shielding required.
 
 ## Delegated Proving
 
@@ -130,8 +140,8 @@ Detection precision `k` is a protocol constant (e.g., k=10). Per note on-chain:
 ```
 (ss_d, ct_d)     = ML-KEM.Encaps(ek_d_j)     — encapsulate under detection key
 tag              = H(ss_d)[0..k]              — k-bit detection tag
-encrypted_memo   = ChaCha20-Poly1305(key=H(ss_v), nonce=0, plaintext=(v, rseed))
 (ss_v, ct_v)     = ML-KEM.Encaps(ek_v_j)     — encapsulate under viewing key
+encrypted_data   = ChaCha20-Poly1305(key=H(ss_v), nonce=0, plaintext=(v || rseed || user_memo))
 ```
 
 The detection server (with `dk_d_j`) decapsulates `ct_d`, computes `H(ss')[0..k]`, and checks against `tag`. True matches always succeed. Non-matches succeed with probability 2^(-k) (false positives from ML-KEM's implicit rejection).
@@ -140,17 +150,69 @@ Detection assumes honest senders. A malicious sender can bypass detection by sub
 
 Precision `k` should NOT be claimed to provide "plausible deniability" without modeling network throughput, user activity, and time aggregation. The false positive rate 2^(-k) is a technical parameter, not a privacy guarantee.
 
-## On-Chain Data Per Note
+## User Memo
+
+Each note carries a 1024-byte user memo field, encrypted alongside `(v, rseed)` inside the AEAD ciphertext. The memo can contain arbitrary data: payment references, return addresses, human-readable messages, or structured metadata.
+
+Memo format conventions (following Zcash ZIP 302):
+- If the first byte is ≤ 0xF4: the memo is a UTF-8 string, zero-padded.
+- If the first byte is 0xF6: "no memo" (remainder is zeros).
+- If the first byte is ≥ 0xF5: application-defined binary format.
+
+The memo is end-to-end encrypted — only the recipient (with `dk_v`) can read it. The on-chain ciphertext reveals nothing about the memo content or length (all memos are padded to exactly 1024 bytes before encryption).
+
+## On-Chain Note Data
+
+Each output note in a transaction carries the following on-chain data:
 
 ```
-cm              —    32 bytes
-ct_d            — 1,088 bytes   (ML-KEM detection ciphertext)
-tag             —     2 bytes   (k-bit detection tag)
-ct_v            — 1,088 bytes   (ML-KEM memo ciphertext)
-encrypted_memo  —    88 bytes   (AEAD encrypted v + rseed)
+cm              —    32 bytes   note commitment
+ct_d            — 1,088 bytes   ML-KEM-768 detection ciphertext
+tag             —     2 bytes   k-bit detection tag
+ct_v            — 1,088 bytes   ML-KEM-768 memo ciphertext
+encrypted_data  — 1,080 bytes   ChaCha20-Poly1305(v:8 || rseed:32 || memo:1024) + 16 auth tag
                 ─────────────
-                 ~2.3 KB per note (vs ~290 KB proof)
+                 3,290 bytes per output note (~3.2 KB)
 ```
+
+## Transaction Format
+
+A transaction submitted on-chain contains:
+
+### Shield
+
+```
+proof             — ~295 KB   circuit proof (ZK, two-level recursive STARK)
+public_outputs    —  128 B    [v_pub, cm_new, ak, sender] (4 × 32 bytes)
+note_data         —  3.2 KB   1 output note (cm + detection + memo)
+signature         —   64 B    spend authorization under ak
+                  ─────────
+                  ~298 KB total
+```
+
+### Transfer (N→2)
+
+```
+proof             — ~295 KB   circuit proof
+public_outputs    — 96+64N B  [root, cm_1, cm_2] + N × [nf_i] + N × [ak_i]
+note_data         —  6.4 KB   2 output notes (each ~3.2 KB)
+signatures        —  64N B    N spend authorizations
+                  ─────────
+                  ~302 KB + 128N bytes  (for N=2: ~302 KB; for N=5: ~303 KB)
+```
+
+### Unshield (N→withdrawal + change)
+
+```
+proof             — ~295 KB   circuit proof
+public_outputs    — 128+64N B [root, v_pub, recipient, cm_change] + N × [nf_i] + N × [ak_i]
+note_data         — 0-3.2 KB  0 or 1 change note
+signatures        —  64N B    N spend authorizations
+                  ─────────
+                  ~295-299 KB + 128N bytes
+```
+
+The proof dominates all transaction types at ~295 KB. Note data adds ~3.2 KB per output note. Per-input overhead (nullifier + ak + signature) is ~128 bytes, negligible even at N=16 (~2 KB).
 
 ## Domain Separation
 

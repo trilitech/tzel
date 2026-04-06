@@ -1,4 +1,4 @@
-/// Step 2: Unshield note A — withdraw 1000 to a recipient.
+/// Step 2: Unshield note A — withdraw 1000 to a recipient (N=1, no change).
 /// Tree: [cm_a]
 
 use starkprivacy::{common, tree, unshield};
@@ -13,5 +13,19 @@ fn main() -> Array<felt252> {
     let leaves: Array<felt252> = array![a.cm];
     let (siblings, idx, root) = tree::auth_path(leaves.span(), 0, zh.span());
 
-    unshield::verify(root, a.nf, a.v, ak, recipient, a.nk, a.d_j, a.rseed, siblings.span(), idx)
+    // N=1: single-element arrays for per-input data.
+    unshield::verify(
+        root,
+        array![a.nf].span(),
+        a.v,
+        recipient,
+        array![a.nk].span(),
+        array![ak].span(),
+        array![a.d_j].span(),
+        array![a.v].span(),
+        array![a.rseed].span(),
+        siblings.span(),
+        array![idx].span(),
+        false, 0, 0, 0, 0, // no change
+    )
 }
