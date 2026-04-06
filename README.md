@@ -37,36 +37,35 @@ scarb build
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────┐
-│  User wallet                                        │
-│  ┌───────────┐  ┌──────────┐  ┌──────────────────┐ │
-│  │ master_sk │→ │ Key tree │→ │ Build transaction │ │
-│  └───────────┘  └──────────┘  └────────┬─────────┘ │
-│                                        │            │
-│              ┌─────────────────────────┐│            │
-│              │ Delegated prover        ││            │
-│              │ (untrusted, sees nk     ││            │
-│              │  but not ask)           ││            │
-│              │                         ▼│            │
-│              │  ┌──────────────────────┐│            │
-│              │  │ STARK proof (~295KB) ││            │
-│              │  │ Cairo → Stwo circuit ││            │
-│              │  └──────────┬───────────┘│            │
-│              └─────────────│────────────┘            │
-│                            ▼                        │
-│  User signs outputs with ask (trivially cheap)      │
-└────────────────────────┬────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────┐
-│  On-chain contract                                  │
-│  • Verify STARK proof                               │
-│  • Verify spend authorization signature             │
-│  • Check nullifiers against NF_set                  │
-│  • Append new commitments to Merkle tree T          │
-│  • Credit/debit public balances                     │
-└─────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Wallet["👤 User Wallet"]
+        MS[master_sk] --> KT[Key Derivation]
+        KT --> TX[Build Transaction]
+        TX -->|"nk, ak, d_j, v, rseed, path"| PROVER
+        PROVER -->|"STARK proof (~295 KB)"| SIGN
+        SIGN["Sign outputs with ask"] --> SUBMIT
+    end
+
+    subgraph PROVER["⚙️ Delegated Prover (untrusted)"]
+        P1["Cairo AIR proof"] --> P2["Stwo circuit reprover"]
+        P2 --> P3["ZK proof with blinding"]
+    end
+
+    subgraph Chain["⛓️ On-chain Contract"]
+        V1["Verify STARK proof"]
+        V2["Verify spend auth signature"]
+        V3["Check nullifiers ∉ NF_set"]
+        V4["Append commitments to tree T"]
+        V5["Credit/debit public balances"]
+    end
+
+    SUBMIT -->|"proof + signature"| V1
+    V1 --> V2 --> V3 --> V4 --> V5
+
+    style Wallet fill:#1a1a2e,stroke:#e94560,color:#eee
+    style PROVER fill:#16213e,stroke:#0f3460,color:#eee
+    style Chain fill:#0f3460,stroke:#53d8fb,color:#eee
 ```
 
 ## Key hierarchy
