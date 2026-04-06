@@ -1,18 +1,15 @@
 /// Shield circuit: deposit public tokens into a private note.
 ///
 /// # Public outputs
-///   - `v_pub`        — deposited amount
-///   - `cm_new`       — new note commitment (appended to T)
-///   - `ak`           — authorization verifying key
-///   - `sender`       — depositor's address (prevents front-running)
-///   - `memo_ct_hash` — hash of the encrypted memo ciphertext (prevents relay tampering)
+///   [v_pub, cm_new, ak, sender, memo_ct_hash]
 ///
 /// # Constraint
-///   cm_new = H_commit(d_j, v_pub, rcm, ak)
+///   owner_tag = H_owner(ak, nk_tag)
+///   rcm = H("rcm", rseed)
+///   cm_new = H_commit(d_j, v_pub, rcm, owner_tag)
 ///
-/// `memo_ct_hash` is computed client-side as H(ciphertext) and passed in
-/// as a public input. The circuit does not touch the memo — it just commits
-/// to the hash so the on-chain contract can verify the posted calldata matches.
+/// The sender computes nk_tag from the payment address and provides it.
+/// The commitment binds to both ak and nk_tag via the owner tag.
 
 use starkprivacy::blake_hash as hash;
 
@@ -22,11 +19,14 @@ pub fn verify(
     ak: felt252,
     sender: felt252,
     memo_ct_hash: felt252,
+    // private inputs
+    nk_tag: felt252,
     d_j: felt252,
     rseed: felt252,
 ) -> Array<felt252> {
+    let otag = hash::owner_tag(ak, nk_tag);
     let rcm = hash::derive_rcm(rseed);
-    assert(hash::commit(d_j, v_pub, rcm, ak) == cm_new, 'shield: bad commitment');
+    assert(hash::commit(d_j, v_pub, rcm, otag) == cm_new, 'shield: bad commitment');
 
     array![v_pub.into(), cm_new, ak, sender, memo_ct_hash]
 }

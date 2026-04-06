@@ -25,8 +25,8 @@
 ///           └── d_j = H(dsk, j)                  — diversified address
 /// ```
 ///
-/// - Commitment: `cm = H_commit(d_j, v, rcm, ak)` — binds address + auth key
-/// - Nullifier:  `nf = H_null(nk, cm)` — account-level, binds to commitment
+/// - Commitment: `cm = H_commit(d_j, v, rcm, owner_tag)` — binds address + auth + nullifier keys
+/// - Nullifier:  `nf = H_nf(nk_spend, H_nf(cm, pos))` — position-dependent, per-address
 /// - All hashing: BLAKE2s-256, 251-bit truncated, personalized IVs
 
 use blake2s_simd::Params;
@@ -105,14 +105,6 @@ fn hash_merkle(a: &F, b: &F) -> F {
     blake2s(b"mrklSP__", &buf)
 }
 
-/// H_null(nk, cm) — nullifier hash.
-fn hash_null(nk: &F, cm: &F) -> F {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(nk);
-    buf[32..].copy_from_slice(cm);
-    blake2s(b"nulfSP__", &buf)
-}
-
 /// H_commit(data) — commitment hash.
 fn hash_commit_raw(data: &[u8]) -> F {
     blake2s(b"cmmtSP__", data)
@@ -127,26 +119,50 @@ fn derive_rcm(rseed: &F) -> F {
     hash_two(&hash(&tag), rseed)
 }
 
-/// Note commitment: cm = H_commit(d_j, v, rcm, ak).
-///
-/// Layout of the 128-byte input:
-///   bytes  0..31:  d_j (diversified address)
-///   bytes 32..39:  v as u64 LE
-///   bytes 40..63:  zeros (felt252 encoding of u64)
-///   bytes 64..95:  rcm (commitment randomness)
-///   bytes 96..127: ak (authorization verifying key — prevents prover substitution)
-fn commit(d_j: &F, v: u64, rcm: &F, ak: &F) -> F {
+/// Derive per-address secret nullifier key: nk_spend_j = H_nksp(nk, d_j).
+fn derive_nk_spend(nk: &F, d_j: &F) -> F {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(nk);
+    buf[32..].copy_from_slice(d_j);
+    blake2s(b"nkspSP__", &buf)
+}
+
+/// Derive per-address public binding tag: nk_tag_j = H_nktg(nk_spend_j).
+fn derive_nk_tag(nk_spend: &F) -> F {
+    blake2s(b"nktgSP__", nk_spend)
+}
+
+/// Owner tag: fuses ak and nk_tag. H_owner(ak, nk_tag).
+fn owner_tag(ak: &F, nk_tag: &F) -> F {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(ak);
+    buf[32..].copy_from_slice(nk_tag);
+    blake2s(b"ownrSP__", &buf)
+}
+
+/// Note commitment: cm = H_commit(d_j, v, rcm, owner_tag_j).
+fn commit(d_j: &F, v: u64, rcm: &F, otag: &F) -> F {
     let mut buf = [0u8; 128];
     buf[..32].copy_from_slice(d_j);
     buf[32..40].copy_from_slice(&v.to_le_bytes());
-    // bytes 40..64 intentionally zero — matches felt252 encoding of a u64
     buf[64..96].copy_from_slice(rcm);
-    buf[96..128].copy_from_slice(ak);
+    buf[96..128].copy_from_slice(otag);
     hash_commit_raw(&buf)
 }
 
-/// Nullifier: nf = H_null(nk, cm). Account-level nk bound to this commitment.
-fn nullifier(nk: &F, cm: &F) -> F { hash_null(nk, cm) }
+/// Position-dependent nullifier: nf = H_nf(nk_spend, H_nf(cm, pos)).
+fn nullifier(nk_spend: &F, cm: &F, pos: u64) -> F {
+    let mut buf1 = [0u8; 64];
+    buf1[..32].copy_from_slice(cm);
+    let mut pos_f = ZERO;
+    pos_f[..8].copy_from_slice(&pos.to_le_bytes());
+    buf1[32..].copy_from_slice(&pos_f);
+    let cm_pos = blake2s(b"nulfSP__", &buf1);
+    let mut buf2 = [0u8; 64];
+    buf2[..32].copy_from_slice(nk_spend);
+    buf2[32..].copy_from_slice(&cm_pos);
+    blake2s(b"nulfSP__", &buf2)
+}
 
 /// Compute the memo ciphertext hash that the circuit commits to.
 /// This is H_memo(ct_v || encrypted_data) — the portion the recipient decrypts.
@@ -412,12 +428,13 @@ fn verify_merkle(leaf: &F, root: &F, siblings: &[F], mut index: usize) {
 /// A private note with all its data.
 #[derive(Clone)]
 struct Note {
-    nk: F,      // account nullifier key
-    ak: F,      // authorization verifying key (bound into commitment)
-    d_j: F,     // diversified address
-    v: u64,     // amount
-    rseed: F,   // per-note randomness
-    cm: F,      // commitment
+    nk_spend: F, // per-address secret nullifier key (given to prover)
+    nk_tag: F,   // per-address public binding tag (in payment address)
+    ak: F,       // authorization verifying key
+    d_j: F,      // diversified address
+    v: u64,      // amount
+    rseed: F,    // per-note randomness
+    cm: F,       // commitment
     index: usize, // Merkle tree leaf index
 }
 
@@ -440,13 +457,16 @@ impl Wallet {
         Self { account, addr_counter: 0, ek_v, dk_v, ek_d, dk_d, notes: vec![], scanned: 0 }
     }
 
-    /// Generate a new diversified address + authorization key.
-    fn next_address(&mut self) -> (F, F) {
+    /// Generate a new diversified address + authorization key + nk_tag.
+    /// Returns (d_j, ak_j, nk_tag_j).
+    fn next_address(&mut self) -> (F, F, F) {
         let j = self.addr_counter;
         let d_j = derive_address(&self.account.incoming_seed, j);
         let ak = derive_ak(&self.account.ask_base, j);
+        let nk_sp = derive_nk_spend(&self.account.nk, &d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
         self.addr_counter += 1;
-        (d_j, ak)
+        (d_j, ak, nk_tg)
     }
 
     /// Three-stage scanning:
@@ -466,14 +486,17 @@ impl Wallet {
             let Some((v, rseed, _user_memo)) = decrypt_memo(enc, &self.dk_v) else { continue; };
             decrypted += 1;
 
-            // Stage 3: try each address to find which d_j + ak produces this cm.
+            // Stage 3: try each address to find which d_j + ak + nk_tag produces this cm.
             let rcm = derive_rcm(&rseed);
             for j in 0..self.addr_counter {
                 let d_j = derive_address(&self.account.incoming_seed, j);
                 let ak = derive_ak(&self.account.ask_base, j);
-                if &commit(&d_j, v, &rcm, &ak) == cm {
+                let nk_sp = derive_nk_spend(&self.account.nk, &d_j);
+                let nk_tg = derive_nk_tag(&nk_sp);
+                let otag = owner_tag(&ak, &nk_tg);
+                if &commit(&d_j, v, &rcm, &otag) == cm {
                     let index = chain.tree.leaves.iter().position(|l| l == cm).unwrap();
-                    self.notes.push(Note { nk: self.account.nk, ak, d_j, v, rseed, cm: *cm, index });
+                    self.notes.push(Note { nk_spend: nk_sp, nk_tag: nk_tg, ak, d_j, v, rseed, cm: *cm, index });
                     println!("    found: v={} cm={} (det={} dec={})", v, short(cm), detected, decrypted);
                     break;
                 }
@@ -542,13 +565,14 @@ impl Chain {
     }
 
     /// Shield: deposit public tokens into a private note.
-    fn shield(&mut self, sender: &str, v: u64, d_j: &F, ak: &F, memo: Option<&[u8]>, ek_v: &Ek, ek_d: &Ek) -> Result<(), String> {
+    fn shield(&mut self, sender: &str, v: u64, d_j: &F, ak: &F, nk_tag: &F, memo: Option<&[u8]>, ek_v: &Ek, ek_d: &Ek) -> Result<(), String> {
         let bal = self.balances.get(sender).copied().unwrap_or(0);
         if bal < v { return Err("insufficient balance".into()); }
         let mut rng = rand::rng();
         let rseed: F = rng.random();
         let rcm = derive_rcm(&rseed);
-        let cm = commit(d_j, v, &rcm, ak);
+        let otag = owner_tag(ak, nk_tag);
+        let cm = commit(d_j, v, &rcm, &otag);
         *self.balances.get_mut(sender).unwrap() -= v;
         let index = self.tree.append(cm);
         self.snapshot_root();
@@ -561,19 +585,19 @@ impl Chain {
     /// Mirrors the Cairo N→change+withdrawal circuit.
     fn unshield(
         &mut self, inputs: &[Note], v_pub: u64, recipient: &str,
-        change: Option<(&F, &F, &Ek, &Ek)>, // (d_j, ak, ek_v, ek_d) for change output
+        change: Option<(&F, &F, &F, &Ek, &Ek)>, // (d_j, ak, nk_tag, ek_v, ek_d) for change output
     ) -> Result<(), String> {
         assert!(!inputs.is_empty() && inputs.len() <= 16);
         let root = self.tree.root();
 
-        // Verify all inputs, compute nullifiers, sum values.
+        // Verify all inputs, compute position-dependent nullifiers, sum values.
         let mut sum_in: u128 = 0;
         let mut nfs = vec![];
         for note in inputs {
             let (siblings, r) = self.tree.auth_path(note.index);
             assert_eq!(r, root, "root mismatch across inputs");
             verify_merkle(&note.cm, &root, &siblings, note.index);
-            let nf = nullifier(&note.nk, &note.cm);
+            let nf = nullifier(&note.nk_spend, &note.cm, note.index as u64);
             if self.nullifiers.contains(&nf) { return Err("nullifier spent".into()); }
             nfs.push(nf);
             sum_in += note.v as u128;
@@ -591,12 +615,13 @@ impl Chain {
         let v_change = sum_in - v_pub as u128;
 
         // Create change output if requested.
-        if let Some((d_j, ak, ek_v, ek_d)) = change {
+        if let Some((d_j, ak, nk_tag, ek_v, ek_d)) = change {
             assert!(v_change <= u64::MAX as u128);
             let mut rng = rand::rng();
             let rseed: F = rng.random();
             let rcm = derive_rcm(&rseed);
-            let cm = commit(d_j, v_change as u64, &rcm, ak);
+            let otag = owner_tag(ak, nk_tag);
+            let cm = commit(d_j, v_change as u64, &rcm, &otag);
             let index = self.tree.append(cm);
             self.post_note(cm, encrypt_note(v_change as u64, &rseed, None, ek_v, ek_d));
             println!("    change cm={} v={} index={}", short(&cm), v_change, index);
@@ -616,8 +641,8 @@ impl Chain {
     /// Mirrors the Cairo N→2 transfer circuit.
     fn transfer(
         &mut self, inputs: &[Note],
-        d1: &F, ak1: &F, v1: u64, memo1: Option<&[u8]>, ev1: &Ek, ed1: &Ek,
-        d2: &F, ak2: &F, v2: u64, memo2: Option<&[u8]>, ev2: &Ek, ed2: &Ek,
+        d1: &F, ak1: &F, nkt1: &F, v1: u64, memo1: Option<&[u8]>, ev1: &Ek, ed1: &Ek,
+        d2: &F, ak2: &F, nkt2: &F, v2: u64, memo2: Option<&[u8]>, ev2: &Ek, ed2: &Ek,
     ) -> Result<(), String> {
         assert!(!inputs.is_empty() && inputs.len() <= 16);
         let root = self.tree.root();
@@ -629,7 +654,7 @@ impl Chain {
             let (siblings, r) = self.tree.auth_path(note.index);
             assert_eq!(r, root, "root mismatch");
             verify_merkle(&note.cm, &root, &siblings, note.index);
-            let nf = nullifier(&note.nk, &note.cm);
+            let nf = nullifier(&note.nk_spend, &note.cm, note.index as u64);
             if self.nullifiers.contains(&nf) { return Err(format!("nf {} spent", short(&nf))); }
             nfs.push(nf);
             sum_in += note.v as u128;
@@ -648,10 +673,11 @@ impl Chain {
 
         // Create two output notes.
         let mut rng = rand::rng();
-        for (d, ak, v, memo, ev, ed) in [(d1, ak1, v1, memo1, ev1, ed1), (d2, ak2, v2, memo2, ev2, ed2)] {
+        for (d, ak, nkt, v, memo, ev, ed) in [(d1,ak1,nkt1,v1,memo1,ev1,ed1),(d2,ak2,nkt2,v2,memo2,ev2,ed2)] {
             let rseed: F = rng.random();
             let rcm = derive_rcm(&rseed);
-            let cm = commit(d, v, &rcm, ak);
+            let otag = owner_tag(ak, nkt);
+            let cm = commit(d, v, &rcm, &otag);
             let index = self.tree.append(cm);
             self.post_note(cm, encrypt_note(v, &rseed, memo, ev, ed));
             println!("    output cm={} v={} index={}", short(&cm), v, index);
@@ -678,12 +704,12 @@ fn main() {
     println!("[1] Fund alice with 2000");
 
     // 2-3. Shield: Alice deposits into private notes at diversified addresses.
-    let (da1, ak_a1) = alice.next_address();
-    let (da2, ak_a2) = alice.next_address();
+    let (da1, ak_a1, nkt_a1) = alice.next_address();
+    let (da2, ak_a2, nkt_a2) = alice.next_address();
     println!("[2] Shield 1500");
-    chain.shield("alice", 1500, &da1, &ak_a1, None, &alice.ek_v, &alice.ek_d).unwrap();
+    chain.shield("alice", 1500, &da1, &ak_a1, &nkt_a1, None, &alice.ek_v, &alice.ek_d).unwrap();
     println!("[3] Shield 500");
-    chain.shield("alice", 500, &da2, &ak_a2, None, &alice.ek_v, &alice.ek_d).unwrap();
+    chain.shield("alice", 500, &da2, &ak_a2, &nkt_a2, None, &alice.ek_v, &alice.ek_d).unwrap();
 
     // 4. Alice scans: detection → decryption → address matching.
     println!("[4] Alice scans:");
@@ -691,15 +717,15 @@ fn main() {
     println!("    public={} private={}", chain.balances["alice"], alice.balance());
 
     // 5. Transfer N=2: Alice(1500+500) → Bob(1200) + Alice(800 change).
-    let (db1, ak_b1) = bob.next_address();
-    let (da3, ak_a3) = alice.next_address();
+    let (db1, ak_b1, nkt_b1) = bob.next_address();
+    let (da3, ak_a3, nkt_a3) = alice.next_address();
     println!("[5] Transfer (N=2): alice(1500+500) -> bob(1200) + alice(800)");
     println!("    (with memo: 'Payment for mass relay parts')");
     let inputs: Vec<Note> = alice.notes.clone();
     chain.transfer(
         &inputs,
-        &db1, &ak_b1, 1200, Some(b"Payment for mass relay parts"), &bob.ek_v, &bob.ek_d,
-        &da3, &ak_a3, 800, None, &alice.ek_v, &alice.ek_d,
+        &db1, &ak_b1, &nkt_b1, 1200, Some(b"Payment for mass relay parts"), &bob.ek_v, &bob.ek_d,
+        &da3, &ak_a3, &nkt_a3, 800, None, &alice.ek_v, &alice.ek_d,
     ).unwrap();
     alice.spend(&[0, 1]);
 
@@ -712,13 +738,13 @@ fn main() {
     // 7. Split N=1: Bob(1200) → Carol(500) + Bob(700 change).
     //    Demonstrates N=1 transfer — no dummy notes needed!
     let mut carol = Wallet::new();
-    let (dc1, ak_c1) = carol.next_address();
-    let (db2, ak_b2) = bob.next_address();
+    let (dc1, ak_c1, nkt_c1) = carol.next_address();
+    let (db2, ak_b2, nkt_b2) = bob.next_address();
     println!("[7] Split (N=1): bob(1200) -> carol(500) + bob(700)");
     chain.transfer(
         &[bob.notes[0].clone()], // N=1: single input
-        &dc1, &ak_c1, 500, None, &carol.ek_v, &carol.ek_d,
-        &db2, &ak_b2, 700, None, &bob.ek_v, &bob.ek_d,
+        &dc1, &ak_c1, &nkt_c1, 500, None, &carol.ek_v, &carol.ek_d,
+        &db2, &ak_b2, &nkt_b2, 700, None, &bob.ek_v, &bob.ek_d,
     ).unwrap();
     bob.spend(&[0]);
 
@@ -728,11 +754,11 @@ fn main() {
     println!("    bob={} carol={}", bob.balance(), carol.balance());
 
     // 9. Unshield N=1 with change: Carol withdraws 200, keeps 300 private.
-    let (dc2, ak_c2) = carol.next_address();
+    let (dc2, ak_c2, nkt_c2) = carol.next_address();
     println!("[9] Unshield (N=1 + change): carol withdraws 200, keeps 300");
     chain.unshield(
         &[carol.notes[0].clone()], 200, "carol",
-        Some((&dc2, &ak_c2, &carol.ek_v, &carol.ek_d)),
+        Some((&dc2, &ak_c2, &nkt_c2, &carol.ek_v, &carol.ek_d)),
     ).unwrap();
     carol.spend(&[0]);
     carol.scan(&chain);
@@ -742,8 +768,8 @@ fn main() {
     print!("[10] Double-spend (alice's notes from step 5): ");
     match chain.transfer(
         &inputs, // alice's notes, already spent in step 5
-        &db1, &ak_b1, 1200, None, &bob.ek_v, &bob.ek_d,
-        &da3, &ak_a3, 800, None, &alice.ek_v, &alice.ek_d,
+        &db1, &ak_b1, &nkt_b1, 1200, None, &bob.ek_v, &bob.ek_d,
+        &da3, &ak_a3, &nkt_a3, 800, None, &alice.ek_v, &alice.ek_d,
     ) {
         Err(e) => println!("REJECTED ({})", e),
         Ok(()) => println!("BUG!"),
@@ -782,8 +808,8 @@ mod tests {
     fn test_roundtrip() {
         let (mut c, mut a, _) = setup();
         c.fund("a", 1000);
-        let (d, ak) = a.next_address();
-        c.shield("a", 1000, &d, &ak, None, &a.ek_v, &a.ek_d).unwrap();
+        let (d, ak, nkt) = a.next_address();
+        c.shield("a", 1000, &d, &ak, &nkt, None, &a.ek_v, &a.ek_d).unwrap();
         a.scan(&c);
         assert_eq!(a.balance(), 1000);
         c.unshield(&[a.notes[0].clone()], 1000, "a", None).unwrap();
@@ -795,8 +821,8 @@ mod tests {
     fn test_double_spend() {
         let (mut c, mut a, _) = setup();
         c.fund("a", 500);
-        let (d, ak) = a.next_address();
-        c.shield("a", 500, &d, &ak, None, &a.ek_v, &a.ek_d).unwrap();
+        let (d, ak, nkt) = a.next_address();
+        c.shield("a", 500, &d, &ak, &nkt, None, &a.ek_v, &a.ek_d).unwrap();
         a.scan(&c);
         let n = a.notes[0].clone();
         c.unshield(&[n.clone()], 500, "a", None).unwrap();
@@ -808,15 +834,15 @@ mod tests {
     fn test_transfer_n2() {
         let (mut c, mut a, mut b) = setup();
         c.fund("a", 1000);
-        let (d1, ak1) = a.next_address();
-        let (d2, ak2) = a.next_address();
-        c.shield("a", 600, &d1, &ak1, None, &a.ek_v, &a.ek_d).unwrap();
-        c.shield("a", 400, &d2, &ak2, None, &a.ek_v, &a.ek_d).unwrap();
+        let (d1, ak1, nkt1) = a.next_address();
+        let (d2, ak2, nkt2) = a.next_address();
+        c.shield("a", 600, &d1, &ak1, &nkt1, None, &a.ek_v, &a.ek_d).unwrap();
+        c.shield("a", 400, &d2, &ak2, &nkt2, None, &a.ek_v, &a.ek_d).unwrap();
         a.scan(&c);
-        let (db, akb) = b.next_address();
-        let (da, aka) = a.next_address();
+        let (db, akb, nktb) = b.next_address();
+        let (da, aka, nkta) = a.next_address();
         let inputs: Vec<Note> = a.notes.clone();
-        c.transfer(&inputs, &db, &akb, 700, None, &b.ek_v, &b.ek_d, &da, &aka, 300, None, &a.ek_v, &a.ek_d).unwrap();
+        c.transfer(&inputs, &db, &akb, &nktb, 700, None, &b.ek_v, &b.ek_d, &da, &aka, &nkta, 300, None, &a.ek_v, &a.ek_d).unwrap();
         a.spend(&[0, 1]); a.scan(&c); b.scan(&c);
         assert_eq!(c.balances.values().sum::<u64>() + a.balance() + b.balance(), 1000);
     }
@@ -826,12 +852,12 @@ mod tests {
     fn test_split_n1() {
         let (mut c, mut a, mut b) = setup();
         c.fund("a", 1000);
-        let (d, ak) = a.next_address();
-        c.shield("a", 1000, &d, &ak, None, &a.ek_v, &a.ek_d).unwrap();
+        let (d, ak, nkt) = a.next_address();
+        c.shield("a", 1000, &d, &ak, &nkt, None, &a.ek_v, &a.ek_d).unwrap();
         a.scan(&c);
-        let (db, akb) = b.next_address();
-        let (da, aka) = a.next_address();
-        c.transfer(&[a.notes[0].clone()], &db, &akb, 400, None, &b.ek_v, &b.ek_d, &da, &aka, 600, None, &a.ek_v, &a.ek_d).unwrap();
+        let (db, akb, nktb) = b.next_address();
+        let (da, aka, nkta) = a.next_address();
+        c.transfer(&[a.notes[0].clone()], &db, &akb, &nktb, 400, None, &b.ek_v, &b.ek_d, &da, &aka, &nkta, 600, None, &a.ek_v, &a.ek_d).unwrap();
         a.spend(&[0]); a.scan(&c); b.scan(&c);
         assert_eq!(a.balance(), 600);
         assert_eq!(b.balance(), 400);
@@ -842,11 +868,11 @@ mod tests {
     fn test_unshield_with_change() {
         let (mut c, mut a, _) = setup();
         c.fund("a", 1000);
-        let (d, ak) = a.next_address();
-        c.shield("a", 1000, &d, &ak, None, &a.ek_v, &a.ek_d).unwrap();
+        let (d, ak, nkt) = a.next_address();
+        c.shield("a", 1000, &d, &ak, &nkt, None, &a.ek_v, &a.ek_d).unwrap();
         a.scan(&c);
-        let (dc, akc) = a.next_address();
-        c.unshield(&[a.notes[0].clone()], 300, "a", Some((&dc, &akc, &a.ek_v, &a.ek_d))).unwrap();
+        let (dc, akc, nktc) = a.next_address();
+        c.unshield(&[a.notes[0].clone()], 300, "a", Some((&dc, &akc, &nktc, &a.ek_v, &a.ek_d))).unwrap();
         a.spend(&[0]); a.scan(&c);
         assert_eq!(c.balances["a"], 300);  // 300 withdrawn to public
         assert_eq!(a.balance(), 700);       // 700 kept private as change
@@ -857,8 +883,8 @@ mod tests {
     fn test_detection_filters() {
         let (mut c, mut a, mut b) = setup();
         c.fund("a", 100);
-        let (d, ak) = a.next_address();
-        c.shield("a", 100, &d, &ak, None, &a.ek_v, &a.ek_d).unwrap();
+        let (d, ak, nkt) = a.next_address();
+        c.shield("a", 100, &d, &ak, &nkt, None, &a.ek_v, &a.ek_d).unwrap();
         b.scan(&c);
         assert_eq!(b.balance(), 0);
         a.scan(&c);
@@ -871,14 +897,19 @@ mod tests {
         let master = [0x42u8; 32];
         let acc = derive_account(&master);
         let d_j = derive_address(&acc.incoming_seed, 0);
+        let ak = derive_ak(&acc.ask_base, 0);
         let rseed = [1u8; 32];
         let rcm = derive_rcm(&rseed);
-        let ak = [3u8; 32];
-        let cm = commit(&d_j, 100, &rcm, &ak);
+        let nk_sp = derive_nk_spend(&acc.nk, &d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
+        let otag = owner_tag(&ak, &nk_tg);
+        let cm = commit(&d_j, 100, &rcm, &otag);
         // Same inputs → same nullifier.
-        assert_eq!(nullifier(&acc.nk, &cm), nullifier(&acc.nk, &cm));
-        // Different nk → different nullifier.
-        assert_ne!(nullifier(&acc.nk, &cm), nullifier(&[0x99u8; 32], &cm));
+        assert_eq!(nullifier(&nk_sp, &cm, 0), nullifier(&nk_sp, &cm, 0));
+        // Different nk_spend → different nullifier.
+        assert_ne!(nullifier(&nk_sp, &cm, 0), nullifier(&[0x99u8; 32], &cm, 0));
+        // Different position → different nullifier.
+        assert_ne!(nullifier(&nk_sp, &cm, 0), nullifier(&nk_sp, &cm, 1));
     }
 
     /// Cross-implementation test: Rust produces the same nk, ak, d_j, cm, nf
@@ -893,23 +924,33 @@ mod tests {
         let acc = derive_account(&master_sk);
         let d_j = derive_address(&acc.incoming_seed, 0);
         let ak = derive_ak(&acc.ask_base, 0);
+        let nk_sp = derive_nk_spend(&acc.nk, &d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
+        let otag = owner_tag(&ak, &nk_tg);
         // rseed = 0x1001 as felt252 LE.
         let mut rseed = ZERO;
         rseed[0] = 0x01; rseed[1] = 0x10;
         let rcm = derive_rcm(&rseed);
-        let cm = commit(&d_j, 1000, &rcm, &ak);
-        let nf = nullifier(&acc.nk, &cm);
+        let cm = commit(&d_j, 1000, &rcm, &otag);
+        let nf = nullifier(&nk_sp, &cm, 0); // position 0
 
-        // Expected values from Cairo execution.
+        // Expected values from Cairo execution (nk, ak, d_j unchanged from v2).
         let exp_nk: F = [0xb5, 0x37, 0x35, 0x11, 0x2c, 0x79, 0xf4, 0x69, 0xb4, 0x0c, 0xe0, 0x59, 0x07, 0xb2, 0xb9, 0xd2, 0xb4, 0x55, 0x10, 0xdc, 0x93, 0x26, 0x1b, 0x44, 0x35, 0x2e, 0x58, 0x5d, 0x7a, 0xf3, 0xec, 0x01];
         let exp_ak: F = [0x7e, 0x77, 0x4c, 0x6c, 0x75, 0x4e, 0x51, 0x9e, 0x27, 0x0c, 0x15, 0xf9, 0x90, 0x3e, 0x01, 0xf5, 0x6e, 0x03, 0x25, 0xf5, 0x31, 0x2f, 0xac, 0x4f, 0x7f, 0xae, 0x10, 0xa3, 0x25, 0x74, 0xf1, 0x00];
         let exp_dj: F = [0x58, 0x37, 0x57, 0x8d, 0xcb, 0x85, 0x82, 0xf8, 0xf7, 0x07, 0x86, 0x50, 0x03, 0x45, 0xf8, 0x4a, 0x27, 0x21, 0x0d, 0x04, 0xc0, 0x29, 0x17, 0x47, 0x9a, 0x13, 0x52, 0x77, 0x40, 0x6b, 0x60, 0x05];
-        let exp_cm: F = [0x48, 0x6b, 0x42, 0x64, 0x32, 0xef, 0x26, 0xdb, 0x67, 0x27, 0x66, 0xd0, 0x62, 0x09, 0xa0, 0x21, 0xa0, 0x43, 0xf5, 0xe6, 0x31, 0xbf, 0x16, 0x98, 0xbe, 0xa0, 0x14, 0x3f, 0x6c, 0x35, 0xbe, 0x02];
-        let exp_nf: F = [0xd8, 0xf1, 0xa5, 0x4b, 0xd0, 0x04, 0x3b, 0xa9, 0xc3, 0xcc, 0xb9, 0x2a, 0x7a, 0x22, 0xeb, 0x19, 0x7a, 0x44, 0xa8, 0xad, 0xc3, 0xe2, 0x37, 0xbe, 0x34, 0xbc, 0x75, 0x48, 0xca, 0x8e, 0x7c, 0x06];
 
         assert_eq!(acc.nk, exp_nk, "nk mismatch");
         assert_eq!(ak, exp_ak, "ak mismatch");
         assert_eq!(d_j, exp_dj, "d_j mismatch");
+
+        // New expected values: commitment uses owner_tag, nullifier is position-dependent.
+        let exp_nk_spend: F = [89, 19, 110, 41, 180, 183, 205, 41, 33, 134, 117, 152, 235, 7, 229, 229, 174, 217, 114, 252, 177, 224, 229, 91, 121, 80, 186, 245, 67, 249, 85, 3];
+        let exp_nk_tag: F = [17, 89, 69, 49, 250, 242, 253, 209, 28, 237, 96, 154, 132, 8, 133, 43, 190, 121, 73, 113, 232, 18, 75, 149, 255, 222, 50, 80, 19, 210, 134, 1];
+        let exp_cm: F = [241, 116, 8, 46, 91, 152, 152, 54, 44, 207, 95, 107, 157, 140, 1, 47, 26, 163, 128, 163, 85, 219, 249, 243, 60, 122, 214, 24, 101, 104, 231, 1];
+        let exp_nf: F = [18, 119, 163, 62, 249, 45, 40, 118, 113, 139, 231, 234, 244, 251, 255, 149, 64, 73, 95, 179, 25, 8, 173, 155, 221, 146, 35, 139, 102, 121, 246, 4];
+
+        assert_eq!(nk_sp, exp_nk_spend, "nk_spend mismatch");
+        assert_eq!(nk_tg, exp_nk_tag, "nk_tag mismatch");
         assert_eq!(cm, exp_cm, "cm mismatch");
         assert_eq!(nf, exp_nf, "nf mismatch");
     }
@@ -919,8 +960,8 @@ mod tests {
     fn test_memo_ct_hash_recorded() {
         let (mut c, mut a, _) = setup();
         c.fund("a", 100);
-        let (d, ak) = a.next_address();
-        c.shield("a", 100, &d, &ak, Some(b"test memo"), &a.ek_v, &a.ek_d).unwrap();
+        let (d, ak, nkt) = a.next_address();
+        c.shield("a", 100, &d, &ak, &nkt, Some(b"test memo"), &a.ek_v, &a.ek_d).unwrap();
         // The chain should have recorded a memo hash for the commitment.
         let cm = c.tree.leaves[0];
         assert!(c.memo_hashes.contains_key(&cm), "memo hash not recorded");
@@ -934,8 +975,8 @@ mod tests {
     fn test_memo_tamper_detected() {
         let (mut c, mut a, _) = setup();
         c.fund("a", 100);
-        let (d, ak) = a.next_address();
-        c.shield("a", 100, &d, &ak, Some(b"real memo"), &a.ek_v, &a.ek_d).unwrap();
+        let (d, ak, nkt) = a.next_address();
+        c.shield("a", 100, &d, &ak, &nkt, Some(b"real memo"), &a.ek_v, &a.ek_d).unwrap();
         let cm = c.tree.leaves[0];
 
         // Before tampering: memo verification passes.

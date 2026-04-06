@@ -9,6 +9,7 @@ A UTXO-based private transaction system with:
 - **Post-quantum cryptography** throughout: BLAKE2s hashing, ML-KEM for memos/detection
 - **Delegated proving**: untrusted provers generate the STARK proof; the user signs afterward
 - **Penumbra-inspired key hierarchy**: spending and address material in separate branches
+- **Per-address nullifier binding**: nullifier keys are bound into commitments via owner tags
 
 ---
 
@@ -17,7 +18,9 @@ A UTXO-based private transaction system with:
 ```text
 master_sk
 ├── spend_seed = H("spend", master_sk)
-│   ├── nk        = H("nk",  spend_seed)       — account nullifier key (ONE per account)
+│   ├── nk        = H("nk",  spend_seed)       — account nullifier root (never leaves user)
+│   │   └── nk_spend_j = H_nksp(nk, d_j)       — per-address secret nullifier key
+│   │       └── nk_tag_j  = H_nktg(nk_spend_j)  — per-address public binding tag
 │   ├── ask_base  = H("ask", spend_seed)        — base authorization secret
 │   │   └── ask_j = H(ask_base, j)              — per-address auth signing key
 │   │       └── ak_j = H(ask_j)                 — per-address auth verifying key
@@ -33,6 +36,19 @@ master_sk
 ```
 
 **Spending branch** holds nullifier material (nk), authorization (ask), and outgoing view (ovk). **Incoming branch** holds address diversification (dsk), memo encryption (view_seed), and detection (det_seed). The two branches are independent — address material reveals nothing about spending keys.
+
+### Per-Address Nullifier Keys
+
+The account-level `nk` never leaves the user's device. Instead, each address derives:
+
+- `nk_spend_j = H_nksp(nk, d_j)` — per-address secret, given to the prover for a specific note
+- `nk_tag_j = H_nktg(nk_spend_j)` — per-address public tag, included in the payment address
+
+These are bound into the commitment via an owner tag:
+
+- `owner_tag_j = H_owner(ak_j, nk_tag_j)` — fuses both keys into a single value
+
+This ensures the commitment cryptographically binds to the nullifier key material. An attacker who invents a fake `nk'` cannot produce a valid commitment without also knowing `ak_j`, and vice versa.
 
 ## Capability Levels
 
@@ -50,27 +66,51 @@ Detection ⊂ incoming view ⊂ full view ⊂ spend. Each level strictly adds ca
 What the sender receives:
 
 ```
-address_j = (d_j, ak_j, ek_v_j, ek_d_j)
+address_j = (d_j, ak_j, nk_tag_j, ek_v_j, ek_d_j)
 ```
 
 - `d_j` — diversifier (32 bytes): identifies the address, appears in the note commitment
+- `ak_j` — auth verifying key (32 bytes): the circuit verifies spend authorization
+- `nk_tag_j` — nullifier binding tag (32 bytes): binds the commitment to the owner's nullifier key
 - `ek_v_j` — ML-KEM encapsulation key (~800 bytes): sender encrypts memos with this
 - `ek_d_j` — ML-KEM encapsulation key (~800 bytes): sender creates detection clues with this
 
 Multiple addresses can be generated from one account (varying j). Each address has unrelated `d_j` values. ML-KEM ciphertexts are randomized per encapsulation, so observers cannot link two transactions to the same recipient.
 
-For circuit purposes, only `d_j` matters. The ML-KEM keys are application-layer.
+For circuit purposes, `d_j`, `ak_j`, and `nk_tag_j` matter. The ML-KEM keys are application-layer.
 
 ## Note Structure
 
 ```
-rseed  — random per-note seed
-rcm    = H("rcm", rseed)           — commitment randomness
-cm     = H_commit(d_j, v, rcm, ak)  — note commitment
-nf     = H_null(nk, cm)            — nullifier
+rseed       — random per-note seed
+rcm         = H("rcm", rseed)                     — commitment randomness
+owner_tag   = H_owner(ak_j, nk_tag_j)             — fuses auth + nullifier binding
+cm          = H_commit(d_j, v, rcm, owner_tag)     — note commitment
+nf          = H_nf(nk_spend_j, H_nf(cm, pos))     — position-dependent nullifier
 ```
 
-The commitment binds to the diversified address and value. It does NOT contain spending material. The nullifier binds the account-level nullifier key to this specific commitment.
+The commitment binds to the diversified address, value, and owner tag (which fuses both the auth key and nullifier key material). The nullifier uses the per-address `nk_spend_j` and includes the leaf position to prevent faerie gold attacks.
+
+### Position-Dependent Nullifiers
+
+The nullifier includes the Merkle tree leaf index (`pos`):
+
+```
+nf = H_nf(nk_spend, H_nf(cm, pos))
+```
+
+This prevents an attacker from creating two identical commitments (same d_j, v, rcm, owner_tag) that resolve to a single nullifier. With position in the nullifier, each tree insertion produces a unique nullifier even for duplicate commitments.
+
+### Why Owner Tags
+
+Without owner tags, the commitment `cm = H(d_j, v, rcm)` would not bind to the nullifier key. An attacker could:
+
+1. Observe `cm` on-chain
+2. Choose an arbitrary `nk'`
+3. Compute `nf' = H(nk', cm)` — a fresh, unused nullifier
+4. Produce a valid proof showing `nf'` has never been spent
+
+This allows unlimited double-spending from a single note. The owner tag fix binds `nk_spend → nk_tag → owner_tag → cm`, creating a unique chain from the nullifier key to the commitment.
 
 ## Transaction Types
 
@@ -80,7 +120,9 @@ The commitment binds to the diversified address and value. It does NOT contain s
 
 **Circuit constraints:**
 1. `rcm = H("rcm", rseed)`
-2. `cm_new = H_commit(d_j, v_pub, rcm, ak)`
+2. `nk_tag = H_nktg(nk_spend)` where `nk_spend` is private input
+3. `owner_tag = H_owner(ak, nk_tag)`
+4. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
 
 `memo_ct_hash` is computed client-side as `H(ct_v || encrypted_data)` and passed into the circuit as a public input. The circuit does not compute it — it just includes it in the outputs so the contract can verify the posted memo calldata matches.
 
@@ -97,13 +139,22 @@ Consumes N private notes and creates exactly 2 new private notes. Handles splits
 **Public outputs:** `[root, nf_0..nf_{N-1}, cm_1, cm_2, ak_0..ak_{N-1}, memo_ct_hash_1, memo_ct_hash_2]`
 
 **Circuit constraints:**
-1. For each input i (0..N): `rcm = H("rcm", rseed)`, `cm = H_commit(d_j, v, rcm, ak)`, Merkle membership, `nf = H_null(nk, cm)`
+1. For each input i (0..N):
+   - `rcm = H("rcm", rseed_i)`
+   - `nk_tag_i = H_nktg(nk_spend_i)`
+   - `owner_tag_i = H_owner(ak_i, nk_tag_i)`
+   - `cm_i = H_commit(d_j_i, v_i, rcm_i, owner_tag_i)`
+   - Merkle membership of `cm_i` at position `pos_i` against `root`
+   - `nf_i = H_nf(nk_spend_i, H_nf(cm_i, pos_i))`
 2. All nullifiers pairwise distinct
-3. For both outputs: `rcm = H("rcm", rseed)`, `cm = H_commit(d_j, v, rcm, ak)`
+3. For both outputs:
+   - `nk_tag_out = H_nktg(nk_spend_out)` (private input)
+   - `owner_tag_out = H_owner(ak_out, nk_tag_out)`
+   - `cm_out = H_commit(d_j_out, v_out, rcm_out, owner_tag_out)`
 4. `sum(v_inputs) = v_1 + v_2` (in u128)
 5. All values are u64 (implicit range check)
 
-Each input has its own `nk` (supporting cross-account inputs). The contract verifies N signatures (one per `ak_i`). `memo_ct_hash_1` and `memo_ct_hash_2` are hashes of the output notes' encrypted memo ciphertexts (computed client-side, verified by the contract against posted calldata).
+The contract verifies N signatures (one per `ak_i`). `memo_ct_hash_1` and `memo_ct_hash_2` are hashes of the output notes' encrypted memo ciphertexts (computed client-side, verified by the contract against posted calldata).
 
 ### Unshield (N→withdrawal + optional change, where 1 ≤ N ≤ 16)
 
@@ -116,8 +167,12 @@ Consumes N private notes, releases `v_pub` to a public address, and optionally c
 **Circuit constraints:**
 1. Same per-input verification as Transfer
 2. All nullifiers pairwise distinct
-3. If change: `cm_change = H_commit(d_j_c, v_change, rcm_c, ak_c)`
-4. `sum(v_inputs) = v_pub + v_change`
+3. If change:
+   - `nk_tag_c = H_nktg(nk_spend_c)` (private input)
+   - `owner_tag_c = H_owner(ak_c, nk_tag_c)`
+   - `cm_change = H_commit(d_j_c, v_change, rcm_c, owner_tag_c)`
+4. If no change: `v_change = 0` AND `memo_ct_hash_change = 0`
+5. `sum(v_inputs) = v_pub + v_change`
 
 The contract verifies N signatures, credits `v_pub` to `recipient`, and appends `cm_change` to T (if nonzero).
 
@@ -128,12 +183,12 @@ With N=1 supported natively, there is no second input slot to fill. The only "du
 ## Delegated Proving
 
 1. User constructs the transaction, deriving all keys from `master_sk`.
-2. User gives the prover: `(nk, ak, d_j, v, rseed, Merkle path)` per input note, plus output data.
+2. User gives the prover per-input: `(nk_spend_j, ak_j, d_j, v, rseed, Merkle path, pos)`, plus output data including `nk_tag` for output notes.
 3. Prover generates the STARK proof (expensive, ~30-50 seconds).
 4. User signs the proof outputs with `ask_j` (trivially cheap).
 5. Transaction (proof + signature) submitted in one on-chain call.
 
-The prover sees `nk` (account-level nullifier key). This lets them compute nullifiers for any of the user's notes — but NF_set is public, so this is equivalent to public information. The prover cannot spend (no `ask`) or decrypt other memos (no `dk_v`).
+The prover sees `nk_spend_j` (per-address nullifier key) for each input note. This lets them compute the nullifier for that specific note — but NF_set is public, so this is equivalent to public information. The prover does NOT learn `nk` (the account-level nullifier root) and cannot compute nullifiers for addresses not involved in the transaction. The prover cannot spend (no `ask`) or decrypt other memos (no `dk_v`).
 
 ## Detection (Fuzzy Message Detection)
 
@@ -234,12 +289,15 @@ The proof dominates all transaction types at ~295 KB. Note data adds ~3.2 KB per
 
 All hashing uses BLAKE2s-256 truncated to 251 bits, with domain separation via BLAKE2s personalization (parameter block P[6..7]):
 
-| Use | Personalization | h[6] |
-|-----|----------------|------|
-| Key derivation | (none) | 0x1F83D9AB |
-| Merkle nodes | `mrklSP__` | 0x73E8ABC6 |
-| Nullifiers | `nulfSP__` | 0x79EFACC5 |
-| Commitments | `cmmtSP__` | 0x6BEEB4C8 |
+| Use | Personalization | Function |
+|-----|----------------|----------|
+| Key derivation | (none) | `hash1`, `hash2_generic` |
+| Merkle nodes | `mrklSP__` | `hash2` |
+| Nullifiers | `nulfSP__` | `nullifier` |
+| Commitments | `cmmtSP__` | `commit` |
+| Per-address nk_spend | `nkspSP__` | `derive_nk_spend` |
+| Per-address nk_tag | `nktgSP__` | `derive_nk_tag` |
+| Owner tag | `ownrSP__` | `owner_tag` |
 | Memo hash (client-side) | `memoSP__` | — (not in circuit) |
 
 Cross-domain collision is impossible regardless of inputs — different IVs produce structurally independent compression states.
@@ -247,9 +305,10 @@ Cross-domain collision is impossible regardless of inputs — different IVs prod
 ## Security Properties
 
 - **Balance:** u64 values, u128 arithmetic, exact equality. No overflow or wraparound.
-- **Double-spend:** Nullifier set on-chain. `nf_a ≠ nf_b` in circuit. `nf = H(nk, cm)` is deterministic per note.
-- **Spend authority:** Requires both `nk` (for the proof) and `ask_j` (for the signature).
-- **Privacy:** Commitments are hiding (randomness `rcm`). Nullifiers unlinkable to commitments (different hash domains, `nk` is private). Per-address diversification prevents cross-address linking.
+- **Double-spend:** Nullifier set on-chain. Pairwise `nf_i ≠ nf_j` in circuit. Position-dependent `nf = H(nk_spend, H(cm, pos))` ensures unique nullifiers even for duplicate commitments.
+- **Nullifier binding:** `nk_spend → nk_tag → owner_tag → cm` chain. The commitment cryptographically binds to the nullifier key material. An attacker cannot substitute a fake `nk'` without breaking the commitment preimage.
+- **Spend authority:** Requires both `nk_spend` (for the proof) and `ask_j` (for the signature).
+- **Privacy:** Commitments are hiding (randomness `rcm`). Nullifiers unlinkable to commitments (different hash domains, `nk_spend` is private). Per-address diversification prevents cross-address linking.
 - **Post-quantum:** BLAKE2s (hash), ML-KEM (memos/detection), STARKs (proofs). No elliptic curves.
 - **Zero-knowledge:** Two-level recursive proofs. Circuit layer has ZK blinding. Single-level mode is debug-only (not ZK).
 
@@ -257,6 +316,6 @@ Cross-domain collision is impossible regardless of inputs — different IVs prod
 
 - **`ak_j` sender-timing leak:** The sender knows `ak_j` (it's in the proof output). When the note is spent, `ak_j` appears on-chain. The sender can link "I sent to this address" ↔ "this address just spent." Requires blinded lattice signatures to fix (future work).
 - **Detection is honest-sender:** Malicious sender can bypass detection. Recipient falls back to viewing key scanning.
-- **Prover learns nk:** Can compute nullifiers for any of the user's notes. Equivalent to public info (NF_set is on-chain).
+- **Prover learns nk_spend_j:** Can compute the nullifier for the specific note being spent. This is equivalent to public info (NF_set is on-chain). The prover does NOT learn `nk` (the account root) and cannot compute nullifiers for other addresses.
 - **ML-KEM key anonymity (ANO-CCA):** We rely on Kyber's key anonymity property, proven separately from IND-CCA2. Should be cited explicitly in production.
 - **Detection statistics:** False positive rate 2^(-k) does not automatically provide plausible deniability. Depends on network throughput and user activity.

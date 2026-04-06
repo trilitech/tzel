@@ -19,6 +19,10 @@ function = "starkprivacy::step_join::main"
 name = "step_split"
 function = "starkprivacy::step_split::main"
 
+[[target.executable]]
+name = "step_testvec"
+function = "starkprivacy::step_testvec::main"
+
 [cairo]
 enable-gas = false
 

@@ -1,37 +1,37 @@
 /// BLAKE2s-256 hash primitives for StarkPrivacy v2.
 ///
-/// # Key hierarchy (v2 — Penumbra-inspired, post-quantum)
+/// # Key hierarchy
 ///
 /// ```text
 ///   master_sk
 ///   ├── spend_seed = H("spend", master_sk)
-///   │   ├── nk       = H("nk",  spend_seed)    — account nullifier key (ONE per account)
-///   │   ├── ask_base = H("ask", spend_seed)     — base authorization secret
-///   │   └── ovk      = H("ovk", spend_seed)     — outgoing viewing key
+///   │   ├── nk       = H("nk",  spend_seed)    — account nullifier root
+///   │   │   └── nk_spend_j = H_nksp(nk, d_j)   — per-address secret nullifier key
+///   │   │       └── nk_tag_j = H_nktg(nk_spend_j) — per-address public binding tag
+///   │   └── ask_base = H("ask", spend_seed)     — authorization derivation root
+///   │       └── ak_j = H(H(ask_base, j))        — per-address auth verifying key
 ///   │
 ///   └── incoming_seed = H("incoming", master_sk)
-///       ├── dsk       = H("dsk", incoming_seed) — diversifier derivation key
-///       ├── view_seed = H("view", incoming_seed)— per-address ML-KEM viewing keys
-///       └── det_seed  = H("detect", view_seed)  — detection keys (detect ⊂ view)
+///       └── dsk = H("dsk", incoming_seed)
+///           └── d_j = H(dsk, j)                 — diversified address
 /// ```
-///
-/// Spending material (nk, ask) and address material (d_j, ek_v, ek_d) live
-/// in separate branches. The commitment binds to the diversified address,
-/// NOT to spending keys. The nullifier binds to the account-level nk.
 ///
 /// # Note structure
 ///
-///   cm = H_commit(d_j, v, rcm, ak)     — commitment (address + value + randomness)
-///   nf = H_null(nk, cm)               — nullifier (account key + commitment)
-///   rcm = H("rcm", rseed)             — commitment randomness from per-note seed
+///   owner_tag_j = H_owner(ak_j, nk_tag_j)
+///   cm = H_commit(d_j, v, rcm, owner_tag_j)  — commitment
+///   nf = H_nf(nk_spend_j, cm, pos)           — nullifier (position-dependent)
 ///
-/// # Domain separation via BLAKE2s personalization
+/// # Domain separation
 ///
-/// Each hash use has a unique IV via the BLAKE2s personalization field:
-///   - Generic (no personal): key derivation, derive_rcm, derive_rho
-///   - "mrklSP__": Merkle internal nodes
-///   - "nulfSP__": nullifiers
-///   - "cmmtSP__": note commitments
+/// Each hash use has a unique IV via BLAKE2s personalization (P[6..7]):
+///   - Generic:   key derivation, derive_rcm
+///   - mrklSP__:  Merkle internal nodes
+///   - nulfSP__:  nullifiers
+///   - cmmtSP__:  note commitments
+///   - nkspSP__:  nk_spend_j derivation (per-address secret nullifier key)
+///   - nktgSP__:  nk_tag_j derivation (per-address public binding tag)
+///   - ownrSP__:  owner_tag_j (fuses ak + nk_tag into commitment)
 
 use core::blake::{blake2s_compress, blake2s_finalize};
 use core::box::BoxTrait;
@@ -43,11 +43,8 @@ const POW64: u128 = 0x10000000000000000;
 const POW96: u128 = 0x1000000000000000000000000;
 
 // ── Personalized BLAKE2s IVs ─────────────────────────────────────────
-//
-// h[i] = IV[i] ^ P[i], where P[0] = 0x01010020 (digest=32, unkeyed,
-// sequential) and P[6..7] carry the personalization string.
 
-/// Generic IV — no personalization. Used for key derivation.
+/// Generic IV — no personalization. Key derivation only.
 fn blake2s_iv() -> Box<[u32; 8]> {
     BoxTrait::new([
         0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -55,7 +52,7 @@ fn blake2s_iv() -> Box<[u32; 8]> {
     ])
 }
 
-/// Merkle-node IV — personalization "mrklSP__".
+/// Merkle-node IV — "mrklSP__".
 fn blake2s_iv_merkle() -> Box<[u32; 8]> {
     BoxTrait::new([
         0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -63,7 +60,7 @@ fn blake2s_iv_merkle() -> Box<[u32; 8]> {
     ])
 }
 
-/// Nullifier IV — personalization "nulfSP__".
+/// Nullifier IV — "nulfSP__".
 fn blake2s_iv_nullifier() -> Box<[u32; 8]> {
     BoxTrait::new([
         0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -71,7 +68,7 @@ fn blake2s_iv_nullifier() -> Box<[u32; 8]> {
     ])
 }
 
-/// Commitment IV — personalization "cmmtSP__".
+/// Commitment IV — "cmmtSP__".
 fn blake2s_iv_commit() -> Box<[u32; 8]> {
     BoxTrait::new([
         0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -79,9 +76,35 @@ fn blake2s_iv_commit() -> Box<[u32; 8]> {
     ])
 }
 
+/// nk_spend derivation IV — "nkspSP__".
+/// Derives per-address secret nullifier key from account nk.
+fn blake2s_iv_nk_spend() -> Box<[u32; 8]> {
+    BoxTrait::new([
+        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+        0x510E527F, 0x9B05688C, 0x6FF0B2C5, 0x04BF9D4A,
+    ])
+}
+
+/// nk_tag derivation IV — "nktgSP__".
+/// Derives per-address public binding tag from nk_spend.
+fn blake2s_iv_nk_tag() -> Box<[u32; 8]> {
+    BoxTrait::new([
+        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+        0x510E527F, 0x9B05688C, 0x78F7B2C5, 0x04BF9D4A,
+    ])
+}
+
+/// Owner-tag IV — "ownrSP__".
+/// Fuses ak and nk_tag into the commitment.
+fn blake2s_iv_owner() -> Box<[u32; 8]> {
+    BoxTrait::new([
+        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+        0x510E527F, 0x9B05688C, 0x6DEDAEC4, 0x04BF9D4A,
+    ])
+}
+
 // ── Encoding helpers ─────────────────────────────────────────────────
 
-/// Encode felt252 as 8 little-endian u32 words.
 fn felt_to_u32x8(val: felt252) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
     let v: u256 = val.into();
     let lo = v.low;
@@ -98,7 +121,6 @@ fn felt_to_u32x8(val: felt252) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
     )
 }
 
-/// Decode 8 u32 words to felt252, truncating to 251 bits (mask 0x07FFFFFF on word 7).
 fn u32x8_to_felt(h0: u32, h1: u32, h2: u32, h3: u32, h4: u32, h5: u32, h6: u32, h7: u32) -> felt252 {
     let low: u128 = h0.into() + h1.into() * POW32 + h2.into() * POW64 + h3.into() * POW96;
     let h7_masked: u128 = h7.into() & 0x07FFFFFF;
@@ -109,8 +131,7 @@ fn u32x8_to_felt(h0: u32, h1: u32, h2: u32, h3: u32, h4: u32, h5: u32, h6: u32, 
 
 // ── Core hash functions ──────────────────────────────────────────────
 
-/// H(a) — single-element hash (32 bytes, generic IV).
-/// Used for key derivation steps.
+/// H(a) — single-element hash (32 bytes, generic IV). Key derivation.
 pub fn hash1(a: felt252) -> felt252 {
     let (a0, a1, a2, a3, a4, a5, a6, a7) = felt_to_u32x8(a);
     let msg = BoxTrait::new([a0, a1, a2, a3, a4, a5, a6, a7, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -119,7 +140,7 @@ pub fn hash1(a: felt252) -> felt252 {
     u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
 }
 
-/// H(a, b) — two-element hash (64 bytes) with caller-specified IV.
+/// H(a, b) with caller-specified IV.
 fn hash2_with_iv(iv: Box<[u32; 8]>, a: felt252, b: felt252) -> felt252 {
     let (a0, a1, a2, a3, a4, a5, a6, a7) = felt_to_u32x8(a);
     let (b0, b1, b2, b3, b4, b5, b6, b7) = felt_to_u32x8(b);
@@ -129,27 +150,24 @@ fn hash2_with_iv(iv: Box<[u32; 8]>, a: felt252, b: felt252) -> felt252 {
     u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
 }
 
-/// H(a, b) — generic two-element hash (64 bytes, no personalization).
-/// Used for key derivation intermediate steps only.
+/// H(a, b) — generic (no personalization). Key derivation only.
 pub fn hash2_generic(a: felt252, b: felt252) -> felt252 {
     hash2_with_iv(blake2s_iv(), a, b)
 }
 
-/// H_merkle(a, b) — Merkle tree internal node hash ("mrklSP__" IV).
+/// H_merkle(a, b) — Merkle tree internal nodes.
 pub fn hash2(a: felt252, b: felt252) -> felt252 {
     hash2_with_iv(blake2s_iv_merkle(), a, b)
 }
 
-/// H_commit(a, b, c, d) — 128-byte hash with commitment IV ("cmmtSP__").
+/// H_commit(a, b, c, d) — 128-byte commitment hash.
 fn hash4(a: felt252, b: felt252, c: felt252, d: felt252) -> felt252 {
     let (a0, a1, a2, a3, a4, a5, a6, a7) = felt_to_u32x8(a);
     let (b0, b1, b2, b3, b4, b5, b6, b7) = felt_to_u32x8(b);
     let (c0, c1, c2, c3, c4, c5, c6, c7) = felt_to_u32x8(c);
     let (d0, d1, d2, d3, d4, d5, d6, d7) = felt_to_u32x8(d);
-
     let block1 = BoxTrait::new([a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7]);
     let state = blake2s_compress(blake2s_iv_commit(), 64, block1);
-
     let block2 = BoxTrait::new([c0, c1, c2, c3, c4, c5, c6, c7, d0, d1, d2, d3, d4, d5, d6, d7]);
     let result = blake2s_finalize(state, 128, block2);
     let [h0, h1, h2, h3, h4, h5, h6, h7] = result.unbox();
@@ -158,38 +176,64 @@ fn hash4(a: felt252, b: felt252, c: felt252, d: felt252) -> felt252 {
 
 // ── Protocol functions ───────────────────────────────────────────────
 
-/// Derive commitment randomness from per-note seed: rcm = H(H("rcm"), rseed).
-/// Domain-separated by the "rcm" tag in the first hash.
+/// Derive commitment randomness: rcm = H(H("rcm"), rseed).
 pub fn derive_rcm(rseed: felt252) -> felt252 {
-    hash2_generic(hash1(0x72636D), rseed) // 0x72636D = "rcm"
+    hash2_generic(hash1(0x72636D), rseed)
 }
 
-/// Derive nullifier nonce from per-note seed: rho = H(H("rho"), rseed).
-/// Used for outgoing view key recovery; NOT used in the nullifier itself
-/// (v2 nullifiers are H(nk, cm), not H(nk, rho)).
-pub fn derive_rho(rseed: felt252) -> felt252 {
-    hash2_generic(hash1(0x72686F), rseed) // 0x72686F = "rho"
+/// Derive per-address secret nullifier key: nk_spend_j = H_nksp(nk, d_j).
+///
+/// This is the secret given to the delegated prover for a specific note.
+/// It is per-address (different d_j → different nk_spend_j), so the prover
+/// doesn't learn the account-wide nk. Uses dedicated "nkspSP__" domain.
+pub fn derive_nk_spend(nk: felt252, d_j: felt252) -> felt252 {
+    hash2_with_iv(blake2s_iv_nk_spend(), nk, d_j)
 }
 
-/// Note commitment: cm = H_commit(d_j, v, rcm, ak).
+/// Derive per-address public binding tag: nk_tag_j = H_nktg(nk_spend_j).
 ///
-/// Binds to the diversified address (d_j), value, commitment randomness,
-/// AND the authorization verifying key (ak). Binding ak into the commitment
-/// prevents a delegated prover from substituting their own authorization
-/// key — doing so would change cm, breaking the Merkle proof.
-///
-/// ak is a public key (not a secret), so including it here doesn't
-/// compromise the spending/address separation.
-pub fn commit(d_j: felt252, v: u64, rcm: felt252, ak: felt252) -> felt252 {
-    hash4(d_j, v.into(), rcm, ak)
+/// This is included in the payment address. The sender uses it to compute
+/// the commitment. It is per-address and one-way from nk_spend_j, so it
+/// reveals nothing about nk. Uses dedicated "nktgSP__" domain.
+pub fn derive_nk_tag(nk_spend: felt252) -> felt252 {
+    let (a0, a1, a2, a3, a4, a5, a6, a7) = felt_to_u32x8(nk_spend);
+    let msg = BoxTrait::new([a0, a1, a2, a3, a4, a5, a6, a7, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let result = blake2s_finalize(blake2s_iv_nk_tag(), 32, msg);
+    let [h0, h1, h2, h3, h4, h5, h6, h7] = result.unbox();
+    u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
 }
 
-/// Nullifier: nf = H_null(nk, cm).
+/// Compute owner tag: owner_tag_j = H_owner(ak_j, nk_tag_j).
 ///
-/// Binds the account-level nullifier key to this specific commitment.
-/// Only the owner (who knows nk) can compute the nullifier. Since nk
-/// is account-level (not per-note), the full viewing key holder can
-/// also compute nullifiers to track spent/unspent status.
-pub fn nullifier(nk: felt252, cm: felt252) -> felt252 {
-    hash2_with_iv(blake2s_iv_nullifier(), nk, cm)
+/// Fuses the authorization key and the nullifier binding tag into a single
+/// value for the commitment. Binds the note to both the spending authority
+/// (ak) and the nullifier key chain (nk_tag). Uses "ownrSP__" domain.
+pub fn owner_tag(ak: felt252, nk_tag: felt252) -> felt252 {
+    hash2_with_iv(blake2s_iv_owner(), ak, nk_tag)
+}
+
+/// Note commitment: cm = H_commit(d_j, v, rcm, owner_tag_j).
+///
+/// Binds to the diversified address, value, randomness, and the owner tag
+/// (which fuses ak and nk_tag). This ensures:
+///   - The prover can't substitute a different ak (breaks Merkle proof)
+///   - The prover can't use a different nk (changes nk_tag → changes
+///     owner_tag → changes cm → breaks Merkle proof)
+pub fn commit(d_j: felt252, v: u64, rcm: felt252, owner_tag: felt252) -> felt252 {
+    hash4(d_j, v.into(), rcm, owner_tag)
+}
+
+/// Nullifier: nf = H_nf(nk_spend_j, cm, pos).
+///
+/// Position-dependent nullifier. Each note at a different tree position
+/// gets a unique nullifier, even if the commitment is identical (prevents
+/// the "faerie gold" attack where a malicious sender mints duplicate
+/// commitments that collapse to one spendable nullifier).
+///
+/// nk_spend_j is per-address (not account-level), so the delegated prover
+/// only learns the nullifier key for the specific note being spent.
+pub fn nullifier(nk_spend: felt252, cm: felt252, pos: u64) -> felt252 {
+    // H_nf(nk_spend, H(cm, pos)) — nest pos inside cm to fit hash2's 2-input interface.
+    let cm_pos = hash2_with_iv(blake2s_iv_nullifier(), cm, pos.into());
+    hash2_with_iv(blake2s_iv_nullifier(), nk_spend, cm_pos)
 }

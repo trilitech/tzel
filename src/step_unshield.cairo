@@ -1,11 +1,7 @@
-/// Test executable: Unshield note A — withdraw 1000 to a recipient.
-///
-/// Demonstrates N=1 unshield with no change output.
-/// The circuit proves Merkle membership, nullifier correctness,
-/// and outputs the withdrawal amount + recipient address.
-///
-/// Tree state: [cm_a] (from step_shield)
+/// Test: Unshield note A — withdraw 1000 (N=1, no change).
+/// Tree: [cm_a]
 
+use starkprivacy::blake_hash as hash;
 use starkprivacy::{common, tree, unshield};
 
 #[executable]
@@ -14,27 +10,27 @@ fn main() -> Array<felt252> {
     let (_, ak) = common::derive_ask(common::alice_account().ask_base, 0);
     let recipient: felt252 = 0xCAFE;
 
-    // Build Merkle tree with a single leaf and get auth path.
     let zh = tree::zero_hashes();
     let leaves: Array<felt252> = array![a.cm];
     let (siblings, idx, root) = tree::auth_path(leaves.span(), 0, zh.span());
 
-    // N=1: single-element arrays for all per-input data.
-    // No change output (has_change=false, all change fields=0).
+    // Compute nullifier: nf = H_nf(nk_spend, cm, pos) where pos = leaf index.
+    let nf = hash::nullifier(a.nk_spend, a.cm, idx);
+
     unshield::verify(
         root,
-        array![a.nf].span(),
+        array![nf].span(),
         a.v,
         recipient,
-        // per-input arrays (N=1)
-        array![a.nk].span(),
+        // per-input (N=1)
+        array![a.nk_spend].span(),
         array![ak].span(),
         array![a.d_j].span(),
         array![a.v].span(),
         array![a.rseed].span(),
         siblings.span(),
         array![idx].span(),
-        // no change output
-        false, 0, 0, 0, 0, 0,
+        // no change
+        false, 0, 0, 0, 0, 0, 0,
     )
 }
