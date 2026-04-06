@@ -120,9 +120,10 @@ This allows unlimited double-spending from a single note. The owner tag fix bind
 
 **Circuit constraints:**
 1. `rcm = H("rcm", rseed)`
-2. `nk_tag = H_nktg(nk_spend)` where `nk_spend` is private input
-3. `owner_tag = H_owner(ak, nk_tag)`
-4. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
+2. `owner_tag = H_owner(ak, nk_tag)` where `nk_tag` is a private input from the recipient's payment address (the sender does NOT know `nk_spend`)
+3. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
+
+Note: the circuit cannot verify `nk_tag = H_nktg(nk_spend)` because the sender does not have the recipient's `nk_spend`. An incorrect `nk_tag` creates an unspendable note (self-griefing only — the sender loses their own deposited tokens). The spending circuits (transfer/unshield) enforce the full derivation chain when the note is later spent.
 
 `memo_ct_hash` is computed client-side as `H(ct_v || encrypted_data)` and passed into the circuit as a public input. The circuit does not compute it — it just includes it in the outputs so the contract can verify the posted memo calldata matches.
 
@@ -148,9 +149,9 @@ Consumes N private notes and creates exactly 2 new private notes. Handles splits
    - `nf_i = H_nf(nk_spend_i, H_nf(cm_i, pos_i))`
 2. All nullifiers pairwise distinct
 3. For both outputs:
-   - `nk_tag_out = H_nktg(nk_spend_out)` (private input)
-   - `owner_tag_out = H_owner(ak_out, nk_tag_out)`
+   - `owner_tag_out = H_owner(ak_out, nk_tag_out)` where `nk_tag_out` is a private input from the recipient's payment address
    - `cm_out = H_commit(d_j_out, v_out, rcm_out, owner_tag_out)`
+   - Note: same caveat as shield — incorrect `nk_tag` creates an unspendable output (self-griefing by the spender)
 4. `sum(v_inputs) = v_1 + v_2` (in u128)
 5. All values are u64 (implicit range check)
 
@@ -168,10 +169,9 @@ Consumes N private notes, releases `v_pub` to a public address, and optionally c
 1. Same per-input verification as Transfer
 2. All nullifiers pairwise distinct
 3. If change:
-   - `nk_tag_c = H_nktg(nk_spend_c)` (private input)
-   - `owner_tag_c = H_owner(ak_c, nk_tag_c)`
+   - `owner_tag_c = H_owner(ak_c, nk_tag_c)` where `nk_tag_c` is a private input
    - `cm_change = H_commit(d_j_c, v_change, rcm_c, owner_tag_c)`
-4. If no change: `v_change = 0` AND `memo_ct_hash_change = 0`
+4. If no change: all change witness data constrained to zero (`v_change`, `d_j_change`, `rseed_change`, `ak_change`, `nk_tag_change`, `memo_ct_hash_change` = 0) to eliminate prover malleability
 5. `sum(v_inputs) = v_pub + v_change`
 
 The contract verifies N signatures, credits `v_pub` to `recipient`, and appends `cm_change` to T (if nonzero).

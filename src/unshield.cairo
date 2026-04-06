@@ -102,8 +102,13 @@ pub fn verify(
         let otag_c = hash::owner_tag(ak_change, nk_tag_change);
         hash::commit(d_j_change, v_change, rcm_c, otag_c)
     } else {
+        // Constrain all change witness data to eliminate prover malleability.
         assert(v_change == 0, 'unshield: no change but v!=0');
         assert(memo_ct_hash_change == 0, 'unshield: mh!=0 but no change');
+        assert(d_j_change == 0, 'unshield: d_j!=0 but no change');
+        assert(rseed_change == 0, 'unshield: rseed!=0 no change');
+        assert(ak_change == 0, 'unshield: ak!=0 but no change');
+        assert(nk_tag_change == 0, 'unshield: nkt!=0 but no change');
         0
     };
 

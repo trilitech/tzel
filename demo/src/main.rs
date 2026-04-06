@@ -309,10 +309,10 @@ fn encrypt_note(v: u64, rseed: &F, user_memo: Option<&[u8]>, ek_v: &Ek, ek_d: &E
 /// Detection: fast check if this note MIGHT be for us.
 /// Returns true for real matches + ~2^(-k) false positives.
 fn detect(enc: &EncryptedNote, dk_d: &Dk) -> bool {
-    let ct = ml_kem_768::Ciphertext::try_from(enc.ct_d.as_slice()).unwrap();
+    let Ok(ct) = ml_kem_768::Ciphertext::try_from(enc.ct_d.as_slice()) else { return false; };
     // ML-KEM implicit rejection: decapsulation always returns a shared secret,
     // but for non-matching ciphertexts it's pseudorandom (not the real one).
-    let ss = dk_d.try_decapsulate(&ct).unwrap();
+    let ss = dk_d.try_decapsulate(&ct).expect("ML-KEM decaps is infallible");
     let tag_hash = hash(ss.as_slice());
     let computed = u16::from_le_bytes([tag_hash[0], tag_hash[1]]) & ((1 << DETECT_K) - 1);
     computed == enc.tag
@@ -321,7 +321,7 @@ fn detect(enc: &EncryptedNote, dk_d: &Dk) -> bool {
 /// Decrypt a note: recover (v, rseed, user_memo) from ML-KEM + AEAD layers.
 /// Returns None if decryption fails (wrong key or tampered ciphertext).
 fn decrypt_memo(enc: &EncryptedNote, dk_v: &Dk) -> Option<(u64, F, Vec<u8>)> {
-    let ct = ml_kem_768::Ciphertext::try_from(enc.ct_v.as_slice()).unwrap();
+    let ct = ml_kem_768::Ciphertext::try_from(enc.ct_v.as_slice()).ok()?;
     let ss = dk_v.try_decapsulate(&ct).ok()?;
     let key = hash(ss.as_slice());
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
@@ -418,6 +418,8 @@ fn verify_merkle(leaf: &F, root: &F, siblings: &[F], mut index: usize) {
         };
         index /= 2;
     }
+    // Reject if index had bits above DEPTH (mirrors merkle.cairo range check).
+    assert_eq!(index, 0, "path_indices out of range");
     assert_eq!(&current, root, "merkle root mismatch");
 }
 
@@ -512,7 +514,7 @@ impl Wallet {
         for &i in sorted.iter().rev() { self.notes.remove(i); }
     }
 
-    fn balance(&self) -> u64 { self.notes.iter().map(|n| n.v).sum() }
+    fn balance(&self) -> u128 { self.notes.iter().map(|n| n.v as u128).sum() }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -587,7 +589,7 @@ impl Chain {
         &mut self, inputs: &[Note], v_pub: u64, recipient: &str,
         change: Option<(&F, &F, &F, &Ek, &Ek)>, // (d_j, ak, nk_tag, ek_v, ek_d) for change output
     ) -> Result<(), String> {
-        assert!(!inputs.is_empty() && inputs.len() <= 16);
+        if inputs.is_empty() || inputs.len() > 16 { return Err("bad input count".into()); }
         let root = self.tree.root();
 
         // Verify all inputs, compute position-dependent nullifiers, sum values.
@@ -595,10 +597,10 @@ impl Chain {
         let mut nfs = vec![];
         for note in inputs {
             let (siblings, r) = self.tree.auth_path(note.index);
-            assert_eq!(r, root, "root mismatch across inputs");
+            if r != root { return Err("root mismatch across inputs".into()); }
             verify_merkle(&note.cm, &root, &siblings, note.index);
             let nf = nullifier(&note.nk_spend, &note.cm, note.index as u64);
-            if self.nullifiers.contains(&nf) { return Err("nullifier spent".into()); }
+            if self.nullifiers.contains(&nf) { return Err(format!("nf {} spent", short(&nf))); }
             nfs.push(nf);
             sum_in += note.v as u128;
         }
@@ -607,16 +609,17 @@ impl Chain {
         // Pairwise nullifier distinctness.
         for i in 0..nfs.len() {
             for j in i+1..nfs.len() {
-                assert_ne!(nfs[i], nfs[j], "duplicate nullifier");
+                if nfs[i] == nfs[j] { return Err("duplicate nullifier".into()); }
             }
         }
 
         // Balance: sum_in = v_pub + v_change
+        if (v_pub as u128) > sum_in { return Err("withdrawal exceeds inputs".into()); }
         let v_change = sum_in - v_pub as u128;
 
         // Create change output if requested.
         if let Some((d_j, ak, nk_tag, ek_v, ek_d)) = change {
-            assert!(v_change <= u64::MAX as u128);
+            if v_change > u64::MAX as u128 { return Err("change overflow".into()); }
             let mut rng = rand::rng();
             let rseed: F = rng.random();
             let rcm = derive_rcm(&rseed);
@@ -625,8 +628,8 @@ impl Chain {
             let index = self.tree.append(cm);
             self.post_note(cm, encrypt_note(v_change as u64, &rseed, None, ek_v, ek_d));
             println!("    change cm={} v={} index={}", short(&cm), v_change, index);
-        } else {
-            assert_eq!(v_change, 0, "no change output but value remains");
+        } else if v_change != 0 {
+            return Err("no change output but value remains".into());
         }
 
         // State updates.
@@ -644,7 +647,7 @@ impl Chain {
         d1: &F, ak1: &F, nkt1: &F, v1: u64, memo1: Option<&[u8]>, ev1: &Ek, ed1: &Ek,
         d2: &F, ak2: &F, nkt2: &F, v2: u64, memo2: Option<&[u8]>, ev2: &Ek, ed2: &Ek,
     ) -> Result<(), String> {
-        assert!(!inputs.is_empty() && inputs.len() <= 16);
+        if inputs.is_empty() || inputs.len() > 16 { return Err("bad input count".into()); }
         let root = self.tree.root();
 
         // Verify all inputs.
@@ -652,7 +655,7 @@ impl Chain {
         let mut nfs = vec![];
         for note in inputs {
             let (siblings, r) = self.tree.auth_path(note.index);
-            assert_eq!(r, root, "root mismatch");
+            if r != root { return Err("root mismatch".into()); }
             verify_merkle(&note.cm, &root, &siblings, note.index);
             let nf = nullifier(&note.nk_spend, &note.cm, note.index as u64);
             if self.nullifiers.contains(&nf) { return Err(format!("nf {} spent", short(&nf))); }
@@ -664,12 +667,13 @@ impl Chain {
         // Pairwise nullifier distinctness.
         for i in 0..nfs.len() {
             for j in i+1..nfs.len() {
-                assert_ne!(nfs[i], nfs[j], "duplicate nullifier");
+                if nfs[i] == nfs[j] { return Err("duplicate nullifier".into()); }
             }
         }
 
         // Balance conservation.
-        assert_eq!(sum_in, v1 as u128 + v2 as u128, "balance mismatch");
+        let sum_out = v1 as u128 + v2 as u128;
+        if sum_in != sum_out { return Err(format!("balance mismatch: in={} out={}", sum_in, sum_out)); }
 
         // Create two output notes.
         let mut rng = rand::rng();
@@ -777,7 +781,7 @@ fn main() {
 
     // Value conservation check.
     println!("\n=== Final State ===");
-    let total = chain.balances.values().sum::<u64>()
+    let total: u128 = chain.balances.values().map(|&v| v as u128).sum::<u128>()
         + alice.balance() + bob.balance() + carol.balance();
     println!("Tree: {} commitments, Nullifiers: {} spent",
         chain.tree.leaves.len(), chain.nullifiers.len());
@@ -844,7 +848,7 @@ mod tests {
         let inputs: Vec<Note> = a.notes.clone();
         c.transfer(&inputs, &db, &akb, &nktb, 700, None, &b.ek_v, &b.ek_d, &da, &aka, &nkta, 300, None, &a.ek_v, &a.ek_d).unwrap();
         a.spend(&[0, 1]); a.scan(&c); b.scan(&c);
-        assert_eq!(c.balances.values().sum::<u64>() + a.balance() + b.balance(), 1000);
+        assert_eq!(c.balances.values().map(|&v| v as u128).sum::<u128>() + a.balance() + b.balance(), 1000);
     }
 
     /// N=1 split: one input → two outputs, no dummies needed.
