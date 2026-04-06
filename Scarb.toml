@@ -4,26 +4,6 @@ version = "0.2.0"
 edition = "2025_12"
 
 [[target.executable]]
-name = "step_shield"
-function = "starkprivacy::step_shield::main"
-
-[[target.executable]]
-name = "step_unshield"
-function = "starkprivacy::step_unshield::main"
-
-[[target.executable]]
-name = "step_join"
-function = "starkprivacy::step_join::main"
-
-[[target.executable]]
-name = "step_split"
-function = "starkprivacy::step_split::main"
-
-[[target.executable]]
-name = "step_testvec"
-function = "starkprivacy::step_testvec::main"
-
-[[target.executable]]
 name = "run_shield"
 function = "starkprivacy::run_shield::main"
 

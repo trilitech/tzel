@@ -71,13 +71,16 @@ fn main(args: Array<felt252>) -> Array<felt252> {
 
     // Change output
     let has_change_felt: u64 = (*args.at(pos)).try_into().unwrap(); pos += 1;
+    assert(has_change_felt <= 1, 'has_change must be 0 or 1');
     let has_change = has_change_felt != 0;
     let d_j_change = *args.at(pos); pos += 1;
     let v_change: u64 = (*args.at(pos)).try_into().unwrap(); pos += 1;
     let rseed_change = *args.at(pos); pos += 1;
     let auth_root_change = *args.at(pos); pos += 1;
     let nk_tag_change = *args.at(pos); pos += 1;
-    let mh_change = *args.at(pos);
+    let mh_change = *args.at(pos); pos += 1;
+
+    assert(pos == args.len(), 'unexpected trailing args');
 
     unshield::verify(
         root,

@@ -84,6 +84,8 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let nk_tag_2 = *args.at(pos); pos += 1;
     let mh_2 = *args.at(pos);
 
+    assert(pos == args.len(), 'unexpected trailing args');
+
     transfer::verify(
         root,
         nf_list.span(),
