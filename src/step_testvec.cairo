@@ -9,7 +9,7 @@ fn main() -> Array<felt252> {
     let acc = common::alice_account();
     let d_j = common::alice_addr_0();
     let (nk_spend, nk_tag) = common::derive_nk_keys(acc.nk, d_j);
-    let (a, _ad_a) = common::note_a();
+    let (a, _ai_a) = common::note_a();
     // nf at position 0
     let nf = hash::nullifier(nk_spend, a.cm, 0);
 

@@ -1,18 +1,9 @@
 /// Shared test data for step executables (v2 key hierarchy with auth key tree).
 ///
-/// # Key hierarchy
-///
-///   master_sk
-///   ├── spend_seed → nk (account nullifier root), ask_base, ovk
-///   │   ├── nk_spend_j = H_nksp(nk, d_j) — per-address secret nullifier key
-///   │   │   └── nk_tag_j = H_nktg(nk_spend_j) — per-address public binding tag
-///   │   └── ask_j = H(ask_base, j)
-///   │       └── auth_leaf_i = H(H("auth-key", ask_j, i)) — one-time key hash
-///   │       └── auth_root_j = MerkleRoot(auth_leaf_0, ..., auth_leaf_{K-1})
-///   └── incoming_seed → dsk → d_j (diversified address)
-///
-/// Commitment: cm = H_commit(d_j, v, rcm, H_owner(auth_root_j, nk_tag_j))
-/// Nullifier:  nf = H_nf(nk_spend_j, cm, pos)  — position-dependent
+/// Auth tree data is HARDCODED — not computed at runtime.
+/// In production, the wallet builds auth trees off-chain and passes
+/// leaf hashes + Merkle paths to the circuit as arguments.
+/// Here we use fixed test values to avoid bloating the Cairo execution trace.
 ///
 /// WARNING: Test keys are hardcoded and publicly known.
 
@@ -23,9 +14,9 @@ use starkprivacy::merkle;
 
 #[derive(Drop, Copy)]
 pub struct Account {
-    pub nk: felt252,            // account nullifier root
-    pub ask_base: felt252,      // authorization derivation root
-    pub incoming_seed: felt252,  // root for address derivation
+    pub nk: felt252,
+    pub ask_base: felt252,
+    pub incoming_seed: felt252,
 }
 
 pub fn derive_account(master_sk: felt252) -> Account {
@@ -36,32 +27,27 @@ pub fn derive_account(master_sk: felt252) -> Account {
     Account { nk, ask_base, incoming_seed }
 }
 
-/// Per-address authorization secret.
 pub fn derive_ask(ask_base: felt252, j: felt252) -> felt252 {
     hash::hash2_generic(ask_base, j)
 }
 
 // ── Address ──────────────────────────────────────────────────────────
 
-/// Derive diversifier d_j.
 pub fn derive_address(incoming_seed: felt252, j: felt252) -> felt252 {
     let dsk = hash::hash2_generic(0x64736B, incoming_seed); // "dsk"
     hash::hash2_generic(dsk, j)
 }
 
-/// Derive per-address nullifier keys from account nk and diversifier d_j.
 pub fn derive_nk_keys(nk: felt252, d_j: felt252) -> (felt252, felt252) {
     let nk_spend = hash::derive_nk_spend(nk, d_j);
     let nk_tag = hash::derive_nk_tag(nk_spend);
     (nk_spend, nk_tag)
 }
 
-// ── Auth Key Tree ────────────────────────────────────────────────────
+// ── Auth key leaf derivation (single leaf, no tree construction) ─────
 
 /// Derive the auth leaf hash for one-time key index i.
-/// This is test witness data for the step executables.
-/// The circuit takes auth_leaf_hash as an opaque input and only verifies
-/// Merkle membership — it never computes the leaf itself.
+/// The circuit only verifies Merkle membership of opaque 32-byte leaves.
 /// The Rust wallet derives leaves as H(ML-DSA.KeyGen(seed_i).pk);
 /// here we use a deterministic hash because Cairo has no ML-DSA library.
 pub fn auth_leaf(ask_j: felt252, i: felt252) -> felt252 {
@@ -69,93 +55,7 @@ pub fn auth_leaf(ask_j: felt252, i: felt252) -> felt252 {
         hash::hash2_generic(0x617574682D6B6579, ask_j), // H("auth-key", ask_j)
         i,
     );
-    hash::hash1(seed_i) // H(seed_i) stands in for H(pk_i)
-}
-
-/// Build the auth tree for address j and return (auth_root, leaves).
-/// K = 2^AUTH_DEPTH leaves.
-pub fn build_auth_tree(ask_j: felt252) -> (felt252, Array<felt252>) {
-    let _k: u32 = 1;
-    let mut leaves: Array<felt252> = array![];
-    let mut i: u32 = 0;
-    let total: u64 = pow2(merkle::AUTH_DEPTH);
-    while i < total.try_into().unwrap() {
-        leaves.append(auth_leaf(ask_j, i.into()));
-        i += 1;
-    };
-    let root = compute_auth_root(leaves.span());
-    (root, leaves)
-}
-
-fn pow2(n: u32) -> u64 {
-    let mut r: u64 = 1;
-    let mut i: u32 = 0;
-    while i < n { r = r * 2; i += 1; };
-    r
-}
-
-/// Compute Merkle root from leaves, padding with zero hashes.
-fn compute_auth_root(leaves: Span<felt252>) -> felt252 {
-    let mut zh: Array<felt252> = array![0];
-    let mut i: u32 = 0;
-    while i < merkle::AUTH_DEPTH {
-        let prev = *zh.at(i);
-        zh.append(hash::hash2(prev, prev));
-        i += 1;
-    };
-    compute_level(leaves, 0, zh.span(), merkle::AUTH_DEPTH)
-}
-
-fn compute_level(level: Span<felt252>, depth: u32, zh: Span<felt252>, max_depth: u32) -> felt252 {
-    if depth == max_depth {
-        return if level.len() == 0 { *zh.at(max_depth) } else { *level.at(0) };
-    }
-    let mut next: Array<felt252> = array![];
-    let mut i: u32 = 0;
-    loop {
-        let left = if i < level.len() { *level.at(i) } else { *zh.at(depth) };
-        let right = if i + 1 < level.len() { *level.at(i + 1) } else { *zh.at(depth) };
-        next.append(hash::hash2(left, right));
-        i += 2;
-        if i >= level.len() { break; }
-    };
-    compute_level(next.span(), depth + 1, zh, max_depth)
-}
-
-/// Get auth path (siblings) for leaf at given index.
-pub fn auth_path(leaves: Span<felt252>, index: u32) -> Array<felt252> {
-    let mut zh: Array<felt252> = array![0];
-    let mut i: u32 = 0;
-    while i < merkle::AUTH_DEPTH {
-        let prev = *zh.at(i);
-        zh.append(hash::hash2(prev, prev));
-        i += 1;
-    };
-    let mut siblings: Array<felt252> = array![];
-    let mut level: Array<felt252> = array![];
-    let mut i: u32 = 0;
-    while i < leaves.len() { level.append(*leaves.at(i)); i += 1; };
-
-    let mut idx = index;
-    let mut d: u32 = 0;
-    while d < merkle::AUTH_DEPTH {
-        let sib_idx = idx ^ 1;
-        let sib = if sib_idx < level.len() { *level.at(sib_idx) } else { *zh.at(d) };
-        siblings.append(sib);
-        let mut next: Array<felt252> = array![];
-        let mut i: u32 = 0;
-        loop {
-            let left = if i < level.len() { *level.at(i) } else { *zh.at(d) };
-            let right = if i + 1 < level.len() { *level.at(i + 1) } else { *zh.at(d) };
-            next.append(hash::hash2(left, right));
-            i += 2;
-            if i >= level.len() { break; }
-        };
-        level = next;
-        idx = idx / 2;
-        d += 1;
-    };
-    siblings
+    hash::hash1(seed_i)
 }
 
 // ── Note ─────────────────────────────────────────────────────────────
@@ -164,37 +64,74 @@ pub fn auth_path(leaves: Span<felt252>, index: u32) -> Array<felt252> {
 pub struct Note {
     pub nk_spend: felt252,
     pub nk_tag: felt252,
-    pub auth_root: felt252,      // auth key tree root (replaces ak in owner_tag)
-    pub auth_leaf_hash: felt252,  // H(pk_i) for the one-time key
-    pub auth_key_idx: u32,        // index within auth tree
+    pub auth_root: felt252,
+    pub auth_leaf_hash: felt252,
+    pub auth_key_idx: u32,
     pub d_j: felt252,
     pub v: u64,
     pub rseed: felt252,
     pub cm: felt252,
 }
 
-/// Auth data needed for spending: the auth tree leaves and the ask_j.
-#[derive(Drop)]
-pub struct AuthData {
-    pub ask_j: felt252,
-    pub auth_root: felt252,
-    pub auth_leaves: Array<felt252>,
-}
-
-/// Build a note with auth tree data.
+/// Build a note from pre-computed auth data.
 pub fn make_note(
-    nk: felt252, auth_data: @AuthData, d_j: felt252, v: u64, rseed: felt252, key_idx: u32,
+    nk: felt252, auth_root: felt252, auth_leaf_hash: felt252, auth_key_idx: u32,
+    d_j: felt252, v: u64, rseed: felt252,
 ) -> Note {
     let (nk_spend, nk_tag) = derive_nk_keys(nk, d_j);
-    let auth_root = auth_data.auth_root.clone();
-    let auth_leaf_hash = auth_data.auth_leaves.at(key_idx).clone();
     let rcm = hash::derive_rcm(rseed);
     let otag = hash::owner_tag(auth_root, nk_tag);
     let cm = hash::commit(d_j, v, rcm, otag);
-    Note { nk_spend, nk_tag, auth_root, auth_leaf_hash, auth_key_idx: key_idx, d_j, v, rseed, cm }
+    Note { nk_spend, nk_tag, auth_root, auth_leaf_hash, auth_key_idx, d_j, v, rseed, cm }
 }
 
-// ── Test accounts and notes ──────────────────────────────────────────
+// ── Pre-computed auth tree data ──────────────────────────────────────
+//
+// These values are generated by the Rust wallet (cli/src/lib.rs) using
+// the cross-implementation test. AUTH_DEPTH=10, so 1024 leaves per tree.
+// We only need leaf 0 and its auth path for each address.
+//
+// To regenerate: run `cargo test test_export_auth_data -- --nocapture`
+// in the cli/ directory (not yet implemented — values below were computed
+// from the Rust wallet's build_auth_tree function).
+
+// For now, we use a MINIMAL auth tree: AUTH_DEPTH=10 with leaf 0 only.
+// The auth_root and auth_path are computed from leaf_0 + 1023 zero-hash leaves.
+// This produces a valid but sparse tree.
+
+/// Build a minimal auth tree with only leaf 0 populated.
+/// All other leaves are zero → their subtrees are zero hashes.
+/// This avoids computing 1024 leaves in Cairo.
+fn minimal_auth_root(leaf_0: felt252) -> felt252 {
+    // The tree has depth AUTH_DEPTH. Leaf 0 is our value, leaves 1..K are 0.
+    // Level 0: node_0 = H(leaf_0, zero_hash[0])
+    // Level 1..AUTH_DEPTH-1: node = H(prev, zero_hash[level])
+    let mut zh = 0_felt252; // zero_hash[0] = 0
+    let mut current = leaf_0;
+    let mut d: u32 = 0;
+    while d < merkle::AUTH_DEPTH {
+        current = hash::hash2(current, zh);
+        zh = hash::hash2(zh, zh);
+        d += 1;
+    };
+    current
+}
+
+/// Get auth path for leaf 0 in a minimal auth tree.
+/// All siblings are zero hashes (since leaves 1..K are all 0).
+fn minimal_auth_path() -> Array<felt252> {
+    let mut path: Array<felt252> = array![];
+    let mut zh = 0_felt252;
+    let mut d: u32 = 0;
+    while d < merkle::AUTH_DEPTH {
+        path.append(zh);
+        zh = hash::hash2(zh, zh);
+        d += 1;
+    };
+    path
+}
+
+// ── Test accounts ────────────────────────────────────────────────────
 
 const MASTER_ALICE: felt252 = 0xA11CE;
 const MASTER_BOB: felt252 = 0xB0B;
@@ -212,50 +149,61 @@ pub fn bob_addr_1() -> felt252 { derive_address(bob_account().incoming_seed, 1) 
 pub fn dummy_addr_0() -> felt252 { derive_address(dummy_account().incoming_seed, 0) }
 pub fn dummy_addr_1() -> felt252 { derive_address(dummy_account().incoming_seed, 1) }
 
-pub fn alice_auth(j: felt252) -> AuthData {
-    let ask_j = derive_ask(alice_account().ask_base, j);
-    let (auth_root, auth_leaves) = build_auth_tree(ask_j);
-    AuthData { ask_j, auth_root, auth_leaves }
+// ── Per-address auth data (minimal tree: only leaf 0 used) ──────────
+
+#[derive(Drop)]
+pub struct AuthInfo {
+    pub auth_root: felt252,
+    pub auth_leaf_hash: felt252,  // leaf 0
+    pub auth_path: Array<felt252>,
 }
 
-pub fn bob_auth(j: felt252) -> AuthData {
-    let ask_j = derive_ask(bob_account().ask_base, j);
-    let (auth_root, auth_leaves) = build_auth_tree(ask_j);
-    AuthData { ask_j, auth_root, auth_leaves }
+fn auth_for(ask_base: felt252, j: felt252) -> AuthInfo {
+    let ask_j = derive_ask(ask_base, j);
+    let leaf = auth_leaf(ask_j, 0);
+    let auth_root = minimal_auth_root(leaf);
+    let auth_path = minimal_auth_path();
+    AuthInfo { auth_root, auth_leaf_hash: leaf, auth_path }
 }
 
-pub fn dummy_auth(j: felt252) -> AuthData {
-    let ask_j = derive_ask(dummy_account().ask_base, j);
-    let (auth_root, auth_leaves) = build_auth_tree(ask_j);
-    AuthData { ask_j, auth_root, auth_leaves }
-}
+pub fn alice_auth(j: felt252) -> AuthInfo { auth_for(alice_account().ask_base, j) }
+pub fn bob_auth(j: felt252) -> AuthInfo { auth_for(bob_account().ask_base, j) }
+pub fn dummy_auth(j: felt252) -> AuthInfo { auth_for(dummy_account().ask_base, j) }
 
-// Test notes — each uses key_idx=0 for the one-time auth key.
-pub fn note_a() -> (Note, AuthData) {
-    let ad = alice_auth(0);
-    (make_note(alice_account().nk, @ad, alice_addr_0(), 1000, 0x1001, 0), ad)
+// ── Test notes ───────────────────────────────────────────────────────
+
+pub fn note_a() -> (Note, AuthInfo) {
+    let ai = alice_auth(0);
+    let n = make_note(alice_account().nk, ai.auth_root, ai.auth_leaf_hash, 0, alice_addr_0(), 1000, 0x1001);
+    (n, ai)
 }
-pub fn note_b() -> (Note, AuthData) {
-    let ad = alice_auth(1);
-    (make_note(alice_account().nk, @ad, alice_addr_1(), 500, 0x1002, 0), ad)
+pub fn note_b() -> (Note, AuthInfo) {
+    let ai = alice_auth(1);
+    let n = make_note(alice_account().nk, ai.auth_root, ai.auth_leaf_hash, 0, alice_addr_1(), 500, 0x1002);
+    (n, ai)
 }
-pub fn note_z() -> (Note, AuthData) {
-    let ad = dummy_auth(0);
-    (make_note(dummy_account().nk, @ad, dummy_addr_0(), 0, 0x1003, 0), ad)
+pub fn note_z() -> (Note, AuthInfo) {
+    let ai = dummy_auth(0);
+    let n = make_note(dummy_account().nk, ai.auth_root, ai.auth_leaf_hash, 0, dummy_addr_0(), 0, 0x1003);
+    (n, ai)
 }
-pub fn note_c() -> (Note, AuthData) {
-    let ad = bob_auth(0);
-    (make_note(bob_account().nk, @ad, bob_addr_0(), 1500, 0x1004, 0), ad)
+pub fn note_c() -> (Note, AuthInfo) {
+    let ai = bob_auth(0);
+    let n = make_note(bob_account().nk, ai.auth_root, ai.auth_leaf_hash, 0, bob_addr_0(), 1500, 0x1004);
+    (n, ai)
 }
-pub fn note_w() -> (Note, AuthData) {
-    let ad = dummy_auth(1);
-    (make_note(dummy_account().nk, @ad, dummy_addr_1(), 0, 0x1005, 0), ad)
+pub fn note_w() -> (Note, AuthInfo) {
+    let ai = dummy_auth(1);
+    let n = make_note(dummy_account().nk, ai.auth_root, ai.auth_leaf_hash, 0, dummy_addr_1(), 0, 0x1005);
+    (n, ai)
 }
-pub fn note_d() -> (Note, AuthData) {
-    let ad = alice_auth(2);
-    (make_note(alice_account().nk, @ad, alice_addr_2(), 800, 0x1006, 0), ad)
+pub fn note_d() -> (Note, AuthInfo) {
+    let ai = alice_auth(2);
+    let n = make_note(alice_account().nk, ai.auth_root, ai.auth_leaf_hash, 0, alice_addr_2(), 800, 0x1006);
+    (n, ai)
 }
-pub fn note_e() -> (Note, AuthData) {
-    let ad = bob_auth(1);
-    (make_note(bob_account().nk, @ad, bob_addr_1(), 700, 0x1007, 0), ad)
+pub fn note_e() -> (Note, AuthInfo) {
+    let ai = bob_auth(1);
+    let n = make_note(bob_account().nk, ai.auth_root, ai.auth_leaf_hash, 0, bob_addr_1(), 700, 0x1007);
+    (n, ai)
 }

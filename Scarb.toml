@@ -23,6 +23,18 @@ function = "starkprivacy::step_split::main"
 name = "step_testvec"
 function = "starkprivacy::step_testvec::main"
 
+[[target.executable]]
+name = "run_shield"
+function = "starkprivacy::run_shield::main"
+
+[[target.executable]]
+name = "run_transfer"
+function = "starkprivacy::run_transfer::main"
+
+[[target.executable]]
+name = "run_unshield"
+function = "starkprivacy::run_unshield::main"
+
 [cairo]
 enable-gas = false
 

@@ -11,7 +11,7 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 use starkprivacy_reprover::custom_circuit::ProofBundle;
-use starkprivacy_reprover::{prove, prove_single_level};
+use starkprivacy_reprover::{prove_with_args_file, prove_single_level};
 use tracing_subscriber::fmt;
 
 #[derive(Parser)]
@@ -23,6 +23,10 @@ struct Cli {
     /// Write proof bundle (JSON) to this file
     #[arg(long, short)]
     output: Option<PathBuf>,
+
+    /// JSON file with witness arguments (array of decimal felt strings, length-prefixed)
+    #[arg(long)]
+    arguments_file: Option<PathBuf>,
 
     /// DEBUG ONLY: single-level proof (NOT zero-knowledge)
     #[arg(long)]
@@ -47,6 +51,8 @@ fn main() -> Result<()> {
     eprintln!("Loading executable from {:?}", cli.executable);
     let t_total = Instant::now();
 
+    let args_file = cli.arguments_file.clone();
+
     if cli.debug_single_level {
         eprintln!("WARNING: single-level mode is NOT zero-knowledge");
         let t_prove = Instant::now();
@@ -61,7 +67,7 @@ fn main() -> Result<()> {
     } else {
         eprintln!("Running recursive prove...");
         let t_prove = Instant::now();
-        let proof_output = prove(&cli.executable)?;
+        let proof_output = prove_with_args_file(&cli.executable, args_file)?;
         let prove_ms = t_prove.elapsed().as_millis();
         let proof_size = proof_output.proof.len();
         let peak_mem_kb = get_peak_memory_kb();

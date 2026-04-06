@@ -10,3 +10,6 @@ pub mod step_unshield;
 pub mod step_join;
 pub mod step_split;
 pub mod step_testvec;
+pub mod run_shield;
+pub mod run_transfer;
+pub mod run_unshield;

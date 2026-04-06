@@ -6,11 +6,11 @@ use starkprivacy::{common, shield, transfer, tree};
 
 #[executable]
 fn main() -> Array<felt252> {
-    let (a, ad_a) = common::note_a();
-    let (b, ad_b) = common::note_b();
-    let (z, _ad_z) = common::note_z();
-    let (c, _ad_c) = common::note_c();
-    let (w, _ad_w) = common::note_w();
+    let (a, ai_a) = common::note_a();
+    let (b, ai_b) = common::note_b();
+    let (z, _ai_z) = common::note_z();
+    let (c, _ai_c) = common::note_c();
+    let (w, _ai_w) = common::note_w();
 
     // Shield dummy note Z.
     shield::verify(z.v, z.cm, 0xA11CE_ADD8, 0, z.auth_root, z.nk_tag, z.d_j, z.rseed);
@@ -20,10 +20,6 @@ fn main() -> Array<felt252> {
     let leaves: Array<felt252> = array![a.cm, b.cm, z.cm];
     let (cm_sib_a, idx_a, root) = tree::auth_path(leaves.span(), 0, zh.span());
     let (cm_sib_b, idx_b, _) = tree::auth_path(leaves.span(), 1, zh.span());
-
-    // Auth tree paths for the one-time keys.
-    let auth_sib_a = common::auth_path(ad_a.auth_leaves.span(), a.auth_key_idx);
-    let auth_sib_b = common::auth_path(ad_b.auth_leaves.span(), b.auth_key_idx);
 
     // Compute position-dependent nullifiers.
     let nf_a = hash::nullifier(a.nk_spend, a.cm, idx_a);
@@ -37,11 +33,13 @@ fn main() -> Array<felt252> {
     while i < cm_sib_b.len() { cm_sibs.append(*cm_sib_b.at(i)); i += 1; };
 
     // Flatten auth siblings for N=2.
+    let auth_path_a = ai_a.auth_path;
+    let auth_path_b = ai_b.auth_path;
     let mut auth_sibs: Array<felt252> = array![];
     let mut i: u32 = 0;
-    while i < auth_sib_a.len() { auth_sibs.append(*auth_sib_a.at(i)); i += 1; };
+    while i < auth_path_a.len() { auth_sibs.append(*auth_path_a.at(i)); i += 1; };
     let mut i: u32 = 0;
-    while i < auth_sib_b.len() { auth_sibs.append(*auth_sib_b.at(i)); i += 1; };
+    while i < auth_path_b.len() { auth_sibs.append(*auth_path_b.at(i)); i += 1; };
 
     transfer::verify(
         root,

@@ -30,16 +30,23 @@ pub use custom_circuit::CustomProofOutput;
 /// Run a Cairo executable through the privacy bootloader,
 /// generate a two-level recursive ZK proof.
 ///
+/// `args` is an optional list of felt252 values passed to the executable's main().
 /// Returns the proof bytes (zstd-compressed circuit proof) and public outputs.
-pub fn prove(executable_path: &PathBuf) -> Result<CustomProofOutput> {
-    let (prover_input, output_preimage) = run_privacy_bootloader(executable_path)?;
+pub fn prove(executable_path: &PathBuf, args: Option<Vec<Felt>>) -> Result<CustomProofOutput> {
+    let (prover_input, output_preimage) = run_privacy_bootloader(executable_path, args, None)?;
+    custom_circuit::custom_recursive_prove(prover_input, output_preimage)
+}
+
+/// Same as `prove` but takes a BigUintAsHex args file path directly.
+pub fn prove_with_args_file(executable_path: &PathBuf, args_file: Option<PathBuf>) -> Result<CustomProofOutput> {
+    let (prover_input, output_preimage) = run_privacy_bootloader(executable_path, None, args_file)?;
     custom_circuit::custom_recursive_prove(prover_input, output_preimage)
 }
 
 /// Run a Cairo executable through the bootloader and generate a
 /// single-level (NON-ZK) proof. For debugging/testing only.
 pub fn prove_single_level(executable_path: &PathBuf) -> Result<(Vec<u8>, Vec<Felt>)> {
-    let (prover_input, output_preimage) = run_privacy_bootloader(executable_path)?;
+    let (prover_input, output_preimage) = run_privacy_bootloader(executable_path, None, None)?;
     let cairo_proof = prove_cairo::<Blake2sM31MerkleChannel>(prover_input, CAIRO_PROVER_PARAMS)
         .map_err(|e| anyhow!("{e}"))?;
     let json_bytes = serde_json::to_vec(&cairo_proof)?;
@@ -48,11 +55,27 @@ pub fn prove_single_level(executable_path: &PathBuf) -> Result<(Vec<u8>, Vec<Fel
 }
 
 /// Run a Cairo executable through the privacy bootloader.
+/// `args` is an optional list of felt252 values passed as user_args.
 /// Returns the prover input (execution trace) and public outputs.
 pub fn run_privacy_bootloader(
     executable_path: &PathBuf,
+    args: Option<Vec<Felt>>,
+    args_file_path: Option<PathBuf>,
 ) -> Result<(stwo_cairo_adapter::ProverInput, Vec<Felt>)> {
-    let task = create_cairo1_program_task(executable_path, None, None)
+    // Convert Vec<Felt> to a BigUintAsHex temp file, or use provided file directly.
+    let args_temp = if let Some(felts) = args {
+        let file = NamedTempFile::new()?;
+        let hex_args: Vec<serde_json::Value> = felts
+            .iter()
+            .map(|f| serde_json::json!({ "value": format!("{:#x}", f) }))
+            .collect();
+        serde_json::to_writer(&file, &hex_args)?;
+        Some(file)
+    } else {
+        None
+    };
+    let args_path = args_file_path.or_else(|| args_temp.as_ref().map(|f| f.path().to_path_buf()));
+    let task = create_cairo1_program_task(executable_path, None, args_path)
         .map_err(|e| anyhow!("{e}"))?;
 
     let task_spec = TaskSpec {

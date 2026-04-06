@@ -6,13 +6,13 @@ use starkprivacy::{common, transfer, tree};
 
 #[executable]
 fn main() -> Array<felt252> {
-    let (a, _ad_a) = common::note_a();
-    let (b, _ad_b) = common::note_b();
-    let (z, _ad_z) = common::note_z();
-    let (c, ad_c) = common::note_c();
-    let (w, _ad_w) = common::note_w();
-    let (d, _ad_d) = common::note_d();
-    let (e, _ad_e) = common::note_e();
+    let (a, _ai_a) = common::note_a();
+    let (b, _ai_b) = common::note_b();
+    let (z, _ai_z) = common::note_z();
+    let (c, ai_c) = common::note_c();
+    let (w, _ai_w) = common::note_w();
+    let (d, _ai_d) = common::note_d();
+    let (e, _ai_e) = common::note_e();
 
     // Build commitment tree and Merkle path for note C at index 3.
     let zh = tree::zero_hashes();
@@ -20,7 +20,7 @@ fn main() -> Array<felt252> {
     let (cm_sib_c, idx_c, root) = tree::auth_path(leaves.span(), 3, zh.span());
 
     // Auth tree path for the one-time key.
-    let auth_sib_c = common::auth_path(ad_c.auth_leaves.span(), c.auth_key_idx);
+    let auth_sib_c = ai_c.auth_path;
 
     // Compute nullifier.
     let nf_c = hash::nullifier(c.nk_spend, c.cm, idx_c);

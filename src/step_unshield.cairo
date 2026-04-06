@@ -6,7 +6,7 @@ use starkprivacy::{common, tree, unshield};
 
 #[executable]
 fn main() -> Array<felt252> {
-    let (a, ad_a) = common::note_a();
+    let (a, ai_a) = common::note_a();
     let recipient: felt252 = 0xCAFE;
 
     // Commitment tree path.
@@ -15,7 +15,7 @@ fn main() -> Array<felt252> {
     let (cm_siblings, idx, root) = tree::auth_path(leaves.span(), 0, zh.span());
 
     // Auth tree path for the one-time key.
-    let auth_siblings_a = common::auth_path(ad_a.auth_leaves.span(), a.auth_key_idx);
+    let auth_siblings_a = ai_a.auth_path;
 
     // Compute nullifier: nf = H_nf(nk_spend, cm, pos).
     let nf = hash::nullifier(a.nk_spend, a.cm, idx);
