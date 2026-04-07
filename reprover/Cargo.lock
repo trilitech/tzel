@@ -3679,6 +3679,7 @@ dependencies = [
  "stwo-cairo-common",
  "stwo-cairo-prover",
  "stwo-cairo-serialize",
+ "stwo-constraint-framework",
  "tempfile",
  "tracing",
  "tracing-subscriber",

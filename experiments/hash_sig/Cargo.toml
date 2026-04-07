@@ -1,0 +1,19 @@
+[package]
+name = "hash-sig-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "gen_witness"
+path = "src/gen_witness.rs"
+
+[dependencies]
+blake2s_simd = "1.0"
+rand = "0.9"
+hex = "0.4"
+serde_json = "1"
+starkprivacy-cli = { path = "../../cli" }

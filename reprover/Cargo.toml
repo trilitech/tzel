@@ -40,6 +40,7 @@ stwo-cairo-prover = { git = "https://github.com/starkware-libs/stwo-cairo", rev 
 stwo-cairo-serialize = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
 stwo-cairo-common = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
 stwo = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c", features = ["parallel", "prover"] }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c" }
 
 # stwo circuits (same rev as proving-utils v1.2.2)
 circuit-cairo-air = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }

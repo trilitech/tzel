@@ -31,6 +31,11 @@ struct Cli {
     /// DEBUG ONLY: single-level proof (NOT zero-knowledge)
     #[arg(long)]
     debug_single_level: bool,
+
+    /// Verify a proof bundle JSON file instead of generating a proof.
+    /// Exit code 0 = valid, 1 = invalid.
+    #[arg(long)]
+    verify: Option<PathBuf>,
 }
 
 fn get_peak_memory_kb() -> Option<u64> {
@@ -47,6 +52,24 @@ fn get_peak_memory_kb() -> Option<u64> {
 fn main() -> Result<()> {
     fmt().with_max_level(tracing::Level::INFO).init();
     let cli = Cli::parse();
+
+    // ── Verify mode ──────────────────────────────────────────────────
+    if let Some(bundle_path) = &cli.verify {
+        eprintln!("Verifying proof bundle: {:?}", bundle_path);
+        let bundle_json = std::fs::read_to_string(bundle_path)?;
+        let bundle: ProofBundle = serde_json::from_str(&bundle_json)?;
+        match bundle.verify() {
+            Ok(()) => {
+                eprintln!("Proof VALID ✓");
+                println!("verify=ok");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Proof INVALID: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     eprintln!("Loading executable from {:?}", cli.executable);
     let t_total = Instant::now();

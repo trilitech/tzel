@@ -1,0 +1,31 @@
+[package]
+name = "wots_circuit_bench"
+version = "0.1.0"
+edition = "2025_12"
+
+[[target.executable]]
+name = "transfer_baseline"
+function = "wots_circuit_bench::transfer_baseline::main"
+
+[[target.executable]]
+name = "transfer_wots4"
+function = "wots_circuit_bench::transfer_wots4::main"
+
+[[target.executable]]
+name = "transfer_wots16"
+function = "wots_circuit_bench::transfer_wots16::main"
+
+[[target.executable]]
+name = "transfer_lamport"
+function = "wots_circuit_bench::transfer_lamport::main"
+
+[cairo]
+enable-gas = false
+
+[features]
+depth16 = []
+depth48 = []
+default = ["depth48"]
+
+[dependencies]
+cairo_execute = "2.16.1"

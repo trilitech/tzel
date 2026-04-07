@@ -1,23 +1,23 @@
 /// Parameterized unshield executable — takes all witness data as input.
 ///
 /// Argument layout (flattened felt252 array):
-///   [0]  N                    — number of inputs
+///   [0]  N
 ///   [1]  root
 ///   [2]  v_pub
 ///   [3]  recipient
 ///   Then per input (N times):
-///     nf, nk_spend, auth_root, auth_leaf_hash, auth_index,
+///     nf, nk_spend, auth_root, auth_index,
 ///     d_j, v, rseed, cm_path_idx
-///   Then per input (N times):
-///     TREE_DEPTH commitment tree siblings
-///   Then per input (N times):
-///     AUTH_DEPTH auth tree siblings
-///   Then change output:
-///     has_change (0 or 1), d_j_change, v_change, rseed_change,
-///     auth_root_change, nk_tag_change, memo_ct_hash_change
+///   Then per input (N times): TREE_DEPTH cm siblings
+///   Then per input (N times): AUTH_DEPTH auth siblings
+///   Then per input (N times): WOTS_CHAINS sig values
+///   Then per input (N times): WOTS_CHAINS pk values
+///   Then change: has_change, d_j, v, rseed, auth_root, nk_tag, memo_ct_hash
 
 use starkprivacy::unshield;
 use starkprivacy::merkle;
+
+const WOTS_CHAINS: u32 = 133;
 
 #[executable]
 fn main(args: Array<felt252>) -> Array<felt252> {
@@ -28,11 +28,9 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let v_pub: u64 = (*args.at(pos)).try_into().unwrap(); pos += 1;
     let recipient = *args.at(pos); pos += 1;
 
-    // Per-input scalar fields
     let mut nf_list: Array<felt252> = array![];
     let mut nk_spend_list: Array<felt252> = array![];
     let mut auth_root_list: Array<felt252> = array![];
-    let mut auth_leaf_list: Array<felt252> = array![];
     let mut auth_idx_list: Array<u64> = array![];
     let mut d_j_list: Array<felt252> = array![];
     let mut v_list: Array<u64> = array![];
@@ -44,7 +42,6 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         nf_list.append(*args.at(pos)); pos += 1;
         nk_spend_list.append(*args.at(pos)); pos += 1;
         auth_root_list.append(*args.at(pos)); pos += 1;
-        auth_leaf_list.append(*args.at(pos)); pos += 1;
         auth_idx_list.append((*args.at(pos)).try_into().unwrap()); pos += 1;
         d_j_list.append(*args.at(pos)); pos += 1;
         v_list.append((*args.at(pos)).try_into().unwrap()); pos += 1;
@@ -53,21 +50,21 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         i += 1;
     };
 
-    // Commitment tree siblings (N * TREE_DEPTH)
     let mut cm_sibs: Array<felt252> = array![];
     let mut i: u32 = 0;
-    while i < n * merkle::TREE_DEPTH {
-        cm_sibs.append(*args.at(pos)); pos += 1;
-        i += 1;
-    };
+    while i < n * merkle::TREE_DEPTH { cm_sibs.append(*args.at(pos)); pos += 1; i += 1; };
 
-    // Auth tree siblings (N * AUTH_DEPTH)
     let mut auth_sibs: Array<felt252> = array![];
     let mut i: u32 = 0;
-    while i < n * merkle::AUTH_DEPTH {
-        auth_sibs.append(*args.at(pos)); pos += 1;
-        i += 1;
-    };
+    while i < n * merkle::AUTH_DEPTH { auth_sibs.append(*args.at(pos)); pos += 1; i += 1; };
+
+    let mut wots_sig: Array<felt252> = array![];
+    let mut i: u32 = 0;
+    while i < n * WOTS_CHAINS { wots_sig.append(*args.at(pos)); pos += 1; i += 1; };
+
+    let mut wots_pk: Array<felt252> = array![];
+    let mut i: u32 = 0;
+    while i < n * WOTS_CHAINS { wots_pk.append(*args.at(pos)); pos += 1; i += 1; };
 
     // Change output
     let has_change_felt: u64 = (*args.at(pos)).try_into().unwrap(); pos += 1;
@@ -89,7 +86,8 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         recipient,
         nk_spend_list.span(),
         auth_root_list.span(),
-        auth_leaf_list.span(),
+        wots_sig.span(),
+        wots_pk.span(),
         auth_sibs.span(),
         auth_idx_list.span(),
         d_j_list.span(),

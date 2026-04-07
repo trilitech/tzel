@@ -8,9 +8,9 @@ A UTXO-based private transaction system with:
 - **Merkle commitment tree** for note storage
 - **Nullifiers** for double-spend prevention
 - **Two-level recursive STARKs** (Cairo AIR + Stwo circuit reprover) with ZK blinding
-- **Post-quantum cryptography**: BLAKE2s hashing, ML-KEM-768 for memos/detection, ML-DSA-65 for spend authorization, STARKs for proofs. No elliptic curves.
-- **Delegated proving**: untrusted provers generate the STARK proof; the user authorizes with a one-time ML-DSA signature afterward
-- **Unlinkable spend authorization**: each spend uses a fresh one-time signing key from a Merkle tree of ML-DSA keys. The tree root stays private inside the STARK, so the on-chain key cannot be linked back to the spender's address.
+- **Post-quantum cryptography**: BLAKE2s hashing, ML-KEM-768 for memos/detection, WOTS+ (w=4) for spend authorization verified inside the STARK, STARKs for proofs. No elliptic curves.
+- **Delegated proving**: untrusted provers generate the STARK proof; the WOTS+ signature is included in the witness and verified inside the STARK, so the proof itself proves spend authorization
+- **Unlinkable spend authorization**: each spend uses a fresh one-time WOTS+ key from a Merkle tree of WOTS+ public keys. The tree root stays private inside the STARK, so on-chain outputs cannot be linked back to the spender's address.
 - **Penumbra-inspired key hierarchy**: spending and address material in separate branches
 - **Per-address nullifier binding**: nullifier keys are bound into commitments via owner tags
 
@@ -26,8 +26,8 @@ master_sk
 │   │       └── nk_tag_j  = H_nktg(nk_spend_j)   — per-address public binding tag
 │   ├── ask_base   = H("ask", spend_seed)         — base authorization secret
 │   │   └── ask_j  = H(ask_base, j)               — per-address auth secret
-│   │       └── seed_i = H("auth-key", ask_j, i)  — per-key ML-DSA seed
-│   │           └── (sk_i, pk_i) = ML-DSA.KeyGen(seed_i)
+│   │       └── seed_i = H("auth-key", ask_j, i)  — per-key WOTS+ seed
+│   │           └── pk_i = WOTS+.KeyGen(seed_i)   — 133 chain endpoints (w=4)
 │   │       └── auth_root_j = MerkleRoot(H(pk_0), ..., H(pk_{K-1}))
 │   └── ovk        = H("ovk", spend_seed)         — outgoing viewing key
 │
@@ -44,14 +44,14 @@ master_sk
 
 ### Auth Key Tree
 
-Each address `j` has a Merkle tree of K one-time ML-DSA signing keys (K = 2^AUTH_DEPTH, default AUTH_DEPTH = 10, giving 1024 keys per address). The tree is constructed at address generation time:
+Each address `j` has a Merkle tree of K one-time WOTS+ public keys (K = 2^AUTH_DEPTH, default AUTH_DEPTH = 10, giving 1024 keys per address). WOTS+ uses Winternitz parameter w=4 with 133 hash chains per key, all using BLAKE2s. The tree is constructed at address generation time:
 
 1. For each index i in 0..K: `seed_i = H("auth-key", ask_j, i)`
-2. `(sk_i, pk_i) = ML-DSA-65.KeyGen(seed_i)` — deterministic keygen from seed
-3. `leaf_i = H(pk_i_bytes)` — BLAKE2s hash of serialized ML-DSA public key
+2. `pk_i = WOTS+.KeyGen(seed_i)` — 133 chain endpoints derived from seed via BLAKE2s hash chains
+3. `leaf_i = H(pk_i_folded)` — BLAKE2s hash of the 133 chain endpoints folded to a single leaf hash
 4. `auth_root_j = MerkleRoot(leaf_0, ..., leaf_{K-1})` — standard Merkle tree using `H_merkle`
 
-The `auth_root_j` is included in the payment address and bound into commitments via `owner_tag`. Each key is used at most once. When spending, the STARK proves the chosen `pk_i` is a leaf in the tree, but outputs only `H(pk_i)` — not `auth_root_j`. Since `auth_root_j` stays private, two spends from the same address publish unrelated one-time keys.
+The `auth_root_j` is included in the payment address and bound into commitments via `owner_tag`. Each key is used at most once. When spending, the STARK proves the chosen `pk_i` is a leaf in the tree and verifies the WOTS+ signature inside the circuit. No auth leaf, public key, or signature appears in the public outputs — the STARK proof itself proves spend authorization.
 
 After exhausting all K keys for an address, generate a new address (increment j).
 
@@ -128,11 +128,11 @@ Without owner tags, the commitment `cm = H(d_j, v, rcm)` would not bind to the n
 3. Compute `nf' = H(nk', cm)` — a fresh, unused nullifier
 4. Produce a valid proof showing `nf'` has never been spent
 
-This allows unlimited double-spending from a single note. The owner tag fix binds `nk_spend → nk_tag → owner_tag → cm`, creating a unique chain from the nullifier key to the commitment.
+This allows unlimited double-spending from a single note. The owner tag fix binds `nk_spend -> nk_tag -> owner_tag -> cm`, creating a unique chain from the nullifier key to the commitment.
 
 ## Transaction Types
 
-### Shield (public → private)
+### Shield (public -> private)
 
 **Public outputs:** `[v_pub, cm_new, sender, memo_ct_hash]`
 
@@ -153,15 +153,15 @@ Note: the circuit cannot verify that `auth_root` or `nk_tag` are correctly deriv
 
 Shield requires no spend authorization — the depositor is authenticated by `msg.sender`.
 
-### Transfer (N→2, where 1 ≤ N ≤ 16)
+### Transfer (N->2, where 1 <= N <= 16)
 
 Consumes N private notes and creates exactly 2 new private notes. Handles splits (N=1), standard transfers (N=2), and consolidations (N>2) with a single circuit. N is a runtime parameter, not a program parameter — the program hash is the same for all N.
 
 **N is not private.** The number of published nullifiers reveals the input count. This is inherent to per-input nullifier publication.
 
-**Public outputs:** `[root, nf_0..nf_{N-1}, cm_1, cm_2, auth_leaf_0..auth_leaf_{N-1}, memo_ct_hash_1, memo_ct_hash_2]`
+**Public outputs:** `[root, nf_0..nf_{N-1}, cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2]`
 
-Where `auth_leaf_i = H(pk_i)` — the hash of the one-time ML-DSA public key for input i.
+WOTS+ signature verification happens inside the STARK. No auth leaves, public keys, or signatures appear in the public outputs.
 
 **Circuit constraints:**
 1. For each input i (0..N):
@@ -172,6 +172,7 @@ Where `auth_leaf_i = H(pk_i)` — the hash of the one-time ML-DSA public key for
    - Merkle membership of `cm_i` at position `pos_i` against `root` (commitment tree)
    - `nf_i = H_nf(nk_spend_i, H_nf(cm_i, pos_i))`
    - Merkle membership of `auth_leaf_i` at position `key_idx_i` against `auth_root_i` (auth key tree)
+   - WOTS+ signature verification: verify the WOTS+ signature over the sighash under `pk_i`, confirming spend authorization
 2. All nullifiers pairwise distinct
 3. For both outputs:
    - `owner_tag_out = H_owner(auth_root_out, nk_tag_out)` where `auth_root_out` and `nk_tag_out` are private inputs from the recipient's payment address
@@ -180,18 +181,18 @@ Where `auth_leaf_i = H(pk_i)` — the hash of the one-time ML-DSA public key for
 4. `sum(v_inputs) = v_1 + v_2` (in u128)
 5. All values are u64 (implicit range check)
 
-**Contract checks:** proof valid, for each input i: verify ML-DSA signature against `pk_i` where `H(pk_i) == auth_leaf_i`. See "Spend Authorization."
+**Contract checks:** proof valid. No signature verification needed — the STARK proof proves spend authorization.
 
-### Unshield (N→withdrawal + optional change, where 1 ≤ N ≤ 16)
+### Unshield (N->withdrawal + optional change, where 1 <= N <= 16)
 
 Consumes N private notes, releases `v_pub` to a public address, and optionally creates one private change note.
 
-**Public outputs:** `[root, nf_0..nf_{N-1}, v_pub, auth_leaf_0..auth_leaf_{N-1}, recipient, cm_change, memo_ct_hash_change]`
+**Public outputs:** `[root, nf_0..nf_{N-1}, v_pub, recipient, cm_change, memo_ct_hash_change]`
 
 `cm_change` and `memo_ct_hash_change` are 0 if no change output.
 
 **Circuit constraints:**
-1. Same per-input verification as Transfer (including auth tree membership proof)
+1. Same per-input verification as Transfer (including auth tree membership proof and WOTS+ signature verification)
 2. All nullifiers pairwise distinct
 3. If change:
    - `owner_tag_c = H_owner(auth_root_c, nk_tag_c)` where `auth_root_c` and `nk_tag_c` are private inputs
@@ -199,9 +200,9 @@ Consumes N private notes, releases `v_pub` to a public address, and optionally c
 4. If no change: all change witness data constrained to zero (`v_change`, `d_j_change`, `rseed_change`, `auth_root_change`, `nk_tag_change`, `memo_ct_hash_change` = 0) to eliminate prover malleability
 5. `sum(v_inputs) = v_pub + v_change`
 
-**Contract checks:** proof valid, for each input i: verify ML-DSA signature. Credit `v_pub` to `recipient`, append `cm_change` to T (if nonzero).
+**Contract checks:** proof valid. Credit `v_pub` to `recipient`, append `cm_change` to T (if nonzero). No signature verification needed — the STARK proof proves spend authorization.
 
-### Why N→2 eliminates dummy notes
+### Why N->2 eliminates dummy notes
 
 With N=1 supported natively, there is no second input slot to fill. The only "dummies" are zero-value *outputs* (when change is exactly zero), which are fresh commitments created on the fly — no pre-shielding required.
 
@@ -215,7 +216,7 @@ The contract maintains an append-only set of historical Merkle roots (anchors). 
 
 ### Global nullifier uniqueness (all spending transactions)
 
-The circuit enforces pairwise nullifier distinctness within a single transaction (`nf_i ≠ nf_j`). The contract MUST additionally reject any `nf_i` that already exists in the global on-chain nullifier set. This prevents double-spends across transactions. After validation, the contract inserts all `nf_i` into the global set.
+The circuit enforces pairwise nullifier distinctness within a single transaction (`nf_i != nf_j`). The contract MUST additionally reject any `nf_i` that already exists in the global on-chain nullifier set. This prevents double-spends across transactions. After validation, the contract inserts all `nf_i` into the global set.
 
 ### Commitment binding (all transactions with outputs)
 
@@ -231,23 +232,27 @@ For shield transactions, the contract MUST verify `msg.sender == sender` (from t
 
 ### Spend authorization (all spending transactions)
 
-For each input note i, the user publishes the full ML-DSA public key `pk_i` as calldata. The contract:
-1. Verifies `H(pk_i) == auth_leaf_i` (from the proof's public outputs)
-2. Verifies the ML-DSA-65 signature under `pk_i` over the sighash (see below)
+WOTS+ signature verification happens entirely inside the STARK circuit. The contract does not verify any signatures — it only verifies the STARK proof. A valid proof guarantees that:
+1. Each input note's WOTS+ key is a leaf in the spender's auth tree (bound to the spent commitment)
+2. A valid WOTS+ signature over the sighash was provided for each input
 
-The STARK guarantees that `auth_leaf_i` corresponds to a key in the spender's auth tree bound to the spent commitment. The contract verifies the cryptographic signature. Together they ensure only the note owner can authorize the spend.
+No public keys, auth leaves, or signatures appear in the public outputs or on-chain calldata.
 
 ### Sighash
 
-Each spend authorization signature MUST bind the full transaction context:
+The WOTS+ signature inside the STARK binds to the transaction's public outputs. The sighash is computed inside the circuit by folding all public outputs with a circuit-type tag using the `sighSP__` personalization:
 
 ```
-sighash = H("sighash", chain_id, contract_addr, program_hash,
-             H(all_public_outputs), H(note_data_1), H(note_data_2),
-             expiry, nonce)
+// Transfer (type_tag = 0x01):
+sighash = fold(0x01, root, nf_0, ..., nf_{N-1}, cm_1, cm_2, mh_1, mh_2)
+
+// Unshield (type_tag = 0x02):
+sighash = fold(0x02, root, nf_0, ..., nf_{N-1}, v_pub, recipient, cm_change, mh_change)
 ```
 
-This prevents replay across chains/contracts and substitution of proof or note data by a relayer.
+The circuit-type tag prevents cross-circuit replay (a transfer signature cannot be used for an unshield). Nullifier uniqueness prevents replay on the same chain. Cross-chain replay prevention relies on distinct Merkle tree roots across deployments.
+
+**Not yet included:** `chain_id`, `contract_addr`, `program_hash`, `expiry`, `nonce`. These would provide defense-in-depth against replay across chains/contracts sharing tree state (e.g., after a fork). For production, these fields should be added as circuit public inputs folded into the sighash.
 
 ### Change output handling (unshield)
 
@@ -259,31 +264,31 @@ The contract appends commitments to the tree in a deterministic order and snapsh
 
 ## Delegated Proving
 
-1. User constructs the transaction, deriving all keys from `master_sk`.
-2. User gives the prover per-input: `(nk_spend_j, auth_root_j, H(pk_i), auth_tree_path_i, d_j, v, rseed, commitment_tree_path, pos)`, plus output data including `auth_root` and `nk_tag` for output notes.
-3. Prover generates the STARK proof (expensive, ~30-50 seconds).
-4. Prover returns proof to user. Public outputs include `auth_leaf_i = H(pk_i)` per input.
-5. User inspects public outputs to verify the prover didn't redirect funds (checks output commitments match intended recipients and amounts).
-6. User signs the sighash with `sk_i` (ML-DSA-65, trivially cheap) for each input.
-7. Transaction (proof + N signatures + N public keys + note data) submitted on-chain.
+1. User constructs the transaction, computing the WOTS+ signature over the sighash with `sk_i` for each input.
+2. User gives the prover per-input: `(nk_spend_j, auth_root_j, wots_sig_i, auth_tree_path_i, d_j, v, rseed, commitment_tree_path, pos)`, plus output data including `auth_root` and `nk_tag` for output notes.
+3. Prover generates the STARK proof (expensive, ~30-50 seconds). The WOTS+ signature is verified inside the circuit.
+4. Prover returns proof to user. Public outputs contain only `[root, nullifiers, commitments, memo hashes]` — no auth leaves, public keys, or signatures.
+5. Transaction (proof + note data) submitted on-chain. No separate signatures or public keys needed.
 
-The prover sees `nk_spend_j` (per-address nullifier key) but NOT `ask_j` or any ML-DSA signing key. The prover:
+The prover sees `nk_spend_j` (per-address nullifier key) and the WOTS+ signature, but NOT `ask_j` or any WOTS+ secret key. The prover:
+- **Cannot redirect funds** — the WOTS+ signature is bound to specific output commitments via the sighash. A prover who substitutes different outputs cannot produce a valid proof because the signature verification inside the STARK would fail.
 - **Cannot forge a signature** — doesn't have `sk_i`
-- **Cannot redirect funds** — the user verifies public outputs before signing
-- **Cannot link spends** — sees `auth_root_j` and `H(pk_i)` but not the relationship between different `pk_i` values across transactions
+- **Cannot link spends** — sees `auth_root_j` but not the relationship between different keys across transactions
 - **Cannot spend other notes** — doesn't have witness data for notes not involved in this transaction
+
+Both self-prove and delegated modes produce identical on-chain outputs.
 
 ## Why This Eliminates the ak Leak
 
 In the previous design, `ak_j` appeared directly in the proof's public outputs, allowing the original sender (who knows `ak_j` from the payment address) to see when a note was spent. The sender cannot compute the nullifier (they don't know `nk_spend`), so without `ak_j` on-chain, spends are unlinkable.
 
-With the auth key tree:
-- The STARK outputs `H(pk_i)` — a hash of a one-time ML-DSA key, used once and discarded
+With the auth key tree and in-STARK WOTS+ verification:
+- No auth leaf, public key, or signature appears in the public outputs
 - `auth_root_j` stays inside the STARK as a private input
-- The sender knows `auth_root_j` but cannot match any on-chain `H(pk_i)` back to it (they don't know the tree leaves, which are derived from `ask_j`)
-- Two spends from the same address publish unrelated one-time keys
+- The sender knows `auth_root_j` but cannot extract any information from the public outputs to link back to it
+- Two spends from the same address produce identical-looking on-chain outputs (just nullifiers, commitments, and memo hashes)
 
-This achieves the same unlinkability as Zcash's randomized keys (`rk = ak + α·G`) but using only hash-based and lattice-based primitives — no elliptic curves.
+This achieves the same unlinkability as Zcash's randomized keys (`rk = ak + alpha*G`) but using only hash-based primitives — no elliptic curves or lattice-based signatures.
 
 ## Detection (Fuzzy Message Detection)
 
@@ -293,7 +298,7 @@ Detection precision `k` is a protocol constant (e.g., k=10). Per note on-chain:
 (ss_d, ct_d)     = ML-KEM.Encaps(ek_d_j)     — encapsulate under detection key
 tag              = H(ss_d)[0..k]              — k-bit detection tag
 (ss_v, ct_v)     = ML-KEM.Encaps(ek_v_j)     — encapsulate under viewing key
-encrypted_data   = ChaCha20-Poly1305(key=H(ss_v), nonce=0, plaintext=(v || rseed || user_memo))
+encrypted_data   = ChaCha20-Poly1305(key=H(ss_v), nonce=0, plaintext=(v || rseed || memo))
 ```
 
 The detection server (with `dk_d_j`) decapsulates `ct_d`, computes `H(ss')[0..k]`, and checks against `tag`. True matches always succeed. Non-matches succeed with probability 2^(-k) (false positives from ML-KEM's implicit rejection).
@@ -307,9 +312,9 @@ Precision `k` should NOT be claimed to provide "plausible deniability" without m
 Each note carries a 1024-byte user memo field, encrypted alongside `(v, rseed)` inside the AEAD ciphertext. The memo can contain arbitrary data: payment references, return addresses, human-readable messages, or structured metadata.
 
 Memo format conventions (following Zcash ZIP 302):
-- If the first byte is ≤ 0xF4: the memo is a UTF-8 string, zero-padded.
+- If the first byte is <= 0xF4: the memo is a UTF-8 string, zero-padded.
 - If the first byte is 0xF6: "no memo" (remainder is zeros).
-- If the first byte is ≥ 0xF5: application-defined binary format.
+- If the first byte is >= 0xF5: application-defined binary format.
 
 The memo is end-to-end encrypted — only the recipient (with `dk_v`) can read it. The on-chain ciphertext reveals nothing about the memo content or length (all memos are padded to exactly 1024 bytes before encryption).
 
@@ -333,7 +338,7 @@ ct_d            — 1,088 bytes   ML-KEM-768 detection ciphertext
 tag             —     2 bytes   k-bit detection tag
 ct_v            — 1,088 bytes   ML-KEM-768 memo ciphertext
 encrypted_data  — 1,080 bytes   ChaCha20-Poly1305(v:8 || rseed:32 || memo:1024) + 16 auth tag
-                ─────────────
+                ---------
                  3,290 bytes per output note (~3.2 KB)
 ```
 
@@ -343,37 +348,35 @@ encrypted_data  — 1,080 bytes   ChaCha20-Poly1305(v:8 || rseed:32 || memo:1024
 
 ```
 proof             — ~295 KB    circuit proof (ZK, two-level recursive STARK)
-public_outputs    —  128 B     [v_pub, cm_new, sender, memo_ct_hash] (4 × 32 bytes)
+public_outputs    —  128 B     [v_pub, cm_new, sender, memo_ct_hash] (4 x 32 bytes)
 note_data         —  3.2 KB    1 output note
-                  ──────────
+                  ----------
                   ~298 KB total (no signature — sender authenticated by msg.sender)
 ```
 
-### Transfer (N→2)
+### Transfer (N->2)
 
 ```
-proof             — ~295 KB    circuit proof
-public_outputs    — 128+64N B  [root, cm_1, cm_2, mh_1, mh_2] + N×[nf_i] + N×[auth_leaf_i]
-pk_calldata       — ~2.0N KB   N ML-DSA-65 public keys (~1952 bytes each)
+proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
+public_outputs    — 128+32N B  [root, cm_1, cm_2, mh_1, mh_2] + N x [nf_i]
 note_data         —  6.4 KB    2 output notes
-signatures        — ~3.3N KB   N ML-DSA-65 signatures (~3309 bytes each)
-                  ──────────
-                  ~302 KB + ~5.3N KB
+                  ----------
+                  ~301 KB + 32N B
 ```
 
-### Unshield (N→withdrawal + change)
+No pk_calldata or signatures — WOTS+ verification happens inside the STARK. For a typical N=2 transfer: ~302 KB total.
+
+### Unshield (N->withdrawal + change)
 
 ```
-proof             — ~295 KB    circuit proof
-public_outputs    — 160+64N B  [root, v_pub, recipient, cm_change, mh_change] + N×[nf_i] + N×[auth_leaf_i]
-pk_calldata       — ~2.0N KB   N ML-DSA-65 public keys
-note_data         — 0–3.2 KB   0 or 1 change note
-signatures        — ~3.3N KB   N ML-DSA-65 signatures
-                  ──────────
-                  ~295–299 KB + ~5.3N KB
+proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
+public_outputs    — 160+32N B  [root, v_pub, recipient, cm_change, mh_change] + N x [nf_i]
+note_data         — 0-3.2 KB   0 or 1 change note
+                  ----------
+                  ~295-299 KB + 32N B
 ```
 
-The proof dominates at ~295 KB. ML-DSA overhead is ~5.3 KB per input (public key + signature). For a typical N=2 transfer: ~312 KB total.
+The proof dominates at ~295 KB. There is no per-input overhead for public keys or signatures. For a typical N=2 unshield: ~296-299 KB total.
 
 ## Domain Separation
 
@@ -388,8 +391,8 @@ All hashing uses BLAKE2s-256 truncated to 251 bits, with domain separation via B
 | Per-address nk_spend | `nkspSP__` | `derive_nk_spend` |
 | Per-address nk_tag | `nktgSP__` | `derive_nk_tag` |
 | Owner tag | `ownrSP__` | `owner_tag` |
-| Memo hash (client-side) | `memoSP__` | — (not in circuit) |
-| Sighash (client-side) | `sighSP__` | — (not in circuit) |
+| Memo hash (client-side) | `memoSP__` | -- (not in circuit) |
+| Sighash | `sighSP__` | `sighash_fold` (in circuit + client) |
 
 The commitment tree and auth tree both use `mrklSP__` for internal nodes. This is safe because they are verified against different roots in different circuit contexts — there is no cross-tree confusion.
 
@@ -397,17 +400,18 @@ The commitment tree and auth tree both use `mrklSP__` for internal nodes. This i
 
 - **Balance:** u64 values, u128 arithmetic, exact equality. No overflow or wraparound.
 - **Double-spend:** Nullifier set on-chain (contract-enforced globally, circuit-enforced per-tx). Position-dependent `nf = H(nk_spend, H(cm, pos))` ensures unique nullifiers even for duplicate commitments.
-- **Nullifier binding:** `nk_spend → nk_tag → owner_tag → cm` chain. The commitment cryptographically binds to the nullifier key material via second-preimage resistance of `H_commit`.
-- **Spend authority:** Requires `nk_spend` (for the STARK proof) AND `sk_i` (for the ML-DSA signature). The prover has the former but not the latter.
-- **Spend unlinkability:** On-chain spend authorization uses one-time ML-DSA keys. The auth tree root (`auth_root`) stays private inside the STARK. The sender who created the note knows `auth_root` but cannot match any on-chain `H(pk_i)` back to it.
+- **Nullifier binding:** `nk_spend -> nk_tag -> owner_tag -> cm` chain. The commitment cryptographically binds to the nullifier key material via second-preimage resistance of `H_commit`.
+- **Spend authority:** The STARK proof proves both knowledge of `nk_spend` and a valid WOTS+ signature over the sighash. The WOTS+ signature is verified inside the circuit. No external signature verification is needed.
+- **Spend unlinkability:** WOTS+ signature verification and auth tree membership are entirely inside the STARK. No auth leaves, public keys, or signatures appear in the public outputs. The sender who created the note knows `auth_root` but cannot extract any information from on-chain data to link back to it.
 - **Privacy:** Commitments are hiding (randomness `rcm`). Nullifiers unlinkable to commitments (different hash domains, `nk_spend` is private). Per-address diversification prevents cross-address linking.
-- **Post-quantum:** BLAKE2s (hash), ML-KEM-768 (memos/detection), ML-DSA-65 (spend authorization), STARKs (proofs). No elliptic curves.
+- **Post-quantum:** BLAKE2s (hash), ML-KEM-768 (memos/detection), WOTS+ w=4 (spend authorization, verified in-STARK), STARKs (proofs). No elliptic curves. No lattice-based signatures.
 - **Zero-knowledge:** Two-level recursive proofs. Circuit layer has ZK blinding. Single-level mode is debug-only (not ZK).
 
 ## Known Limitations
 
-- **One-time key exhaustion:** Each address has K = 2^AUTH_DEPTH one-time signing keys. After exhaustion, the address cannot be used for further spends. Users should rotate addresses before this limit. Reusing a one-time key across two transactions makes those transactions linkable (but does not compromise funds — ML-DSA is many-time secure).
-- **Auth tree generation cost:** Generating auth_root requires K ML-DSA key generations at address creation time. With AUTH_DEPTH=10 (K=1024), this takes ~1 second. Higher depths increase this cost linearly.
+- **WOTS+ key reuse compromises funds:** Each WOTS+ key MUST be used at most once. Reusing a one-time key across two transactions reveals enough hash chain preimages to allow an attacker to forge signatures and steal funds. This is fundamentally different from ML-DSA (which is many-time secure) — WOTS+ key reuse is a critical security failure, not merely a linkability issue. Users MUST rotate to a new key index for every spend and generate a new address before exhausting all K keys.
+- **One-time key exhaustion:** Each address has K = 2^AUTH_DEPTH one-time WOTS+ keys. After exhaustion, the address cannot be used for further spends. Users should rotate addresses before this limit.
+- **Auth tree generation cost:** Generating auth_root requires K WOTS+ key derivations at address creation time. With AUTH_DEPTH=10 (K=1024), this is fast (pure BLAKE2s hash chains). Higher depths increase this cost linearly.
 - **Detection is honest-sender:** Malicious sender can bypass detection. Recipient falls back to viewing key scanning.
 - **Prover learns nk_spend_j:** Can compute the nullifier for the specific note being spent. This is equivalent to public info (NF_set is on-chain). The prover does NOT learn `nk` (the account root) and cannot compute nullifiers for other addresses.
 - **ML-KEM key anonymity (ANO-CCA):** We rely on Kyber's key anonymity property, proven separately from IND-CCA2. Should be cited explicitly in production.

@@ -19,6 +19,11 @@ struct WalletFile {
     addr_counter: u32,
     notes: Vec<Note>,
     scanned: usize,
+    /// Tracks the next unused WOTS+ key index per address.
+    /// Key = addr_index, Value = next unused key index within that address's auth tree.
+    /// WOTS+ keys are one-time — reuse leaks secret material and allows forgery.
+    #[serde(default)]
+    wots_key_indices: std::collections::HashMap<u32, u32>,
 }
 
 impl WalletFile {
@@ -35,7 +40,7 @@ impl WalletFile {
     }
 
     /// Generate next address. Returns (d_j, auth_root, nk_tag, j).
-    /// Builds the full auth tree (1024 ML-DSA keygens, ~1s).
+    /// Builds the full auth tree (1024 WOTS+ key derivations).
     fn next_address(&mut self) -> (F, F, F, u32) {
         let acc = self.account();
         let j = self.addr_counter;
@@ -46,6 +51,20 @@ impl WalletFile {
         let nk_tg = derive_nk_tag(&nk_sp);
         self.addr_counter += 1;
         (d_j, auth_root, nk_tg, j)
+    }
+
+    /// Allocate the next unused WOTS+ key index for an address.
+    /// Panics if all 1024 keys are exhausted.
+    fn next_wots_key(&mut self, addr_index: u32) -> u32 {
+        let idx = self.wots_key_indices.entry(addr_index).or_insert(0);
+        let key_idx = *idx;
+        assert!(
+            (key_idx as usize) < AUTH_TREE_SIZE,
+            "WOTS+ keys exhausted for address {} — generate a new address",
+            addr_index
+        );
+        *idx = key_idx + 1;
+        key_idx
     }
 
     fn balance(&self) -> u128 {
@@ -81,7 +100,10 @@ fn load_wallet(path: &str) -> Result<WalletFile, String> {
 
 fn save_wallet(path: &str, w: &WalletFile) -> Result<(), String> {
     let data = serde_json::to_string_pretty(w).map_err(|e| format!("serialize: {}", e))?;
-    std::fs::write(path, data).map_err(|e| format!("write wallet: {}", e))
+    // Atomic write: write to temp file then rename. Prevents corruption on crash.
+    let tmp = format!("{}.tmp", path);
+    std::fs::write(&tmp, &data).map_err(|e| format!("write tmp: {}", e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {}", e))
 }
 
 fn load_address(path: &str) -> Result<PaymentAddress, String> {
@@ -128,6 +150,20 @@ fn get_json<Resp: for<'de> Deserialize<'de>>(url: &str) -> Result<Resp, String> 
 struct Cli {
     #[arg(short, long, default_value = "wallet.json")]
     wallet: String,
+
+    /// DANGEROUS: skip STARK proof generation and send TrustMeBro instead.
+    /// The ledger accepts transactions without cryptographic verification.
+    /// Only for local development/testing.
+    #[arg(long)]
+    trust_me_bro: bool,
+
+    /// Path to the reprove binary
+    #[arg(long, default_value = "reprove")]
+    reprove_bin: String,
+
+    /// Path to directory containing compiled .executable.json files
+    #[arg(long, default_value = "target/dev")]
+    executables_dir: String,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -203,7 +239,30 @@ fn main() {
     }
 }
 
+struct ProveConfig {
+    skip_proof: bool,
+    reprove_bin: String,
+    executables_dir: String,
+}
+
+impl ProveConfig {
+    fn make_proof(&self, circuit: &str, args: &[String]) -> Result<Proof, String> {
+        if self.skip_proof {
+            eprintln!("WARNING: --trust-me-bro is set. Skipping STARK proof generation.");
+            eprintln!("WARNING: Transaction has NO cryptographic guarantee. DO NOT use in production.");
+            Ok(Proof::TrustMeBro)
+        } else {
+            generate_proof(&self.reprove_bin, &self.executables_dir, circuit, args)
+        }
+    }
+}
+
 fn run(cli: Cli) -> Result<(), String> {
+    let pc = ProveConfig {
+        skip_proof: cli.trust_me_bro,
+        reprove_bin: cli.reprove_bin,
+        executables_dir: cli.executables_dir,
+    };
     match cli.cmd {
         Cmd::Keygen => cmd_keygen(&cli.wallet),
         Cmd::Address => cmd_address(&cli.wallet),
@@ -217,24 +276,99 @@ fn run(cli: Cli) -> Result<(), String> {
             amount,
             to,
             memo,
-        } => cmd_shield(&cli.wallet, &ledger, &sender, amount, to, memo),
+        } => cmd_shield(&cli.wallet, &ledger, &sender, amount, to, memo, &pc),
         Cmd::Transfer {
             ledger,
             to,
             amount,
             memo,
-        } => cmd_transfer(&cli.wallet, &ledger, &to, amount, memo),
+        } => cmd_transfer(&cli.wallet, &ledger, &to, amount, memo, &pc),
         Cmd::Unshield {
             ledger,
             amount,
             recipient,
-        } => cmd_unshield(&cli.wallet, &ledger, amount, &recipient),
+        } => cmd_unshield(&cli.wallet, &ledger, amount, &recipient, &pc),
         Cmd::Fund {
             ledger,
             addr,
             amount,
         } => cmd_fund(&ledger, &addr, amount),
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Proving helper — shells out to reprove binary
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Felt252 as a hex string for BigUintAsHex format.
+fn felt_to_hex(f: &F) -> String {
+    // Convert LE bytes to big integer, then to hex
+    let mut val = [0u8; 32];
+    val.copy_from_slice(f);
+    // Reverse to big-endian for hex display
+    let mut be = [0u8; 32];
+    for i in 0..32 { be[i] = val[31 - i]; }
+    // Strip leading zeros
+    let hex_str = hex::encode(be);
+    let trimmed = hex_str.trim_start_matches('0');
+    if trimmed.is_empty() { "0x0".to_string() } else { format!("0x{}", trimmed) }
+}
+
+fn felt_u64_to_hex(v: u64) -> String {
+    format!("0x{:x}", v)
+}
+
+/// Call the reprover to generate a ZK proof.
+/// `circuit` is "run_shield", "run_transfer", or "run_unshield".
+/// `args` is the list of felt252 values (already length-prefixed for Array<felt252>).
+fn generate_proof(
+    reprove_bin: &str,
+    executables_dir: &str,
+    circuit: &str,
+    args: &[String],
+) -> Result<Proof, String> {
+    let executable = format!("{}/{}.executable.json", executables_dir, circuit);
+    let args_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
+    let args_json = serde_json::to_string(&args).map_err(|e| format!("json: {}", e))?;
+    std::fs::write(args_file.path(), &args_json).map_err(|e| format!("write: {}", e))?;
+
+    let proof_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
+
+    eprintln!("Generating proof for {} ({} args)...", circuit, args.len());
+    let output = std::process::Command::new(reprove_bin)
+        .arg(&executable)
+        .arg("--arguments-file")
+        .arg(args_file.path())
+        .arg("--output")
+        .arg(proof_file.path())
+        .output()
+        .map_err(|e| format!("reprove failed to start: {} (is '{}' in PATH?)", e, reprove_bin))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("reprove failed: {}", stderr));
+    }
+
+    // Parse the proof bundle
+    let bundle_json = std::fs::read_to_string(proof_file.path())
+        .map_err(|e| format!("read proof: {}", e))?;
+    let bundle: serde_json::Value = serde_json::from_str(&bundle_json)
+        .map_err(|e| format!("parse proof: {}", e))?;
+
+    let proof_hex = bundle["proof_hex"].as_str().ok_or("missing proof_hex")?.to_string();
+    let output_preimage: Vec<String> = bundle["output_preimage"]
+        .as_array()
+        .ok_or("missing output_preimage")?
+        .iter()
+        .map(|v| v.as_str().unwrap_or("0").to_string())
+        .collect();
+
+    let proof_kb = proof_hex.len() / 2 / 1024;
+    eprintln!("Proof generated: {} KB, {} public outputs", proof_kb, output_preimage.len());
+
+    let verify_meta = bundle.get("verify_meta").cloned();
+
+    Ok(Proof::Stark { proof_hex, output_preimage, verify_meta })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -246,7 +380,7 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
         return Err(format!("{} already exists", path));
     }
     let mut rng = rand::rng();
-    let master_sk: F = rng.random();
+    let master_sk = random_felt();
     let kem_seed_v: [u8; 64] = rng.random();
     let kem_seed_d: [u8; 64] = rng.random();
 
@@ -257,6 +391,7 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
         addr_counter: 0,
         notes: vec![],
         scanned: 0,
+        wots_key_indices: std::collections::HashMap::new(),
     };
     save_wallet(path, &w)?;
     println!("Wallet created: {}", path);
@@ -384,6 +519,7 @@ fn cmd_shield(
     amount: u64,
     to: Option<String>,
     memo: Option<String>,
+    pc: &ProveConfig,
 ) -> Result<(), String> {
     let mut w = load_wallet(path)?;
     let (ek_v, _, ek_d, _) = w.kem_keys();
@@ -401,12 +537,55 @@ fn cmd_shield(
         }
     };
 
+    // Build the proof if --prove is set.
+    // Shield witness: [v_pub, cm_new, sender, memo_ct_hash, auth_root, nk_tag, d_j, rseed]
+    // Note: with TrustMeBro, the ledger generates rseed and computes the commitment.
+    // With a real proof, the client must do this and prove it.
+    let (proof, shield_cm, shield_enc) = if !pc.skip_proof {
+        let rseed = random_felt();
+        let rcm = derive_rcm(&rseed);
+        let otag = owner_tag(&address.auth_root, &address.nk_tag);
+        let cm = commit(&address.d_j, amount, &rcm, &otag);
+
+        // sender as felt252
+        let sender_f = hash(sender.as_bytes());
+
+        // Create encrypted note to compute memo hash
+        let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
+            address.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
+        ).map_err(|_| "invalid ek_v")?;
+        let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
+            address.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
+        ).map_err(|_| "invalid ek_d")?;
+        let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
+        let enc = encrypt_note(amount, &rseed, memo_bytes, &ek_v_recv, &ek_d_recv);
+        let memo_ct_hash_f = memo_ct_hash(&enc);
+
+        let args: Vec<String> = vec![
+            felt_u64_to_hex(8), // Array length prefix
+            felt_u64_to_hex(amount),
+            felt_to_hex(&cm),
+            felt_to_hex(&sender_f),
+            felt_to_hex(&memo_ct_hash_f),
+            felt_to_hex(&address.auth_root),
+            felt_to_hex(&address.nk_tag),
+            felt_to_hex(&address.d_j),
+            felt_to_hex(&rseed),
+        ];
+        let proof = pc.make_proof("run_shield", &args)?;
+        (proof, cm, Some(enc))
+    } else {
+        (Proof::TrustMeBro, ZERO, None)
+    };
+
     let req = ShieldReq {
         sender: sender.into(),
         v: amount,
         address,
         memo,
-        proof: Proof::TrustMeBro,
+        proof,
+        client_cm: shield_cm,
+        client_enc: shield_enc,
     };
     let resp: ShieldResp = post_json(&format!("{}/shield", ledger), &req)?;
     save_wallet(path, &w)?;
@@ -421,6 +600,7 @@ fn cmd_transfer(
     to_path: &str,
     amount: u64,
     memo: Option<String>,
+    pc: &ProveConfig,
 ) -> Result<(), String> {
     let mut w = load_wallet(path)?;
     let recipient = load_address(to_path)?;
@@ -445,8 +625,7 @@ fn cmd_transfer(
         .collect();
 
     // Build output 1: recipient
-    let mut rng = rand::rng();
-    let rseed_1: F = rng.random();
+    let rseed_1 = random_felt();
     let rcm_1 = derive_rcm(&rseed_1);
     let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
         recipient.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
@@ -461,11 +640,105 @@ fn cmd_transfer(
 
     // Build output 2: change to self
     let (d_j_c, auth_root_c, nk_tag_c, _) = w.next_address();
-    let rseed_2: F = rng.random();
+    let rseed_2 = random_felt();
     let rcm_2 = derive_rcm(&rseed_2);
     let otag_2 = owner_tag(&auth_root_c, &nk_tag_c);
     let cm_2 = commit(&d_j_c, change, &rcm_2, &otag_2);
     let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v, &ek_d);
+
+    let proof = if !pc.skip_proof {
+        // Build witness for run_transfer with WOTS+ w=4 inside the STARK.
+        // Layout: [N, root, per-input(nf,nk_spend,auth_root,auth_idx,d_j,v,rseed,cm_path_idx)×N,
+        //  cm_siblings(N×DEPTH), auth_siblings(N×AUTH_DEPTH),
+        //  wots_sig(N×133), wots_pk(N×133),
+        //  (digits computed by circuit from sighash — not in args)
+        //  output1(7), output2(7)]
+        let n = selected.len();
+        let mut args: Vec<String> = vec![];
+        let mut cm_paths: Vec<Vec<F>> = vec![];
+        let mut auth_paths: Vec<Vec<F>> = vec![];
+        let mut wots_sigs: Vec<Vec<F>> = vec![];
+        let mut wots_pks: Vec<Vec<F>> = vec![];
+
+        // Compute sighash matching the Cairo circuit's computation
+        let nfs_for_sh: Vec<F> = selected.iter()
+            .map(|&i| { let n = &w.notes[i]; nullifier(&n.nk_spend, &n.cm, n.index as u64) })
+            .collect();
+        let mh_1 = memo_ct_hash(&enc_1);
+        let mh_2 = memo_ct_hash(&enc_2);
+        let sighash = transfer_sighash(&root, &nfs_for_sh, &cm_1, &cm_2, &mh_1, &mh_2);
+
+        let mut wots_key_indices: Vec<u32> = vec![];
+        // Clone note data to avoid borrow conflict with next_wots_key
+        let selected_notes: Vec<(usize, u32, F)> = selected.iter()
+            .map(|&i| (w.notes[i].index, w.notes[i].addr_index, w.notes[i].auth_root))
+            .collect();
+        for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
+            let path_resp: MerklePathResp = get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
+            cm_paths.push(path_resp.siblings);
+            let ask_j = derive_ask(&w.account().ask_base, addr_idx);
+            let key_idx = w.next_wots_key(addr_idx);
+            let (rebuilt_root, auth_leaves) = build_auth_tree(&ask_j);
+            if rebuilt_root != stored_auth_root {
+                return Err(format!("auth_root mismatch for note at tree index {}", tree_idx));
+            }
+            auth_paths.push(auth_tree_path(&auth_leaves, key_idx as usize));
+            let (sig, pk, _digits) = wots_sign(&ask_j, key_idx, &sighash);
+            wots_sigs.push(sig);
+            wots_pks.push(pk);
+            wots_key_indices.push(key_idx);
+        }
+
+        let total_fields = 2 + 8 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS * 2 + 14;
+        args.push(felt_u64_to_hex(total_fields as u64));
+        args.push(felt_u64_to_hex(n as u64));
+        args.push(felt_to_hex(&root));
+
+        // Per-input scalar fields (8 per input)
+        for (idx, &si) in selected.iter().enumerate() {
+            let note = &w.notes[si];
+            let nf = nullifier(&note.nk_spend, &note.cm, note.index as u64);
+            args.push(felt_to_hex(&nf));
+            args.push(felt_to_hex(&note.nk_spend));
+            args.push(felt_to_hex(&note.auth_root));
+            args.push(felt_u64_to_hex(wots_key_indices[idx] as u64));
+            args.push(felt_to_hex(&note.d_j));
+            args.push(felt_u64_to_hex(note.v));
+            args.push(felt_to_hex(&note.rseed));
+            args.push(felt_u64_to_hex(note.index as u64));
+        }
+
+        for path in &cm_paths { for sib in path { args.push(felt_to_hex(sib)); } }
+        for path in &auth_paths { for sib in path { args.push(felt_to_hex(sib)); } }
+        for sig in &wots_sigs { for s in sig { args.push(felt_to_hex(s)); } }
+        for pk in &wots_pks { for p in pk { args.push(felt_to_hex(p)); } }
+
+        // Output 1
+        args.push(felt_to_hex(&cm_1));
+        args.push(felt_to_hex(&recipient.d_j));
+        args.push(felt_u64_to_hex(amount));
+        args.push(felt_to_hex(&rseed_1));
+        args.push(felt_to_hex(&recipient.auth_root));
+        args.push(felt_to_hex(&recipient.nk_tag));
+        args.push(felt_to_hex(&memo_ct_hash(&enc_1)));
+
+        // Output 2
+        args.push(felt_to_hex(&cm_2));
+        args.push(felt_to_hex(&d_j_c));
+        args.push(felt_u64_to_hex(change));
+        args.push(felt_to_hex(&rseed_2));
+        args.push(felt_to_hex(&auth_root_c));
+        args.push(felt_to_hex(&nk_tag_c));
+        args.push(felt_to_hex(&memo_ct_hash(&enc_2)));
+
+        pc.make_proof("run_transfer", &args)?
+    } else {
+        Proof::TrustMeBro
+    };
+
+    // Save wallet BEFORE submitting — persists consumed WOTS+ key indices.
+    // If submission fails, the key is "burned" but never reused. Safe for one-time sigs.
+    save_wallet(path, &w)?;
 
     let req = TransferReq {
         root,
@@ -474,11 +747,11 @@ fn cmd_transfer(
         cm_2,
         enc_1,
         enc_2,
-        proof: Proof::TrustMeBro,
+        proof,
     };
     let resp: TransferResp = post_json(&format!("{}/transfer", ledger), &req)?;
 
-    // Remove spent notes (sort descending to avoid index shift)
+    // Remove spent notes after successful submission
     let mut to_remove = selected.clone();
     to_remove.sort_unstable();
     for &i in to_remove.iter().rev() {
@@ -499,6 +772,7 @@ fn cmd_unshield(
     ledger: &str,
     amount: u64,
     recipient: &str,
+    pc: &ProveConfig,
 ) -> Result<(), String> {
     let mut w = load_wallet(path)?;
     let (ek_v, _, ek_d, _) = w.kem_keys();
@@ -519,9 +793,8 @@ fn cmd_unshield(
         .collect();
 
     let (cm_change, enc_change) = if change > 0 {
-        let mut rng = rand::rng();
         let (d_j_c, auth_root_c, nk_tag_c, _) = w.next_address();
-        let rseed_c: F = rng.random();
+        let rseed_c = random_felt();
         let rcm_c = derive_rcm(&rseed_c);
         let otag_c = owner_tag(&auth_root_c, &nk_tag_c);
         let cm = commit(&d_j_c, change, &rcm_c, &otag_c);
@@ -531,6 +804,84 @@ fn cmd_unshield(
         (ZERO, None)
     };
 
+    let proof = if !pc.skip_proof {
+        let n = selected.len();
+        let mut args: Vec<String> = vec![];
+        let mut cm_paths: Vec<Vec<F>> = vec![];
+        let mut auth_paths: Vec<Vec<F>> = vec![];
+        let mut wots_sigs: Vec<Vec<F>> = vec![];
+        let mut wots_pks: Vec<Vec<F>> = vec![];
+
+        let has_change_val: u64 = if change > 0 { 1 } else { 0 };
+        let recipient_f = hash(recipient.as_bytes());
+        let mh_change_f = ZERO; // no change memo hash for now
+
+        // Compute sighash matching Cairo circuit
+        let nfs_for_sh: Vec<F> = selected.iter()
+            .map(|&i| { let n = &w.notes[i]; nullifier(&n.nk_spend, &n.cm, n.index as u64) })
+            .collect();
+        let sighash = unshield_sighash(&root, &nfs_for_sh, amount, &recipient_f, &cm_change, &mh_change_f);
+
+        let mut wots_key_indices: Vec<u32> = vec![];
+        let selected_notes: Vec<(usize, u32, F)> = selected.iter()
+            .map(|&i| (w.notes[i].index, w.notes[i].addr_index, w.notes[i].auth_root))
+            .collect();
+        for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
+            let path_resp: MerklePathResp = get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
+            cm_paths.push(path_resp.siblings);
+            let ask_j = derive_ask(&w.account().ask_base, addr_idx);
+            let key_idx = w.next_wots_key(addr_idx);
+            let (rebuilt_root, auth_leaves) = build_auth_tree(&ask_j);
+            if rebuilt_root != stored_auth_root {
+                return Err(format!("auth_root mismatch for note at tree index {}", tree_idx));
+            }
+            auth_paths.push(auth_tree_path(&auth_leaves, key_idx as usize));
+            let (sig, pk, _digits) = wots_sign(&ask_j, key_idx, &sighash);
+            wots_sigs.push(sig);
+            wots_pks.push(pk);
+            wots_key_indices.push(key_idx);
+        }
+
+        let total = 4 + 8 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS * 2 + 7;
+        args.push(felt_u64_to_hex(total as u64));
+        args.push(felt_u64_to_hex(n as u64));
+        args.push(felt_to_hex(&root));
+        args.push(felt_u64_to_hex(amount));
+        args.push(felt_to_hex(&recipient_f));
+
+        for (idx, &si) in selected.iter().enumerate() {
+            let note = &w.notes[si];
+            let nf = nullifier(&note.nk_spend, &note.cm, note.index as u64);
+            args.push(felt_to_hex(&nf));
+            args.push(felt_to_hex(&note.nk_spend));
+            args.push(felt_to_hex(&note.auth_root));
+            args.push(felt_u64_to_hex(wots_key_indices[idx] as u64));
+            args.push(felt_to_hex(&note.d_j));
+            args.push(felt_u64_to_hex(note.v));
+            args.push(felt_to_hex(&note.rseed));
+            args.push(felt_u64_to_hex(note.index as u64));
+        }
+
+        for path in &cm_paths { for sib in path { args.push(felt_to_hex(sib)); } }
+        for path in &auth_paths { for sib in path { args.push(felt_to_hex(sib)); } }
+        for sig in &wots_sigs { for s in sig { args.push(felt_to_hex(s)); } }
+        for pk in &wots_pks { for p in pk { args.push(felt_to_hex(p)); } }
+
+        args.push(felt_u64_to_hex(has_change_val));
+        if change > 0 {
+            return Err("--prove with unshield change not yet wired".into());
+        } else {
+            for _ in 0..6 { args.push("0x0".to_string()); }
+        }
+
+        pc.make_proof("run_unshield", &args)?
+    } else {
+        Proof::TrustMeBro
+    };
+
+    // Save wallet BEFORE submitting — persists consumed WOTS+ key indices.
+    save_wallet(path, &w)?;
+
     let req = UnshieldReq {
         root,
         nullifiers,
@@ -538,7 +889,7 @@ fn cmd_unshield(
         recipient: recipient.into(),
         cm_change,
         enc_change,
-        proof: Proof::TrustMeBro,
+        proof,
     };
     let resp: UnshieldResp = post_json(&format!("{}/unshield", ledger), &req)?;
 

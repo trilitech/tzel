@@ -173,17 +173,9 @@ fn compute_output(output_preimage: &[Felt]) -> [M31; MEMORY_VALUES_LIMBS] {
 // ── Public API ───────────────────────────────────────────────────────
 
 pub struct CustomProofOutput {
-    /// Compressed circuit proof (zstd). This is the final zero-knowledge
-    /// artifact that can be verified on-chain.
     pub proof: Vec<u8>,
-
-    /// Bootloader output preimage. The on-chain verifier needs this to
-    /// extract the program's public outputs (v_pub, cm, root, nf, etc.).
-    /// The circuit proof commits to a Blake2s hash of this preimage, so
-    /// providing a wrong preimage will fail verification.
     pub output_preimage: Vec<Felt>,
-
-    // Timing breakdowns for benchmarking.
+    pub verify_meta: VerifyMeta,
     pub cairo_prove_ms: u128,
     pub circuit_prove_ms: u128,
     pub verify_ms: u128,
@@ -197,6 +189,44 @@ pub struct ProofBundle {
     pub proof_hex: String,
     /// Output preimage (public outputs as decimal felt strings)
     pub output_preimage: Vec<String>,
+    /// Verification metadata — serialized ProofConfig, CircuitConfig, CircuitPublicData.
+    /// Contains everything needed to deserialize and verify the circuit proof standalone.
+    #[serde(default)]
+    pub verify_meta: Option<VerifyMeta>,
+}
+
+/// Serializable verification metadata.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct VerifyMeta {
+    // ProofConfig fields
+    pub n_pow_bits: u32,
+    pub n_preprocessed_columns: usize,
+    pub n_trace_columns: usize,
+    pub n_interaction_columns: usize,
+    pub trace_columns_per_component: Vec<usize>,
+    pub interaction_columns_per_component: Vec<usize>,
+    pub cumulative_sum_columns: Vec<bool>,
+    pub n_components: usize,
+    pub fri_log_trace_size: usize,
+    pub fri_log_blowup: u32,
+    pub fri_log_last_layer: u32,
+    pub fri_n_queries: usize,
+    pub fri_fold_step: u32,
+    pub interaction_pow_bits: u32,
+    // CircuitConfig fields
+    pub circuit_pow_bits: u32,
+    pub circuit_fri_log_blowup: u32,
+    pub circuit_fri_log_last_layer: u32,
+    pub circuit_fri_n_queries: usize,
+    pub circuit_fri_fold_step: u32,
+    pub circuit_lifting: Option<u32>,
+    pub output_addresses: Vec<usize>,
+    pub n_blake_gates: usize,
+    pub preprocessed_column_ids: Vec<String>,
+    /// Preprocessed root as [a.0, a.1, a.2, a.3, b.0, b.1, b.2, b.3] (8 M31 values)
+    pub preprocessed_root: Vec<u32>,
+    /// CircuitPublicData output_values as flat M31 values (4 per QM31)
+    pub public_output_values: Vec<u32>,
 }
 
 impl ProofBundle {
@@ -204,6 +234,7 @@ impl ProofBundle {
         Self {
             proof_hex: hex::encode(&out.proof),
             output_preimage: out.output_preimage.iter().map(|f| f.to_string()).collect(),
+            verify_meta: Some(out.verify_meta.clone()),
         }
     }
 
@@ -216,6 +247,88 @@ impl ProofBundle {
             .iter()
             .map(|s| Felt::from_dec_str(s).expect("bad felt"))
             .collect()
+    }
+
+    /// Standalone verification: deserialize the circuit proof and verify it
+    /// using the stored verification metadata. Returns Ok(()) if valid.
+    pub fn verify(&self) -> Result<()> {
+        use circuit_air::verify::{CircuitConfig, CircuitPublicData, verify_circuit};
+        use circuit_serialize::deserialize::deserialize_proof_with_config;
+        use circuits::blake::HashValue;
+        use circuits_stark_verifier::proof::ProofConfig;
+        use stwo::core::fields::m31::M31;
+        use stwo::core::fields::qm31::QM31;
+
+        let meta = self.verify_meta.as_ref()
+            .ok_or_else(|| anyhow!("proof bundle missing verify_meta"))?;
+
+        // Reconstruct ProofConfig (uses circuits_stark_verifier::fri_proof::FriConfig)
+        let proof_config = ProofConfig {
+            n_proof_of_work_bits: meta.n_pow_bits,
+            n_preprocessed_columns: meta.n_preprocessed_columns,
+            n_trace_columns: meta.n_trace_columns,
+            n_interaction_columns: meta.n_interaction_columns,
+            trace_columns_per_component: meta.trace_columns_per_component.clone(),
+            interaction_columns_per_component: meta.interaction_columns_per_component.clone(),
+            cumulative_sum_columns: meta.cumulative_sum_columns.clone(),
+            n_components: meta.n_components,
+            fri: circuits_stark_verifier::fri_proof::FriConfig {
+                log_trace_size: meta.fri_log_trace_size,
+                log_blowup_factor: meta.fri_log_blowup as usize,
+                n_queries: meta.fri_n_queries as usize,
+                log_n_last_layer_coefs: meta.fri_log_last_layer as usize,
+                fold_step: meta.fri_fold_step as usize,
+            },
+            interaction_pow_bits: meta.interaction_pow_bits,
+        };
+
+        // Helper to reconstruct QM31 from 4 u32 M31 values
+        let qm31_from = |vals: &[u32]| -> QM31 {
+            QM31::from_m31(M31::from(vals[0]), M31::from(vals[1]), M31::from(vals[2]), M31::from(vals[3]))
+        };
+
+        // Reconstruct CircuitConfig
+        let pr = &meta.preprocessed_root;
+        let circuit_config = CircuitConfig {
+            config: stwo::core::pcs::PcsConfig {
+                pow_bits: meta.circuit_pow_bits,
+                fri_config: stwo::core::fri::FriConfig {
+                    log_blowup_factor: meta.circuit_fri_log_blowup,
+                    log_last_layer_degree_bound: meta.circuit_fri_log_last_layer,
+                    n_queries: meta.circuit_fri_n_queries,
+                    fold_step: meta.circuit_fri_fold_step,
+                },
+                lifting_log_size: meta.circuit_lifting,
+            },
+            output_addresses: meta.output_addresses.clone(),
+            n_blake_gates: meta.n_blake_gates,
+            preprocessed_column_ids: meta.preprocessed_column_ids.iter()
+                .map(|s| stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId {
+                    id: s.clone().into()
+                }).collect(),
+            preprocessed_root: HashValue(qm31_from(&pr[0..4]), qm31_from(&pr[4..8])),
+        };
+
+        // Reconstruct CircuitPublicData
+        let public_data = CircuitPublicData {
+            output_values: meta.public_output_values.chunks(4)
+                .map(|c| qm31_from(c))
+                .collect(),
+        };
+
+        // Decompress and deserialize proof
+        let compressed = self.proof_bytes();
+        let proof_bytes = zstd::decode_all(&compressed[..])
+            .map_err(|e| anyhow!("zstd decompress: {e}"))?;
+        let mut data = proof_bytes.as_slice();
+        let proof = deserialize_proof_with_config(&mut data, &proof_config)
+            .map_err(|e| anyhow!("deserialize proof: {e}"))?;
+
+        // Verify
+        verify_circuit(circuit_config, proof, public_data)
+            .map_err(|e| anyhow!("circuit verification FAILED: {e}"))?;
+
+        Ok(())
     }
 }
 
@@ -453,10 +566,54 @@ pub fn custom_recursive_prove(
     proof_qm31s.serialize(&mut proof_bytes);
     let compressed = zstd::encode_all(&proof_bytes[..], 3)?;
 
-    // ── Verify both proofs ───────────────────────────────────────────
-    // We verify as a sanity check. In production the on-chain verifier
-    // only sees the circuit proof, but checking both here catches bugs.
+    // ── Capture verification metadata for standalone verification ────
+    let verify_meta = {
+        use stwo::core::fields::m31::M31;
+        use stwo::core::fields::qm31::QM31;
+        let qm31_to_m31s = |q: QM31| -> Vec<u32> {
+            vec![q.0.0.0, q.0.1.0, q.1.0.0, q.1.1.0]
+        };
+        let hash_to_m31s = |h: &circuits::blake::HashValue<QM31>| -> Vec<u32> {
+            let mut v = qm31_to_m31s(h.0);
+            v.extend(qm31_to_m31s(h.1));
+            v
+        };
 
+        VerifyMeta {
+            // ProofConfig
+            n_pow_bits: circuit_proof_config.n_proof_of_work_bits,
+            n_preprocessed_columns: circuit_proof_config.n_preprocessed_columns,
+            n_trace_columns: circuit_proof_config.n_trace_columns,
+            n_interaction_columns: circuit_proof_config.n_interaction_columns,
+            trace_columns_per_component: circuit_proof_config.trace_columns_per_component.clone(),
+            interaction_columns_per_component: circuit_proof_config.interaction_columns_per_component.clone(),
+            cumulative_sum_columns: circuit_proof_config.cumulative_sum_columns.clone(),
+            n_components: circuit_proof_config.n_components,
+            fri_log_trace_size: circuit_proof_config.fri.log_trace_size,
+            fri_log_blowup: circuit_proof_config.fri.log_blowup_factor as u32,
+            fri_log_last_layer: circuit_proof_config.fri.log_n_last_layer_coefs as u32,
+            fri_n_queries: circuit_proof_config.fri.n_queries,
+            fri_fold_step: circuit_proof_config.fri.fold_step as u32,
+            interaction_pow_bits: circuit_proof_config.interaction_pow_bits,
+            // CircuitConfig
+            circuit_pow_bits: circuit_config.config.pow_bits,
+            circuit_fri_log_blowup: circuit_config.config.fri_config.log_blowup_factor,
+            circuit_fri_log_last_layer: circuit_config.config.fri_config.log_last_layer_degree_bound,
+            circuit_fri_n_queries: circuit_config.config.fri_config.n_queries,
+            circuit_fri_fold_step: circuit_config.config.fri_config.fold_step,
+            circuit_lifting: circuit_config.config.lifting_log_size,
+            output_addresses: circuit_config.output_addresses.clone(),
+            n_blake_gates: circuit_config.n_blake_gates,
+            preprocessed_column_ids: circuit_config.preprocessed_column_ids.iter()
+                .map(|id| id.id.to_string()).collect(),
+            preprocessed_root: hash_to_m31s(&circuit_config.preprocessed_root),
+            // CircuitPublicData
+            public_output_values: circuit_public_data.output_values.iter()
+                .flat_map(|q| qm31_to_m31s(*q)).collect(),
+        }
+    };
+
+    // ── Verify both proofs ───────────────────────────────────────────
     let t_verify = Instant::now();
 
     info!("Verifying Cairo proof");
@@ -476,6 +633,7 @@ pub fn custom_recursive_prove(
     Ok(CustomProofOutput {
         proof: compressed,
         output_preimage,
+        verify_meta,
         cairo_prove_ms,
         circuit_prove_ms,
         verify_ms,

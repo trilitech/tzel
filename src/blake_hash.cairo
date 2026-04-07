@@ -104,6 +104,33 @@ fn blake2s_iv_owner() -> Box<[u32; 8]> {
     ])
 }
 
+/// WOTS+ chain hash IV — "wotsSP__".
+/// Dedicated domain for WOTS+ hash chain iterations.
+fn blake2s_iv_wots() -> Box<[u32; 8]> {
+    BoxTrait::new([
+        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+        0x510E527F, 0x9B05688C, 0x6CF7B6DC, 0x04BF9D4A,
+    ])
+}
+
+/// PK fold IV — "pkfdSP__".
+/// Dedicated domain for folding WOTS+ public key chains to a leaf hash.
+fn blake2s_iv_pkfold() -> Box<[u32; 8]> {
+    BoxTrait::new([
+        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+        0x510E527F, 0x9B05688C, 0x7BE5B2DB, 0x04BF9D4A,
+    ])
+}
+
+/// Sighash IV — "sighSP__".
+/// Used to compute the transaction sighash that WOTS+ signatures bind to.
+fn blake2s_iv_sighash() -> Box<[u32; 8]> {
+    BoxTrait::new([
+        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+        0x510E527F, 0x9B05688C, 0x77E4B0D8, 0x04BF9D4A,
+    ])
+}
+
 // ── Encoding helpers ─────────────────────────────────────────────────
 
 fn felt_to_u32x8(val: felt252) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
@@ -237,4 +264,64 @@ pub fn nullifier(nk_spend: felt252, cm: felt252, pos: u64) -> felt252 {
     // H_nf(nk_spend, H(cm, pos)) — nest pos inside cm to fit hash2's 2-input interface.
     let cm_pos = hash2_with_iv(blake2s_iv_nullifier(), cm, pos.into());
     hash2_with_iv(blake2s_iv_nullifier(), nk_spend, cm_pos)
+}
+
+// ── WOTS+ hash functions ────────────────────────────────────────────
+
+/// WOTS+ chain hash: H_wots(x). Dedicated domain for chain iterations.
+pub fn hash1_wots(a: felt252) -> felt252 {
+    let (a0, a1, a2, a3, a4, a5, a6, a7) = felt_to_u32x8(a);
+    let msg = BoxTrait::new([a0, a1, a2, a3, a4, a5, a6, a7, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let result = blake2s_finalize(blake2s_iv_wots(), 32, msg);
+    let [h0, h1, h2, h3, h4, h5, h6, h7] = result.unbox();
+    u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
+}
+
+/// WOTS+ PK fold: H_pkfold(a, b). Dedicated domain for folding pk chains.
+pub fn hash2_pkfold(a: felt252, b: felt252) -> felt252 {
+    hash2_with_iv(blake2s_iv_pkfold(), a, b)
+}
+
+// ── WOTS+ sighash support ───────────────────────────────────────────
+
+/// Fold two values into a sighash using the dedicated sighash IV.
+pub fn sighash_fold(a: felt252, b: felt252) -> felt252 {
+    hash2_with_iv(blake2s_iv_sighash(), a, b)
+}
+
+/// Decompose a sighash (felt252) into 133 base-4 WOTS+ digits (128 message + 5 checksum).
+/// The felt252 is interpreted as 32 LE bytes → 128 base-4 digits (2 bits each).
+/// The checksum is sum(3 - digit[i]) for i in 0..128, encoded as 5 base-4 digits.
+pub fn sighash_to_wots_digits(sighash: felt252) -> Array<u32> {
+    let (w0, w1, w2, w3, w4, w5, w6, w7) = felt_to_u32x8(sighash);
+    let words: [u32; 8] = [w0, w1, w2, w3, w4, w5, w6, w7];
+
+    let mut digits: Array<u32> = array![];
+    let mut checksum: u32 = 0;
+
+    // Extract 16 base-4 digits per u32 word (32 bits / 2 = 16 digits)
+    let mut wi: u32 = 0;
+    while wi < 8 {
+        let mut word = *words.span().at(wi);
+        let mut bi: u32 = 0;
+        while bi < 16 {
+            let digit = word & 3;
+            digits.append(digit);
+            checksum += 3 - digit;
+            word = word / 4;
+            bi += 1;
+        };
+        wi += 1;
+    };
+
+    // Append 5 checksum digits (base-4 encoding of checksum)
+    let mut cs = checksum;
+    let mut ci: u32 = 0;
+    while ci < 5 {
+        digits.append(cs & 3);
+        cs = cs / 4;
+        ci += 1;
+    };
+
+    digits
 }

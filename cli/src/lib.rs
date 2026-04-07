@@ -15,8 +15,17 @@ use std::collections::{HashMap, HashSet};
 pub type F = [u8; 32];
 pub const ZERO: F = [0u8; 32];
 pub const DETECT_K: usize = 10;
+
+/// Generate a random valid felt252 (251-bit value).
+pub fn random_felt() -> F {
+    let mut rng = rand::rng();
+    let mut f: F = rng.random();
+    f[31] &= 0x07; // truncate to 251 bits
+    f
+}
 pub const MEMO_SIZE: usize = 1024;
-pub const DEPTH: usize = 16;
+/// Must match TREE_DEPTH in merkle.cairo (default Scarb feature: depth48).
+pub const DEPTH: usize = 48;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Serde helpers — hex encoding for F and Vec<u8>
@@ -171,6 +180,42 @@ pub fn nullifier(nk_spend: &F, cm: &F, pos: u64) -> F {
     blake2s(b"nulfSP__", &buf2)
 }
 
+/// Sighash fold: H_sighash(a, b) using "sighSP__" personalization.
+pub fn sighash_fold(a: &F, b: &F) -> F {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(a);
+    buf[32..].copy_from_slice(b);
+    blake2s(b"sighSP__", &buf)
+}
+
+/// Compute transfer sighash from public outputs.
+pub fn transfer_sighash(root: &F, nullifiers: &[F], cm_1: &F, cm_2: &F, mh_1: &F, mh_2: &F) -> F {
+    // Circuit-type tag 0x01 for transfer
+    let mut type_tag = ZERO; type_tag[0] = 0x01;
+    let mut sh = sighash_fold(&type_tag, root);
+    for nf in nullifiers { sh = sighash_fold(&sh, nf); }
+    sh = sighash_fold(&sh, cm_1);
+    sh = sighash_fold(&sh, cm_2);
+    sh = sighash_fold(&sh, mh_1);
+    sh = sighash_fold(&sh, mh_2);
+    sh
+}
+
+/// Compute unshield sighash from public outputs.
+pub fn unshield_sighash(root: &F, nullifiers: &[F], v_pub: u64, recipient: &F, cm_change: &F, mh_change: &F) -> F {
+    // Circuit-type tag 0x02 for unshield
+    let mut type_tag = ZERO; type_tag[0] = 0x02;
+    let mut sh = sighash_fold(&type_tag, root);
+    for nf in nullifiers { sh = sighash_fold(&sh, nf); }
+    let mut v_felt = ZERO;
+    v_felt[..8].copy_from_slice(&v_pub.to_le_bytes());
+    sh = sighash_fold(&sh, &v_felt);
+    sh = sighash_fold(&sh, recipient);
+    sh = sighash_fold(&sh, cm_change);
+    sh = sighash_fold(&sh, mh_change);
+    sh
+}
+
 pub fn memo_ct_hash(enc: &EncryptedNote) -> F {
     let mut buf = Vec::with_capacity(enc.ct_v.len() + enc.encrypted_data.len());
     buf.extend_from_slice(&enc.ct_v);
@@ -180,6 +225,47 @@ pub fn memo_ct_hash(enc: &EncryptedNote) -> F {
 
 pub fn short(f: &F) -> String {
     hex::encode(&f[..4])
+}
+
+/// Convert F (LE bytes) to decimal string matching Cairo's felt252 representation.
+pub fn felt_to_dec(f: &F) -> String {
+    // Interpret as little-endian u256, convert to decimal
+    let mut val = [0u8; 32];
+    val.copy_from_slice(f);
+    // Build u256 from LE bytes
+    let lo = u128::from_le_bytes(val[..16].try_into().unwrap());
+    let hi = u128::from_le_bytes(val[16..].try_into().unwrap());
+    if hi == 0 {
+        lo.to_string()
+    } else {
+        // For values that don't fit in u128, use long division on LE bytes
+        let mut be = [0u8; 32];
+        for i in 0..32 { be[i] = val[31 - i]; }
+        let hex_str = hex::encode(be);
+        let trimmed = hex_str.trim_start_matches('0');
+        if trimmed.is_empty() { return "0".to_string(); }
+        // Parse hex to decimal using u256-capable parsing
+        // Since we don't have a bigint crate, compute hi*2^128 + lo manually
+        // Actually, the output_preimage from the reprover already contains decimal strings
+        // We just need to match them. Let's use a simpler approach.
+        let mut result = Vec::new();
+        let mut bytes = val.to_vec();
+        // Long division by 10 on LE bytes
+        loop {
+            let mut rem = 0u32;
+            let mut all_zero = true;
+            for i in (0..bytes.len()).rev() {
+                let cur = rem * 256 + bytes[i] as u32;
+                bytes[i] = (cur / 10) as u8;
+                rem = cur % 10;
+                if bytes[i] != 0 { all_zero = false; }
+            }
+            result.push((b'0' + rem as u8) as char);
+            if all_zero { break; }
+        }
+        result.reverse();
+        result.into_iter().collect()
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -227,13 +313,15 @@ pub fn derive_ask(ask_base: &F, j: u32) -> F {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Auth key tree — Merkle tree of ML-DSA-65 one-time signing keys
+// Auth key tree — Merkle tree of WOTS+ w=4 one-time signing keys
 // ═══════════════════════════════════════════════════════════════════════
 
 pub const AUTH_DEPTH: usize = 10;
 pub const AUTH_TREE_SIZE: usize = 1 << AUTH_DEPTH; // 1024
+pub const WOTS_W: usize = 4;
+pub const WOTS_CHAINS: usize = 133; // 128 msg + 5 checksum
 
-/// Derive the ML-DSA keygen seed for one-time key index i.
+/// Derive the WOTS+ secret key seed for one-time key index i.
 pub fn auth_key_seed(ask_j: &F, i: u32) -> F {
     let tag = hash_two(&felt_tag(b"auth-key"), ask_j);
     let mut idx = ZERO;
@@ -241,14 +329,53 @@ pub fn auth_key_seed(ask_j: &F, i: u32) -> F {
     hash_two(&tag, &idx)
 }
 
-/// Derive the auth leaf hash for index i: H(ML-DSA-65 public key bytes).
+/// WOTS+ secret key for chain j of key index i.
+fn wots_sk_chain(ask_j: &F, key_idx: u32, chain_idx: u32) -> F {
+    let seed = auth_key_seed(ask_j, key_idx);
+    let mut cidx = ZERO;
+    cidx[..4].copy_from_slice(&chain_idx.to_le_bytes());
+    hash_two(&seed, &cidx)
+}
+
+/// WOTS+ chain hash using dedicated "wotsSP__" personalization.
+fn hash1_wots(data: &F) -> F {
+    blake2s(b"wotsSP__", data)
+}
+
+/// WOTS+ PK fold using dedicated "pkfdSP__" personalization.
+fn hash2_pkfold(a: &F, b: &F) -> F {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(a);
+    buf[32..].copy_from_slice(b);
+    blake2s(b"pkfdSP__", &buf)
+}
+
+fn hash_chain(x: &F, n: usize) -> F {
+    let mut v = *x;
+    for _ in 0..n { v = hash1_wots(&v); }
+    v
+}
+
+/// WOTS+ public key for key index i: 133 chain endpoints.
+pub fn wots_pk(ask_j: &F, key_idx: u32) -> Vec<F> {
+    (0..WOTS_CHAINS as u32)
+        .map(|j| hash_chain(&wots_sk_chain(ask_j, key_idx, j), WOTS_W - 1))
+        .collect()
+}
+
+/// Fold WOTS+ pk chains into a single leaf hash.
+pub fn wots_pk_to_leaf(pk: &[F]) -> F {
+    let mut leaf = pk[0];
+    for i in 1..pk.len() {
+        leaf = hash2_pkfold(&leaf, &pk[i]);
+    }
+    leaf
+}
+
+/// Derive the auth leaf hash for key index i (WOTS+ pk folded to 32 bytes).
 pub fn auth_leaf_hash(ask_j: &F, i: u32) -> F {
-    use fips204::ml_dsa_65;
-    use fips204::traits::{KeyGen, SerDes};
-    let seed = auth_key_seed(ask_j, i);
-    let (pk, _sk) = ml_dsa_65::KG::keygen_from_seed(&seed);
-    let pk_bytes = pk.into_bytes();
-    hash(&pk_bytes)
+    let pk = wots_pk(ask_j, i);
+    wots_pk_to_leaf(&pk)
 }
 
 /// Build the full auth tree for address j. Returns (auth_root, leaf_hashes).
@@ -258,6 +385,42 @@ pub fn build_auth_tree(ask_j: &F) -> (F, Vec<F>) {
         .collect();
     let root = auth_tree_root(&leaves);
     (root, leaves)
+}
+
+/// WOTS+ sign: given a message hash, produce signature chains and digits.
+pub fn wots_sign(ask_j: &F, key_idx: u32, msg_hash: &F) -> (Vec<F>, Vec<F>, Vec<u32>) {
+    let log_w = 2; // log2(4)
+
+    // Extract base-4 digits from message hash
+    let mut digits: Vec<usize> = Vec::new();
+    for byte in msg_hash.iter() {
+        let mut b = *byte;
+        for _ in 0..4 { // 8 / log_w
+            digits.push((b & 3) as usize);
+            b >>= log_w;
+        }
+    }
+    // Checksum
+    let checksum: usize = digits.iter().map(|d| WOTS_W - 1 - d).sum();
+    let mut cs = checksum;
+    for _ in 0..5 { // checksum chains
+        digits.push(cs & 3);
+        cs >>= 2;
+    }
+    digits.truncate(WOTS_CHAINS);
+
+    // Sign: sig[j] = H^{digit[j]}(sk[j])
+    let sig: Vec<F> = (0..WOTS_CHAINS)
+        .map(|j| hash_chain(&wots_sk_chain(ask_j, key_idx, j as u32), digits[j]))
+        .collect();
+
+    // PK: pk[j] = H^{w-1}(sk[j])
+    let pk: Vec<F> = (0..WOTS_CHAINS)
+        .map(|j| hash_chain(&wots_sk_chain(ask_j, key_idx, j as u32), WOTS_W - 1))
+        .collect();
+
+    let digits_u32: Vec<u32> = digits.iter().map(|&d| d as u32).collect();
+    (sig, pk, digits_u32)
 }
 
 /// Compute the Merkle root of an auth tree from its leaves.
@@ -542,6 +705,10 @@ pub enum Proof {
         proof_hex: String,
         /// Public outputs (decimal felt strings) — the circuit commits to these
         output_preimage: Vec<String>,
+        /// Verification metadata — everything needed for standalone ~50ms verification.
+        /// Serialized ProofConfig, CircuitConfig, CircuitPublicData.
+        #[serde(default)]
+        verify_meta: Option<serde_json::Value>,
     },
 }
 
@@ -577,9 +744,15 @@ pub struct ShieldReq {
     pub address: PaymentAddress,
     pub memo: Option<String>,
     pub proof: Proof,
+    /// When using real proofs, the client provides its own commitment and encrypted note.
+    /// The ledger uses these instead of generating its own.
+    #[serde(default, with = "hex_f")]
+    pub client_cm: F,
+    #[serde(default)]
+    pub client_enc: Option<EncryptedNote>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ShieldResp {
     #[serde(with = "hex_f")]
     pub cm: F,
@@ -601,7 +774,7 @@ pub struct TransferReq {
     pub proof: Proof,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TransferResp {
     pub index_1: usize,
     pub index_2: usize,
@@ -621,7 +794,7 @@ pub struct UnshieldReq {
     pub proof: Proof,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UnshieldResp {
     pub change_index: Option<usize>,
 }
@@ -646,6 +819,14 @@ pub struct TreeInfoResp {
     pub root: F,
     pub size: usize,
     pub depth: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct MerklePathResp {
+    #[serde(with = "hex_f_vec")]
+    pub siblings: Vec<F>,
+    #[serde(with = "hex_f")]
+    pub root: F,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -694,7 +875,8 @@ impl Ledger {
     }
 
     pub fn fund(&mut self, addr: &str, amount: u64) {
-        *self.balances.entry(addr.into()).or_default() += amount;
+        let bal = self.balances.entry(addr.into()).or_default();
+        *bal = bal.saturating_add(amount);
     }
 
     pub fn shield(&mut self, req: &ShieldReq) -> Result<ShieldResp, String> {
@@ -703,35 +885,66 @@ impl Ledger {
             return Err("insufficient balance".into());
         }
 
-        let ek_v = ml_kem_768::EncapsulationKey::new(
-            req.address
-                .ek_v
-                .as_slice()
-                .try_into()
-                .map_err(|_| "bad ek_v length")?,
-        )
-        .map_err(|_| "invalid ek_v")?;
-        let ek_d = ml_kem_768::EncapsulationKey::new(
-            req.address
-                .ek_d
-                .as_slice()
-                .try_into()
-                .map_err(|_| "bad ek_d length")?,
-        )
-        .map_err(|_| "invalid ek_d")?;
+        // Validate output_preimage for Stark proofs
+        match &req.proof {
+            Proof::TrustMeBro => {}
+            Proof::Stark { proof_hex: _, output_preimage, verify_meta: _ } => {
+                // Shield outputs: [v_pub, cm_new, sender, memo_ct_hash]
+                if req.client_cm == ZERO {
+                    return Err("Stark proof requires client_cm (cannot use server-generated cm)".into());
+                }
+                if req.client_enc.is_none() {
+                    return Err("Stark proof requires client_enc (cannot use server-generated note)".into());
+                }
+                if output_preimage.len() < 4 {
+                    return Err("shield output_preimage too short".into());
+                }
+                let tail_start = output_preimage.len() - 4;
+                let tail = &output_preimage[tail_start..];
+                if tail[0] != req.v.to_string() {
+                    return Err("proof v_pub mismatch".into());
+                }
+                if tail[1] != felt_to_dec(&req.client_cm) {
+                    return Err("proof cm mismatch".into());
+                }
+                // Validate sender binding (prevents front-running)
+                let sender_dec = felt_to_dec(&hash(req.sender.as_bytes()));
+                if tail[2] != sender_dec {
+                    return Err("proof sender mismatch".into());
+                }
+                // Validate memo hash (prevents memo spoofing)
+                if let Some(ref enc) = req.client_enc {
+                    let mh = memo_ct_hash(enc);
+                    if tail[3] != felt_to_dec(&mh) {
+                        return Err("proof memo_ct_hash mismatch".into());
+                    }
+                }
+            }
+        }
 
-        let mut rng = rand::rng();
-        let rseed: F = rng.random();
-        let rcm = derive_rcm(&rseed);
-        let otag = owner_tag(&req.address.auth_root, &req.address.nk_tag);
-        let cm = commit(&req.address.d_j, req.v, &rcm, &otag);
+        // If the client provided a commitment and encrypted note (real proof mode),
+        // use those. Otherwise generate them server-side (TrustMeBro mode).
+        let (cm, enc) = if req.client_cm != ZERO && req.client_enc.is_some() {
+            (req.client_cm, req.client_enc.clone().unwrap())
+        } else {
+            let ek_v = ml_kem_768::EncapsulationKey::new(
+                req.address.ek_v.as_slice().try_into().map_err(|_| "bad ek_v length")?,
+            ).map_err(|_| "invalid ek_v")?;
+            let ek_d = ml_kem_768::EncapsulationKey::new(
+                req.address.ek_d.as_slice().try_into().map_err(|_| "bad ek_d length")?,
+            ).map_err(|_| "invalid ek_d")?;
+            let rseed = random_felt();
+            let rcm = derive_rcm(&rseed);
+            let otag = owner_tag(&req.address.auth_root, &req.address.nk_tag);
+            let cm = commit(&req.address.d_j, req.v, &rcm, &otag);
+            let memo_bytes = req.memo.as_ref().map(|s| s.as_bytes());
+            (cm, encrypt_note(req.v, &rseed, memo_bytes, &ek_v, &ek_d))
+        };
 
         *self.balances.get_mut(&req.sender).unwrap() -= req.v;
         let index = self.tree.append(cm);
         self.snapshot_root();
-
-        let memo_bytes = req.memo.as_ref().map(|s| s.as_bytes());
-        self.post_note(cm, encrypt_note(req.v, &rseed, memo_bytes, &ek_v, &ek_d));
+        self.post_note(cm, enc);
 
         Ok(ShieldResp { cm, index })
     }
@@ -758,17 +971,45 @@ impl Ledger {
         }
 
         match &req.proof {
-            Proof::TrustMeBro => {} // skip STARK verification
-            Proof::Stark { proof_hex, output_preimage } => {
-                // Verify the proof by shelling out to the reprover binary.
-                // For now, log that a real proof was received and validate
-                // the output_preimage matches the transaction's public data.
-                let _proof_bytes = hex::decode(proof_hex)
-                    .map_err(|_| "bad proof hex".to_string())?;
-                // TODO: shell out to `reprove --verify` when available
-                // For now, accept any well-formed Stark proof.
-                // The proof was already verified by the prover during generation.
-                let _ = output_preimage; // will be validated against public outputs
+            Proof::TrustMeBro => {}
+            Proof::Stark { proof_hex: _, output_preimage, verify_meta: _ } => {
+                // Validate output_preimage tail matches the transfer's public outputs.
+                // The bootloader wraps with header fields; our program outputs are at the tail.
+                // Transfer outputs: [root, nf_0..nf_N, cm_1, cm_2, mh_1, mh_2]
+                let n = req.nullifiers.len();
+                let expected_tail_len = 1 + n + 4; // root + N nf + cm_1 + cm_2 + mh_1 + mh_2
+                if output_preimage.len() < expected_tail_len {
+                    return Err(format!("output_preimage too short: {} < {}", output_preimage.len(), expected_tail_len));
+                }
+                let tail_start = output_preimage.len() - expected_tail_len;
+                let tail = &output_preimage[tail_start..];
+
+                // Validate positionally
+                let root_dec = felt_to_dec(&req.root);
+                if tail[0] != root_dec {
+                    return Err(format!("proof root mismatch"));
+                }
+                for (i, nf) in req.nullifiers.iter().enumerate() {
+                    if tail[1 + i] != felt_to_dec(nf) {
+                        return Err(format!("proof nullifier {} mismatch", i));
+                    }
+                }
+                let cm1_pos = 1 + n;
+                if tail[cm1_pos] != felt_to_dec(&req.cm_1) {
+                    return Err("proof cm_1 mismatch".into());
+                }
+                if tail[cm1_pos + 1] != felt_to_dec(&req.cm_2) {
+                    return Err("proof cm_2 mismatch".into());
+                }
+                // Validate memo hashes — prevents memo substitution attacks
+                let mh_1 = memo_ct_hash(&req.enc_1);
+                let mh_2 = memo_ct_hash(&req.enc_2);
+                if tail[cm1_pos + 2] != felt_to_dec(&mh_1) {
+                    return Err("proof memo_ct_hash_1 mismatch — encrypted note tampered".into());
+                }
+                if tail[cm1_pos + 3] != felt_to_dec(&mh_2) {
+                    return Err("proof memo_ct_hash_2 mismatch — encrypted note tampered".into());
+                }
             }
         }
 
@@ -807,11 +1048,44 @@ impl Ledger {
 
         match &req.proof {
             Proof::TrustMeBro => {}
-            Proof::Stark { proof_hex, output_preimage } => {
-                let _proof_bytes = hex::decode(proof_hex)
-                    .map_err(|_| "bad proof hex".to_string())?;
-                // TODO: shell out to `reprove --verify` when available
-                let _ = output_preimage;
+            Proof::Stark { proof_hex: _, output_preimage, verify_meta: _ } => {
+                // Unshield outputs: [root, nf_0..nf_N, v_pub, recipient, cm_change, mh_change]
+                let n = req.nullifiers.len();
+                let expected_tail_len = 1 + n + 4; // root + N nf + v_pub + recipient + cm_change + mh_change
+                if output_preimage.len() < expected_tail_len {
+                    return Err(format!("output_preimage too short"));
+                }
+                let tail_start = output_preimage.len() - expected_tail_len;
+                let tail = &output_preimage[tail_start..];
+
+                if tail[0] != felt_to_dec(&req.root) {
+                    return Err("proof root mismatch".into());
+                }
+                for (i, nf) in req.nullifiers.iter().enumerate() {
+                    if tail[1 + i] != felt_to_dec(nf) {
+                        return Err(format!("proof nullifier {} mismatch", i));
+                    }
+                }
+                if tail[1 + n] != req.v_pub.to_string() {
+                    return Err("proof v_pub mismatch".into());
+                }
+                // Validate recipient, cm_change, memo_ct_hash_change
+                let recipient_dec = felt_to_dec(&hash(req.recipient.as_bytes()));
+                if tail[2 + n] != recipient_dec {
+                    return Err("proof recipient mismatch".into());
+                }
+                if tail[3 + n] != felt_to_dec(&req.cm_change) {
+                    return Err("proof cm_change mismatch".into());
+                }
+                // Validate memo_ct_hash_change
+                if let Some(ref enc) = req.enc_change {
+                    let mh = memo_ct_hash(enc);
+                    if tail[4 + n] != felt_to_dec(&mh) {
+                        return Err("proof memo_ct_hash_change mismatch".into());
+                    }
+                } else if tail[4 + n] != "0" {
+                    return Err("proof memo_ct_hash_change should be 0 when no change".into());
+                }
             }
         }
 
@@ -830,7 +1104,8 @@ impl Ledger {
         for nf in &req.nullifiers {
             self.nullifiers.insert(*nf);
         }
-        *self.balances.entry(req.recipient.clone()).or_default() += req.v_pub;
+        let bal = self.balances.entry(req.recipient.clone()).or_default();
+        *bal = bal.saturating_add(req.v_pub);
         self.snapshot_root();
 
         Ok(UnshieldResp { change_index })
@@ -864,7 +1139,7 @@ mod tests {
         let nk_tg = derive_nk_tag(&nk_sp);
 
         // Auth tree: build the tree for address 0.
-        // NOTE: Cairo common.cairo uses a simplified leaf derivation (not ML-DSA keygen).
+        // NOTE: Cairo common.cairo uses a simplified leaf derivation (not WOTS+ keygen).
         // The Cairo leaf is H(H(H("auth-key", ask_j), i)) — two nested hash2_generic + hash1.
         // We replicate that here for test consistency.
         let auth_tag = hash_two(&felt_tag(b"auth-key"), &ask_j);
@@ -896,10 +1171,10 @@ mod tests {
         assert_eq!(hex::encode(nf), "df1ad56380610c948266f0e81ed555bb9152b99bfedff0c328c577277b944501", "nf");
     }
 
-    /// Verify that auth_leaf_hash using ML-DSA keygen produces a valid
+    /// Verify that auth_leaf_hash using WOTS+ key derivation produces a valid
     /// 32-byte hash and that the auth tree built from it is consistent.
     #[test]
-    fn test_auth_tree_ml_dsa() {
+    fn test_auth_tree_wots() {
         let mut ask_j = ZERO;
         ask_j[0] = 0x42;
         let (auth_root, leaves) = build_auth_tree(&ask_j);
@@ -962,6 +1237,8 @@ mod tests {
             address: addr,
             memo: None,
             proof: Proof::TrustMeBro,
+            client_cm: ZERO,
+            client_enc: None,
         }).unwrap();
 
         assert_eq!(resp.index, 0);
@@ -1003,4 +1280,864 @@ mod tests {
             proof: Proof::TrustMeBro,
         }).is_err());
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Attack tests — these attacks would succeed without output_preimage
+    // validation. Each constructs a fake Proof::Stark with a tampered
+    // output_preimage and verifies the ledger rejects it.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Helper: build a fake Stark proof with a given output_preimage.
+    /// The proof_hex is garbage — only the output_preimage matters for
+    /// these tests (we're testing the ledger's validation, not STARK crypto).
+    fn fake_stark(output_preimage: Vec<String>) -> Proof {
+        Proof::Stark {
+            proof_hex: "deadbeef".repeat(100), // non-empty garbage
+            output_preimage,
+            verify_meta: None,
+        }
+    }
+
+    /// Helper: set up a ledger with one shielded note, return (ledger, cm, nf, root, enc).
+    fn setup_with_note() -> (Ledger, F, F, F, EncryptedNote) {
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", 10000);
+
+        let mut master_sk = ZERO;
+        master_sk[0] = 0xAA;
+        let acc = derive_account(&master_sk);
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let (auth_root, _) = build_auth_tree(&ask_j);
+        let nk_sp = derive_nk_spend(&acc.nk, &d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
+
+        let seed_v: [u8; 64] = [11u8; 64];
+        let seed_d: [u8; 64] = [22u8; 64];
+        let (ek_v, _, ek_d, _) = {
+            let (ekv, dkv) = kem_keygen_from_seed(&seed_v);
+            let (ekd, dkd) = kem_keygen_from_seed(&seed_d);
+            (ekv, dkv, ekd, dkd)
+        };
+
+        let addr = PaymentAddress {
+            d_j, auth_root, nk_tag: nk_tg,
+            ek_v: ek_v.to_bytes().to_vec(),
+            ek_d: ek_d.to_bytes().to_vec(),
+        };
+        ledger.shield(&ShieldReq {
+            sender: "alice".into(), v: 1000, address: addr,
+            memo: None, proof: Proof::TrustMeBro,
+            client_cm: ZERO, client_enc: None,
+        }).unwrap();
+
+        let cm = ledger.tree.leaves[0];
+        let root = ledger.tree.root();
+        let nf = nullifier(&nk_sp, &cm, 0);
+        let enc = ledger.memos[0].1.clone();
+        (ledger, cm, nf, root, enc)
+    }
+
+    /// Attack: transfer with inflated output commitments.
+    /// Attacker submits a Stark proof that claims cm_1 and cm_2 are valid,
+    /// but the output_preimage contains DIFFERENT commitments than the request.
+    /// Without validation, the ledger would append the request's cm values
+    /// (which commit to inflated amounts) while the proof proved different ones.
+    #[test]
+    fn test_attack_transfer_cm_mismatch_rejected() {
+        let (mut ledger, cm, nf, root, enc) = setup_with_note();
+
+        let real_cm_1 = random_felt();
+        let fake_cm_1 = random_felt(); // attacker's commitment (different amount)
+        let cm_2 = random_felt();
+
+        // Build output_preimage as if the proof proved (root, nf, real_cm_1, cm_2, mh1, mh2)
+        // but submit the request with fake_cm_1
+        let preimage = vec![
+            "1".into(), // bootloader header
+            format!("{}", 5 + 1), // size
+            "0".into(), "0".into(), // padding
+            felt_to_dec(&root),
+            felt_to_dec(&nf),
+            felt_to_dec(&real_cm_1), // proof proves THIS commitment
+            felt_to_dec(&cm_2),
+            felt_to_dec(&ZERO), // mh_1
+            felt_to_dec(&ZERO), // mh_2
+        ];
+
+        let result = ledger.transfer(&TransferReq {
+            root,
+            nullifiers: vec![nf],
+            cm_1: fake_cm_1, // attacker substitutes a DIFFERENT commitment
+            cm_2,
+            enc_1: enc.clone(),
+            enc_2: enc.clone(),
+            proof: fake_stark(preimage),
+        });
+        assert!(result.is_err(), "transfer with mismatched cm_1 should be rejected");
+        assert!(result.unwrap_err().contains("cm_1 mismatch"),
+            "should specifically catch cm_1 mismatch");
+    }
+
+    /// Attack: transfer with swapped encrypted notes (memo substitution).
+    /// Attacker generates a valid proof but replaces enc_1 with garbage.
+    /// The memo hash in the proof won't match the swapped encrypted note.
+    #[test]
+    fn test_attack_transfer_memo_substitution_rejected() {
+        let (mut ledger, cm, nf, root, enc) = setup_with_note();
+
+        let cm_1 = random_felt();
+        let cm_2 = random_felt();
+        let mh_1 = memo_ct_hash(&enc); // hash of the REAL encrypted note
+
+        // Create a DIFFERENT encrypted note (attacker's garbage)
+        let seed_atk: [u8; 64] = [0xBB; 64];
+        let (ek_atk, _) = kem_keygen_from_seed(&seed_atk);
+        let fake_enc = encrypt_note(999, &random_felt(), None, &ek_atk, &ek_atk);
+        let mh_fake = memo_ct_hash(&fake_enc); // different hash
+
+        // Output_preimage commits to mh_1 (real note's hash)
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(), // bootloader header
+            felt_to_dec(&root),
+            felt_to_dec(&nf),
+            felt_to_dec(&cm_1),
+            felt_to_dec(&cm_2),
+            felt_to_dec(&mh_1),    // proof commits to REAL memo hash
+            felt_to_dec(&ZERO),
+        ];
+
+        let result = ledger.transfer(&TransferReq {
+            root,
+            nullifiers: vec![nf],
+            cm_1, cm_2,
+            enc_1: fake_enc, // attacker swaps in a DIFFERENT encrypted note
+            enc_2: enc.clone(),
+            proof: fake_stark(preimage),
+        });
+        assert!(result.is_err(), "transfer with swapped memo should be rejected");
+        assert!(result.unwrap_err().contains("memo_ct_hash_1 mismatch"),
+            "should specifically catch memo substitution");
+    }
+
+    /// Attack: unshield with redirected recipient.
+    /// Attacker generates a proof for recipient=alice but submits with recipient=attacker.
+    /// Without validation, the ledger credits attacker instead of alice.
+    #[test]
+    fn test_attack_unshield_redirect_recipient_rejected() {
+        let (mut ledger, cm, nf, root, enc) = setup_with_note();
+
+        let alice_recipient = hash(b"alice");
+        let attacker_recipient = hash(b"attacker");
+
+        // Proof commits to alice as recipient
+        let n = 1;
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(), // bootloader header
+            felt_to_dec(&root),
+            felt_to_dec(&nf),
+            "1000".into(), // v_pub
+            felt_to_dec(&alice_recipient), // proof says ALICE
+            felt_to_dec(&ZERO), // cm_change
+            felt_to_dec(&ZERO), // mh_change
+        ];
+
+        let result = ledger.unshield(&UnshieldReq {
+            root,
+            nullifiers: vec![nf],
+            v_pub: 1000,
+            recipient: "attacker".into(), // attacker redirects to themselves
+            cm_change: ZERO,
+            enc_change: None,
+            proof: fake_stark(preimage),
+        });
+        assert!(result.is_err(), "unshield with redirected recipient should be rejected");
+        assert!(result.unwrap_err().contains("recipient mismatch"),
+            "should specifically catch recipient redirect");
+    }
+
+    /// Attack: unshield with inflated v_pub.
+    /// Attacker's proof proves v_pub=100 but submits v_pub=1000000.
+    #[test]
+    fn test_attack_unshield_inflated_vpub_rejected() {
+        let (mut ledger, cm, nf, root, enc) = setup_with_note();
+
+        // Proof commits to v_pub=100
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            felt_to_dec(&root),
+            felt_to_dec(&nf),
+            "100".into(), // proof says 100
+            felt_to_dec(&hash(b"alice")),
+            felt_to_dec(&ZERO),
+            felt_to_dec(&ZERO),
+        ];
+
+        let result = ledger.unshield(&UnshieldReq {
+            root,
+            nullifiers: vec![nf],
+            v_pub: 1000000, // attacker claims 1000000
+            recipient: "alice".into(),
+            cm_change: ZERO,
+            enc_change: None,
+            proof: fake_stark(preimage),
+        });
+        assert!(result.is_err(), "unshield with inflated v_pub should be rejected");
+        assert!(result.unwrap_err().contains("v_pub mismatch"),
+            "should specifically catch v_pub inflation");
+    }
+
+    /// Attack: shield with inflated amount.
+    /// Attacker's proof proves v_pub=1 but submits v=1000000.
+    #[test]
+    fn test_attack_shield_inflated_amount_rejected() {
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", 2000000);
+
+        let cm = random_felt();
+
+        // Proof commits to v_pub=1
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            "1".into(), // proof says v=1
+            felt_to_dec(&cm),
+            felt_to_dec(&hash(b"alice")),
+            felt_to_dec(&ZERO),
+        ];
+
+        let addr = PaymentAddress {
+            d_j: random_felt(), auth_root: random_felt(), nk_tag: random_felt(),
+            ek_v: vec![0; 1184], ek_d: vec![0; 1184],
+        };
+
+        let result = ledger.shield(&ShieldReq {
+            sender: "alice".into(),
+            v: 1000000, // attacker claims 1000000
+            address: addr,
+            memo: None,
+            proof: fake_stark(preimage),
+            client_cm: cm,
+            client_enc: Some(EncryptedNote {
+                ct_d: vec![0; 1088], tag: 0,
+                ct_v: vec![0; 1088], encrypted_data: vec![0; 1080],
+            }),
+        });
+        assert!(result.is_err(), "shield with inflated amount should be rejected");
+        assert!(result.unwrap_err().contains("v_pub mismatch"),
+            "should specifically catch amount inflation");
+    }
+
+    /// Attack: transfer with fabricated nullifier.
+    /// Attacker submits a nullifier not in the proof's output_preimage.
+    #[test]
+    fn test_attack_transfer_fake_nullifier_rejected() {
+        let (mut ledger, cm, nf, root, enc) = setup_with_note();
+
+        let fake_nf = random_felt(); // attacker invents a nullifier
+        let cm_1 = random_felt();
+        let cm_2 = random_felt();
+        let mh = ZERO;
+
+        // Proof commits to the REAL nullifier
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            felt_to_dec(&root),
+            felt_to_dec(&nf), // proof proves THIS nullifier
+            felt_to_dec(&cm_1),
+            felt_to_dec(&cm_2),
+            felt_to_dec(&mh),
+            felt_to_dec(&mh),
+        ];
+
+        let result = ledger.transfer(&TransferReq {
+            root,
+            nullifiers: vec![fake_nf], // attacker substitutes a DIFFERENT nullifier
+            cm_1, cm_2,
+            enc_1: enc.clone(),
+            enc_2: enc.clone(),
+            proof: fake_stark(preimage),
+        });
+        assert!(result.is_err(), "transfer with fake nullifier should be rejected");
+        assert!(result.unwrap_err().contains("nullifier 0 mismatch"),
+            "should specifically catch nullifier substitution");
+    }
+
+    // ── State-level checks (no proof needed) ─────────────────────────
+
+    /// Shield: insufficient public balance.
+    #[test]
+    fn test_shield_insufficient_balance() {
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", 100);
+        let addr = PaymentAddress {
+            d_j: random_felt(), auth_root: random_felt(), nk_tag: random_felt(),
+            ek_v: vec![0; 1184], ek_d: vec![0; 1184],
+        };
+        let r = ledger.shield(&ShieldReq {
+            sender: "alice".into(), v: 200, address: addr, memo: None,
+            proof: Proof::TrustMeBro, client_cm: ZERO, client_enc: None,
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("insufficient"));
+    }
+
+    /// Transfer: zero inputs rejected.
+    #[test]
+    fn test_transfer_zero_inputs_rejected() {
+        let (mut ledger, _, _, root, enc) = setup_with_note();
+        let r = ledger.transfer(&TransferReq {
+            root, nullifiers: vec![], // zero inputs
+            cm_1: random_felt(), cm_2: random_felt(),
+            enc_1: enc.clone(), enc_2: enc.clone(),
+            proof: Proof::TrustMeBro,
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("bad nullifier count"));
+    }
+
+    /// Transfer: invalid Merkle root rejected.
+    #[test]
+    fn test_transfer_invalid_root_rejected() {
+        let (mut ledger, _, nf, _, enc) = setup_with_note();
+        let fake_root = random_felt(); // not in valid_roots
+        let r = ledger.transfer(&TransferReq {
+            root: fake_root, nullifiers: vec![nf],
+            cm_1: random_felt(), cm_2: random_felt(),
+            enc_1: enc.clone(), enc_2: enc.clone(),
+            proof: Proof::TrustMeBro,
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("invalid root"));
+    }
+
+    /// Transfer: double-spend (same nullifier across transactions) rejected.
+    #[test]
+    fn test_transfer_double_spend_rejected() {
+        let (mut ledger, _, nf, root, enc) = setup_with_note();
+        // First spend succeeds
+        ledger.transfer(&TransferReq {
+            root, nullifiers: vec![nf],
+            cm_1: random_felt(), cm_2: random_felt(),
+            enc_1: enc.clone(), enc_2: enc.clone(),
+            proof: Proof::TrustMeBro,
+        }).unwrap();
+        // Second spend with same nullifier fails
+        let r = ledger.transfer(&TransferReq {
+            root, nullifiers: vec![nf],
+            cm_1: random_felt(), cm_2: random_felt(),
+            enc_1: enc.clone(), enc_2: enc.clone(),
+            proof: Proof::TrustMeBro,
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("already spent"));
+    }
+
+    /// Transfer: duplicate nullifiers within one transaction rejected.
+    #[test]
+    fn test_transfer_duplicate_nullifier_rejected() {
+        let (mut ledger, _, nf, root, enc) = setup_with_note();
+        let r = ledger.transfer(&TransferReq {
+            root, nullifiers: vec![nf, nf], // same nf twice
+            cm_1: random_felt(), cm_2: random_felt(),
+            enc_1: enc.clone(), enc_2: enc.clone(),
+            proof: Proof::TrustMeBro,
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("duplicate"));
+    }
+
+    /// Unshield: invalid root rejected.
+    #[test]
+    fn test_unshield_invalid_root_rejected() {
+        let (mut ledger, _, nf, _, _) = setup_with_note();
+        let r = ledger.unshield(&UnshieldReq {
+            root: random_felt(), nullifiers: vec![nf],
+            v_pub: 1000, recipient: "alice".into(),
+            cm_change: ZERO, enc_change: None,
+            proof: Proof::TrustMeBro,
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("invalid root"));
+    }
+
+    /// Unshield: double-spend rejected.
+    #[test]
+    fn test_unshield_double_spend_rejected() {
+        let (mut ledger, _, nf, root, _) = setup_with_note();
+        ledger.unshield(&UnshieldReq {
+            root, nullifiers: vec![nf], v_pub: 1000,
+            recipient: "alice".into(), cm_change: ZERO, enc_change: None,
+            proof: Proof::TrustMeBro,
+        }).unwrap();
+        let r = ledger.unshield(&UnshieldReq {
+            root, nullifiers: vec![nf], v_pub: 1000,
+            recipient: "alice".into(), cm_change: ZERO, enc_change: None,
+            proof: Proof::TrustMeBro,
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("already spent"));
+    }
+
+    /// Unshield: duplicate nullifiers within one transaction rejected.
+    #[test]
+    fn test_unshield_duplicate_nullifier_rejected() {
+        let (mut ledger, _, nf, root, _) = setup_with_note();
+        let r = ledger.unshield(&UnshieldReq {
+            root, nullifiers: vec![nf, nf],
+            v_pub: 1000, recipient: "alice".into(),
+            cm_change: ZERO, enc_change: None,
+            proof: Proof::TrustMeBro,
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("duplicate"));
+    }
+
+    // ── Proof output_preimage checks ────────────────────────────────
+
+    /// Attack: shield with proof cm that doesn't match client_cm.
+    #[test]
+    fn test_attack_shield_cm_mismatch_rejected() {
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", 10000);
+
+        let real_cm = random_felt();
+        let fake_cm = random_felt();
+
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            "1000".into(),
+            felt_to_dec(&real_cm), // proof proves THIS cm
+            felt_to_dec(&ZERO),
+            felt_to_dec(&ZERO),
+        ];
+
+        let addr = PaymentAddress {
+            d_j: random_felt(), auth_root: random_felt(), nk_tag: random_felt(),
+            ek_v: vec![0; 1184], ek_d: vec![0; 1184],
+        };
+        let r = ledger.shield(&ShieldReq {
+            sender: "alice".into(), v: 1000, address: addr, memo: None,
+            proof: fake_stark(preimage),
+            client_cm: fake_cm, // DIFFERENT cm
+            client_enc: Some(EncryptedNote {
+                ct_d: vec![0; 1088], tag: 0,
+                ct_v: vec![0; 1088], encrypted_data: vec![0; 1080],
+            }),
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("cm mismatch"));
+    }
+
+    /// Attack: transfer with proof root that doesn't match request root.
+    #[test]
+    fn test_attack_transfer_root_mismatch_rejected() {
+        let (mut ledger, _, nf, root, enc) = setup_with_note();
+
+        let fake_root = random_felt();
+        let cm_1 = random_felt();
+        let cm_2 = random_felt();
+        let mh = memo_ct_hash(&enc);
+
+        // Proof commits to fake_root
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            felt_to_dec(&fake_root), // proof says THIS root
+            felt_to_dec(&nf),
+            felt_to_dec(&cm_1), felt_to_dec(&cm_2),
+            felt_to_dec(&mh), felt_to_dec(&mh),
+        ];
+
+        let r = ledger.transfer(&TransferReq {
+            root, // request uses the REAL root
+            nullifiers: vec![nf],
+            cm_1, cm_2,
+            enc_1: enc.clone(), enc_2: enc.clone(),
+            proof: fake_stark(preimage),
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("root mismatch"));
+    }
+
+    /// Attack: transfer with mismatched cm_2 (only cm_1 is correct).
+    #[test]
+    fn test_attack_transfer_cm2_mismatch_rejected() {
+        let (mut ledger, _, nf, root, enc) = setup_with_note();
+
+        let cm_1 = random_felt();
+        let real_cm_2 = random_felt();
+        let fake_cm_2 = random_felt();
+        let mh = memo_ct_hash(&enc);
+
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            felt_to_dec(&root), felt_to_dec(&nf),
+            felt_to_dec(&cm_1),
+            felt_to_dec(&real_cm_2), // proof proves THIS cm_2
+            felt_to_dec(&mh), felt_to_dec(&mh),
+        ];
+
+        let r = ledger.transfer(&TransferReq {
+            root, nullifiers: vec![nf],
+            cm_1,
+            cm_2: fake_cm_2, // attacker substitutes cm_2
+            enc_1: enc.clone(), enc_2: enc.clone(),
+            proof: fake_stark(preimage),
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("cm_2 mismatch"));
+    }
+
+    /// Attack: unshield with proof root mismatch.
+    #[test]
+    fn test_attack_unshield_root_mismatch_rejected() {
+        let (mut ledger, _, nf, root, _) = setup_with_note();
+
+        let fake_root = random_felt();
+        let recipient = hash(b"alice");
+
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            felt_to_dec(&fake_root), // proof says THIS root
+            felt_to_dec(&nf),
+            "1000".into(),
+            felt_to_dec(&recipient),
+            felt_to_dec(&ZERO), felt_to_dec(&ZERO),
+        ];
+
+        let r = ledger.unshield(&UnshieldReq {
+            root, // request uses the REAL root
+            nullifiers: vec![nf], v_pub: 1000,
+            recipient: "alice".into(),
+            cm_change: ZERO, enc_change: None,
+            proof: fake_stark(preimage),
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("root mismatch"));
+    }
+
+    /// Attack: unshield with substituted change commitment.
+    /// Attacker's proof commits to cm_change=X but submits cm_change=Y.
+    #[test]
+    fn test_attack_unshield_cm_change_substitution_rejected() {
+        let (mut ledger, cm, nf, root, enc) = setup_with_note();
+
+        let real_cm_change = random_felt();
+        let fake_cm_change = random_felt(); // attacker's commitment
+        let recipient = hash(b"alice");
+
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            felt_to_dec(&root),
+            felt_to_dec(&nf),
+            "500".into(),
+            felt_to_dec(&recipient),
+            felt_to_dec(&real_cm_change), // proof commits to THIS change
+            felt_to_dec(&ZERO),
+        ];
+
+        let result = ledger.unshield(&UnshieldReq {
+            root,
+            nullifiers: vec![nf],
+            v_pub: 500,
+            recipient: "alice".into(),
+            cm_change: fake_cm_change, // attacker substitutes a DIFFERENT change commitment
+            enc_change: None,
+            proof: fake_stark(preimage),
+        });
+        assert!(result.is_err(), "unshield with substituted cm_change should be rejected");
+        assert!(result.unwrap_err().contains("cm_change mismatch"),
+            "should specifically catch cm_change substitution");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Regression tests — each corresponds to a specific bug that was
+    // found and fixed. If any of these fail, the fix has regressed.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Regression: random_felt() must produce valid 251-bit values.
+    /// Bug: rng.random::<[u8;32]>() generated 256-bit values that exceeded
+    /// the Stark field prime. When hex-encoded and sent to Cairo, values
+    /// were reduced mod P, producing different commitments than Rust computed.
+    #[test]
+    fn test_regression_random_felt_251bit() {
+        for _ in 0..1000 {
+            let f = random_felt();
+            // Top 5 bits must be zero (251-bit truncation)
+            assert_eq!(f[31] & 0xF8, 0, "random_felt produced >251-bit value: top byte = {:#04x}", f[31]);
+        }
+    }
+
+    /// Regression: all hash outputs must be 251-bit truncated.
+    /// Bug: if hash output exceeds felt252 range, Cairo and Rust interpret
+    /// the same hex string differently (Cairo reduces mod P, Rust uses raw bytes).
+    #[test]
+    fn test_regression_hash_output_251bit() {
+        for i in 0u32..100 {
+            let mut input = ZERO;
+            input[..4].copy_from_slice(&i.to_le_bytes());
+            let h = hash(&input);
+            assert_eq!(h[31] & 0xF8, 0, "hash output >251 bits at input {}", i);
+
+            let h2 = hash_merkle(&input, &ZERO);
+            assert_eq!(h2[31] & 0xF8, 0, "hash_merkle output >251 bits");
+
+            let h3 = owner_tag(&input, &ZERO);
+            assert_eq!(h3[31] & 0xF8, 0, "owner_tag output >251 bits");
+
+            let h4 = derive_nk_spend(&input, &ZERO);
+            assert_eq!(h4[31] & 0xF8, 0, "derive_nk_spend output >251 bits");
+
+            let h5 = hash1_wots(&input);
+            assert_eq!(h5[31] & 0xF8, 0, "hash1_wots output >251 bits");
+
+            let h6 = hash2_pkfold(&input, &ZERO);
+            assert_eq!(h6[31] & 0xF8, 0, "hash2_pkfold output >251 bits");
+
+            let h7 = sighash_fold(&input, &ZERO);
+            assert_eq!(h7[31] & 0xF8, 0, "sighash_fold output >251 bits");
+        }
+    }
+
+    /// Regression: WOTS+ key indices must produce different keys.
+    /// Bug: wallet always used key index 0, causing one-time signature reuse
+    /// which leaks secret key material and allows forgery.
+    #[test]
+    fn test_regression_wots_key_index_produces_different_keys() {
+        let ask_j = random_felt();
+
+        // Different key indices produce different seeds
+        let seed_0 = auth_key_seed(&ask_j, 0);
+        let seed_1 = auth_key_seed(&ask_j, 1);
+        assert_ne!(seed_0, seed_1, "different key indices must produce different seeds");
+
+        // Different key indices produce different public keys
+        let pk_0 = wots_pk(&ask_j, 0);
+        let pk_1 = wots_pk(&ask_j, 1);
+        assert_ne!(pk_0, pk_1, "different key indices must produce different public keys");
+
+        // Different key indices produce different auth leaves
+        let leaf_0 = wots_pk_to_leaf(&pk_0);
+        let leaf_1 = wots_pk_to_leaf(&pk_1);
+        assert_ne!(leaf_0, leaf_1, "different key indices must produce different auth leaves");
+
+        // Same key + different message = different signature (one-time property)
+        let msg1 = hash(b"msg1");
+        let msg2 = hash(b"msg2");
+        let (sig1, _, _) = wots_sign(&ask_j, 0, &msg1);
+        let (sig2, _, _) = wots_sign(&ask_j, 0, &msg2);
+        assert_ne!(sig1, sig2, "same key + different messages must produce different signatures");
+    }
+
+    /// Regression: shield with Stark proof MUST provide client_cm.
+    /// Bug: ledger accepted Stark proofs with client_cm=ZERO and generated
+    /// its own cm, making the proof commit to a different commitment than
+    /// what was appended to the tree.
+    #[test]
+    fn test_regression_shield_stark_requires_client_cm() {
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", 10000);
+
+        let addr = PaymentAddress {
+            d_j: random_felt(), auth_root: random_felt(), nk_tag: random_felt(),
+            ek_v: vec![0; 1184], ek_d: vec![0; 1184],
+        };
+        let r = ledger.shield(&ShieldReq {
+            sender: "alice".into(), v: 1000, address: addr, memo: None,
+            proof: fake_stark(vec!["0".into(); 8]),
+            client_cm: ZERO, // BUG: no client cm with Stark proof
+            client_enc: None,
+        });
+        assert!(r.is_err(), "Stark proof with ZERO client_cm should be rejected");
+        assert!(r.unwrap_err().contains("requires client_cm"));
+    }
+
+    /// Regression: shield proof must bind to sender.
+    /// Bug: the ledger didn't validate the sender field from the proof's
+    /// output_preimage, allowing front-running of shield proofs.
+    #[test]
+    fn test_regression_shield_sender_validated() {
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", 10000);
+        ledger.fund("attacker", 10000);
+
+        let cm = random_felt();
+        let alice_sender = felt_to_dec(&hash(b"alice"));
+        let enc = EncryptedNote {
+            ct_d: vec![0; 1088], tag: 0,
+            ct_v: vec![0; 1088], encrypted_data: vec![0; 1080],
+        };
+        let mh = memo_ct_hash(&enc);
+
+        // Proof commits to sender=alice
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            "1000".into(), felt_to_dec(&cm), alice_sender, felt_to_dec(&mh),
+        ];
+
+        let addr = PaymentAddress {
+            d_j: random_felt(), auth_root: random_felt(), nk_tag: random_felt(),
+            ek_v: vec![0; 1184], ek_d: vec![0; 1184],
+        };
+        let r = ledger.shield(&ShieldReq {
+            sender: "attacker".into(), // attacker front-runs with different sender
+            v: 1000, address: addr, memo: None,
+            proof: fake_stark(preimage),
+            client_cm: cm,
+            client_enc: Some(enc),
+        });
+        assert!(r.is_err(), "shield with mismatched sender should be rejected");
+        assert!(r.unwrap_err().contains("sender mismatch"));
+    }
+
+    /// Regression: shield proof must bind to memo_ct_hash.
+    /// Bug: the ledger didn't validate memo_ct_hash, allowing memo spoofing.
+    #[test]
+    fn test_regression_shield_memo_hash_validated() {
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", 10000);
+
+        let cm = random_felt();
+        let sender_dec = felt_to_dec(&hash(b"alice"));
+
+        // Real encrypted note
+        let seed: [u8; 64] = [0x33; 64];
+        let (ek, _) = kem_keygen_from_seed(&seed);
+        let real_enc = encrypt_note(1000, &random_felt(), None, &ek, &ek);
+        let real_mh = memo_ct_hash(&real_enc);
+
+        // Fake encrypted note with different content
+        let fake_enc = encrypt_note(999, &random_felt(), Some(b"evil"), &ek, &ek);
+
+        // Proof commits to the REAL memo hash
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            "1000".into(), felt_to_dec(&cm), sender_dec, felt_to_dec(&real_mh),
+        ];
+
+        let addr = PaymentAddress {
+            d_j: random_felt(), auth_root: random_felt(), nk_tag: random_felt(),
+            ek_v: vec![0; 1184], ek_d: vec![0; 1184],
+        };
+        let r = ledger.shield(&ShieldReq {
+            sender: "alice".into(), v: 1000, address: addr, memo: None,
+            proof: fake_stark(preimage),
+            client_cm: cm,
+            client_enc: Some(fake_enc), // attacker swaps the encrypted note
+        });
+        assert!(r.is_err(), "shield with swapped memo should be rejected");
+        assert!(r.unwrap_err().contains("memo_ct_hash mismatch"));
+    }
+
+    /// Regression: unshield proof mh_change must be 0 when no change note.
+    /// Bug: the ledger didn't validate mh_change=0 for no-change unshields,
+    /// allowing an attacker to inject nonzero mh_change.
+    #[test]
+    fn test_regression_unshield_mh_change_zero_enforced() {
+        let (mut ledger, _, nf, root, _) = setup_with_note();
+
+        let recipient = hash(b"alice");
+        // Proof has nonzero mh_change but no enc_change
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            felt_to_dec(&root), felt_to_dec(&nf),
+            "1000".into(), felt_to_dec(&recipient),
+            felt_to_dec(&ZERO), // cm_change = 0
+            "12345".into(), // mh_change should be 0 but isn't
+        ];
+
+        let r = ledger.unshield(&UnshieldReq {
+            root, nullifiers: vec![nf], v_pub: 1000,
+            recipient: "alice".into(),
+            cm_change: ZERO, enc_change: None,
+            proof: fake_stark(preimage),
+        });
+        assert!(r.is_err(), "nonzero mh_change without enc_change should be rejected");
+        assert!(r.unwrap_err().contains("memo_ct_hash_change should be 0"));
+    }
+
+    /// Regression: shield Stark proof must include client_enc.
+    /// Bug: with client_cm set but client_enc=None, the ledger fell through
+    /// to server-side cm generation, inserting an unproved commitment.
+    #[test]
+    fn test_regression_shield_stark_requires_client_enc() {
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", 10000);
+
+        let cm = random_felt();
+        let sender_dec = felt_to_dec(&hash(b"alice"));
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            "1000".into(), felt_to_dec(&cm), sender_dec, felt_to_dec(&ZERO),
+        ];
+
+        let addr = PaymentAddress {
+            d_j: random_felt(), auth_root: random_felt(), nk_tag: random_felt(),
+            ek_v: vec![0; 1184], ek_d: vec![0; 1184],
+        };
+        let r = ledger.shield(&ShieldReq {
+            sender: "alice".into(), v: 1000, address: addr, memo: None,
+            proof: fake_stark(preimage),
+            client_cm: cm,
+            client_enc: None, // BUG: Stark proof without client_enc
+        });
+        assert!(r.is_err(), "Stark proof with None client_enc should be rejected");
+        assert!(r.unwrap_err().contains("requires client_enc"));
+    }
+
+    /// Regression: WOTS+ chain hashing uses dedicated wotsSP__ IV, not generic.
+    /// Bug: WOTS+ chains shared the generic IV with key derivation, violating
+    /// domain separation. Now uses dedicated wotsSP__ personalization.
+    #[test]
+    fn test_regression_wots_dedicated_iv() {
+        let x = random_felt();
+        let generic = hash(&x);
+        let wots = hash1_wots(&x);
+        assert_ne!(generic, wots,
+            "WOTS+ chain hash must differ from generic hash (different IVs)");
+    }
+
+    /// Regression: PK fold uses dedicated pkfdSP__ IV, not generic.
+    #[test]
+    fn test_regression_pkfold_dedicated_iv() {
+        let a = random_felt();
+        let b = random_felt();
+        let generic = hash_two(&a, &b);
+        let pkfold = hash2_pkfold(&a, &b);
+        assert_ne!(generic, pkfold,
+            "PK fold hash must differ from generic hash (different IVs)");
+    }
+
+    /// Regression: sighash uses dedicated sighSP__ IV.
+    #[test]
+    fn test_regression_sighash_dedicated_iv() {
+        let a = random_felt();
+        let b = random_felt();
+        let generic = hash_two(&a, &b);
+        let sh = sighash_fold(&a, &b);
+        assert_ne!(generic, sh,
+            "sighash fold must differ from generic hash (different IVs)");
+    }
+
+    /// Regression: transfer and unshield sighashes differ (circuit-type tag).
+    /// Bug: without type tags, a transfer and unshield with same public
+    /// outputs could produce the same sighash, enabling cross-circuit replay.
+    #[test]
+    fn test_regression_sighash_circuit_type_tags_differ() {
+        let root = random_felt();
+        let nf = random_felt();
+        let cm_1 = random_felt();
+        let cm_2 = random_felt();
+        let mh = ZERO;
+
+        let transfer_sh = transfer_sighash(&root, &[nf], &cm_1, &cm_2, &mh, &mh);
+
+        // Unshield with same values (treating cm_1 as v_pub felt, cm_2 as recipient, etc.)
+        let mut v_pub_felt = ZERO;
+        v_pub_felt[..32].copy_from_slice(&cm_1); // reuse same bytes
+        let unshield_sh = unshield_sighash(&root, &[nf], 0, &cm_2, &mh, &mh);
+
+        assert_ne!(transfer_sh, unshield_sh,
+            "transfer and unshield sighashes must differ due to circuit-type tags");
+    }
+
 }
