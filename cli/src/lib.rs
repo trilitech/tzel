@@ -2181,4 +2181,242 @@ mod tests {
             "changing encrypted_data must change memo_ct_hash");
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // Coverage tests — exercise code paths not hit by other tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Serde roundtrip for Note, PaymentAddress, and API types.
+    /// Covers hex_f, hex_f_vec, hex_bytes serialize/deserialize.
+    #[test]
+    fn test_serde_roundtrip() {
+        // Note roundtrip
+        let note = Note {
+            nk_spend: random_felt(), nk_tag: random_felt(), auth_root: random_felt(),
+            d_j: random_felt(), v: 42, rseed: random_felt(), cm: random_felt(),
+            index: 7, addr_index: 3,
+        };
+        let json = serde_json::to_string(&note).unwrap();
+        let back: Note = serde_json::from_str(&json).unwrap();
+        assert_eq!(note.cm, back.cm);
+        assert_eq!(note.v, back.v);
+        assert_eq!(note.nk_spend, back.nk_spend);
+
+        // PaymentAddress roundtrip
+        let addr = PaymentAddress {
+            d_j: random_felt(), auth_root: random_felt(), nk_tag: random_felt(),
+            ek_v: vec![0xAB; 1184], ek_d: vec![0xCD; 1184],
+        };
+        let json = serde_json::to_string(&addr).unwrap();
+        let back: PaymentAddress = serde_json::from_str(&json).unwrap();
+        assert_eq!(addr.d_j, back.d_j);
+        assert_eq!(addr.ek_v, back.ek_v);
+
+        // TransferReq with nullifier vec (exercises hex_f_vec)
+        let req = TransferReq {
+            root: random_felt(),
+            nullifiers: vec![random_felt(), random_felt()],
+            cm_1: random_felt(), cm_2: random_felt(),
+            enc_1: EncryptedNote { ct_d: vec![0; 1088], tag: 42, ct_v: vec![0; 1088], encrypted_data: vec![0; 1080] },
+            enc_2: EncryptedNote { ct_d: vec![0; 1088], tag: 99, ct_v: vec![0; 1088], encrypted_data: vec![0; 1080] },
+            proof: Proof::TrustMeBro,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: TransferReq = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.nullifiers.len(), back.nullifiers.len());
+        assert_eq!(req.nullifiers[0], back.nullifiers[0]);
+    }
+
+    /// MerkleTree: build a small tree, extract auth path, verify it.
+    /// Covers MerkleTree::auth_path (20 uncovered lines).
+    #[test]
+    fn test_merkle_tree_auth_path() {
+        let mut tree = MerkleTree::new();
+        let leaf_0 = random_felt();
+        let leaf_1 = random_felt();
+        let leaf_2 = random_felt();
+        tree.append(leaf_0);
+        tree.append(leaf_1);
+        tree.append(leaf_2);
+
+        let root = tree.root();
+
+        // Extract and verify auth path for each leaf
+        for (i, leaf) in [leaf_0, leaf_1, leaf_2].iter().enumerate() {
+            let (siblings, path_root) = tree.auth_path(i);
+            assert_eq!(path_root, root, "auth_path root mismatch for leaf {}", i);
+            assert_eq!(siblings.len(), DEPTH, "wrong sibling count");
+
+            // Walk the path manually to verify
+            let mut current = *leaf;
+            let mut idx = i;
+            for sib in &siblings {
+                current = if idx & 1 == 1 {
+                    hash_merkle(sib, &current)
+                } else {
+                    hash_merkle(&current, sib)
+                };
+                idx /= 2;
+            }
+            assert_eq!(current, root, "manual path walk mismatch for leaf {}", i);
+        }
+    }
+
+    /// felt_to_dec for large values (hi != 0 path).
+    /// Covers the long-division big-integer code path.
+    #[test]
+    fn test_felt_to_dec_large_values() {
+        // Zero
+        assert_eq!(felt_to_dec(&ZERO), "0");
+
+        // Small value (hi == 0 fast path)
+        let mut small = ZERO;
+        small[0] = 42;
+        assert_eq!(felt_to_dec(&small), "42");
+
+        // u64 max
+        let mut u64max = ZERO;
+        u64max[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(felt_to_dec(&u64max), u64::MAX.to_string());
+
+        // Value requiring the big-integer path (hi != 0)
+        // 2^128 = value with byte[16] = 1, rest 0
+        let mut big = ZERO;
+        big[16] = 1;
+        let expected = "340282366920938463463374607431768211456"; // 2^128
+        assert_eq!(felt_to_dec(&big), expected);
+
+        // Near max felt252: 2^251 - 1 (all bits set in 251-bit range)
+        let mut max251 = [0xFF_u8; 32];
+        max251[31] = 0x07; // 251-bit truncation
+        let dec = felt_to_dec(&max251);
+        assert!(!dec.is_empty());
+        assert!(dec.len() > 70, "2^251-1 should have ~76 decimal digits, got {}", dec.len());
+    }
+
+    /// Detect with malformed ciphertext returns false (not panic).
+    /// Covers the early-return false path in detect().
+    #[test]
+    fn test_detect_malformed_ciphertext() {
+        let seed: [u8; 64] = [0x55; 64];
+        let (_, _, _, dk_d) = {
+            let (ekv, dkv) = kem_keygen_from_seed(&seed);
+            let (ekd, dkd) = kem_keygen_from_seed(&seed);
+            (ekv, dkv, ekd, dkd)
+        };
+        // Too short ct_d
+        let bad_enc = EncryptedNote {
+            ct_d: vec![0; 10], // wrong length — should be 1088
+            tag: 0, ct_v: vec![0; 1088], encrypted_data: vec![0; 1080],
+        };
+        assert!(!detect(&bad_enc, &dk_d), "malformed ct_d should return false, not panic");
+    }
+
+    /// decrypt_memo with malformed ciphertext returns None (not panic).
+    #[test]
+    fn test_decrypt_memo_malformed() {
+        let seed: [u8; 64] = [0x66; 64];
+        let (_, dk_v, _, _) = {
+            let (ekv, dkv) = kem_keygen_from_seed(&seed);
+            let (ekd, dkd) = kem_keygen_from_seed(&seed);
+            (ekv, dkv, ekd, dkd)
+        };
+        // Too short ct_v
+        let bad_enc = EncryptedNote {
+            ct_d: vec![0; 1088], tag: 0,
+            ct_v: vec![0; 10], // wrong length
+            encrypted_data: vec![0; 1080],
+        };
+        assert!(decrypt_memo(&bad_enc, &dk_v).is_none(), "malformed ct_v should return None");
+    }
+
+    /// Ledger transfer: mh_2 mismatch rejected.
+    /// Covers the mh_2 validation branch.
+    #[test]
+    fn test_attack_transfer_mh2_mismatch_rejected() {
+        let (mut ledger, _cm, nf, root, enc) = setup_with_note();
+        let cm_1 = random_felt();
+        let cm_2 = random_felt();
+        let mh_1 = memo_ct_hash(&enc);
+        let real_mh_2 = memo_ct_hash(&enc);
+
+        // Create a different encrypted note for enc_2
+        let seed: [u8; 64] = [0x77; 64];
+        let (ek, _) = kem_keygen_from_seed(&seed);
+        let fake_enc_2 = encrypt_note(100, &random_felt(), None, &ek, &ek);
+
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            felt_to_dec(&root), felt_to_dec(&nf),
+            felt_to_dec(&cm_1), felt_to_dec(&cm_2),
+            felt_to_dec(&mh_1), felt_to_dec(&real_mh_2), // proof has REAL mh_2
+        ];
+        let r = ledger.transfer(&TransferReq {
+            root, nullifiers: vec![nf], cm_1, cm_2,
+            enc_1: enc.clone(),
+            enc_2: fake_enc_2, // attacker swaps enc_2
+            proof: fake_stark(preimage),
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("memo_ct_hash_2 mismatch"));
+    }
+
+    /// Ledger unshield: zero inputs rejected.
+    #[test]
+    fn test_unshield_zero_inputs_rejected() {
+        let (mut ledger, _, _, root, _) = setup_with_note();
+        let r = ledger.unshield(&UnshieldReq {
+            root, nullifiers: vec![], v_pub: 100,
+            recipient: "alice".into(), cm_change: ZERO, enc_change: None,
+            proof: Proof::TrustMeBro,
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("bad nullifier count"));
+    }
+
+    /// Ledger: output_preimage too short for transfer.
+    #[test]
+    fn test_transfer_preimage_too_short_rejected() {
+        let (mut ledger, _, nf, root, enc) = setup_with_note();
+        let r = ledger.transfer(&TransferReq {
+            root, nullifiers: vec![nf],
+            cm_1: random_felt(), cm_2: random_felt(),
+            enc_1: enc.clone(), enc_2: enc.clone(),
+            proof: fake_stark(vec!["1".into(), "2".into()]), // way too short
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("too short"));
+    }
+
+    /// Shield with Stark proof: client_cm used instead of server-generated.
+    /// Covers the client_cm/client_enc branch in shield().
+    #[test]
+    fn test_shield_client_cm_used() {
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", 10000);
+
+        let cm = random_felt();
+        let sender_dec = felt_to_dec(&hash(b"alice"));
+        let seed: [u8; 64] = [0x88; 64];
+        let (ek, _) = kem_keygen_from_seed(&seed);
+        let enc = encrypt_note(500, &random_felt(), None, &ek, &ek);
+        let mh = memo_ct_hash(&enc);
+
+        let preimage = vec![
+            "1".into(), "0".into(), "0".into(), "0".into(),
+            "500".into(), felt_to_dec(&cm), sender_dec, felt_to_dec(&mh),
+        ];
+        let addr = PaymentAddress {
+            d_j: random_felt(), auth_root: random_felt(), nk_tag: random_felt(),
+            ek_v: vec![0; 1184], ek_d: vec![0; 1184],
+        };
+        let r = ledger.shield(&ShieldReq {
+            sender: "alice".into(), v: 500, address: addr, memo: None,
+            proof: fake_stark(preimage),
+            client_cm: cm,
+            client_enc: Some(enc),
+        });
+        assert!(r.is_ok(), "shield with matching client_cm should succeed: {:?}", r.err());
+        let resp = r.unwrap();
+        assert_eq!(resp.cm, cm, "ledger should use client_cm, not generate its own");
+    }
 }

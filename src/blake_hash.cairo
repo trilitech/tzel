@@ -96,7 +96,7 @@ fn blake2s_iv_nk_tag() -> Box<[u32; 8]> {
 }
 
 /// Owner-tag IV — "ownrSP__".
-/// Fuses ak and nk_tag into the commitment.
+/// Fuses auth_root and nk_tag into the commitment.
 fn blake2s_iv_owner() -> Box<[u32; 8]> {
     BoxTrait::new([
         0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
