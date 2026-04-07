@@ -216,8 +216,13 @@ pub fn unshield_sighash(root: &F, nullifiers: &[F], v_pub: u64, recipient: &F, c
     sh
 }
 
+/// Hash of all encrypted note data — binds the full on-chain note to the proof.
+/// Covers detection ciphertext, tag, viewing ciphertext, and encrypted payload.
+/// A relayer cannot swap any component without invalidating the hash.
 pub fn memo_ct_hash(enc: &EncryptedNote) -> F {
-    let mut buf = Vec::with_capacity(enc.ct_v.len() + enc.encrypted_data.len());
+    let mut buf = Vec::with_capacity(enc.ct_d.len() + 2 + enc.ct_v.len() + enc.encrypted_data.len());
+    buf.extend_from_slice(&enc.ct_d);
+    buf.extend_from_slice(&enc.tag.to_le_bytes());
     buf.extend_from_slice(&enc.ct_v);
     buf.extend_from_slice(&enc.encrypted_data);
     blake2s(b"memoSP__", &buf)
@@ -2138,6 +2143,42 @@ mod tests {
 
         assert_ne!(transfer_sh, unshield_sh,
             "transfer and unshield sighashes must differ due to circuit-type tags");
+    }
+
+    /// Regression: memo_ct_hash must cover detection data (ct_d + tag), not just
+    /// the viewing-key portion (ct_v + encrypted_data).
+    /// Bug: a relayer could swap ct_d/tag to redirect note detection to a different
+    /// server without invalidating the proof, because memo_ct_hash didn't cover them.
+    #[test]
+    fn test_regression_memo_ct_hash_covers_detection_data() {
+        let seed: [u8; 64] = [0x44; 64];
+        let (ek, _) = kem_keygen_from_seed(&seed);
+        let enc = encrypt_note(100, &random_felt(), None, &ek, &ek);
+        let original_hash = memo_ct_hash(&enc);
+
+        // Tamper with detection ciphertext (ct_d)
+        let mut tampered = enc.clone();
+        tampered.ct_d[0] ^= 0xFF;
+        assert_ne!(memo_ct_hash(&tampered), original_hash,
+            "changing ct_d must change memo_ct_hash");
+
+        // Tamper with detection tag
+        let mut tampered = enc.clone();
+        tampered.tag ^= 0xFFFF;
+        assert_ne!(memo_ct_hash(&tampered), original_hash,
+            "changing detection tag must change memo_ct_hash");
+
+        // Tamper with viewing ciphertext (ct_v)
+        let mut tampered = enc.clone();
+        tampered.ct_v[0] ^= 0xFF;
+        assert_ne!(memo_ct_hash(&tampered), original_hash,
+            "changing ct_v must change memo_ct_hash");
+
+        // Tamper with encrypted payload
+        let mut tampered = enc.clone();
+        tampered.encrypted_data[0] ^= 0xFF;
+        assert_ne!(memo_ct_hash(&tampered), original_hash,
+            "changing encrypted_data must change memo_ct_hash");
     }
 
 }
