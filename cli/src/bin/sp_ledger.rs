@@ -69,11 +69,11 @@ fn parse_felt_be_hex(s: &str) -> Result<F, String> {
 async fn fund_handler(
     State(st): State<AppState>,
     Json(req): Json<FundReq>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut ledger = st.ledger.lock().unwrap();
-    ledger.fund(&req.addr, req.amount);
+    ledger.fund(&req.addr, req.amount).map_err(err)?;
     eprintln!("[fund] {} += {}", req.addr, req.amount);
-    Json(serde_json::json!({"ok": true}))
+    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 async fn shield_handler(

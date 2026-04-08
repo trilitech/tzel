@@ -709,6 +709,13 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::{Path as AxumPath, State},
+        routing::get,
+        Json, Router,
+    };
+    use std::{sync::mpsc, thread};
+    use tokio::sync::oneshot;
 
     fn test_wallet(addr_counter: u32, legacy: Option<([u8; 64], [u8; 64])>) -> WalletFile {
         let mut master_sk = ZERO;
@@ -724,6 +731,120 @@ mod tests {
             notes: vec![],
             scanned: 0,
             wots_key_indices: std::collections::HashMap::new(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockLedgerState {
+        root: F,
+        siblings: Vec<F>,
+        auth_domain: F,
+    }
+
+    async fn mock_tree_handler(State(st): State<MockLedgerState>) -> Json<TreeInfoResp> {
+        Json(TreeInfoResp {
+            root: st.root,
+            size: 1,
+            depth: DEPTH,
+        })
+    }
+
+    async fn mock_tree_path_handler(
+        State(st): State<MockLedgerState>,
+        AxumPath(index): AxumPath<usize>,
+    ) -> Json<MerklePathResp> {
+        assert_eq!(index, 0, "test mock only serves note index 0");
+        Json(MerklePathResp {
+            siblings: st.siblings,
+            root: st.root,
+        })
+    }
+
+    async fn mock_config_handler(State(st): State<MockLedgerState>) -> Json<ConfigResp> {
+        Json(ConfigResp {
+            auth_domain: st.auth_domain,
+        })
+    }
+
+    fn spawn_mock_ledger(
+        root: F,
+        siblings: Vec<F>,
+        auth_domain: F,
+    ) -> (String, oneshot::Sender<()>, thread::JoinHandle<()>) {
+        let (addr_tx, addr_rx) = mpsc::sync_channel(1);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let handle = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(async move {
+                let state = MockLedgerState {
+                    root,
+                    siblings,
+                    auth_domain,
+                };
+                let app = Router::new()
+                    .route("/tree", get(mock_tree_handler))
+                    .route("/tree/path/{index}", get(mock_tree_path_handler))
+                    .route("/config", get(mock_config_handler))
+                    .with_state(state);
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind mock ledger");
+                let addr = listener.local_addr().expect("mock ledger addr");
+                addr_tx.send(addr).expect("send mock ledger addr");
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .expect("serve mock ledger");
+            });
+        });
+        let addr = addr_rx.recv().expect("receive mock ledger addr");
+        (format!("http://{}", addr), shutdown_tx, handle)
+    }
+
+    fn wallet_with_single_note(note_value: u64) -> (WalletFile, F) {
+        let mut w = test_wallet(1, None);
+        let acc = w.account();
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let (auth_root, _) = build_auth_tree(&ask_j);
+        let nk_sp = derive_nk_spend(&acc.nk, &d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
+        let otag = owner_tag(&auth_root, &nk_tg);
+        let rseed = random_felt();
+        let rcm = derive_rcm(&rseed);
+        let cm = commit(&d_j, note_value, &rcm, &otag);
+        w.notes.push(Note {
+            nk_spend: nk_sp,
+            nk_tag: nk_tg,
+            auth_root,
+            d_j,
+            v: note_value,
+            rseed,
+            cm,
+            index: 0,
+            addr_index: 0,
+        });
+        (w, cm)
+    }
+
+    fn sample_payment_address(seed_byte: u8) -> PaymentAddress {
+        let mut master_sk = ZERO;
+        master_sk[0] = seed_byte;
+        let acc = derive_account(&master_sk);
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let (auth_root, _) = build_auth_tree(&ask_j);
+        let nk_sp = derive_nk_spend(&acc.nk, &d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
+        let (ek_v, _, ek_d, _) = derive_kem_keys(&acc.incoming_seed, 0);
+        PaymentAddress {
+            d_j,
+            auth_root,
+            nk_tag: nk_tg,
+            ek_v: ek_v.to_bytes().to_vec(),
+            ek_d: ek_d.to_bytes().to_vec(),
         }
     }
 
@@ -844,6 +965,90 @@ mod tests {
         let err = ensure_path_matches_root(&actual, &expected, 7).unwrap_err();
         assert!(err.contains("stale Merkle path"));
         assert!(err.contains("tree index 7"));
+    }
+
+    #[test]
+    fn test_transfer_persists_wots_state_before_proving() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let recipient_path = dir.path().join("recipient.json");
+        let recipient_path_str = recipient_path.to_str().unwrap();
+
+        let (w, cm) = wallet_with_single_note(50);
+        save_wallet(wallet_path_str, &w).expect("wallet should save");
+        std::fs::write(
+            &recipient_path,
+            serde_json::to_string_pretty(&sample_payment_address(0x99)).unwrap(),
+        )
+        .expect("recipient address should save");
+
+        let mut tree = MerkleTree::new();
+        tree.append(cm);
+        let (siblings, root) = tree.auth_path(0);
+        let (ledger_url, shutdown_tx, handle) =
+            spawn_mock_ledger(root, siblings, default_auth_domain());
+
+        let pc = ProveConfig {
+            skip_proof: false,
+            reprove_bin: "/definitely/missing/reprove".into(),
+            executables_dir: "target/dev".into(),
+        };
+        let err = cmd_transfer(wallet_path_str, &ledger_url, recipient_path_str, 30, None, &pc)
+            .unwrap_err();
+        shutdown_tx.send(()).ok();
+        handle.join().unwrap();
+
+        assert!(
+            err.contains("reprove failed to start"),
+            "unexpected error: {}",
+            err
+        );
+        let loaded = load_wallet(wallet_path_str).expect("wallet should reload");
+        assert_eq!(loaded.addr_counter, 2, "change address reservation must persist");
+        assert_eq!(
+            loaded.wots_key_indices.get(&0),
+            Some(&1),
+            "consumed WOTS leaf must persist across proving failure"
+        );
+    }
+
+    #[test]
+    fn test_unshield_persists_wots_state_before_proving() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        let (w, cm) = wallet_with_single_note(50);
+        save_wallet(wallet_path_str, &w).expect("wallet should save");
+
+        let mut tree = MerkleTree::new();
+        tree.append(cm);
+        let (siblings, root) = tree.auth_path(0);
+        let (ledger_url, shutdown_tx, handle) =
+            spawn_mock_ledger(root, siblings, default_auth_domain());
+
+        let pc = ProveConfig {
+            skip_proof: false,
+            reprove_bin: "/definitely/missing/reprove".into(),
+            executables_dir: "target/dev".into(),
+        };
+        let err = cmd_unshield(wallet_path_str, &ledger_url, 30, "alice", &pc).unwrap_err();
+        shutdown_tx.send(()).ok();
+        handle.join().unwrap();
+
+        assert!(
+            err.contains("reprove failed to start"),
+            "unexpected error: {}",
+            err
+        );
+        let loaded = load_wallet(wallet_path_str).expect("wallet should reload");
+        assert_eq!(loaded.addr_counter, 2, "change address reservation must persist");
+        assert_eq!(
+            loaded.wots_key_indices.get(&0),
+            Some(&1),
+            "consumed WOTS leaf must persist across proving failure"
+        );
     }
 }
 
@@ -1080,6 +1285,11 @@ fn cmd_transfer(
             wots_key_indices.push(key_idx);
         }
 
+        // Persist consumed WOTS+ leaf reservations before handing witness material
+        // to the prover. If proving fails, the keys stay burned instead of being
+        // silently reused on retry.
+        save_wallet(path, &w)?;
+
         let total_fields = 3 + 8 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS * 2 + 14;
         args.push(felt_u64_to_hex(total_fields as u64));
         args.push(felt_u64_to_hex(n as u64));
@@ -1292,6 +1502,11 @@ fn cmd_unshield(
             wots_pks.push(pk);
             wots_key_indices.push(key_idx);
         }
+
+        // Persist consumed WOTS+ leaf reservations before handing witness material
+        // to the prover. If proving fails, the keys stay burned instead of being
+        // silently reused on retry.
+        save_wallet(path, &w)?;
 
         let total = 5 + 8 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS * 2 + 7;
         args.push(felt_u64_to_hex(total as u64));

@@ -1405,9 +1405,12 @@ impl Ledger {
         self.memos.push((cm, enc));
     }
 
-    pub fn fund(&mut self, addr: &str, amount: u64) {
+    pub fn fund(&mut self, addr: &str, amount: u64) -> Result<(), String> {
         let bal = self.balances.entry(addr.into()).or_default();
-        *bal = bal.saturating_add(amount);
+        *bal = bal
+            .checked_add(amount)
+            .ok_or_else(|| "public balance overflow".to_string())?;
+        Ok(())
     }
 
     pub fn shield(&mut self, req: &ShieldReq) -> Result<ShieldResp, String> {
@@ -1679,6 +1682,14 @@ impl Ledger {
             }
         }
 
+        let next_balance = self
+            .balances
+            .get(&req.recipient)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(req.v_pub)
+            .ok_or_else(|| "public balance overflow".to_string())?;
+
         let change_index = if req.cm_change != ZERO {
             let enc = req
                 .enc_change
@@ -1694,8 +1705,7 @@ impl Ledger {
         for nf in &req.nullifiers {
             self.nullifiers.insert(*nf);
         }
-        let bal = self.balances.entry(req.recipient.clone()).or_default();
-        *bal = bal.saturating_add(req.v_pub);
+        self.balances.insert(req.recipient.clone(), next_balance);
         self.snapshot_root();
 
         Ok(UnshieldResp { change_index })
@@ -4457,6 +4467,86 @@ mod tests {
             err.contains("length mismatch"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_fund_rejects_public_balance_overflow() {
+        let mut ledger = Ledger::new();
+        ledger.balances.insert("alice".into(), u64::MAX);
+
+        let err = ledger.fund("alice", 1).unwrap_err();
+        assert!(
+            err.contains("public balance overflow"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(ledger.balances.get("alice"), Some(&u64::MAX));
+    }
+
+    #[test]
+    fn test_unshield_rejects_public_balance_overflow() {
+        let mut ledger = Ledger::new();
+        ledger.balances.insert("alice".into(), u64::MAX);
+
+        let req = UnshieldReq {
+            root: ledger.tree.root(),
+            nullifiers: vec![random_felt()],
+            v_pub: 1,
+            recipient: "alice".into(),
+            cm_change: ZERO,
+            enc_change: None,
+            proof: Proof::TrustMeBro,
+        };
+
+        let err = ledger.unshield(&req).unwrap_err();
+        assert!(
+            err.contains("public balance overflow"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(ledger.balances.get("alice"), Some(&u64::MAX));
+        assert!(
+            !ledger.nullifiers.contains(&req.nullifiers[0]),
+            "overflowing unshield must not consume nullifiers"
+        );
+    }
+
+    #[test]
+    fn test_unshield_overflow_is_atomic_even_with_change_note() {
+        let mut ledger = Ledger::new();
+        ledger.balances.insert("alice".into(), u64::MAX);
+        let tree_size_before = ledger.tree.leaves.len();
+        let memo_count_before = ledger.memos.len();
+
+        let seed: [u8; 64] = [0xAB; 64];
+        let (ek_v, _, ek_d, _) = {
+            let (ekv, dkv) = kem_keygen_from_seed(&seed);
+            let (ekd, dkd) = kem_keygen_from_seed(&seed);
+            (ekv, dkv, ekd, dkd)
+        };
+        let enc_change = encrypt_note(1, &random_felt(), None, &ek_v, &ek_d);
+        let req = UnshieldReq {
+            root: ledger.tree.root(),
+            nullifiers: vec![random_felt()],
+            v_pub: 1,
+            recipient: "alice".into(),
+            cm_change: random_felt(),
+            enc_change: Some(enc_change),
+            proof: Proof::TrustMeBro,
+        };
+
+        let err = ledger.unshield(&req).unwrap_err();
+        assert!(
+            err.contains("public balance overflow"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(ledger.tree.leaves.len(), tree_size_before);
+        assert_eq!(ledger.memos.len(), memo_count_before);
+        assert!(
+            !ledger.nullifiers.contains(&req.nullifiers[0]),
+            "overflowing unshield must not consume nullifiers"
         );
     }
 }
