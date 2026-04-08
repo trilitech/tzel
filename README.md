@@ -49,7 +49,7 @@ scarb build
 ./bench.sh
 ```
 
-> **WARNING:** Running the ledger without `--reprove-bin` starts it in `--trust-me-bro` mode, which accepts transactions without verifying STARK proofs. This is for development only — never use it for real value.
+> **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). `--trust-me-bro` is never appropriate for real value.
 
 ## Architecture
 

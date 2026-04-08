@@ -11,11 +11,14 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 use starkprivacy_reprover::custom_circuit::ProofBundle;
-use starkprivacy_reprover::{prove_with_args_file, prove_single_level};
+use starkprivacy_reprover::{prove_single_level, prove_with_args_file};
 use tracing_subscriber::fmt;
 
 #[derive(Parser)]
-#[command(name = "reprove", about = "Generate privacy proofs for StarkPrivacy executables")]
+#[command(
+    name = "reprove",
+    about = "Generate privacy proofs for StarkPrivacy executables"
+)]
 struct Cli {
     /// Path to a .executable.json file
     executable: PathBuf,
@@ -83,10 +86,14 @@ fn main() -> Result<()> {
         let prove_ms = t_prove.elapsed().as_millis();
         let peak_mem_kb = get_peak_memory_kb();
         eprintln!("Prove: {}ms, Proof: {} bytes", prove_ms, compressed.len());
-        if let Some(mem) = peak_mem_kb { eprintln!("Peak RSS: {:.1} MB", mem as f64 / 1024.0); }
+        if let Some(mem) = peak_mem_kb {
+            eprintln!("Peak RSS: {:.1} MB", mem as f64 / 1024.0);
+        }
         println!("prove_ms={}", prove_ms);
         println!("proof_zstd_bytes={}", compressed.len());
-        if let Some(mem) = peak_mem_kb { println!("peak_rss_kb={}", mem); }
+        if let Some(mem) = peak_mem_kb {
+            println!("peak_rss_kb={}", mem);
+        }
     } else {
         eprintln!("Running recursive prove...");
         let t_prove = Instant::now();
@@ -95,10 +102,21 @@ fn main() -> Result<()> {
         let proof_size = proof_output.proof.len();
         let peak_mem_kb = get_peak_memory_kb();
 
-        eprintln!("Cairo: {}ms, Circuit: {}ms, Total: {}ms, Verify: {}ms",
-            proof_output.cairo_prove_ms, proof_output.circuit_prove_ms, prove_ms, proof_output.verify_ms);
-        eprintln!("Proof: {} bytes ({:.1} KB)", proof_size, proof_size as f64 / 1024.0);
-        if let Some(mem) = peak_mem_kb { eprintln!("Peak RSS: {:.1} MB", mem as f64 / 1024.0); }
+        eprintln!(
+            "Cairo: {}ms, Circuit: {}ms, Total: {}ms, Verify: {}ms",
+            proof_output.cairo_prove_ms,
+            proof_output.circuit_prove_ms,
+            prove_ms,
+            proof_output.verify_ms
+        );
+        eprintln!(
+            "Proof: {} bytes ({:.1} KB)",
+            proof_size,
+            proof_size as f64 / 1024.0
+        );
+        if let Some(mem) = peak_mem_kb {
+            eprintln!("Peak RSS: {:.1} MB", mem as f64 / 1024.0);
+        }
 
         // Write proof bundle (JSON with proof + output_preimage)
         if let Some(path) = cli.output {
@@ -115,7 +133,9 @@ fn main() -> Result<()> {
         println!("verify_ms={}", proof_output.verify_ms);
         println!("proof_bytes={}", proof_size);
         println!("output_preimage_len={}", proof_output.output_preimage.len());
-        if let Some(mem) = peak_mem_kb { println!("peak_rss_kb={}", mem); }
+        if let Some(mem) = peak_mem_kb {
+            println!("peak_rss_kb={}", mem);
+        }
     }
 
     Ok(())

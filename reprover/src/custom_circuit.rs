@@ -52,8 +52,8 @@ use std::time::Instant;
 use anyhow::{Result, anyhow};
 use cairo_air::PreProcessedTraceVariant;
 use cairo_air::flat_claims::FlatClaim;
-use circuit_air::verify::CircuitConfig;
 use circuit_air::statement::INTERACTION_POW_BITS as CIRCUIT_INTERACTION_POW_BITS;
+use circuit_air::verify::CircuitConfig;
 use circuit_cairo_air::all_components::all_components;
 use circuit_cairo_air::preprocessed_columns::PREPROCESSED_COLUMNS_ORDER;
 use circuit_cairo_air::statement::MEMORY_VALUES_LIMBS;
@@ -67,11 +67,13 @@ use circuit_prover::prover::{
     prepare_circuit_proof_for_circuit_verifier, prove_circuit_with_precompute,
 };
 use circuit_serialize::serialize::CircuitSerialize;
+use circuits::blake::HashValue;
+use circuits::ivalue::IValue;
 use circuits_stark_verifier::empty_component::EmptyComponent;
 use circuits_stark_verifier::proof::ProofConfig;
-use privacy_circuit_verify::get_privacy_bootloader_program;
+use circuits_stark_verifier::proof_from_stark_proof::pack_into_qm31s;
+use privacy_circuit_verify::{compute_privacy_bootloader_output, get_privacy_bootloader_program};
 use starknet_types_core::felt::Felt;
-use starknet_types_core::hash::Blake2Felt252;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::QM31;
 use stwo::core::fri::FriConfig;
@@ -105,7 +107,11 @@ fn build_proof_config_from_enable_bits(enable_bits: &[bool]) -> ProofConfig {
         .into_iter()
         .zip(enable_bits.iter())
         .map(|((_name, comp), &enabled)| {
-            if enabled { comp } else { Box::new(EmptyComponent {}) as _ }
+            if enabled {
+                comp
+            } else {
+                Box::new(EmptyComponent {}) as _
+            }
         })
         .collect();
     ProofConfig::from_components(
@@ -166,8 +172,22 @@ const CUSTOM_PROVER_PARAMS: ProverParameters = ProverParameters {
 /// of Felt values. This function hashes them with Blake2s to produce the
 /// 28-limb M31 representation that the circuit embeds as public data.
 fn compute_output(output_preimage: &[Felt]) -> [M31; MEMORY_VALUES_LIMBS] {
-    let output = Blake2Felt252::encode_felt252_data_and_calc_blake_hash(output_preimage);
-    Felt252::from(output).get_limbs()
+    compute_privacy_bootloader_output(output_preimage)
+}
+
+fn qm31_to_m31s(q: QM31) -> Vec<u32> {
+    vec![q.0.0.0, q.0.1.0, q.1.0.0, q.1.1.0]
+}
+
+fn compute_output_hash_values(output_preimage: &[Felt]) -> Vec<u32> {
+    let outputs = compute_output(output_preimage);
+    let output_qm31s = pack_into_qm31s(outputs.into_iter());
+    let output_hash: HashValue<QM31> =
+        QM31::blake(output_qm31s.as_slice(), output_qm31s.len() * 16);
+    vec![output_hash.0, output_hash.1]
+        .into_iter()
+        .flat_map(qm31_to_m31s)
+        .collect()
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -259,22 +279,27 @@ impl ProofBundle {
     pub fn verify(&self) -> Result<()> {
         use circuit_air::verify::{CircuitConfig, CircuitPublicData, verify_circuit};
         use circuit_serialize::deserialize::deserialize_proof_with_config;
-        use circuits::blake::HashValue;
         use circuits_stark_verifier::proof::ProofConfig;
-        use stwo::core::fields::m31::M31;
         use stwo::core::fields::qm31::QM31;
 
-        let meta = self.verify_meta.as_ref()
+        let meta = self
+            .verify_meta
+            .as_ref()
             .ok_or_else(|| anyhow!("proof bundle missing verify_meta"))?;
 
         // ── Step 0: Bind output_preimage to the verified public outputs ──
-        // The STARK proof authenticates public_output_values (an M31 hash).
-        // We must verify that output_preimage hashes to the same values,
-        // otherwise the ledger could be tricked into using tampered outputs.
+        // The first two QM31 public outputs are the output hash derived from
+        // the bootloader output preimage. If these do not match, the ledger
+        // is interpreting attacker-chosen outputs that were not authenticated
+        // by the proof.
         let preimage_felts = self.output_preimage_felts();
-        let recomputed = compute_output(&preimage_felts);
-        let expected_m31s: Vec<u32> = recomputed.iter().map(|m| m.0).collect();
-        if expected_m31s != meta.public_output_values {
+        let expected_output_hash_values = compute_output_hash_values(&preimage_felts);
+        if meta.public_output_values.len() < expected_output_hash_values.len() {
+            return Err(anyhow!("verify_meta public_output_values too short"));
+        }
+        if meta.public_output_values[..expected_output_hash_values.len()]
+            != expected_output_hash_values
+        {
             return Err(anyhow!(
                 "output_preimage does not match verified public_output_values — \
                  the preimage may have been tampered with"
@@ -303,7 +328,12 @@ impl ProofBundle {
 
         // Helper to reconstruct QM31 from 4 u32 M31 values
         let qm31_from = |vals: &[u32]| -> QM31 {
-            QM31::from_m31(M31::from(vals[0]), M31::from(vals[1]), M31::from(vals[2]), M31::from(vals[3]))
+            QM31::from_m31(
+                M31::from(vals[0]),
+                M31::from(vals[1]),
+                M31::from(vals[2]),
+                M31::from(vals[3]),
+            )
         };
 
         // Reconstruct CircuitConfig
@@ -321,24 +351,31 @@ impl ProofBundle {
             },
             output_addresses: meta.output_addresses.clone(),
             n_blake_gates: meta.n_blake_gates,
-            preprocessed_column_ids: meta.preprocessed_column_ids.iter()
-                .map(|s| stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId {
-                    id: s.clone().into()
-                }).collect(),
+            preprocessed_column_ids: meta
+                .preprocessed_column_ids
+                .iter()
+                .map(
+                    |s| stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId {
+                        id: s.clone().into(),
+                    },
+                )
+                .collect(),
             preprocessed_root: HashValue(qm31_from(&pr[0..4]), qm31_from(&pr[4..8])),
         };
 
         // Reconstruct CircuitPublicData
         let public_data = CircuitPublicData {
-            output_values: meta.public_output_values.chunks(4)
+            output_values: meta
+                .public_output_values
+                .chunks(4)
                 .map(|c| qm31_from(c))
                 .collect(),
         };
 
         // Decompress and deserialize proof
         let compressed = self.proof_bytes();
-        let proof_bytes = zstd::decode_all(&compressed[..])
-            .map_err(|e| anyhow!("zstd decompress: {e}"))?;
+        let proof_bytes =
+            zstd::decode_all(&compressed[..]).map_err(|e| anyhow!("zstd decompress: {e}"))?;
         let mut data = proof_bytes.as_slice();
         let proof = deserialize_proof_with_config(&mut data, &proof_config)
             .map_err(|e| anyhow!("deserialize proof: {e}"))?;
@@ -380,7 +417,9 @@ pub fn custom_recursive_prove(
     // Build the preprocessed trace (static lookup tables shared by all proofs).
     info!("Preparing Cairo preprocessed trace");
     let cairo_preprocessed_trace = Arc::new(
-        CUSTOM_PROVER_PARAMS.preprocessed_trace.to_preprocessed_trace(),
+        CUSTOM_PROVER_PARAMS
+            .preprocessed_trace
+            .to_preprocessed_trace(),
     );
     let cairo_lifting = CAIRO_PCS_CONFIG.lifting_log_size.unwrap();
     let twiddles = SimdBackend::precompute_twiddles(
@@ -422,7 +461,10 @@ pub fn custom_recursive_prove(
     // actual proof structure — this is what makes our circuit reprover
     // work for any Cairo program, not just a hardcoded component set.
 
-    let FlatClaim { component_enable_bits, .. } = cairo_proof.claim.flatten_claim();
+    let FlatClaim {
+        component_enable_bits,
+        ..
+    } = cairo_proof.claim.flatten_claim();
     info!(
         "Proof has {} enabled components out of {}",
         component_enable_bits.iter().filter(|&&b| b).count(),
@@ -437,7 +479,10 @@ pub fn custom_recursive_prove(
     let sampled = &cairo_proof.extended_stark_proof.proof.sampled_values;
     let config_cols: Vec<usize> = cairo_proof_config.n_columns_per_trace().to_vec();
     let proof_cols: Vec<usize> = sampled.0.iter().map(|t| t.len()).collect();
-    assert_eq!(config_cols, proof_cols, "Column count mismatch between config and proof");
+    assert_eq!(
+        config_cols, proof_cols,
+        "Column count mismatch between config and proof"
+    );
 
     // ── Build the Cairo verifier configuration ───────────────────────
     // The CairoVerifierConfig tells the circuit what program was executed,
@@ -447,8 +492,7 @@ pub fn custom_recursive_prove(
     let mut program = vec![];
     for value in bootloader_program.iter_data() {
         program.push(
-            Felt252::from(value.get_int().ok_or_else(|| anyhow!("bad program data"))?)
-                .get_limbs(),
+            Felt252::from(value.get_int().ok_or_else(|| anyhow!("bad program data"))?).get_limbs(),
         );
     }
     let cairo_lifting_log_size = cairo_proof_config.fri.log_evaluation_domain_size() as u32;
@@ -464,10 +508,8 @@ pub fn custom_recursive_prove(
     // verifier can process: Merkle roots, OODS evaluations, FRI layers.
 
     info!("Preparing Cairo proof for circuit verifier");
-    let (proof, public_data) = prepare_cairo_proof_for_circuit_verifier(
-        &cairo_proof,
-        &cairo_verifier_config.proof_config,
-    );
+    let (proof, public_data) =
+        prepare_cairo_proof_for_circuit_verifier(&cairo_proof, &cairo_verifier_config.proof_config);
 
     // ── Build and evaluate the circuit ──���────────────────────────────
     // The circuit is a fixed-topology computation that verifies the Cairo
@@ -477,17 +519,15 @@ pub fn custom_recursive_prove(
     info!("Building circuit verifier context");
     let (public_claim, _outputs, _program) = public_data.pack_into_u32s();
     let outputs = compute_output(&output_preimage);
-    let mut context = build_fixed_cairo_circuit(
-        &cairo_verifier_config,
-        proof,
-        public_claim,
-        vec![outputs],
-    );
+    let mut context =
+        build_fixed_cairo_circuit(&cairo_verifier_config, proof, public_claim, vec![outputs]);
 
     // The circuit context now holds the full execution trace of the
     // verifier. Check that all constraints are satisfied.
     if !context.is_circuit_valid() {
-        return Err(anyhow!("Circuit verification failed — the Cairo proof may be invalid"));
+        return Err(anyhow!(
+            "Circuit verification failed — the Cairo proof may be invalid"
+        ));
     }
 
     // ── Add ZK blinding ──────────────────────────────────────────────
@@ -511,23 +551,28 @@ pub fn custom_recursive_prove(
     let preprocessed_circuit = {
         // Build the circuit topology with NoValue types to get the
         // preprocessed trace (lookup tables for the circuit itself).
-        let mut nv = circuit_cairo_air::verify::build_cairo_verifier_circuit(&cairo_verifier_config);
+        let mut nv =
+            circuit_cairo_air::verify::build_cairo_verifier_circuit(&cairo_verifier_config);
         add_zk_blinding(&mut nv, [0; 32], CIRCUIT_FRI_CONFIG.n_queries);
         PreprocessedCircuit::preprocess_circuit(&mut nv)
     };
     let circuit_trace_log_size = preprocessed_circuit.params.trace_log_size;
     let circuit_lifting = circuit_trace_log_size + CIRCUIT_FRI_CONFIG.log_blowup_factor;
-    info!("Circuit trace log_size: {}, lifting: {}", circuit_trace_log_size, circuit_lifting);
+    info!(
+        "Circuit trace log_size: {}, lifting: {}",
+        circuit_trace_log_size, circuit_lifting
+    );
 
     // The circuit may need a larger domain than the Cairo proof.
     // Recompute twiddles for the maximum of both.
     let max_domain = max(cairo_lifting, circuit_lifting);
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(max_domain).circle_domain().half_coset,
-    );
+    let twiddles =
+        SimdBackend::precompute_twiddles(CanonicCoset::new(max_domain).circle_domain().half_coset);
 
     // Commit to the circuit's preprocessed trace.
-    let circuit_pp_trace = preprocessed_circuit.preprocessed_trace.get_trace::<SimdBackend>();
+    let circuit_pp_trace = preprocessed_circuit
+        .preprocessed_trace
+        .get_trace::<SimdBackend>();
     let circuit_pp_polys = SimdBackend::interpolate_columns(circuit_pp_trace, &twiddles);
     let circuit_pp_tree = CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
         circuit_pp_polys,
@@ -587,11 +632,7 @@ pub fn custom_recursive_prove(
 
     // ── Capture verification metadata for standalone verification ────
     let verify_meta = {
-        use stwo::core::fields::m31::M31;
         use stwo::core::fields::qm31::QM31;
-        let qm31_to_m31s = |q: QM31| -> Vec<u32> {
-            vec![q.0.0.0, q.0.1.0, q.1.0.0, q.1.1.0]
-        };
         let hash_to_m31s = |h: &circuits::blake::HashValue<QM31>| -> Vec<u32> {
             let mut v = qm31_to_m31s(h.0);
             v.extend(qm31_to_m31s(h.1));
@@ -605,7 +646,9 @@ pub fn custom_recursive_prove(
             n_trace_columns: circuit_proof_config.n_trace_columns,
             n_interaction_columns: circuit_proof_config.n_interaction_columns,
             trace_columns_per_component: circuit_proof_config.trace_columns_per_component.clone(),
-            interaction_columns_per_component: circuit_proof_config.interaction_columns_per_component.clone(),
+            interaction_columns_per_component: circuit_proof_config
+                .interaction_columns_per_component
+                .clone(),
             cumulative_sum_columns: circuit_proof_config.cumulative_sum_columns.clone(),
             n_components: circuit_proof_config.n_components,
             fri_log_trace_size: circuit_proof_config.fri.log_trace_size,
@@ -617,18 +660,27 @@ pub fn custom_recursive_prove(
             // CircuitConfig
             circuit_pow_bits: circuit_config.config.pow_bits,
             circuit_fri_log_blowup: circuit_config.config.fri_config.log_blowup_factor,
-            circuit_fri_log_last_layer: circuit_config.config.fri_config.log_last_layer_degree_bound,
+            circuit_fri_log_last_layer: circuit_config
+                .config
+                .fri_config
+                .log_last_layer_degree_bound,
             circuit_fri_n_queries: circuit_config.config.fri_config.n_queries,
             circuit_fri_fold_step: circuit_config.config.fri_config.fold_step,
             circuit_lifting: circuit_config.config.lifting_log_size,
             output_addresses: circuit_config.output_addresses.clone(),
             n_blake_gates: circuit_config.n_blake_gates,
-            preprocessed_column_ids: circuit_config.preprocessed_column_ids.iter()
-                .map(|id| id.id.to_string()).collect(),
+            preprocessed_column_ids: circuit_config
+                .preprocessed_column_ids
+                .iter()
+                .map(|id| id.id.to_string())
+                .collect(),
             preprocessed_root: hash_to_m31s(&circuit_config.preprocessed_root),
             // CircuitPublicData
-            public_output_values: circuit_public_data.output_values.iter()
-                .flat_map(|q| qm31_to_m31s(*q)).collect(),
+            public_output_values: circuit_public_data
+                .output_values
+                .iter()
+                .flat_map(|q| qm31_to_m31s(*q))
+                .collect(),
         }
     };
 
@@ -639,7 +691,8 @@ pub fn custom_recursive_prove(
     cairo_air::verifier::verify_cairo_ex::<Blake2sM31MerkleChannel>(
         cairo_proof.into(),
         CUSTOM_PROVER_PARAMS.include_all_preprocessed_columns,
-    ).map_err(|e| anyhow!("{e}"))?;
+    )
+    .map_err(|e| anyhow!("{e}"))?;
 
     info!("Verifying circuit proof");
     use circuit_air::verify::verify_circuit;

@@ -39,7 +39,10 @@ pub fn prove(executable_path: &PathBuf, args: Option<Vec<Felt>>) -> Result<Custo
 }
 
 /// Same as `prove` but takes a BigUintAsHex args file path directly.
-pub fn prove_with_args_file(executable_path: &PathBuf, args_file: Option<PathBuf>) -> Result<CustomProofOutput> {
+pub fn prove_with_args_file(
+    executable_path: &PathBuf,
+    args_file: Option<PathBuf>,
+) -> Result<CustomProofOutput> {
     let (prover_input, output_preimage) = run_privacy_bootloader(executable_path, None, args_file)?;
     custom_circuit::custom_recursive_prove(prover_input, output_preimage)
 }
@@ -66,18 +69,15 @@ pub fn run_privacy_bootloader(
     // Convert Vec<Felt> to a BigUintAsHex temp file, or use provided file directly.
     let args_temp = if let Some(felts) = args {
         let file = NamedTempFile::new()?;
-        let hex_args: Vec<String> = felts
-            .iter()
-            .map(|f| format!("{:#x}", f))
-            .collect();
+        let hex_args: Vec<String> = felts.iter().map(|f| format!("{:#x}", f)).collect();
         serde_json::to_writer(&file, &hex_args)?;
         Some(file)
     } else {
         None
     };
     let args_path = args_file_path.or_else(|| args_temp.as_ref().map(|f| f.path().to_path_buf()));
-    let task = create_cairo1_program_task(executable_path, None, args_path)
-        .map_err(|e| anyhow!("{e}"))?;
+    let task =
+        create_cairo1_program_task(executable_path, None, args_path).map_err(|e| anyhow!("{e}"))?;
 
     let task_spec = TaskSpec {
         task: Rc::new(task),
@@ -96,8 +96,7 @@ pub fn run_privacy_bootloader(
         output_preimage_dump_path: output_preimage_path.clone(),
     };
 
-    let bootloader_program = get_privacy_bootloader_program()
-        .map_err(|e| anyhow!("{e}"))?;
+    let bootloader_program = get_privacy_bootloader_program().map_err(|e| anyhow!("{e}"))?;
 
     let runner = cairo_run_program(
         &bootloader_program,

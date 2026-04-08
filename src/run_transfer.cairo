@@ -2,7 +2,8 @@
 ///
 /// Argument layout (flattened felt252 array):
 ///   [0]  N
-///   [1]  root
+///   [1]  auth_domain
+///   [2]  root
 ///   Then per input (N times):
 ///     nf, nk_spend, auth_root, auth_index,
 ///     d_j, v, rseed, cm_path_idx
@@ -24,6 +25,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let mut pos: u32 = 0;
 
     let n: u32 = (*args.at(pos)).try_into().unwrap(); pos += 1;
+    let auth_domain = *args.at(pos); pos += 1;
     let root = *args.at(pos); pos += 1;
 
     // Per-input scalar fields
@@ -90,6 +92,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     assert(pos == args.len(), 'unexpected trailing args');
 
     transfer::verify(
+        auth_domain,
         root,
         nf_list.span(),
         cm_1, cm_2,

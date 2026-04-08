@@ -1,7 +1,7 @@
 /// Unshield circuit: N→withdrawal + optional change (1 ≤ N ≤ 16).
 ///
 /// # Public outputs
-///   [root, nf_0..nf_{N-1}, v_pub, recipient, cm_change, memo_ct_hash_change]
+///   [auth_domain, root, nf_0..nf_{N-1}, v_pub, recipient, cm_change, memo_ct_hash_change]
 ///
 /// # Spend authorization
 ///   WOTS+ w=4 signature verification inside the STARK, bound to the sighash.
@@ -15,6 +15,7 @@ const WOTS_CHAINS: u32 = 133;
 
 pub fn verify(
     // --- public ---
+    auth_domain: felt252,
     root: felt252,
     nf_list: Span<felt252>,
     v_pub: u64,
@@ -57,7 +58,8 @@ pub fn verify(
 
     // ── Compute sighash from public outputs ─────────────────────────
     // Circuit-type tag 0x02 prevents cross-circuit replay.
-    let mut sighash = hash::sighash_fold(0x02, root);
+    let mut sighash = hash::sighash_fold(0x02, auth_domain);
+    sighash = hash::sighash_fold(sighash, root);
     let mut si: u32 = 0;
     while si < n {
         sighash = hash::sighash_fold(sighash, *nf_list.at(si));
@@ -153,7 +155,7 @@ pub fn verify(
     assert(sum_in == sum_out, 'unshield: balance mismatch');
 
     // ── Public outputs ───────────────────────────────────────────────
-    let mut outputs: Array<felt252> = array![root];
+    let mut outputs: Array<felt252> = array![auth_domain, root];
     let mut j: u32 = 0;
     while j < n { outputs.append(*nf_list.at(j)); j += 1; };
     outputs.append(v_pub.into());

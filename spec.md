@@ -159,7 +159,7 @@ Consumes N private notes and creates exactly 2 new private notes. Handles splits
 
 **N is not private.** The number of published nullifiers reveals the input count. This is inherent to per-input nullifier publication.
 
-**Public outputs:** `[root, nf_0..nf_{N-1}, cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2]`
+**Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2]`
 
 WOTS+ signature verification happens inside the STARK. No auth leaves, public keys, or signatures appear in the public outputs.
 
@@ -187,7 +187,7 @@ WOTS+ signature verification happens inside the STARK. No auth leaves, public ke
 
 Consumes N private notes, releases `v_pub` to a public address, and optionally creates one private change note.
 
-**Public outputs:** `[root, nf_0..nf_{N-1}, v_pub, recipient, cm_change, memo_ct_hash_change]`
+**Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, v_pub, recipient, cm_change, memo_ct_hash_change]`
 
 `cm_change` and `memo_ct_hash_change` are 0 if no change output.
 
@@ -213,6 +213,10 @@ The circuit proves constraints over private inputs. The on-chain contract enforc
 ### Root validation (all spending transactions)
 
 The contract maintains an append-only set of historical Merkle roots (anchors). For every transfer or unshield, the contract MUST verify that `root` (from the proof's public outputs) is a member of this set. Rejection of unknown roots prevents an attacker from constructing a fake tree containing self-chosen notes and "spending" them with a valid proof against that fake root.
+
+### Authorization-domain validation (all spending transactions)
+
+The contract or verifier environment MUST verify that `auth_domain` (from the proof's public outputs) equals the deployment's configured spend-authorization domain. Rejection of mismatched domains prevents replay of a valid spend authorization onto a mirrored deployment, fork, or verifier migration that shares the same Merkle root history.
 
 ### Global nullifier uniqueness (all spending transactions)
 
@@ -244,15 +248,17 @@ The WOTS+ signature inside the STARK binds to the transaction's public outputs. 
 
 ```
 // Transfer (type_tag = 0x01):
-sighash = fold(0x01, root, nf_0, ..., nf_{N-1}, cm_1, cm_2, mh_1, mh_2)
+sighash = fold(0x01, auth_domain, root, nf_0, ..., nf_{N-1}, cm_1, cm_2, mh_1, mh_2)
 
 // Unshield (type_tag = 0x02):
-sighash = fold(0x02, root, nf_0, ..., nf_{N-1}, v_pub, recipient, cm_change, mh_change)
+sighash = fold(0x02, auth_domain, root, nf_0, ..., nf_{N-1}, v_pub, recipient, cm_change, mh_change)
 ```
 
-The circuit-type tag prevents cross-circuit replay (a transfer signature cannot be used for an unshield). Nullifier uniqueness prevents replay on the same chain. Cross-chain replay prevention relies on distinct Merkle tree roots across deployments.
+`auth_domain` is a deployment-specific public input/output chosen by the verifier environment and enforced by the contract or ledger. It MUST uniquely identify the deployment context for spend authorizations. A practical derivation is `H(chain_id || contract_addr || verifier_or_program_id || deployment_salt)`, encoded canonically as a felt252.
 
-**Out of scope:** `chain_id`, `contract_addr`, `program_hash`, `expiry`, `nonce` are not included in the sighash. Cross-chain replay is prevented by distinct Merkle tree roots across deployments — an authorization signed against one chain's root is invalid on another chain unless both chains share identical tree state. The edge case of forked chains with identical state is accepted as a deployment concern, not a protocol concern. Implementations that deploy on multiple chains sharing state MUST add a chain discriminator as a circuit public input.
+The circuit-type tag prevents cross-circuit replay (a transfer signature cannot be used for an unshield). `auth_domain` prevents replay across mirrored deployments, forks, or verifier migrations that would otherwise share the same Merkle root history. Nullifier uniqueness still prevents replay of an already-consumed authorization on the same deployment.
+
+**Still out of scope:** `expiry` and per-transaction `nonce` are not currently included in the sighash. They remain higher-level anti-withholding / anti-latency controls, not part of the base spend authorization proof.
 
 ### Change output handling (unshield)
 
@@ -267,7 +273,7 @@ The contract appends commitments to the tree in sequential order (each new commi
 1. User constructs the transaction, computing the WOTS+ signature over the sighash with `sk_i` for each input.
 2. User gives the prover per-input: `(nk_spend_j, auth_root_j, wots_sig_i, auth_tree_path_i, d_j, v, rseed, commitment_tree_path, pos)`, plus output data including `auth_root` and `nk_tag` for output notes.
 3. Prover generates the STARK proof (expensive, ~30-50 seconds). The WOTS+ signature is verified inside the circuit.
-4. Prover returns proof to user. Public outputs contain only `[root, nullifiers, commitments, memo hashes]` — no auth leaves, public keys, or signatures.
+4. Prover returns proof to user. Public outputs contain only `[auth_domain, root, nullifiers, commitments, memo hashes]` — no auth leaves, public keys, or signatures.
 5. Transaction (proof + note data) submitted on-chain. No separate signatures or public keys needed.
 
 The prover sees `nk_spend_j` (per-address nullifier key) and the WOTS+ signature, but NOT `ask_j` or any WOTS+ secret key. The prover:
@@ -358,7 +364,7 @@ note_data         —  3.2 KB    1 output note
 
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
-public_outputs    — (N+5)*32 B  [root, nf_0..nf_{N-1}, cm_1, cm_2, mh_1, mh_2]
+public_outputs    — (N+6)*32 B  [auth_domain, root, nf_0..nf_{N-1}, cm_1, cm_2, mh_1, mh_2]
 note_data         —  6.4 KB    2 output notes
                   ----------
                   ~301 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
@@ -370,7 +376,7 @@ For a typical N=2 transfer: ~302 KB total.
 
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
-public_outputs    — (N+5)*32 B  [root, nf_0..nf_{N-1}, v_pub, recipient, cm_change, mh_change]
+public_outputs    — (N+6)*32 B  [auth_domain, root, nf_0..nf_{N-1}, v_pub, recipient, cm_change, mh_change]
 note_data         — 0-3.2 KB   0 or 1 change note
                   ----------
                   ~295-299 KB + 32N B  (no signatures — WOTS+ verified inside STARK)

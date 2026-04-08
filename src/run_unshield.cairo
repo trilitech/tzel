@@ -2,9 +2,10 @@
 ///
 /// Argument layout (flattened felt252 array):
 ///   [0]  N
-///   [1]  root
-///   [2]  v_pub
-///   [3]  recipient
+///   [1]  auth_domain
+///   [2]  root
+///   [3]  v_pub
+///   [4]  recipient
 ///   Then per input (N times):
 ///     nf, nk_spend, auth_root, auth_index,
 ///     d_j, v, rseed, cm_path_idx
@@ -24,6 +25,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let mut pos: u32 = 0;
 
     let n: u32 = (*args.at(pos)).try_into().unwrap(); pos += 1;
+    let auth_domain = *args.at(pos); pos += 1;
     let root = *args.at(pos); pos += 1;
     let v_pub: u64 = (*args.at(pos)).try_into().unwrap(); pos += 1;
     let recipient = *args.at(pos); pos += 1;
@@ -80,6 +82,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     assert(pos == args.len(), 'unexpected trailing args');
 
     unshield::verify(
+        auth_domain,
         root,
         nf_list.span(),
         v_pub,

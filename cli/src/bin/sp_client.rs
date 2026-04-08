@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
 use ml_kem::KeyExport;
+use serde::{Deserialize, Serialize};
 use starkprivacy_cli::*;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -112,8 +112,7 @@ impl WalletFile {
             let Some((v, rseed, _memo)) = decrypt_memo(&nm.enc, &dk_v_j) else {
                 continue;
             };
-            if let Some(note) = self.recover_note_for_address(&acc, j, v, rseed, nm.cm, nm.index)
-            {
+            if let Some(note) = self.recover_note_for_address(&acc, j, v, rseed, nm.cm, nm.index) {
                 return Some(note);
             }
         }
@@ -155,8 +154,12 @@ impl WalletFile {
 
     /// Select notes to cover at least `amount`. Returns indices into self.notes.
     fn select_notes(&self, amount: u64) -> Result<Vec<usize>, String> {
-        let mut indexed: Vec<(usize, u64)> =
-            self.notes.iter().enumerate().map(|(i, n)| (i, n.v)).collect();
+        let mut indexed: Vec<(usize, u64)> = self
+            .notes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (i, n.v))
+            .collect();
         indexed.sort_by(|a, b| b.1.cmp(&a.1)); // largest first
         let mut sum = 0u128;
         let mut selected = vec![];
@@ -331,7 +334,9 @@ impl ProveConfig {
     fn make_proof(&self, circuit: &str, args: &[String]) -> Result<Proof, String> {
         if self.skip_proof {
             eprintln!("WARNING: --trust-me-bro is set. Skipping STARK proof generation.");
-            eprintln!("WARNING: Transaction has NO cryptographic guarantee. DO NOT use in production.");
+            eprintln!(
+                "WARNING: Transaction has NO cryptographic guarantee. DO NOT use in production."
+            );
             Ok(Proof::TrustMeBro)
         } else {
             generate_proof(&self.reprove_bin, &self.executables_dir, circuit, args)
@@ -389,11 +394,17 @@ fn felt_to_hex(f: &F) -> String {
     val.copy_from_slice(f);
     // Reverse to big-endian for hex display
     let mut be = [0u8; 32];
-    for i in 0..32 { be[i] = val[31 - i]; }
+    for i in 0..32 {
+        be[i] = val[31 - i];
+    }
     // Strip leading zeros
     let hex_str = hex::encode(be);
     let trimmed = hex_str.trim_start_matches('0');
-    if trimmed.is_empty() { "0x0".to_string() } else { format!("0x{}", trimmed) }
+    if trimmed.is_empty() {
+        "0x0".to_string()
+    } else {
+        format!("0x{}", trimmed)
+    }
 }
 
 fn felt_u64_to_hex(v: u64) -> String {
@@ -424,7 +435,12 @@ fn generate_proof(
         .arg("--output")
         .arg(proof_file.path())
         .output()
-        .map_err(|e| format!("reprove failed to start: {} (is '{}' in PATH?)", e, reprove_bin))?;
+        .map_err(|e| {
+            format!(
+                "reprove failed to start: {} (is '{}' in PATH?)",
+                e, reprove_bin
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -432,12 +448,15 @@ fn generate_proof(
     }
 
     // Parse the proof bundle
-    let bundle_json = std::fs::read_to_string(proof_file.path())
-        .map_err(|e| format!("read proof: {}", e))?;
-    let bundle: serde_json::Value = serde_json::from_str(&bundle_json)
-        .map_err(|e| format!("parse proof: {}", e))?;
+    let bundle_json =
+        std::fs::read_to_string(proof_file.path()).map_err(|e| format!("read proof: {}", e))?;
+    let bundle: serde_json::Value =
+        serde_json::from_str(&bundle_json).map_err(|e| format!("parse proof: {}", e))?;
 
-    let proof_hex = bundle["proof_hex"].as_str().ok_or("missing proof_hex")?.to_string();
+    let proof_hex = bundle["proof_hex"]
+        .as_str()
+        .ok_or("missing proof_hex")?
+        .to_string();
     let output_preimage: Vec<String> = bundle["output_preimage"]
         .as_array()
         .ok_or("missing output_preimage")?
@@ -446,11 +465,19 @@ fn generate_proof(
         .collect();
 
     let proof_kb = proof_hex.len() / 2 / 1024;
-    eprintln!("Proof generated: {} KB, {} public outputs", proof_kb, output_preimage.len());
+    eprintln!(
+        "Proof generated: {} KB, {} public outputs",
+        proof_kb,
+        output_preimage.len()
+    );
 
     let verify_meta = bundle.get("verify_meta").cloned();
 
-    Ok(Proof::Stark { proof_hex, output_preimage, verify_meta })
+    Ok(Proof::Stark {
+        proof_hex,
+        output_preimage,
+        verify_meta,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -465,7 +492,7 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
 
     let w = WalletFile {
         master_sk,
-        kem_seed_v: vec![],  // legacy, unused — keys derived per-address from incoming_seed
+        kem_seed_v: vec![], // legacy, unused — keys derived per-address from incoming_seed
         kem_seed_d: vec![],
         addr_counter: 0,
         notes: vec![],
@@ -535,7 +562,12 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
     for nm in &feed.notes {
         if let Some(note) = w.try_recover_note(nm) {
             if known_notes.insert((note.index, note.cm)) {
-                println!("  found: v={} cm={} index={}", note.v, short(&note.cm), note.index);
+                println!(
+                    "  found: v={} cm={} index={}",
+                    note.v,
+                    short(&note.cm),
+                    note.index
+                );
                 w.notes.push(note);
                 found += 1;
             }
@@ -612,7 +644,9 @@ mod tests {
         let enc = encrypt_note(77, &rseed, Some(b"new"), &ek_v, &ek_d);
         let nm = NoteMemo { index: 5, cm, enc };
 
-        let note = w.try_recover_note(&nm).expect("new per-address note should recover");
+        let note = w
+            .try_recover_note(&nm)
+            .expect("new per-address note should recover");
         assert_eq!(note.index, 5);
         assert_eq!(note.addr_index, 0);
         assert_eq!(note.v, 77);
@@ -697,10 +731,12 @@ fn cmd_shield(
         // Create encrypted note to compute memo hash
         let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
             address.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
-        ).map_err(|_| "invalid ek_v")?;
+        )
+        .map_err(|_| "invalid ek_v")?;
         let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
             address.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
-        ).map_err(|_| "invalid ek_d")?;
+        )
+        .map_err(|_| "invalid ek_d")?;
         let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
         let enc = encrypt_note(amount, &rseed, memo_bytes, &ek_v_recv, &ek_d_recv);
         let memo_ct_hash_f = memo_ct_hash(&enc);
@@ -733,7 +769,12 @@ fn cmd_shield(
     };
     let resp: ShieldResp = post_json(&format!("{}/shield", ledger), &req)?;
     save_wallet(path, &w)?;
-    println!("Shielded {} -> cm={} index={}", amount, short(&resp.cm), resp.index);
+    println!(
+        "Shielded {} -> cm={} index={}",
+        amount,
+        short(&resp.cm),
+        resp.index
+    );
     println!("Run 'scan' to pick up the note.");
     Ok(())
 }
@@ -771,11 +812,21 @@ fn cmd_transfer(
     let rseed_1 = random_felt();
     let rcm_1 = derive_rcm(&rseed_1);
     let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
-    ).map_err(|_| "invalid ek_v")?;
+        recipient
+            .ek_v
+            .as_slice()
+            .try_into()
+            .map_err(|_| "bad ek_v")?,
+    )
+    .map_err(|_| "invalid ek_v")?;
     let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
-    ).map_err(|_| "invalid ek_d")?;
+        recipient
+            .ek_d
+            .as_slice()
+            .try_into()
+            .map_err(|_| "bad ek_d")?,
+    )
+    .map_err(|_| "invalid ek_d")?;
     let otag_1 = owner_tag(&recipient.auth_root, &recipient.nk_tag);
     let cm_1 = commit(&recipient.d_j, amount, &rcm_1, &otag_1);
     let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
@@ -791,8 +842,12 @@ fn cmd_transfer(
     let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v_c, &ek_d_c);
 
     let proof = if !pc.skip_proof {
+        let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
+        let auth_domain = cfg.auth_domain;
+
         // Build witness for run_transfer with WOTS+ w=4 inside the STARK.
-        // Layout: [N, root, per-input(nf,nk_spend,auth_root,auth_idx,d_j,v,rseed,cm_path_idx)×N,
+        // Layout:
+        // [N, auth_domain, root, per-input(nf,nk_spend,auth_root,auth_idx,d_j,v,rseed,cm_path_idx)×N,
         //  cm_siblings(N×DEPTH), auth_siblings(N×AUTH_DEPTH),
         //  wots_sig(N×133), wots_pk(N×133),
         //  (digits computed by circuit from sighash — not in args)
@@ -805,26 +860,42 @@ fn cmd_transfer(
         let mut wots_pks: Vec<Vec<F>> = vec![];
 
         // Compute sighash matching the Cairo circuit's computation
-        let nfs_for_sh: Vec<F> = selected.iter()
-            .map(|&i| { let n = &w.notes[i]; nullifier(&n.nk_spend, &n.cm, n.index as u64) })
+        let nfs_for_sh: Vec<F> = selected
+            .iter()
+            .map(|&i| {
+                let n = &w.notes[i];
+                nullifier(&n.nk_spend, &n.cm, n.index as u64)
+            })
             .collect();
         let mh_1 = memo_ct_hash(&enc_1);
         let mh_2 = memo_ct_hash(&enc_2);
-        let sighash = transfer_sighash(&root, &nfs_for_sh, &cm_1, &cm_2, &mh_1, &mh_2);
+        let sighash =
+            transfer_sighash(&auth_domain, &root, &nfs_for_sh, &cm_1, &cm_2, &mh_1, &mh_2);
 
         let mut wots_key_indices: Vec<u32> = vec![];
         // Clone note data to avoid borrow conflict with next_wots_key
-        let selected_notes: Vec<(usize, u32, F)> = selected.iter()
-            .map(|&i| (w.notes[i].index, w.notes[i].addr_index, w.notes[i].auth_root))
+        let selected_notes: Vec<(usize, u32, F)> = selected
+            .iter()
+            .map(|&i| {
+                (
+                    w.notes[i].index,
+                    w.notes[i].addr_index,
+                    w.notes[i].auth_root,
+                )
+            })
             .collect();
         for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
-            let path_resp: MerklePathResp = get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
+            let path_resp: MerklePathResp =
+                get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
             cm_paths.push(path_resp.siblings);
             let ask_j = derive_ask(&w.account().ask_base, addr_idx);
             let key_idx = w.next_wots_key(addr_idx);
             let (rebuilt_root, auth_leaves) = build_auth_tree(&ask_j);
             if rebuilt_root != stored_auth_root {
-                return Err(format!("auth_root mismatch for note at tree index {}", tree_idx));
+                return Err(format!(
+                    "auth_root mismatch for note at tree index {}",
+                    tree_idx
+                ));
             }
             auth_paths.push(auth_tree_path(&auth_leaves, key_idx as usize));
             let (sig, pk, _digits) = wots_sign(&ask_j, key_idx, &sighash);
@@ -833,9 +904,10 @@ fn cmd_transfer(
             wots_key_indices.push(key_idx);
         }
 
-        let total_fields = 2 + 8 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS * 2 + 14;
+        let total_fields = 3 + 8 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS * 2 + 14;
         args.push(felt_u64_to_hex(total_fields as u64));
         args.push(felt_u64_to_hex(n as u64));
+        args.push(felt_to_hex(&auth_domain));
         args.push(felt_to_hex(&root));
 
         // Per-input scalar fields (8 per input)
@@ -852,10 +924,26 @@ fn cmd_transfer(
             args.push(felt_u64_to_hex(note.index as u64));
         }
 
-        for path in &cm_paths { for sib in path { args.push(felt_to_hex(sib)); } }
-        for path in &auth_paths { for sib in path { args.push(felt_to_hex(sib)); } }
-        for sig in &wots_sigs { for s in sig { args.push(felt_to_hex(s)); } }
-        for pk in &wots_pks { for p in pk { args.push(felt_to_hex(p)); } }
+        for path in &cm_paths {
+            for sib in path {
+                args.push(felt_to_hex(sib));
+            }
+        }
+        for path in &auth_paths {
+            for sib in path {
+                args.push(felt_to_hex(sib));
+            }
+        }
+        for sig in &wots_sigs {
+            for s in sig {
+                args.push(felt_to_hex(s));
+            }
+        }
+        for pk in &wots_pks {
+            for p in pk {
+                args.push(felt_to_hex(p));
+            }
+        }
 
         // Output 1
         args.push(felt_to_hex(&cm_1));
@@ -936,7 +1024,13 @@ fn cmd_unshield(
         .collect();
 
     // Build change output — save intermediate values for proving path
-    struct ChangeData { d_j: F, rseed: F, auth_root: F, nk_tag: F, mh: F }
+    struct ChangeData {
+        d_j: F,
+        rseed: F,
+        auth_root: F,
+        nk_tag: F,
+        mh: F,
+    }
     let (cm_change, enc_change, change_data) = if change > 0 {
         let (d_j_c, auth_root_c, nk_tag_c, j_c) = w.next_address();
         let (ek_v_c, _, ek_d_c, _) = w.kem_keys(j_c);
@@ -946,13 +1040,22 @@ fn cmd_unshield(
         let cm = commit(&d_j_c, change, &rcm_c, &otag_c);
         let enc = encrypt_note(change, &rseed_c, None, &ek_v_c, &ek_d_c);
         let mh = memo_ct_hash(&enc);
-        let cd = ChangeData { d_j: d_j_c, rseed: rseed_c, auth_root: auth_root_c, nk_tag: nk_tag_c, mh };
+        let cd = ChangeData {
+            d_j: d_j_c,
+            rseed: rseed_c,
+            auth_root: auth_root_c,
+            nk_tag: nk_tag_c,
+            mh,
+        };
         (cm, Some(enc), Some(cd))
     } else {
         (ZERO, None, None)
     };
 
     let proof = if !pc.skip_proof {
+        let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
+        let auth_domain = cfg.auth_domain;
+
         let n = selected.len();
         let mut args: Vec<String> = vec![];
         let mut cm_paths: Vec<Vec<F>> = vec![];
@@ -965,23 +1068,46 @@ fn cmd_unshield(
         let mh_change_f = change_data.as_ref().map(|cd| cd.mh).unwrap_or(ZERO);
 
         // Compute sighash matching Cairo circuit
-        let nfs_for_sh: Vec<F> = selected.iter()
-            .map(|&i| { let n = &w.notes[i]; nullifier(&n.nk_spend, &n.cm, n.index as u64) })
+        let nfs_for_sh: Vec<F> = selected
+            .iter()
+            .map(|&i| {
+                let n = &w.notes[i];
+                nullifier(&n.nk_spend, &n.cm, n.index as u64)
+            })
             .collect();
-        let sighash = unshield_sighash(&root, &nfs_for_sh, amount, &recipient_f, &cm_change, &mh_change_f);
+        let sighash = unshield_sighash(
+            &auth_domain,
+            &root,
+            &nfs_for_sh,
+            amount,
+            &recipient_f,
+            &cm_change,
+            &mh_change_f,
+        );
 
         let mut wots_key_indices: Vec<u32> = vec![];
-        let selected_notes: Vec<(usize, u32, F)> = selected.iter()
-            .map(|&i| (w.notes[i].index, w.notes[i].addr_index, w.notes[i].auth_root))
+        let selected_notes: Vec<(usize, u32, F)> = selected
+            .iter()
+            .map(|&i| {
+                (
+                    w.notes[i].index,
+                    w.notes[i].addr_index,
+                    w.notes[i].auth_root,
+                )
+            })
             .collect();
         for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
-            let path_resp: MerklePathResp = get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
+            let path_resp: MerklePathResp =
+                get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
             cm_paths.push(path_resp.siblings);
             let ask_j = derive_ask(&w.account().ask_base, addr_idx);
             let key_idx = w.next_wots_key(addr_idx);
             let (rebuilt_root, auth_leaves) = build_auth_tree(&ask_j);
             if rebuilt_root != stored_auth_root {
-                return Err(format!("auth_root mismatch for note at tree index {}", tree_idx));
+                return Err(format!(
+                    "auth_root mismatch for note at tree index {}",
+                    tree_idx
+                ));
             }
             auth_paths.push(auth_tree_path(&auth_leaves, key_idx as usize));
             let (sig, pk, _digits) = wots_sign(&ask_j, key_idx, &sighash);
@@ -990,9 +1116,10 @@ fn cmd_unshield(
             wots_key_indices.push(key_idx);
         }
 
-        let total = 4 + 8 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS * 2 + 7;
+        let total = 5 + 8 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS * 2 + 7;
         args.push(felt_u64_to_hex(total as u64));
         args.push(felt_u64_to_hex(n as u64));
+        args.push(felt_to_hex(&auth_domain));
         args.push(felt_to_hex(&root));
         args.push(felt_u64_to_hex(amount));
         args.push(felt_to_hex(&recipient_f));
@@ -1010,10 +1137,26 @@ fn cmd_unshield(
             args.push(felt_u64_to_hex(note.index as u64));
         }
 
-        for path in &cm_paths { for sib in path { args.push(felt_to_hex(sib)); } }
-        for path in &auth_paths { for sib in path { args.push(felt_to_hex(sib)); } }
-        for sig in &wots_sigs { for s in sig { args.push(felt_to_hex(s)); } }
-        for pk in &wots_pks { for p in pk { args.push(felt_to_hex(p)); } }
+        for path in &cm_paths {
+            for sib in path {
+                args.push(felt_to_hex(sib));
+            }
+        }
+        for path in &auth_paths {
+            for sib in path {
+                args.push(felt_to_hex(sib));
+            }
+        }
+        for sig in &wots_sigs {
+            for s in sig {
+                args.push(felt_to_hex(s));
+            }
+        }
+        for pk in &wots_pks {
+            for p in pk {
+                args.push(felt_to_hex(p));
+            }
+        }
 
         args.push(felt_u64_to_hex(has_change_val));
         if let Some(cd) = &change_data {
@@ -1024,7 +1167,9 @@ fn cmd_unshield(
             args.push(felt_to_hex(&cd.nk_tag));
             args.push(felt_to_hex(&cd.mh));
         } else {
-            for _ in 0..6 { args.push("0x0".to_string()); }
+            for _ in 0..6 {
+                args.push("0x0".to_string());
+            }
         }
 
         pc.make_proof("run_unshield", &args)?

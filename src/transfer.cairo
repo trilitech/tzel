@@ -1,7 +1,7 @@
 /// Transfer circuit: N→2 JoinSplit (1 ≤ N ≤ 16).
 ///
 /// # Public outputs
-///   [root, nf_0..nf_{N-1}, cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2]
+///   [auth_domain, root, nf_0..nf_{N-1}, cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2]
 ///
 /// # Spend authorization
 ///   WOTS+ w=4 signature verification inside the STARK.
@@ -18,6 +18,7 @@ const WOTS_CHAINS: u32 = 133;
 
 pub fn verify(
     // --- public ---
+    auth_domain: felt252,
     root: felt252,
     nf_list: Span<felt252>,
     cm_1: felt252,
@@ -57,7 +58,8 @@ pub fn verify(
     // ── Compute sighash from public outputs ─────────────────────────
     // The sighash binds the WOTS+ signature to this specific transaction.
     // Circuit-type tag 0x01 prevents cross-circuit replay (transfer vs unshield).
-    let mut sighash = hash::sighash_fold(0x01, root);
+    let mut sighash = hash::sighash_fold(0x01, auth_domain);
+    sighash = hash::sighash_fold(sighash, root);
     let mut si: u32 = 0;
     while si < n {
         sighash = hash::sighash_fold(sighash, *nf_list.at(si));
@@ -161,7 +163,7 @@ pub fn verify(
     assert(sum_in == sum_out, 'transfer: balance mismatch');
 
     // ── Public outputs ───────────────────────────────────────────────
-    let mut outputs: Array<felt252> = array![root];
+    let mut outputs: Array<felt252> = array![auth_domain, root];
     let mut j: u32 = 0;
     while j < n { outputs.append(*nf_list.at(j)); j += 1; };
     outputs.append(cm_1);
