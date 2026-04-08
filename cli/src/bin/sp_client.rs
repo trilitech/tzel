@@ -3,6 +3,7 @@ use ml_kem::KeyExport;
 use serde::{Deserialize, Serialize};
 use starkprivacy_cli::*;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Wallet file
@@ -177,6 +178,70 @@ impl WalletFile {
             amount
         ))
     }
+}
+
+#[derive(Debug)]
+struct WalletLock {
+    path: PathBuf,
+}
+
+impl Drop for WalletLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn wallet_lock_path(path: &str) -> PathBuf {
+    PathBuf::from(format!("{}.lock", path))
+}
+
+#[cfg(unix)]
+fn is_stale_wallet_lock(path: &Path) -> Result<bool, String> {
+    let pid_text = std::fs::read_to_string(path).map_err(|e| format!("read lock file: {}", e))?;
+    let pid = pid_text
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "lock file contains invalid pid".to_string())?;
+    Ok(!PathBuf::from(format!("/proc/{}", pid)).exists())
+}
+
+#[cfg(not(unix))]
+fn is_stale_wallet_lock(_path: &Path) -> Result<bool, String> {
+    Ok(false)
+}
+
+fn acquire_wallet_lock(path: &str) -> Result<WalletLock, String> {
+    fn try_acquire(lock_path: &Path, allow_stale_recovery: bool) -> Result<WalletLock, String> {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "{}", std::process::id())
+                    .map_err(|e| format!("write lock file: {}", e))?;
+                file.sync_all()
+                    .map_err(|e| format!("fsync lock file: {}", e))?;
+                Ok(WalletLock {
+                    path: lock_path.to_path_buf(),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if allow_stale_recovery && is_stale_wallet_lock(lock_path).unwrap_or(false) {
+                    std::fs::remove_file(lock_path)
+                        .map_err(|e| format!("remove stale lock: {}", e))?;
+                    return try_acquire(lock_path, false);
+                }
+                Err(format!(
+                    "wallet is locked by another process: {}",
+                    lock_path.display()
+                ))
+            }
+            Err(e) => Err(format!("create lock file: {}", e)),
+        }
+    }
+
+    try_acquire(&wallet_lock_path(path), true)
 }
 
 fn load_wallet(path: &str) -> Result<WalletFile, String> {
@@ -382,6 +447,15 @@ impl ProveConfig {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    let _wallet_lock = match &cli.cmd {
+        Cmd::Keygen
+        | Cmd::Address
+        | Cmd::Scan { .. }
+        | Cmd::Shield { .. }
+        | Cmd::Transfer { .. }
+        | Cmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
+        Cmd::ExportDetect | Cmd::ExportView | Cmd::Balance | Cmd::Fund { .. } => None,
+    };
     let pc = ProveConfig {
         skip_proof: cli.trust_me_bro,
         reprove_bin: cli.reprove_bin,
@@ -732,6 +806,38 @@ mod tests {
     }
 
     #[test]
+    fn test_wallet_lock_rejects_concurrent_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        let _guard = acquire_wallet_lock(wallet_path_str).expect("first lock should succeed");
+        let err = acquire_wallet_lock(wallet_path_str).unwrap_err();
+        assert!(
+            err.contains("wallet is locked by another process"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_wallet_lock_recovers_stale_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let lock_path = wallet_lock_path(wallet_path.to_str().unwrap());
+
+        std::fs::write(&lock_path, "999999\n").expect("write stale lock");
+        let guard = acquire_wallet_lock(wallet_path.to_str().unwrap())
+            .expect("stale lock should be recovered");
+        assert!(lock_path.exists(), "live lock file should exist while held");
+        drop(guard);
+        assert!(
+            !lock_path.exists(),
+            "lock file should be removed when guard drops"
+        );
+    }
+
+    #[test]
     fn test_ensure_path_matches_root_rejects_mismatch() {
         let expected = [1u8; 32];
         let actual = [2u8; 32];
@@ -762,18 +868,21 @@ fn cmd_shield(
 ) -> Result<(), String> {
     let mut w = load_wallet(path)?;
 
-    let address = if let Some(addr_path) = to {
-        load_address(&addr_path)?
+    let (address, generated_self_address) = if let Some(addr_path) = to {
+        (load_address(&addr_path)?, false)
     } else {
         let (d_j, auth_root, nk_tag, j) = w.next_address();
         let (ek_v, _, ek_d, _) = w.kem_keys(j);
-        PaymentAddress {
-            d_j,
-            auth_root,
-            nk_tag,
-            ek_v: ek_v.to_bytes().to_vec(),
-            ek_d: ek_d.to_bytes().to_vec(),
-        }
+        (
+            PaymentAddress {
+                d_j,
+                auth_root,
+                nk_tag,
+                ek_v: ek_v.to_bytes().to_vec(),
+                ek_d: ek_d.to_bytes().to_vec(),
+            },
+            true,
+        )
     };
 
     // Build the proof if --prove is set.
@@ -828,6 +937,11 @@ fn cmd_shield(
         client_cm: shield_cm,
         client_enc: shield_enc,
     };
+    if generated_self_address {
+        // Persist generated self-addresses before submission so a crash after a
+        // successful shield does not hide the note from future scans.
+        save_wallet(path, &w)?;
+    }
     let resp: ShieldResp = post_json(&format!("{}/shield", ledger), &req)?;
     save_wallet(path, &w)?;
     println!(

@@ -7,6 +7,7 @@ use ml_kem::ml_kem_768;
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Core types
@@ -950,6 +951,237 @@ pub fn validate_single_task_program_hash<'a>(
         ));
     }
     Ok(parsed.public_outputs)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramHashes {
+    pub shield: String,
+    pub transfer: String,
+    pub unshield: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitKind {
+    Shield,
+    Transfer,
+    Unshield,
+}
+
+impl CircuitKind {
+    fn name(self) -> &'static str {
+        match self {
+            CircuitKind::Shield => "shield",
+            CircuitKind::Transfer => "transfer",
+            CircuitKind::Unshield => "unshield",
+        }
+    }
+
+    fn executable_filename(self) -> &'static str {
+        match self {
+            CircuitKind::Shield => "run_shield.executable.json",
+            CircuitKind::Transfer => "run_transfer.executable.json",
+            CircuitKind::Unshield => "run_unshield.executable.json",
+        }
+    }
+
+    fn expected_program_hash<'a>(self, hashes: &'a ProgramHashes) -> &'a str {
+        match self {
+            CircuitKind::Shield => &hashes.shield,
+            CircuitKind::Transfer => &hashes.transfer,
+            CircuitKind::Unshield => &hashes.unshield,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LedgerProofVerifier {
+    allow_trust_me_bro: bool,
+    verified_mode: Option<VerifiedProofConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedProofConfig {
+    reprove_bin: String,
+    program_hashes: ProgramHashes,
+}
+
+impl LedgerProofVerifier {
+    pub fn trust_me_bro_only() -> Self {
+        Self {
+            allow_trust_me_bro: true,
+            verified_mode: None,
+        }
+    }
+
+    pub fn verified(
+        allow_trust_me_bro: bool,
+        reprove_bin: String,
+        program_hashes: ProgramHashes,
+    ) -> Self {
+        Self {
+            allow_trust_me_bro,
+            verified_mode: Some(VerifiedProofConfig {
+                reprove_bin,
+                program_hashes,
+            }),
+        }
+    }
+
+    pub fn from_reprove_bin(
+        allow_trust_me_bro: bool,
+        reprove_bin: String,
+        executables_dir: &str,
+    ) -> Result<Self, String> {
+        let program_hashes = load_program_hashes(&reprove_bin, executables_dir)?;
+        Ok(Self::verified(
+            allow_trust_me_bro,
+            reprove_bin,
+            program_hashes,
+        ))
+    }
+
+    pub fn validate(&self, proof: &Proof, circuit: CircuitKind) -> Result<(), String> {
+        self.check_proof(proof)?;
+        if let Some(ref verified_mode) = self.verified_mode {
+            verify_stark_proof(&verified_mode.reprove_bin, proof)?;
+            validate_stark_circuit(proof, circuit, &verified_mode.program_hashes)?;
+        }
+        Ok(())
+    }
+
+    fn check_proof(&self, proof: &Proof) -> Result<(), String> {
+        match proof {
+            Proof::TrustMeBro => {
+                if !self.allow_trust_me_bro {
+                    return Err("TrustMeBro proofs rejected. Ledger requires real STARK proofs. (Start ledger with --trust-me-bro to allow.)".into());
+                }
+                Ok(())
+            }
+            Proof::Stark {
+                proof_hex,
+                output_preimage,
+                verify_meta: _,
+            } => {
+                if self.verified_mode.is_none() {
+                    return Err(
+                        "Stark proofs rejected: ledger is not configured with --reprove-bin. Start the ledger with --reprove-bin for verified proofs or use --trust-me-bro for development.".into(),
+                    );
+                }
+                let proof_bytes = hex::decode(proof_hex).map_err(|_| "bad proof hex".to_string())?;
+                if proof_bytes.is_empty() {
+                    return Err("empty proof".into());
+                }
+                if output_preimage.is_empty() {
+                    return Err("empty output_preimage".into());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn verify_stark_proof(reprove_bin: &str, proof: &Proof) -> Result<(), String> {
+    let Proof::Stark {
+        proof_hex,
+        output_preimage,
+        verify_meta,
+    } = proof
+    else {
+        return Ok(());
+    };
+
+    if verify_meta.is_none() {
+        return Err("Stark proof missing verify_meta — cannot verify".into());
+    }
+
+    let bundle_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
+    let bundle = serde_json::json!({
+        "proof_hex": proof_hex,
+        "output_preimage": output_preimage,
+        "verify_meta": verify_meta,
+    });
+    std::fs::write(bundle_file.path(), serde_json::to_string(&bundle).unwrap())
+        .map_err(|e| format!("write bundle: {}", e))?;
+
+    let output = std::process::Command::new(reprove_bin)
+        .arg("dummy")
+        .arg("--verify")
+        .arg(bundle_file.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("reprove failed to start: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("STARK proof verification FAILED: {}", stderr.trim()));
+    }
+
+    Ok(())
+}
+
+fn compute_program_hash(reprove_bin: &str, executable: &Path) -> Result<String, String> {
+    let output = std::process::Command::new(reprove_bin)
+        .arg(executable)
+        .arg("--program-hash")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to start reprover for {}: {}", executable.display(), e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to compute program hash for {}: {}",
+            executable.display(),
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Err(format!(
+            "reprover returned empty program hash for {}",
+            executable.display()
+        ));
+    }
+    Ok(stdout)
+}
+
+fn load_program_hashes(reprove_bin: &str, executables_dir: &str) -> Result<ProgramHashes, String> {
+    let base = PathBuf::from(executables_dir);
+    let shield = base.join(CircuitKind::Shield.executable_filename());
+    let transfer = base.join(CircuitKind::Transfer.executable_filename());
+    let unshield = base.join(CircuitKind::Unshield.executable_filename());
+
+    for path in [&shield, &transfer, &unshield] {
+        if !path.exists() {
+            return Err(format!(
+                "missing Cairo executable required for verified mode: {}",
+                path.display()
+            ));
+        }
+    }
+
+    Ok(ProgramHashes {
+        shield: compute_program_hash(reprove_bin, &shield)?,
+        transfer: compute_program_hash(reprove_bin, &transfer)?,
+        unshield: compute_program_hash(reprove_bin, &unshield)?,
+    })
+}
+
+fn validate_stark_circuit(
+    proof: &Proof,
+    circuit: CircuitKind,
+    hashes: &ProgramHashes,
+) -> Result<(), String> {
+    let Proof::Stark { output_preimage, .. } = proof else {
+        return Ok(());
+    };
+
+    validate_single_task_program_hash(output_preimage, circuit.expected_program_hash(hashes))
+        .map(|_| ())
+        .map_err(|e| format!("invalid output_preimage for {} circuit: {}", circuit.name(), e))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4092,6 +4324,71 @@ mod tests {
         let err = validate_single_task_program_hash(&output_preimage, "99999").unwrap_err();
         assert!(
             err.contains("unexpected circuit program hash"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    fn fake_stark_with_program_hash(program_hash: &str) -> Proof {
+        Proof::Stark {
+            proof_hex: "00".into(),
+            output_preimage: vec![
+                "1".into(),
+                "5".into(),
+                program_hash.into(),
+                "11".into(),
+                "22".into(),
+                "33".into(),
+            ],
+            verify_meta: None,
+        }
+    }
+
+    #[test]
+    fn test_ledger_proof_verifier_accepts_expected_program_hash() {
+        let proof = fake_stark_with_program_hash("12345");
+        let hashes = ProgramHashes {
+            shield: "111".into(),
+            transfer: "12345".into(),
+            unshield: "333".into(),
+        };
+
+        let result = validate_stark_circuit(&proof, CircuitKind::Transfer, &hashes);
+        assert!(result.is_ok(), "expected matching program hash to verify");
+    }
+
+    #[test]
+    fn test_ledger_proof_verifier_rejects_unexpected_program_hash() {
+        let proof = fake_stark_with_program_hash("12345");
+        let hashes = ProgramHashes {
+            shield: "111".into(),
+            transfer: "99999".into(),
+            unshield: "333".into(),
+        };
+
+        let err = validate_stark_circuit(&proof, CircuitKind::Transfer, &hashes).unwrap_err();
+        assert!(
+            err.contains("unexpected circuit program hash"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            err.contains("transfer"),
+            "expected circuit name in error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ledger_proof_verifier_rejects_stark_without_verified_mode() {
+        let verifier = LedgerProofVerifier::trust_me_bro_only();
+        let proof = fake_stark_with_program_hash("12345");
+
+        let err = verifier
+            .validate(&proof, CircuitKind::Transfer)
+            .unwrap_err();
+        assert!(
+            err.contains("not configured with --reprove-bin"),
             "unexpected error: {}",
             err
         );

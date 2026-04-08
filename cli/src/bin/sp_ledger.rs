@@ -6,21 +6,12 @@ use axum::{
 };
 use clap::Parser;
 use starkprivacy_cli::*;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
-struct ProgramHashes {
-    shield: String,
-    transfer: String,
-    unshield: String,
-}
-
 struct LedgerState {
     ledger: Mutex<Ledger>,
-    allow_trust_me_bro: bool,
-    reprove_bin: Option<String>,
-    program_hashes: Option<ProgramHashes>,
+    proof_verifier: LedgerProofVerifier,
 }
 
 type AppState = Arc<LedgerState>;
@@ -75,169 +66,6 @@ fn parse_felt_be_hex(s: &str) -> Result<F, String> {
     Ok(le)
 }
 
-fn check_proof(
-    proof: &Proof,
-    allow_trust_me_bro: bool,
-    has_verifier: bool,
-) -> Result<(), (StatusCode, String)> {
-    match proof {
-        Proof::TrustMeBro => {
-            if !allow_trust_me_bro {
-                return Err(err("TrustMeBro proofs rejected. Ledger requires real STARK proofs. (Start ledger with --trust-me-bro to allow.)".into()));
-            }
-            eprintln!("  WARNING: accepting TrustMeBro proof — NO cryptographic verification");
-            Ok(())
-        }
-        Proof::Stark {
-            proof_hex,
-            output_preimage,
-            verify_meta: _,
-        } => {
-            if !has_verifier {
-                return Err(err(
-                    "Stark proofs rejected: ledger is not configured with --reprove-bin. \
-                     Start the ledger with --reprove-bin for verified proofs or use --trust-me-bro for development."
-                        .into(),
-                ));
-            }
-            let proof_bytes = hex::decode(proof_hex).map_err(|_| err("bad proof hex".into()))?;
-            if proof_bytes.is_empty() {
-                return Err(err("empty proof".into()));
-            }
-            if output_preimage.is_empty() {
-                return Err(err("empty output_preimage".into()));
-            }
-            eprintln!(
-                "  Stark proof received ({} bytes, {} public outputs)",
-                proof_bytes.len(),
-                output_preimage.len()
-            );
-            // Output_preimage is validated positionally by the calling handler.
-            Ok(())
-        }
-    }
-}
-
-/// Verify a STARK proof cryptographically by shelling out to the reprover.
-/// The reprover deserializes the circuit proof, reconstructs the verification
-/// context from the stored metadata, and runs verify_circuit (~50ms).
-/// The reprover internally verifies; if it succeeds and produces matching output_preimage,
-/// the proof is valid.
-fn verify_stark_proof(reprove_bin: &str, proof: &Proof) -> Result<(), String> {
-    let Proof::Stark {
-        proof_hex,
-        output_preimage,
-        verify_meta,
-    } = proof
-    else {
-        return Ok(());
-    };
-
-    if verify_meta.is_none() {
-        return Err("Stark proof missing verify_meta — cannot verify".into());
-    }
-
-    // Write the proof bundle to a temp file for the reprover to verify
-    let bundle_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
-    let bundle = serde_json::json!({
-        "proof_hex": proof_hex,
-        "output_preimage": output_preimage,
-        "verify_meta": verify_meta,
-    });
-    std::fs::write(bundle_file.path(), serde_json::to_string(&bundle).unwrap())
-        .map_err(|e| format!("write bundle: {}", e))?;
-
-    eprintln!("  Verifying STARK proof via reprover...");
-    let output = std::process::Command::new(reprove_bin)
-        .arg("dummy") // executable arg required by clap but not used for --verify
-        .arg("--verify")
-        .arg(bundle_file.path())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("reprove failed to start: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "STARK proof verification FAILED: {}",
-            stderr.trim()
-        ));
-    }
-
-    eprintln!("  STARK proof verified ✓ (~50ms)");
-    Ok(())
-}
-
-fn compute_program_hash(reprove_bin: &str, executable: &Path) -> Result<String, String> {
-    let output = std::process::Command::new(reprove_bin)
-        .arg(executable)
-        .arg("--program-hash")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("failed to start reprover for {}: {}", executable.display(), e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "failed to compute program hash for {}: {}",
-            executable.display(),
-            stderr.trim()
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return Err(format!(
-            "reprover returned empty program hash for {}",
-            executable.display()
-        ));
-    }
-    Ok(stdout)
-}
-
-fn load_program_hashes(reprove_bin: &str, executables_dir: &str) -> Result<ProgramHashes, String> {
-    let base = PathBuf::from(executables_dir);
-    let shield = base.join("run_shield.executable.json");
-    let transfer = base.join("run_transfer.executable.json");
-    let unshield = base.join("run_unshield.executable.json");
-
-    for path in [&shield, &transfer, &unshield] {
-        if !path.exists() {
-            return Err(format!(
-                "missing Cairo executable required for verified mode: {}",
-                path.display()
-            ));
-        }
-    }
-
-    Ok(ProgramHashes {
-        shield: compute_program_hash(reprove_bin, &shield)?,
-        transfer: compute_program_hash(reprove_bin, &transfer)?,
-        unshield: compute_program_hash(reprove_bin, &unshield)?,
-    })
-}
-
-fn validate_stark_circuit(
-    proof: &Proof,
-    circuit_name: &str,
-    expected_program_hash: &str,
-) -> Result<(), (StatusCode, String)> {
-    let Proof::Stark { output_preimage, .. } = proof else {
-        return Ok(());
-    };
-
-    validate_single_task_program_hash(output_preimage, expected_program_hash)
-        .map(|_| ())
-        .map_err(|e| {
-            err(format!(
-                "invalid output_preimage for {} circuit: {}",
-                circuit_name, e
-            ))
-        })
-}
-
 async fn fund_handler(
     State(st): State<AppState>,
     Json(req): Json<FundReq>,
@@ -252,13 +80,9 @@ async fn shield_handler(
     State(st): State<AppState>,
     Json(req): Json<ShieldReq>,
 ) -> Result<Json<ShieldResp>, (StatusCode, String)> {
-    check_proof(&req.proof, st.allow_trust_me_bro, st.reprove_bin.is_some())?;
-    if let Some(ref bin) = st.reprove_bin {
-        verify_stark_proof(bin, &req.proof).map_err(err)?;
-        if let Some(ref hashes) = st.program_hashes {
-            validate_stark_circuit(&req.proof, "shield", &hashes.shield)?;
-        }
-    }
+    st.proof_verifier
+        .validate(&req.proof, CircuitKind::Shield)
+        .map_err(err)?;
     let mut ledger = st.ledger.lock().unwrap();
     let resp = ledger.shield(&req).map_err(err)?;
     eprintln!(
@@ -275,13 +99,9 @@ async fn transfer_handler(
     State(st): State<AppState>,
     Json(req): Json<TransferReq>,
 ) -> Result<Json<TransferResp>, (StatusCode, String)> {
-    check_proof(&req.proof, st.allow_trust_me_bro, st.reprove_bin.is_some())?;
-    if let Some(ref bin) = st.reprove_bin {
-        verify_stark_proof(bin, &req.proof).map_err(err)?;
-        if let Some(ref hashes) = st.program_hashes {
-            validate_stark_circuit(&req.proof, "transfer", &hashes.transfer)?;
-        }
-    }
+    st.proof_verifier
+        .validate(&req.proof, CircuitKind::Transfer)
+        .map_err(err)?;
     let mut ledger = st.ledger.lock().unwrap();
     let n = req.nullifiers.len();
     let resp = ledger.transfer(&req).map_err(err)?;
@@ -300,13 +120,9 @@ async fn unshield_handler(
     State(st): State<AppState>,
     Json(req): Json<UnshieldReq>,
 ) -> Result<Json<UnshieldResp>, (StatusCode, String)> {
-    check_proof(&req.proof, st.allow_trust_me_bro, st.reprove_bin.is_some())?;
-    if let Some(ref bin) = st.reprove_bin {
-        verify_stark_proof(bin, &req.proof).map_err(err)?;
-        if let Some(ref hashes) = st.program_hashes {
-            validate_stark_circuit(&req.proof, "unshield", &hashes.unshield)?;
-        }
-    }
+    st.proof_verifier
+        .validate(&req.proof, CircuitKind::Unshield)
+        .map_err(err)?;
     let mut ledger = st.ledger.lock().unwrap();
     let n = req.nullifiers.len();
     let resp = ledger.unshield(&req).map_err(err)?;
@@ -418,21 +234,23 @@ async fn main() {
     if cli.reprove_bin.is_some() {
         eprintln!("STARK proof verification enabled (re-proving via reprover).");
     }
-    let program_hashes = match cli.reprove_bin.as_deref() {
-        Some(bin) => match load_program_hashes(bin, &cli.executables_dir) {
-            Ok(hashes) => Some(hashes),
+    let proof_verifier = match cli.reprove_bin {
+        Some(reprove_bin) => match LedgerProofVerifier::from_reprove_bin(
+            cli.trust_me_bro,
+            reprove_bin,
+            &cli.executables_dir,
+        ) {
+            Ok(verifier) => verifier,
             Err(e) => {
                 eprintln!("ERROR: {}", e);
                 std::process::exit(2);
             }
         },
-        None => None,
+        None => LedgerProofVerifier::trust_me_bro_only(),
     };
     let state: AppState = Arc::new(LedgerState {
         ledger: Mutex::new(Ledger::with_auth_domain(auth_domain)),
-        allow_trust_me_bro: cli.trust_me_bro,
-        reprove_bin: cli.reprove_bin,
-        program_hashes,
+        proof_verifier,
     });
 
     let app = Router::new()
@@ -452,50 +270,4 @@ async fn main() {
     eprintln!("sp-ledger listening on {}", addr);
     let listener = TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fake_stark_with_program_hash(program_hash: &str) -> Proof {
-        Proof::Stark {
-            proof_hex: "00".into(),
-            // privacy bootloader output:
-            // [n_tasks=1, task_output_size=5, program_hash, out0, out1, out2]
-            output_preimage: vec![
-                "1".into(),
-                "5".into(),
-                program_hash.into(),
-                "11".into(),
-                "22".into(),
-                "33".into(),
-            ],
-            verify_meta: None,
-        }
-    }
-
-    #[test]
-    fn test_validate_stark_circuit_accepts_expected_program_hash() {
-        let proof = fake_stark_with_program_hash("12345");
-        let result = validate_stark_circuit(&proof, "transfer", "12345");
-        assert!(result.is_ok(), "expected matching program hash to verify");
-    }
-
-    #[test]
-    fn test_validate_stark_circuit_rejects_unexpected_program_hash() {
-        let proof = fake_stark_with_program_hash("12345");
-        let err = validate_stark_circuit(&proof, "transfer", "99999").unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(
-            err.1.contains("unexpected circuit program hash"),
-            "unexpected error: {}",
-            err.1
-        );
-        assert!(
-            err.1.contains("transfer"),
-            "expected circuit name in error: {}",
-            err.1
-        );
-    }
 }
