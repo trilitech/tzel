@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::{Result, anyhow};
+use cairo_program_runner_lib::hints::compute_program_hash_chain;
 use cairo_program_runner_lib::tasks::create_cairo1_program_task;
 use cairo_program_runner_lib::types::{
     HashFunc, PrivacySimpleBootloaderInput, SimpleBootloaderInput, TaskSpec,
@@ -36,6 +37,14 @@ pub use custom_circuit::ProofBundle;
 pub fn prove(executable_path: &PathBuf, args: Option<Vec<Felt>>) -> Result<CustomProofOutput> {
     let (prover_input, output_preimage) = run_privacy_bootloader(executable_path, args, None)?;
     custom_circuit::custom_recursive_prove(prover_input, output_preimage)
+}
+
+/// Compute the privacy bootloader program hash for a Cairo 1 executable.
+pub fn compute_executable_program_hash(executable_path: &PathBuf) -> Result<Felt> {
+    let task =
+        create_cairo1_program_task(executable_path, None, None).map_err(|e| anyhow!("{e}"))?;
+    let program = task.get_program().map_err(|e| anyhow!("{e}"))?;
+    compute_program_hash_chain(&program, 0, HashFunc::Blake).map_err(|e| anyhow!("{e}"))
 }
 
 /// Same as `prove` but takes a BigUintAsHex args file path directly.

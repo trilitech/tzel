@@ -884,6 +884,74 @@ pub enum Proof {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootloaderTaskOutput<'a> {
+    pub program_hash: &'a str,
+    pub public_outputs: &'a [String],
+}
+
+/// Parse the privacy bootloader output preimage for the common StarkPrivacy case:
+/// exactly one authenticated Cairo task.
+pub fn parse_single_task_output_preimage(
+    output_preimage: &[String],
+) -> Result<BootloaderTaskOutput<'_>, String> {
+    if output_preimage.len() < 3 {
+        return Err("output_preimage too short for bootloader prefix".into());
+    }
+
+    let n_tasks: usize = output_preimage[0]
+        .parse()
+        .map_err(|_| "invalid bootloader task count".to_string())?;
+    if n_tasks != 1 {
+        return Err(format!(
+            "expected exactly 1 bootloader task, got {}",
+            n_tasks
+        ));
+    }
+
+    let task_output_size: usize = output_preimage[1]
+        .parse()
+        .map_err(|_| "invalid bootloader task output size".to_string())?;
+    if task_output_size < 2 {
+        return Err(format!(
+            "bootloader task output too short: {} < 2",
+            task_output_size
+        ));
+    }
+
+    let expected_total_len = 1usize
+        .checked_add(task_output_size)
+        .ok_or_else(|| "bootloader task output size overflow".to_string())?;
+    if output_preimage.len() != expected_total_len {
+        return Err(format!(
+            "output_preimage length mismatch: {} != {}",
+            output_preimage.len(),
+            expected_total_len
+        ));
+    }
+
+    Ok(BootloaderTaskOutput {
+        program_hash: &output_preimage[2],
+        public_outputs: &output_preimage[3..],
+    })
+}
+
+/// Validate that the verified bootloader output preimage corresponds to the
+/// expected StarkPrivacy circuit executable, not just any Cairo task.
+pub fn validate_single_task_program_hash<'a>(
+    output_preimage: &'a [String],
+    expected_program_hash: &str,
+) -> Result<&'a [String], String> {
+    let parsed = parse_single_task_output_preimage(output_preimage)?;
+    if parsed.program_hash != expected_program_hash {
+        return Err(format!(
+            "unexpected circuit program hash: got {}, expected {}",
+            parsed.program_hash, expected_program_hash
+        ));
+    }
+    Ok(parsed.public_outputs)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // API types
 // ═══════════════════════════════════════════════════════════════════════
@@ -3992,5 +4060,59 @@ mod tests {
         let sv = derive_kem_view_seed(&acc.incoming_seed, 0);
         let sd = derive_kem_detect_seed(&acc.incoming_seed, 0);
         assert_ne!(sv, sd, "view and detect seeds for same address must differ");
+    }
+
+    #[test]
+    fn test_parse_single_task_output_preimage() {
+        let output_preimage = vec![
+            "1".to_string(),
+            "5".to_string(),
+            "12345".to_string(),
+            "11".to_string(),
+            "22".to_string(),
+            "33".to_string(),
+        ];
+
+        let parsed = parse_single_task_output_preimage(&output_preimage).unwrap();
+        assert_eq!(parsed.program_hash, "12345");
+        assert_eq!(parsed.public_outputs, &output_preimage[3..]);
+    }
+
+    #[test]
+    fn test_validate_single_task_program_hash_rejects_wrong_program() {
+        let output_preimage = vec![
+            "1".to_string(),
+            "5".to_string(),
+            "12345".to_string(),
+            "11".to_string(),
+            "22".to_string(),
+            "33".to_string(),
+        ];
+
+        let err = validate_single_task_program_hash(&output_preimage, "99999").unwrap_err();
+        assert!(
+            err.contains("unexpected circuit program hash"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_single_task_output_preimage_rejects_bad_length() {
+        let output_preimage = vec![
+            "1".to_string(),
+            "7".to_string(),
+            "12345".to_string(),
+            "11".to_string(),
+            "22".to_string(),
+            "33".to_string(),
+        ];
+
+        let err = parse_single_task_output_preimage(&output_preimage).unwrap_err();
+        assert!(
+            err.contains("length mismatch"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

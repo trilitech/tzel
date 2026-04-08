@@ -11,7 +11,9 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 use starkprivacy_reprover::custom_circuit::ProofBundle;
-use starkprivacy_reprover::{prove_single_level, prove_with_args_file};
+use starkprivacy_reprover::{
+    compute_executable_program_hash, prove_single_level, prove_with_args_file,
+};
 use tracing_subscriber::fmt;
 
 #[derive(Parser)]
@@ -39,6 +41,10 @@ struct Cli {
     /// Exit code 0 = valid, 1 = invalid.
     #[arg(long)]
     verify: Option<PathBuf>,
+
+    /// Print the bootloader-authenticated program hash for the executable and exit.
+    #[arg(long)]
+    program_hash: bool,
 }
 
 fn get_peak_memory_kb() -> Option<u64> {
@@ -72,6 +78,12 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    if cli.program_hash {
+        let program_hash = compute_executable_program_hash(&cli.executable)?;
+        println!("{}", program_hash);
+        return Ok(());
     }
 
     eprintln!("Loading executable from {:?}", cli.executable);

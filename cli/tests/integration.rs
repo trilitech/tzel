@@ -64,6 +64,17 @@ fn client_tmb(wallet: &str, args: &[&str]) -> (bool, String) {
     (ok, format!("{}{}", stdout, stderr))
 }
 
+fn wait_for_ledger(port: u16) {
+    let url = format!("http://localhost:{}/tree", port);
+    for _ in 0..50 {
+        if ureq::get(&url).call().is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("ledger did not start listening on {}", url);
+}
+
 /// Run sp-client with real STARK proof generation.
 fn client_prove(wallet: &str, args: &[&str]) -> (bool, String) {
     let reprove = reprove_bin();
@@ -88,12 +99,13 @@ fn start_ledger() -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to start ledger");
-    std::thread::sleep(Duration::from_millis(500));
+    wait_for_ledger(LEDGER_PORT);
     child
 }
 
 fn start_ledger_with_verifier(port: u16) -> Child {
     let reprove = reprove_bin();
+    let exedir = executables_dir();
     let child = Command::new(sp_ledger())
         .args([
             "--port",
@@ -101,24 +113,34 @@ fn start_ledger_with_verifier(port: u16) -> Child {
             "--trust-me-bro",
             "--reprove-bin",
             &reprove,
+            "--executables-dir",
+            &exedir,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to start ledger with verifier");
-    std::thread::sleep(Duration::from_millis(500));
+    wait_for_ledger(port);
     child
 }
 
 fn start_verified_ledger(port: u16) -> Child {
     let reprove = reprove_bin();
+    let exedir = executables_dir();
     let child = Command::new(sp_ledger())
-        .args(["--port", &port.to_string(), "--reprove-bin", &reprove])
+        .args([
+            "--port",
+            &port.to_string(),
+            "--reprove-bin",
+            &reprove,
+            "--executables-dir",
+            &exedir,
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to start verified ledger");
-    std::thread::sleep(Duration::from_millis(500));
+    wait_for_ledger(port);
     child
 }
 

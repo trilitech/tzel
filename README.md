@@ -35,6 +35,7 @@ cd ../reprover && cargo build --release
 cd ..
 
 # Run the ledger with proof verification (production mode)
+# If you launch it from elsewhere, also pass --executables-dir /abs/path/to/target/dev
 cli/target/release/sp-ledger --port 8080 --reprove-bin reprover/target/release/reprove &
 
 # Run the wallet
@@ -49,7 +50,7 @@ scarb build
 ./bench.sh
 ```
 
-> **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). `--trust-me-bro` is never appropriate for real value.
+> **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `target/dev`). `--trust-me-bro` is never appropriate for real value.
 >
 > **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. Its public-balance layer intentionally uses submitted strings such as `"alice"` as stand-ins for chain-native caller identity. It is not a network-authenticated wallet service and should not be exposed as a real public endpoint.
 
