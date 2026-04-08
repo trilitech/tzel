@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use ml_kem::KeyExport;
 use starkprivacy_cli::*;
@@ -33,12 +32,93 @@ impl WalletFile {
         derive_account(&self.master_sk)
     }
 
+    /// Legacy global KEM keys used by pre-migration wallets.
+    /// Returns None when the wallet was created after the per-address migration.
+    fn legacy_kem_keys(&self) -> Option<(Ek, Dk, Ek, Dk)> {
+        let seed_v: [u8; 64] = self.kem_seed_v.as_slice().try_into().ok()?;
+        let seed_d: [u8; 64] = self.kem_seed_d.as_slice().try_into().ok()?;
+        let (ek_v, dk_v) = kem_keygen_from_seed(&seed_v);
+        let (ek_d, dk_d) = kem_keygen_from_seed(&seed_d);
+        Some((ek_v, dk_v, ek_d, dk_d))
+    }
+
     /// Per-address KEM keys derived from incoming_seed + address index.
     /// Each address j gets unique (ek_v_j, dk_v_j, ek_d_j, dk_d_j) so that
     /// addresses from the same wallet are unlinkable by their public keys.
     fn kem_keys(&self, j: u32) -> (Ek, Dk, Ek, Dk) {
         let acc = self.account();
         derive_kem_keys(&acc.incoming_seed, j)
+    }
+
+    fn recover_note_for_address(
+        &self,
+        acc: &Account,
+        j: u32,
+        v: u64,
+        rseed: F,
+        cm: F,
+        index: usize,
+    ) -> Option<Note> {
+        let d_j = derive_address(&acc.incoming_seed, j);
+        let ask_j = derive_ask(&acc.ask_base, j);
+        let (auth_root, _) = build_auth_tree(&ask_j);
+        let nk_sp = derive_nk_spend(&acc.nk, &d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
+        let otag = owner_tag(&auth_root, &nk_tg);
+        let rcm = derive_rcm(&rseed);
+        if commit(&d_j, v, &rcm, &otag) != cm {
+            return None;
+        }
+        Some(Note {
+            nk_spend: nk_sp,
+            nk_tag: nk_tg,
+            auth_root,
+            d_j,
+            v,
+            rseed,
+            cm,
+            index,
+            addr_index: j,
+        })
+    }
+
+    /// Recover a note from the notes feed using either:
+    /// 1. Legacy global KEM keys (for pre-migration wallets), or
+    /// 2. Current per-address KEM keys.
+    fn try_recover_note(&self, nm: &NoteMemo) -> Option<Note> {
+        let acc = self.account();
+
+        // Legacy compatibility: old wallets used one global ML-KEM keypair
+        // for all addresses. Keep scanning those notes until users migrate.
+        if let Some((_, dk_v_legacy, _, dk_d_legacy)) = self.legacy_kem_keys() {
+            if detect(&nm.enc, &dk_d_legacy) {
+                if let Some((v, rseed, _memo)) = decrypt_memo(&nm.enc, &dk_v_legacy) {
+                    for j in 0..self.addr_counter {
+                        if let Some(note) =
+                            self.recover_note_for_address(&acc, j, v, rseed, nm.cm, nm.index)
+                        {
+                            return Some(note);
+                        }
+                    }
+                }
+            }
+        }
+
+        for j in 0..self.addr_counter {
+            let (_, dk_v_j, _, dk_d_j) = derive_kem_keys(&acc.incoming_seed, j);
+            if !detect(&nm.enc, &dk_d_j) {
+                continue;
+            }
+            let Some((v, rseed, _memo)) = decrypt_memo(&nm.enc, &dk_v_j) else {
+                continue;
+            };
+            if let Some(note) = self.recover_note_for_address(&acc, j, v, rseed, nm.cm, nm.index)
+            {
+                return Some(note);
+            }
+        }
+
+        None
     }
 
     /// Generate next address. Returns (d_j, auth_root, nk_tag, j).
@@ -419,11 +499,12 @@ fn cmd_address(path: &str) -> Result<(), String> {
 fn cmd_export_detect(path: &str) -> Result<(), String> {
     let w = load_wallet(path)?;
     let acc = w.account();
-    // Export incoming_seed in detect mode: holder can derive per-address dk_d_j
-    // for any j (via derive_kem_detect_seed), enabling detection but not decryption.
+    let detect_root = derive_detect_root(&acc.incoming_seed);
+    // Export detection root only: holder can derive per-address dk_d_j
+    // for any j, but cannot derive viewing keys or decrypt memos.
     println!(
-        "{{\"incoming_seed\":\"{}\",\"addr_count\":{},\"mode\":\"detect\"}}",
-        hex::encode(acc.incoming_seed),
+        "{{\"detect_root\":\"{}\",\"addr_count\":{},\"mode\":\"detect\"}}",
+        hex::encode(detect_root),
         w.addr_counter
     );
     Ok(())
@@ -444,54 +525,21 @@ fn cmd_export_view(path: &str) -> Result<(), String> {
 
 fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
     let mut w = load_wallet(path)?;
-    let acc = w.account();
 
     let url = format!("{}/notes?cursor={}", ledger, w.scanned);
     let feed: NotesFeedResp = get_json(&url)?;
 
     let mut found = 0usize;
+    let mut known_notes: std::collections::HashSet<(usize, F)> =
+        w.notes.iter().map(|n| (n.index, n.cm)).collect();
     for nm in &feed.notes {
-        // Try each address's per-address KEM keys for detection + decryption
-        let mut matched = false;
-        for j in 0..w.addr_counter {
-            let (_, dk_v_j, _, dk_d_j) = derive_kem_keys(&acc.incoming_seed, j);
-
-            // Stage 1: detection with per-address dk_d_j
-            if !detect(&nm.enc, &dk_d_j) {
-                continue;
-            }
-            // Stage 2: decrypt with per-address dk_v_j
-            let Some((v, rseed, _memo)) = decrypt_memo(&nm.enc, &dk_v_j) else {
-                continue;
-            };
-            // Stage 3: verify commitment matches this address
-            let d_j = derive_address(&acc.incoming_seed, j);
-            let ask_j = derive_ask(&acc.ask_base, j);
-            let (auth_root, _) = build_auth_tree(&ask_j);
-            let nk_sp = derive_nk_spend(&acc.nk, &d_j);
-            let nk_tg = derive_nk_tag(&nk_sp);
-            let otag = owner_tag(&auth_root, &nk_tg);
-            let rcm = derive_rcm(&rseed);
-            if commit(&d_j, v, &rcm, &otag) == nm.cm {
-                let leaf_index = nm.index;
-                w.notes.push(Note {
-                    nk_spend: nk_sp,
-                    nk_tag: nk_tg,
-                    auth_root,
-                    d_j,
-                    v,
-                    rseed,
-                    cm: nm.cm,
-                    index: leaf_index,
-                    addr_index: j,
-                });
+        if let Some(note) = w.try_recover_note(nm) {
+            if known_notes.insert((note.index, note.cm)) {
+                println!("  found: v={} cm={} index={}", note.v, short(&note.cm), note.index);
+                w.notes.push(note);
                 found += 1;
-                println!("  found: v={} cm={} index={}", v, short(&nm.cm), leaf_index);
-                matched = true;
-                break;
             }
         }
-        let _ = matched; // suppress unused warning
     }
 
     // Check which notes have been spent (nullified)
@@ -513,6 +561,89 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
         w.balance()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_wallet(addr_counter: u32, legacy: Option<([u8; 64], [u8; 64])>) -> WalletFile {
+        let mut master_sk = ZERO;
+        master_sk[0] = 0x42;
+        let (kem_seed_v, kem_seed_d) = legacy
+            .map(|(v, d)| (v.to_vec(), d.to_vec()))
+            .unwrap_or_else(|| (vec![], vec![]));
+        WalletFile {
+            master_sk,
+            kem_seed_v,
+            kem_seed_d,
+            addr_counter,
+            notes: vec![],
+            scanned: 0,
+            wots_key_indices: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_export_detect_uses_detect_root_not_incoming_seed() {
+        let w = test_wallet(3, None);
+        let acc = w.account();
+        let detect_root = derive_detect_root(&acc.incoming_seed);
+        assert_ne!(
+            detect_root, acc.incoming_seed,
+            "detect export material must not expose incoming_seed"
+        );
+    }
+
+    #[test]
+    fn test_try_recover_note_new_per_address_wallet() {
+        let w = test_wallet(1, None);
+        let acc = w.account();
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let (auth_root, _) = build_auth_tree(&ask_j);
+        let nk_sp = derive_nk_spend(&acc.nk, &d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
+        let otag = owner_tag(&auth_root, &nk_tg);
+        let rseed = random_felt();
+        let rcm = derive_rcm(&rseed);
+        let cm = commit(&d_j, 77, &rcm, &otag);
+        let (ek_v, _, ek_d, _) = w.kem_keys(0);
+        let enc = encrypt_note(77, &rseed, Some(b"new"), &ek_v, &ek_d);
+        let nm = NoteMemo { index: 5, cm, enc };
+
+        let note = w.try_recover_note(&nm).expect("new per-address note should recover");
+        assert_eq!(note.index, 5);
+        assert_eq!(note.addr_index, 0);
+        assert_eq!(note.v, 77);
+        assert_eq!(note.cm, cm);
+    }
+
+    #[test]
+    fn test_try_recover_note_legacy_wallet() {
+        let legacy_v = [0x11; 64];
+        let legacy_d = [0x22; 64];
+        let w = test_wallet(1, Some((legacy_v, legacy_d)));
+        let acc = w.account();
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let (auth_root, _) = build_auth_tree(&ask_j);
+        let nk_sp = derive_nk_spend(&acc.nk, &d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
+        let otag = owner_tag(&auth_root, &nk_tg);
+        let rseed = random_felt();
+        let rcm = derive_rcm(&rseed);
+        let cm = commit(&d_j, 91, &rcm, &otag);
+        let (ek_v, _dk_v, ek_d, _dk_d) = w.legacy_kem_keys().expect("legacy keys");
+        let enc = encrypt_note(91, &rseed, Some(b"legacy"), &ek_v, &ek_d);
+        let nm = NoteMemo { index: 2, cm, enc };
+
+        let note = w.try_recover_note(&nm).expect("legacy note should recover");
+        assert_eq!(note.index, 2);
+        assert_eq!(note.addr_index, 0);
+        assert_eq!(note.v, 91);
+        assert_eq!(note.cm, cm);
+    }
 }
 
 fn cmd_balance(path: &str) -> Result<(), String> {

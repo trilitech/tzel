@@ -494,10 +494,22 @@ pub fn kem_keygen_from_seed(seed: &[u8; 64]) -> (Ek, Dk) {
     (ek, dk)
 }
 
+/// Derive the incoming viewing root from incoming_seed.
+pub fn derive_view_root(incoming_seed: &F) -> F {
+    hash_two(&felt_tag(b"view"), incoming_seed)
+}
+
+/// Derive the detection root from incoming_seed.
+/// Holders of detect_root can derive detection keys only, not viewing keys.
+pub fn derive_detect_root(incoming_seed: &F) -> F {
+    let view_root = derive_view_root(incoming_seed);
+    hash_two(&felt_tag(b"detect"), &view_root)
+}
+
 /// Derive per-address ML-KEM viewing keypair from incoming_seed and address index j.
 /// Each address gets unique ek_v_j / dk_v_j so that addresses are unlinkable.
 pub fn derive_kem_view_seed(incoming_seed: &F, j: u32) -> [u8; 64] {
-    let view_seed = hash_two(&felt_tag(b"view"), incoming_seed);
+    let view_seed = derive_view_root(incoming_seed);
     let mut idx = ZERO;
     idx[..4].copy_from_slice(&j.to_le_bytes());
     let h1 = hash_two(&felt_tag(b"mlkem-v"), &view_seed);
@@ -513,8 +525,7 @@ pub fn derive_kem_view_seed(incoming_seed: &F, j: u32) -> [u8; 64] {
 /// Derive per-address ML-KEM detection keypair from incoming_seed and address index j.
 /// Each address gets unique ek_d_j / dk_d_j so that addresses are unlinkable.
 pub fn derive_kem_detect_seed(incoming_seed: &F, j: u32) -> [u8; 64] {
-    let view_seed = hash_two(&felt_tag(b"view"), incoming_seed);
-    let det_seed = hash_two(&felt_tag(b"detect"), &view_seed);
+    let det_seed = derive_detect_root(incoming_seed);
     let mut idx = ZERO;
     idx[..4].copy_from_slice(&j.to_le_bytes());
     let h1 = hash_two(&felt_tag(b"mlkem-d"), &det_seed);
@@ -533,6 +544,19 @@ pub fn derive_kem_keys(incoming_seed: &F, j: u32) -> (Ek, Dk, Ek, Dk) {
     let (ek_v, dk_v) = kem_keygen_from_seed(&sv);
     let (ek_d, dk_d) = kem_keygen_from_seed(&sd);
     (ek_v, dk_v, ek_d, dk_d)
+}
+
+/// Derive detection-only ML-KEM keypair from a detection root and address index.
+pub fn derive_kem_detect_keys_from_root(detect_root: &F, j: u32) -> (Ek, Dk) {
+    let mut idx = ZERO;
+    idx[..4].copy_from_slice(&j.to_le_bytes());
+    let h1 = hash_two(&felt_tag(b"mlkem-d"), detect_root);
+    let h2 = hash_two(&h1, &idx);
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&h2);
+    let h3 = hash_two(&felt_tag(b"mlkem-d2"), &h2);
+    out[32..].copy_from_slice(&h3);
+    kem_keygen_from_seed(&out)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -591,9 +615,8 @@ pub fn detect(enc: &EncryptedNote, dk_d: &Dk) -> bool {
     let Ok(ct) = ml_kem_768::Ciphertext::try_from(enc.ct_d.as_slice()) else {
         return false;
     };
-    let Ok(ss) = dk_d.try_decapsulate(&ct) else {
-        return false; // malformed ciphertext from untrusted source
-    };
+    // For correctly-sized ciphertexts the ml-kem API's decapsulation path is infallible.
+    let ss = dk_d.try_decapsulate(&ct).unwrap();
     let tag_hash = hash(ss.as_slice());
     let computed = u16::from_le_bytes([tag_hash[0], tag_hash[1]]) & ((1 << DETECT_K) - 1);
     computed == enc.tag
