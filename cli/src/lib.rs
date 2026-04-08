@@ -1,5 +1,7 @@
 //! StarkPrivacy shared library — crypto, types, Merkle tree, API types.
 
+pub mod canonical_wire;
+
 use blake2s_simd::Params;
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
 use ml_kem::kem::{Encapsulate, TryDecapsulate};
@@ -696,6 +698,51 @@ pub fn encrypt_note(
     plaintext.extend_from_slice(&memo_padded);
 
     let (ct_v, ss_v): (ml_kem_768::Ciphertext, _) = ek_v.encapsulate();
+    let key = hash(ss_v.as_slice());
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let encrypted_data = cipher
+        .encrypt(Nonce::from_slice(&[0u8; 12]), plaintext.as_slice())
+        .unwrap();
+
+    EncryptedNote {
+        ct_d: ct_d.to_vec(),
+        tag,
+        ct_v: ct_v.to_vec(),
+        encrypted_data,
+    }
+}
+
+pub fn encrypt_note_deterministic(
+    v: u64,
+    rseed: &F,
+    user_memo: Option<&[u8]>,
+    ek_v: &Ek,
+    ek_d: &Ek,
+    detect_ephemeral: &[u8; 32],
+    view_ephemeral: &[u8; 32],
+) -> EncryptedNote {
+    let detect_m = ml_kem::array::Array::from(*detect_ephemeral);
+    let view_m = ml_kem::array::Array::from(*view_ephemeral);
+    let (ct_d, ss_d): (ml_kem_768::Ciphertext, _) = ek_d.encapsulate_deterministic(&detect_m);
+    let tag_hash = hash(ss_d.as_slice());
+    let tag = u16::from_le_bytes([tag_hash[0], tag_hash[1]]) & ((1 << DETECT_K) - 1);
+
+    let mut plaintext = Vec::with_capacity(8 + 32 + MEMO_SIZE);
+    plaintext.extend_from_slice(&v.to_le_bytes());
+    plaintext.extend_from_slice(rseed);
+    let mut memo_padded = vec![0u8; MEMO_SIZE];
+    match user_memo {
+        Some(m) => {
+            let len = m.len().min(MEMO_SIZE);
+            memo_padded[..len].copy_from_slice(&m[..len]);
+        }
+        None => {
+            memo_padded[0] = 0xF6;
+        }
+    }
+    plaintext.extend_from_slice(&memo_padded);
+
+    let (ct_v, ss_v): (ml_kem_768::Ciphertext, _) = ek_v.encapsulate_deterministic(&view_m);
     let key = hash(ss_v.as_slice());
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
     let encrypted_data = cipher

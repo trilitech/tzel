@@ -435,6 +435,70 @@ The commitment tree and auth tree both use `mrklSP__` for internal nodes. This i
 
 All hash outputs are BLAKE2s-256 (32 bytes) with the top 5 bits cleared (`output[31] &= 0x07`), producing values in `[0, 2^251)` that fit in a felt252. Values are encoded as 32-byte little-endian arrays.
 
+### Canonical Binary Wire Format
+
+For cross-implementation interoperability, the stable protocol objects in this section have a **normative canonical binary encoding** based on **Tezos Data Encoding (TDE)**. The Rust reference implementation uses the `tezos_data_encoding` crate for this binary form, but the specification is the schema below, not the Rust crate itself.
+
+This canonical binary format is the interoperability target for clean-room implementations. The current JSON HTTP API and proof-bundle JSON are convenience transports used by the reference CLI; they are **not** the normative binary compatibility layer.
+
+Unless otherwise stated:
+- all records are encoded in the field order listed below
+- `felt252` means exactly 32 raw little-endian bytes
+- `bytes[N]` means exactly `N` raw bytes
+- `bytes` means a TDE dynamic byte string
+- `u16` means the TDE unsigned 16-bit integer
+- `u64le` means exactly 8 raw little-endian bytes interpreted as an unsigned 64-bit integer
+
+The following stable objects are standardized in v1:
+
+```text
+felt252 := bytes[32]
+
+PaymentAddress := record {
+  d_j:       felt252,
+  auth_root: felt252,
+  nk_tag:    felt252,
+  ek_v:      bytes[1184],   // ML-KEM-768 encapsulation key
+  ek_d:      bytes[1184]    // ML-KEM-768 encapsulation key
+}
+
+EncryptedNote := record {
+  ct_d:           bytes[1088],   // ML-KEM-768 ciphertext
+  tag:            u16,           // detection tag, little-endian on the wire
+  ct_v:           bytes[1088],   // ML-KEM-768 ciphertext
+  encrypted_data: bytes[1080]    // ChaCha20-Poly1305 ciphertext+tag
+}
+
+PublishedNote := record {
+  cm:  felt252,
+  enc: EncryptedNote
+}
+
+NoteMemo := record {
+  index: u64le,
+  cm:    felt252,
+  enc:   EncryptedNote
+}
+```
+
+Notes:
+- `PaymentAddress` and `EncryptedNote` are consensus-relevant application objects and MUST decode exactly as above in interoperable implementations.
+- `PublishedNote` is the canonical binary form of posted note data (`cm` plus memo/detection ciphertexts).
+- `NoteMemo` is the canonical binary form of the reference ledger's notes feed item.
+- The STARK proof envelope (`proof bytes`, `output_preimage`, verifier metadata) is intentionally **not** part of this canonical core schema yet. It is verifier-stack-specific and remains a reference-implementation transport detail in this version of the spec.
+- The repository includes deterministic reference vectors for this schema in `test_vectors/canonical_wire_v1.json`.
+
+### Reference JSON Mapping
+
+The reference CLI currently exposes JSON over HTTP. That JSON must map losslessly to the canonical binary objects above:
+- `felt252` fields are serialized as lowercase hex strings of exactly 64 hex characters, no `0x` prefix, representing the 32 raw little-endian bytes
+- raw byte fields are serialized as lowercase hex strings, no `0x` prefix
+- `index` is serialized as a JSON integer
+- canonical binary `index` is `u64le`; the JSON mapping uses the same integer value
+- public sender / recipient account identifiers remain JSON strings outside the circuit
+
+This JSON mapping is a convenience API, not the normative interoperability format.
+
 ### Public Account Identifier Encoding
 
 The current reference ledger represents public sender / recipient accounts as UTF-8 strings outside the circuit and hashes them into felt public outputs:
