@@ -590,7 +590,7 @@
         <div class="nav-links">
           <a href="#why">Why PQ</a>
           <a href="#features">Features</a>
-          <a href="https://github.com/murbard/tzel/blob/main/specs/spec.md" target="_blank" rel="noreferrer">Spec</a>
+          <a href="spec.html">Spec</a>
           <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">GitHub</a>
         </div>
       </div>
@@ -605,7 +605,7 @@
         </p>
         <div class="hero-actions">
           <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">View on GitHub</a>
-          <a href="https://github.com/murbard/tzel/blob/main/specs/spec.md" class="btn btn-outline" target="_blank" rel="noreferrer">Read the spec</a>
+          <a href="spec.html" class="btn btn-outline">Read the spec</a>
         </div>
       </div>
     </section>
@@ -715,7 +715,7 @@
           <span class="dim">commitment</span>&nbsp; = <span class="hl">BLAKE2s</span>(d, v, rcm, tag)<br>
           <span class="dim">nullifier</span>&nbsp;&nbsp; = <span class="hl">BLAKE2s</span>(nk, cm, pos)<br>
           <span class="dim">memo</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = <span class="hl">ML-KEM-768</span> + ChaCha20<br>
-          <span class="dim">spend auth</span> = <span class="hl">WOTS+</span> verified in-STARK<br>
+          <span class="dim">spend auth</span> = <span class="hl">hash-based OTS</span> verified in-STARK<br>
           <span class="dim">proof</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = <span class="hl">recursive STARK</span> (Cairo + Stwo)
         </div>
       </div>
@@ -724,7 +724,7 @@
         <div>
           <h3>Sign on your hardware wallet.<br>Prove anywhere.</h3>
           <p>TzEL separates signing from proving. Even the most lightweight device&mdash;a hardware wallet, a phone, a smart card&mdash;can authorize a transaction by producing a single hash-based signature. The heavy proof generation is outsourced to any untrusted machine.</p>
-          <p>The signature is verified <em>inside</em> the STARK circuit. A malicious prover cannot redirect funds&mdash;the signature binds to the exact outputs. The prover never sees your signing key and nothing on-chain links back to your address.</p>
+          <p>The signature is verified <em>inside</em> the STARK circuit. A malicious prover cannot redirect funds&mdash;the signature binds to the exact outputs. The prover never sees your signing key, and the chain never sees auth leaves, public keys, or spend signatures.</p>
           <p>Run the prover on your own machine, or delegate to a third-party service running a TEE. In the worst case&mdash;a TEE breach&mdash;the attacker learns which transaction you made, but still cannot steal funds or forge spends. Proving is a pure computation with no secret key access.</p>
         </div>
         <div class="feature-visual">
@@ -736,18 +736,18 @@
           <br>
           <span class="dim">on-chain verifier sees:</span><br>
           &nbsp;&nbsp;proof, nullifiers, commitments<br>
-          &nbsp;&nbsp;<span class="hl">no keys, no signatures, no links</span>
+          &nbsp;&nbsp;<span class="hl">no keys, no signatures, no auth leaves</span>
         </div>
       </div>
 
       <div class="feature">
         <div>
           <h3>Your transactions.<br>Your choice who sees them.</h3>
-          <p>Every transaction is encrypted on-chain by default. No one can read your balances, trace your payments, or link your addresses&mdash;unless you decide otherwise.</p>
+          <p>Private notes and memos are encrypted on-chain by default. The chain still reveals transaction shape and timing, but not note plaintexts, auth paths, or spend signatures.</p>
           <p>TzEL gives you fine-grained viewing keys you can share selectively. Give an auditor read access to a single address. Let a portfolio tracker see balances without spending power. Disclose exactly what you choose, to exactly who you choose, and nothing more.</p>
         </div>
         <div class="feature-visual">
-          <span class="dim">on-chain:</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="hl">encrypted</span>, unlinkable<br>
+          <span class="dim">on-chain:</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="hl">encrypted</span> note data<br>
           <br>
           <span class="dim">detection key:</span> flag incoming txs<br>
           <span class="dim">viewing key:</span>&nbsp;&nbsp; read balances + memos<br>
@@ -764,7 +764,7 @@
         <p>TzEL is under active development. The protocol spec, Cairo circuits, Rust wallet, and STARK prover are all open source.</p>
         <div class="cta-actions">
           <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">GitHub Repository</a>
-          <a href="https://github.com/murbard/tzel/blob/main/specs/spec.md" class="btn btn-outline" target="_blank" rel="noreferrer">Protocol Specification</a>
+          <a href="spec.html" class="btn btn-outline">Protocol Specification</a>
         </div>
       </div>
     </section>

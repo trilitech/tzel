@@ -6,13 +6,13 @@
 
 > **WARNING: This project is under active development. Neither the cryptographic scheme nor the implementation should be assumed secure. Do not use for real value. The protocol design is evolving — see `specs/spec.md` for the current state.**
 
-Privacy on blockchains today relies on elliptic curve cryptography that quantum computers will break. StarkPrivacy replaces every elliptic curve with post-quantum alternatives — BLAKE2s hashing, ML-KEM-768 lattice-based encryption, WOTS+ (w=4) spend authorization verified inside the STARK, and STARKs — while keeping proofs small (~295 KB) and verification instant (~35 ms).
+Privacy on blockchains today relies on elliptic curve cryptography that quantum computers will break. StarkPrivacy replaces every elliptic curve with post-quantum alternatives — BLAKE2s hashing, ML-KEM-768 lattice-based encryption, Winternitz-style one-time spend authorization verified inside the STARK, and recursive STARK proofs — with current reference proofs around 300 KB and verification around 35 ms.
 
 ### Features
 
-- **Post-quantum end-to-end.** No elliptic curves anywhere. BLAKE2s for commitments and nullifiers, ML-KEM-768 for encrypted memos, WOTS+ (w=4) for spend authorization (verified inside the STARK), STARKs for proofs.
-- **~295 KB zero-knowledge proofs.** Two-level recursive STARKs (Cairo AIR -> Stwo circuit reprover) with ZK blinding.
-- **Delegated proving with unlinkable authorization.** Outsource the expensive proof generation (~35s) to an untrusted server. Each spend uses a fresh one-time WOTS+ key from a Merkle tree, with the signature verified inside the STARK — the prover can't redirect funds (signature is bound to specific outputs), and nothing on-chain can be linked back to the spender's address.
+- **Post-quantum end-to-end.** No elliptic curves anywhere. BLAKE2s for commitments and nullifiers, ML-KEM-768 for encrypted memos, Winternitz-style one-time signatures for spend authorization (verified inside the STARK), and recursive STARKs for proofs.
+- **~300 KB recursive zero-knowledge proofs.** Two-level recursive STARKs (Cairo AIR -> Stwo circuit reprover) with ZK blinding.
+- **Delegated proving with spend-bound authorization.** Outsource proof generation to an untrusted server. Each spend uses a fresh one-time hash-signature key from a Merkle tree, and the signature is verified inside the STARK, so the prover cannot redirect funds by changing outputs. On the current reference stack, proof generation is measured in tens of seconds rather than milliseconds.
 - **Fuzzy message detection.** ML-KEM-based detection keys let a lightweight indexer flag likely-incoming transactions without being able to read them.
 - **Diversified addresses.** Generate unlimited unlinkable addresses from a single master key.
 - **1 KB encrypted memos.** End-to-end encrypted with ML-KEM-768 + ChaCha20-Poly1305.
@@ -34,7 +34,7 @@ cd rust/cli && cargo build --release
 cd ../reprover && cargo build --release
 cd .. && scarb build
 
-# Run the ledger with proof verification (production mode)
+# Run the ledger with proof verification (verified mode)
 # If you launch it from elsewhere, also pass --executables-dir /abs/path/to/target/dev
 cli/target/release/sp-ledger --port 8080 --reprove-bin reprover/target/release/reprove &
 
@@ -54,6 +54,8 @@ cd ..
 >
 > **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. Its public-balance layer intentionally uses submitted strings such as `"alice"` as stand-ins for chain-native caller identity. It is not a network-authenticated wallet service and should not be exposed as a real public endpoint.
 
+For local testing and fast integration loops, `--trust-me-bro` is still useful: `sp-client` skips STARK proving and `sp-ledger` accepts unverified bundles so you can exercise the state-transition checks quickly. Keep that mode on localhost only and switch back to `--reprove-bin` for any path where proof verification actually matters.
+
 ## Architecture
 
 ```
@@ -69,7 +71,7 @@ cd ..
 | v, rseed, paths,    |      |                          | |
 | wots_sig            | Stwo circuit reprover           | |
 |                     |      |                          | |
-|                     | ZK proof (~295 KB)              | |
+|                     | ZK proof (~300 KB)             | |
 |                     | (WOTS+ sig verified in-circuit) | |
 |                     +------+--------------------------+ |
 |                            |                            |
@@ -140,8 +142,8 @@ ocaml/                  Independent OCaml implementation
 ## Running benchmarks
 
 ```bash
-cd rust && ./bench.sh                # Recursive proofs (ZK, ~295 KB)
-cd rust && ./bench.sh --depth 16     # Faster testing with smaller Merkle tree
+cd rust && ./bench.sh                # Recursive proofs (currently ~300 KB)
+cd rust && ./bench.sh --depth 16
 ```
 
 ## Known limitations

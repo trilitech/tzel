@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TzEL Spec</title>
+  <meta name="description" content="Rendered protocol specification for TzEL.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0c1117;
+      --bg-deep: #090d12;
+      --surface: rgba(17, 25, 36, 0.82);
+      --surface-soft: rgba(17, 25, 36, 0.58);
+      --line: rgba(173, 197, 255, 0.12);
+      --line-strong: rgba(173, 197, 255, 0.24);
+      --text: #f7fbff;
+      --muted: #9aa8bb;
+      --blue: #0d61ff;
+      --blue-light: #54a1ff;
+      --teal: #24d0c4;
+      --gradient: linear-gradient(135deg, #0d61ff 0%, #24d0c4 100%);
+      --radius: 18px;
+      --radius-sm: 12px;
+      --radius-pill: 999px;
+      --font: "IBM Plex Sans", sans-serif;
+      --display: "Space Grotesk", sans-serif;
+      --mono: "JetBrains Mono", monospace;
+      --max-width: 1280px;
+      --shadow: 0 28px 90px rgba(0, 0, 0, 0.34);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: var(--font);
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(13, 97, 255, 0.15), transparent 30%),
+        radial-gradient(circle at 82% 10%, rgba(36, 208, 196, 0.11), transparent 24%),
+        linear-gradient(180deg, #101822 0%, var(--bg) 28%, var(--bg-deep) 100%);
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+      background-size: 72px 72px;
+      mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.38), transparent 88%);
+      opacity: 0.18;
+    }
+
+    a { color: inherit; }
+    code, pre { font-family: var(--mono); }
+
+    .wrap {
+      width: min(calc(100% - 48px), var(--max-width));
+      margin: 0 auto;
+    }
+
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(8, 12, 18, 0.78);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .nav-inner {
+      width: min(calc(100% - 48px), var(--max-width));
+      margin: 0 auto;
+      padding: 18px 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .logo {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      font-family: var(--display);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+    }
+
+    .logo-icon,
+    .logo-icon svg {
+      width: 32px;
+      height: 32px;
+      display: block;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 26px;
+    }
+
+    .nav-links a {
+      text-decoration: none;
+      color: var(--muted);
+      font-size: 0.92rem;
+      font-weight: 500;
+    }
+
+    .nav-links a:hover,
+    .nav-links a.active {
+      color: var(--text);
+    }
+
+    .hero {
+      padding: 72px 0 36px;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.3fr 0.9fr;
+      gap: 28px;
+      align-items: start;
+    }
+
+    .hero-copy h1 {
+      margin: 0 0 18px;
+      font-family: var(--display);
+      font-size: clamp(2.2rem, 5vw, 4rem);
+      line-height: 1.04;
+      letter-spacing: -0.04em;
+    }
+
+    .hero-copy p {
+      margin: 0;
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 1.06rem;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      margin-bottom: 20px;
+      border-radius: var(--radius-pill);
+      border: 1px solid rgba(173, 197, 255, 0.16);
+      background: rgba(13, 97, 255, 0.1);
+      color: #c6ddff;
+      font-size: 0.82rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .badge::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--gradient);
+      box-shadow: 0 0 18px rgba(36, 208, 196, 0.35);
+    }
+
+    .mirror-card {
+      padding: 24px;
+      border-radius: var(--radius);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+
+    .mirror-card h2 {
+      margin: 0 0 10px;
+      font-family: var(--display);
+      font-size: 1.2rem;
+      letter-spacing: -0.03em;
+    }
+
+    .mirror-card p {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .mirror-card code {
+      font-size: 0.88rem;
+      padding: 2px 6px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .mirror-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 44px;
+      padding: 10px 18px;
+      border-radius: var(--radius-pill);
+      text-decoration: none;
+      font-size: 0.92rem;
+      font-weight: 600;
+      border: 1px solid transparent;
+      transition: 180ms ease;
+    }
+
+    .btn-primary {
+      color: var(--text);
+      background: linear-gradient(135deg, var(--blue) 0%, var(--blue-light) 100%);
+      box-shadow: 0 18px 40px rgba(13, 97, 255, 0.24);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-1px);
+    }
+
+    .btn-outline {
+      color: var(--text);
+      border-color: rgba(173, 197, 255, 0.18);
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 250px minmax(0, 1fr);
+      gap: 28px;
+      align-items: start;
+      padding-bottom: 80px;
+    }
+
+    .toc {
+      position: sticky;
+      top: 92px;
+      padding: 20px;
+      border-radius: var(--radius);
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      max-height: calc(100vh - 120px);
+      overflow: auto;
+    }
+
+    .toc-title {
+      margin: 0 0 14px;
+      font-size: 0.84rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #bfd8ff;
+    }
+
+    .toc ul {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 8px;
+    }
+
+    .toc a {
+      text-decoration: none;
+      color: var(--muted);
+      font-size: 0.94rem;
+      display: block;
+    }
+
+    .toc .toc-h3 {
+      padding-left: 14px;
+      font-size: 0.88rem;
+    }
+
+    .toc a:hover,
+    .toc a.active {
+      color: var(--text);
+    }
+
+    .article-shell {
+      min-width: 0;
+      padding: 34px 38px;
+      border-radius: 26px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+
+    .article-meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 22px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .article-meta code {
+      padding: 2px 6px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .loading,
+    .error {
+      padding: 16px 18px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--line-strong);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--muted);
+    }
+
+    .error { color: #ffd3d3; }
+
+    .markdown h1,
+    .markdown h2,
+    .markdown h3 {
+      font-family: var(--display);
+      letter-spacing: -0.03em;
+      line-height: 1.12;
+      scroll-margin-top: 100px;
+    }
+
+    .markdown h1 {
+      margin: 0 0 16px;
+      font-size: clamp(2rem, 4vw, 3rem);
+    }
+
+    .markdown h2 {
+      margin: 42px 0 16px;
+      font-size: 1.6rem;
+    }
+
+    .markdown h3 {
+      margin: 28px 0 12px;
+      font-size: 1.18rem;
+    }
+
+    .markdown p,
+    .markdown li,
+    .markdown blockquote {
+      color: #dce6f5;
+    }
+
+    .markdown p,
+    .markdown ul,
+    .markdown ol,
+    .markdown blockquote,
+    .markdown pre,
+    .markdown table {
+      margin: 0 0 16px;
+    }
+
+    .markdown ul,
+    .markdown ol {
+      padding-left: 22px;
+    }
+
+    .markdown li + li {
+      margin-top: 6px;
+    }
+
+    .markdown a {
+      color: #8cc6ff;
+      text-decoration: none;
+    }
+
+    .markdown a:hover {
+      text-decoration: underline;
+    }
+
+    .markdown code {
+      padding: 2px 6px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.06);
+      font-size: 0.92em;
+    }
+
+    .markdown pre {
+      overflow: auto;
+      padding: 18px;
+      border-radius: var(--radius-sm);
+      background: #0a1017;
+      border: 1px solid rgba(173, 197, 255, 0.08);
+    }
+
+    .markdown pre code {
+      padding: 0;
+      background: transparent;
+    }
+
+    .markdown table {
+      width: 100%;
+      border-collapse: collapse;
+      display: block;
+      overflow: auto;
+      border-radius: var(--radius-sm);
+      border: 1px solid rgba(173, 197, 255, 0.08);
+    }
+
+    .markdown th,
+    .markdown td {
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(173, 197, 255, 0.08);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .markdown th {
+      background: rgba(255, 255, 255, 0.04);
+      color: #dfeaff;
+      font-size: 0.92rem;
+    }
+
+    .markdown blockquote {
+      padding: 14px 18px;
+      border-left: 3px solid #54a1ff;
+      background: rgba(13, 97, 255, 0.08);
+      border-radius: 0 12px 12px 0;
+    }
+
+    .markdown hr {
+      border: 0;
+      border-top: 1px solid rgba(173, 197, 255, 0.12);
+      margin: 28px 0;
+    }
+
+    @media (max-width: 980px) {
+      .hero-grid,
+      .layout {
+        grid-template-columns: 1fr;
+      }
+
+      .toc {
+        position: static;
+        max-height: none;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .wrap,
+      .nav-inner {
+        width: min(calc(100% - 28px), var(--max-width));
+      }
+
+      .article-shell {
+        padding: 24px 20px;
+      }
+
+      .nav-links {
+        gap: 16px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a href="index.html" class="logo">
+        <div class="logo-icon"><svg viewBox="0 0 47 64" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tz-grad-spec" x1="0" y1="0" x2="47" y2="64" gradientUnits="userSpaceOnUse"><stop stop-color="#0D61FF"/><stop offset="1" stop-color="#24D0C4"/></linearGradient></defs><path fill="url(#tz-grad-spec)" d="M30.252 63.441c-4.55 0-7.864-1.089-9.946-3.267-2.08-2.177-3.121-4.525-3.121-7.041 0-.92.181-1.694.544-2.323a3.993 3.993 0 0 1 1.489-1.489c.629-.363 1.403-.544 2.323-.544.92 0 1.693.181 2.323.544.629.363 1.125.86 1.488 1.489.363.629.544 1.403.544 2.323 0 1.113-.266 2.02-.798 2.722-.533.702-1.162 1.161-1.888 1.38.63.87 1.622 1.487 2.977 1.85 1.355.388 2.71.581 4.065.581 1.887 0 3.593-.508 5.118-1.524 1.524-1.017 2.65-2.517 3.376-4.501.726-1.984 1.089-4.235 1.089-6.752 0-2.734-.4-5.07-1.198-7.005-.775-1.96-1.924-3.412-3.449-4.356a9.21 9.21 0 0 0-4.936-1.415c-1.162 0-2.613.484-4.356 1.452l-3.194 1.597v-1.597L37.076 16.4H17.185v19.89c0 1.646.363 3.001 1.089 4.066s1.839 1.597 3.34 1.597c1.16 0 2.274-.387 3.339-1.162a11.803 11.803 0 0 0 2.758-2.83c.097-.219.218-.376.363-.473a.723.723 0 0 1 .472-.181c.266 0 .58.133.944.4.339.386.508.834.508 1.342a9.243 9.243 0 0 1-.182 1.017c-.822 1.839-1.96 3.242-3.412 4.21a8.457 8.457 0 0 1-4.79 1.452c-4.308 0-7.285-.847-8.93-2.54-1.645-1.695-2.468-3.994-2.468-6.897V16.4H.052v-3.703h10.164v-8.42L7.893 1.952V.066h6.751l2.54 1.306v11.325l26.28-.072 2.614 2.613-16.116 16.116a10.807 10.807 0 0 1 3.049-.726c1.742 0 3.702.557 5.88 1.67 2.202 1.089 3.896 2.59 5.081 4.5 1.186 1.888 1.948 3.703 2.287 5.445.363 1.743.545 3.291.545 4.646 0 3.098-.654 5.977-1.96 8.64-1.307 2.661-3.291 4.645-5.953 5.952-2.662 1.307-5.542 1.96-8.639 1.96z"/></svg></div>
+        TzEL
+      </a>
+      <div class="nav-links">
+        <a href="index.html">Home</a>
+        <a href="spec.html" class="active">Spec</a>
+        <a href="https://github.com/murbard/tzel/blob/main/specs/spec.md" target="_blank" rel="noreferrer">Canonical Markdown</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="wrap">
+    <section class="hero">
+      <div class="hero-grid">
+        <div class="hero-copy">
+          <div class="badge">Protocol Reference</div>
+          <h1>Readable web view.<br>Single markdown source.</h1>
+          <p>
+            The canonical protocol document lives in <code>specs/spec.md</code>. This page renders that same file through a symlinked <code>docs/spec.md</code> so the site stays readable without creating a second spec to maintain.
+          </p>
+        </div>
+        <aside class="mirror-card">
+          <h2>Source of truth</h2>
+          <p>
+            Edit <code>specs/spec.md</code>. The site reads <code>docs/spec.md</code>, which is only a symlink to the canonical file for publishing.
+          </p>
+          <div class="mirror-actions">
+            <a href="https://github.com/murbard/tzel/blob/main/specs/spec.md" class="btn btn-primary" target="_blank" rel="noreferrer">Open markdown</a>
+            <a href="index.html" class="btn btn-outline">Back to site</a>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="layout">
+      <aside class="toc">
+        <div class="toc-title">Contents</div>
+        <div id="toc-root" class="loading">Loading headings…</div>
+      </aside>
+
+      <div class="article-shell">
+        <div class="article-meta">
+          <span>Rendered from <code>docs/spec.md</code> → <code>../specs/spec.md</code></span>
+        </div>
+        <article id="content" class="markdown">
+          <div class="loading">Loading specification…</div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <script type="module">
+    import { marked } from "https://cdn.jsdelivr.net/npm/marked/lib/marked.esm.js";
+
+    const content = document.getElementById("content");
+    const tocRoot = document.getElementById("toc-root");
+
+    const slugify = (text) =>
+      text
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, "")
+        .trim()
+        .replace(/\s+/g, "-");
+
+    async function loadSpec() {
+      try {
+        const response = await fetch("./spec.md");
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const markdown = await response.text();
+        marked.setOptions({
+          gfm: true,
+          breaks: false,
+          headerIds: false,
+          mangle: false
+        });
+
+        content.innerHTML = marked.parse(markdown);
+        decorateHeadings();
+        buildToc();
+      } catch (error) {
+        content.innerHTML = `
+          <div class="error">
+            Failed to load <code>docs/spec.md</code>. If you opened this page directly from the filesystem, try serving <code>docs/</code> over HTTP instead.
+          </div>
+        `;
+        tocRoot.innerHTML = `
+          <div class="error">
+            No table of contents available.
+          </div>
+        `;
+      }
+    }
+
+    function decorateHeadings() {
+      const seen = new Map();
+      content.querySelectorAll("h1, h2, h3").forEach((heading) => {
+        const base = slugify(heading.textContent || "section");
+        const count = seen.get(base) || 0;
+        seen.set(base, count + 1);
+        heading.id = count === 0 ? base : `${base}-${count + 1}`;
+      });
+
+      content.querySelectorAll("a").forEach((link) => {
+        const href = link.getAttribute("href");
+        if (href && /^https?:\/\//.test(href)) {
+          link.setAttribute("target", "_blank");
+          link.setAttribute("rel", "noreferrer");
+        }
+      });
+    }
+
+    function buildToc() {
+      const headings = [...content.querySelectorAll("h2, h3")];
+      if (headings.length === 0) {
+        tocRoot.innerHTML = `<div class="loading">No section headings found.</div>`;
+        return;
+      }
+
+      const list = document.createElement("ul");
+      headings.forEach((heading) => {
+        const item = document.createElement("li");
+        const link = document.createElement("a");
+        link.href = `#${heading.id}`;
+        link.textContent = heading.textContent;
+        if (heading.tagName === "H3") {
+          link.className = "toc-h3";
+        }
+        item.appendChild(link);
+        list.appendChild(item);
+      });
+
+      tocRoot.innerHTML = "";
+      tocRoot.appendChild(list);
+    }
+
+    loadSpec();
+  </script>
+</body>
+</html>
