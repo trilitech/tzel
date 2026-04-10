@@ -1,0 +1,19 @@
+[package]
+name = "tzel-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tzel_core"
+path = "src/lib.rs"
+
+[dependencies]
+blake2s_simd = "1.0"
+rand = "0.9"
+hex = "0.4"
+chacha20poly1305 = "0.10"
+ml-kem = { version = "0.3.0-rc.2", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tezos_data_encoding = "0.6"
+nom = "7"

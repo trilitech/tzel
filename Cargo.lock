@@ -5017,13 +5017,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tzel-backend-rust"
-version = "0.1.0"
-dependencies = [
- "tzel-services",
-]
-
-[[package]]
 name = "tzel-core"
 version = "0.1.0"
 dependencies = [
@@ -5059,7 +5052,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tzel-backend-rust",
+ "tzel-services",
 ]
 
 [[package]]
@@ -5153,7 +5146,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tzel-backend-rust",
+ "tzel-services",
  "ureq",
 ]
 

@@ -32,10 +32,10 @@ A UTXO-based private transaction system where:
 # Build everything
 cargo build --release -p tzel-wallet-app -p tzel-ledger-app
 cd apps/prover && cargo build --release && cd ../..
-cd rust/protocol/cairo && scarb build && cd ../../..
+cd cairo && scarb build && cd ..
 
 # Run the ledger with proof verification (verified mode)
-# If you launch it from elsewhere, also pass --executables-dir /abs/path/to/rust/protocol/cairo/target/dev
+# If you launch it from elsewhere, also pass --executables-dir /abs/path/to/cairo/target/dev
 target/release/sp-ledger --port 8080 --reprove-bin apps/prover/target/release/reprove &
 
 # Run the wallet
@@ -49,7 +49,7 @@ target/release/sp-client balance
 ./apps/prover/bench.sh
 ```
 
-> **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `rust/protocol/cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
+> **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
 >
 > **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. Its public-balance layer intentionally uses submitted strings such as `"alice"` as stand-ins for chain-native caller identity. It is not a network-authenticated wallet service and should not be exposed as a real public endpoint.
 
@@ -128,14 +128,14 @@ nf = H_nf(nk_spend, H_nf(cm, pos))      -- nullifier (prevents double-spend)
 docs/                   Site assets
 specs/                  Protocol spec and shared test vectors
 apps/                   Thin shells (wallet, ledger, prover, demo)
-backends/               Backend adapters used by the shells
-  rust/                 Current adapter to the Rust libraries
-rust/                   Rust implementation libraries
-  protocol/tzel-core/   Shared deterministic protocol/state layer
-  protocol/cairo/       Cairo circuits and executable build
-  protocol/rollup-kernel/
-                         Tezos smart-rollup kernel scaffold
-  services/             Rust libraries used by the shells and tests
+tezos/                  Tezos-specific integration targets
+  rollup-kernel/        Tezos smart-rollup kernel scaffold
+core/                   Shared deterministic Rust protocol/state layer
+verifier/               Shared Rust proof-verification bridge
+services/               Rust libraries used by the shells and tests
+  reprover/             STARK reproving binary/library
+  tzel/                 Shell-facing Rust service crate
+cairo/                  Cairo circuits and executable build
 ocaml/                  Independent OCaml implementation
   protocol/             Pure protocol modules
   services/             Ledger/prover service modules
@@ -150,12 +150,12 @@ ocaml/                  Independent OCaml implementation
 
 ## Rollup kernel MVP
 
-The shared deterministic Rust layer now lives in `rust/protocol/tzel-core/`.
+The shared deterministic Rust layer now lives in `core/`.
 Both the HTTP ledger path and the rollup-kernel MVP are meant to call that same
 logic rather than fork state-transition code.
 
 The first Tezos smart-rollup kernel scaffold lives in
-`rust/protocol/rollup-kernel/`.
+`tezos/rollup-kernel/`.
 
 It currently:
 - reads raw inbox messages from the WASM host

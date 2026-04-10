@@ -26,7 +26,7 @@ cd "$(dirname "$0")/../.."
 # Build Cairo executables
 echo "Building Cairo executables..."
 (
-  cd rust/protocol/cairo
+  cd cairo
   scarb build --no-default-features --features "depth${DEPTH}" 2>&1 | tail -1
 )
 
@@ -59,7 +59,7 @@ if [ "$RECURSIVE" = "1" ]; then
         label=${LABELS[$i]}
         echo "[$label]"
 
-        OUTPUT=$(./apps/prover/target/release/reprove "rust/protocol/cairo/target/dev/${step}.executable.json" 2>&1)
+        OUTPUT=$(./apps/prover/target/release/reprove "cairo/target/dev/${step}.executable.json" 2>&1)
         CAIRO_PROVES[$i]=$(echo "$OUTPUT" | grep "^cairo_prove_ms=" | cut -d= -f2)
         CIRCUIT_PROVES[$i]=$(echo "$OUTPUT" | grep "^circuit_prove_ms=" | cut -d= -f2)
         TOTAL_PROVES[$i]=$(echo "$OUTPUT" | grep "^prove_ms=" | cut -d= -f2)
@@ -91,7 +91,7 @@ else
         label=${LABELS[$i]}
         echo "[$label]"
 
-        OUTPUT=$(./apps/prover/target/release/reprove "rust/protocol/cairo/target/dev/${step}.executable.json" --debug-single-level 2>&1)
+        OUTPUT=$(./apps/prover/target/release/reprove "cairo/target/dev/${step}.executable.json" --debug-single-level 2>&1)
         PROVES[$i]=$(echo "$OUTPUT" | grep "^prove_ms=" | cut -d= -f2)
         PROOF_SIZES[$i]=$(echo "$OUTPUT" | grep "^proof_zstd_bytes=" | cut -d= -f2)
         PEAK_MEMS[$i]=$(echo "$OUTPUT" | grep "^peak_rss_kb=" | cut -d= -f2)

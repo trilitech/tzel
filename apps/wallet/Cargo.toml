@@ -14,7 +14,7 @@ ml-kem = { version = "0.3.0-rc.2", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-tzel-backend = { package = "tzel-backend-rust", path = "../../backends/rust" }
+tzel-services = { path = "../../services/tzel" }
 ureq = { version = "3", features = ["json"] }
 
 [dev-dependencies]

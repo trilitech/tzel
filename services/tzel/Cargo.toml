@@ -1,0 +1,36 @@
+[package]
+name = "tzel-services"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tzel_services"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gen-test-vectors"
+path = "src/bin/gen_test_vectors.rs"
+
+[[bin]]
+name = "gen-interop-scenario"
+path = "src/bin/gen_interop_scenario.rs"
+
+[dependencies]
+tzel-core = { path = "../../core" }
+blake2s_simd = "1.0"
+rand = "0.9"
+hex = "0.4"
+chacha20poly1305 = "0.10"
+ml-kem = { version = "0.3.0-rc.2", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+ureq = { version = "3", features = ["json"] }
+
+tempfile = "3"
+tezos_data_encoding = "0.6"
+nom = "7"
+
+[dev-dependencies]

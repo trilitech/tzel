@@ -1,0 +1,14 @@
+[package]
+name = "tzel-verifier"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tzel_verifier"
+path = "src/lib.rs"
+
+[dependencies]
+hex = "0.4"
+serde_json = "1"
+tzel-core = { path = "../core" }
+tzel-reprover = { path = "../services/reprover" }
