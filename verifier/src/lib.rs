@@ -174,3 +174,173 @@ pub fn load_program_hashes(executables_dir: &str) -> Result<ProgramHashes, Strin
             .to_bytes_le(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tzel_core::{u64_to_felt, F};
+
+    use super::*;
+
+    fn f(v: u64) -> F {
+        u64_to_felt(v)
+    }
+
+    fn sample_hashes() -> ProgramHashes {
+        ProgramHashes {
+            shield: f(11),
+            transfer: f(22),
+            unshield: f(33),
+        }
+    }
+
+    fn sample_stark_proof(output_preimage: Vec<F>) -> Proof {
+        Proof::Stark {
+            proof_bytes: vec![1, 2, 3],
+            output_preimage,
+            verify_meta: Some(json!({"bad":"shape"})),
+        }
+    }
+
+    #[test]
+    fn test_check_proof_shape_rejects_disallowed_trust_me_bro() {
+        let err = check_proof_shape(&Proof::TrustMeBro, false, false).unwrap_err();
+        assert!(err.contains("TrustMeBro proofs rejected"));
+        check_proof_shape(&Proof::TrustMeBro, true, false).unwrap();
+    }
+
+    #[test]
+    fn test_check_proof_shape_rejects_malformed_stark_proofs() {
+        let err = check_proof_shape(
+            &Proof::Stark {
+                proof_bytes: vec![1],
+                output_preimage: vec![f(1), f(2), f(3)],
+                verify_meta: Some(json!({})),
+            },
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("verifier is not configured for verified mode"));
+
+        let err = check_proof_shape(
+            &Proof::Stark {
+                proof_bytes: vec![],
+                output_preimage: vec![f(1), f(2), f(3)],
+                verify_meta: Some(json!({})),
+            },
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("empty proof"));
+
+        let err = check_proof_shape(
+            &Proof::Stark {
+                proof_bytes: vec![1],
+                output_preimage: vec![],
+                verify_meta: Some(json!({})),
+            },
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("empty output_preimage"));
+
+        let err = check_proof_shape(
+            &Proof::Stark {
+                proof_bytes: vec![1],
+                output_preimage: vec![f(1), f(2), f(3)],
+                verify_meta: None,
+            },
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("missing verify_meta"));
+    }
+
+    #[test]
+    fn test_validate_stark_circuit_binds_expected_program_hash() {
+        let hashes = sample_hashes();
+        let proof = sample_stark_proof(vec![f(1), f(4), hashes.transfer, f(99), f(100)]);
+        validate_stark_circuit(&proof, CircuitKind::Transfer, &hashes).unwrap();
+
+        let err = validate_stark_circuit(&proof, CircuitKind::Shield, &hashes).unwrap_err();
+        assert!(err.contains("invalid output_preimage for shield circuit"));
+        assert!(err.contains("unexpected circuit program hash"));
+    }
+
+    #[test]
+    fn test_verify_stark_bundle_rejects_invalid_verify_meta() {
+        let err = verify_stark_bundle(&sample_stark_proof(vec![f(1), f(5), f(22), f(99), f(100)]))
+            .unwrap_err();
+        assert!(err.contains("invalid verify_meta"));
+    }
+
+    #[test]
+    fn test_direct_verifier_validate_respects_mode_and_shape() {
+        let trust_only = DirectProofVerifier::trust_me_bro_only();
+        trust_only.validate(&Proof::TrustMeBro, CircuitKind::Shield).unwrap();
+
+        let err = trust_only
+            .validate(
+                &Proof::Stark {
+                    proof_bytes: vec![1],
+                    output_preimage: vec![f(1), f(4), f(11), f(99), f(100)],
+                    verify_meta: Some(json!({})),
+                },
+                CircuitKind::Shield,
+            )
+            .unwrap_err();
+        assert!(err.contains("not configured for verified mode"));
+
+        let verified = DirectProofVerifier::verified(false, sample_hashes());
+        let err = verified
+            .validate(&Proof::TrustMeBro, CircuitKind::Shield)
+            .unwrap_err();
+        assert!(err.contains("TrustMeBro proofs rejected"));
+    }
+
+    #[test]
+    fn test_direct_verifier_validate_kernel_uses_host_conversion() {
+        let verifier = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
+            auth_domain: f(77),
+            verified_program_hashes: sample_hashes(),
+        })
+        .unwrap();
+
+        let err = verifier
+            .validate_kernel(
+                &KernelStarkProof {
+                    proof_bytes: vec![1, 2, 3],
+                    output_preimage: vec![f(1), f(4), f(22), f(99), f(100)],
+                    verify_meta: json!({"bad":"shape"}),
+                },
+                CircuitKind::Transfer,
+            )
+            .unwrap_err();
+        assert!(err.contains("invalid verify_meta"));
+    }
+
+    #[test]
+    fn test_from_kernel_config_disables_trust_me_bro() {
+        let verifier = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
+            auth_domain: f(77),
+            verified_program_hashes: sample_hashes(),
+        })
+        .unwrap();
+
+        let err = verifier
+            .validate(&Proof::TrustMeBro, CircuitKind::Shield)
+            .unwrap_err();
+        assert!(err.contains("TrustMeBro proofs rejected"));
+    }
+
+    #[test]
+    fn test_load_program_hashes_reports_missing_executables() {
+        let err = load_program_hashes("/definitely/missing/tzel-executables").unwrap_err();
+        assert!(err.contains("missing Cairo executable required for verified mode"));
+        assert!(err.contains("run_shield.executable.json"));
+    }
+}

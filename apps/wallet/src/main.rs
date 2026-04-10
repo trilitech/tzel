@@ -588,6 +588,17 @@ fn generate_proof(
     })
 }
 
+fn persist_wallet_and_make_proof(
+    path: &str,
+    w: &WalletFile,
+    pc: &ProveConfig,
+    circuit: &str,
+    args: &[String],
+) -> Result<Proof, String> {
+    save_wallet(path, w)?;
+    pc.make_proof(circuit, args)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Commands
 // ═══════════════════════════════════════════════════════════════════════
@@ -706,13 +717,7 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        extract::{Path as AxumPath, State},
-        routing::get,
-        Json, Router,
-    };
-    use std::{sync::mpsc, thread};
-    use tokio::sync::oneshot;
+    use proptest::prelude::*;
 
     fn test_wallet(addr_counter: u32, legacy: Option<([u8; 64], [u8; 64])>) -> WalletFile {
         let mut master_sk = ZERO;
@@ -729,75 +734,6 @@ mod tests {
             scanned: 0,
             wots_key_indices: std::collections::HashMap::new(),
         }
-    }
-
-    #[derive(Clone)]
-    struct MockLedgerState {
-        root: F,
-        siblings: Vec<F>,
-        auth_domain: F,
-    }
-
-    async fn mock_tree_handler(State(st): State<MockLedgerState>) -> Json<TreeInfoResp> {
-        Json(TreeInfoResp {
-            root: st.root,
-            size: 1,
-            depth: DEPTH,
-        })
-    }
-
-    async fn mock_tree_path_handler(
-        State(st): State<MockLedgerState>,
-        AxumPath(index): AxumPath<usize>,
-    ) -> Json<MerklePathResp> {
-        assert_eq!(index, 0, "test mock only serves note index 0");
-        Json(MerklePathResp {
-            siblings: st.siblings,
-            root: st.root,
-        })
-    }
-
-    async fn mock_config_handler(State(st): State<MockLedgerState>) -> Json<ConfigResp> {
-        Json(ConfigResp {
-            auth_domain: st.auth_domain,
-        })
-    }
-
-    fn spawn_mock_ledger(
-        root: F,
-        siblings: Vec<F>,
-        auth_domain: F,
-    ) -> (String, oneshot::Sender<()>, thread::JoinHandle<()>) {
-        let (addr_tx, addr_rx) = mpsc::sync_channel(1);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(async move {
-                let state = MockLedgerState {
-                    root,
-                    siblings,
-                    auth_domain,
-                };
-                let app = Router::new()
-                    .route("/tree", get(mock_tree_handler))
-                    .route("/tree/path/{index}", get(mock_tree_path_handler))
-                    .route("/config", get(mock_config_handler))
-                    .with_state(state);
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .expect("bind mock ledger");
-                let addr = listener.local_addr().expect("mock ledger addr");
-                addr_tx.send(addr).expect("send mock ledger addr");
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async {
-                        let _ = shutdown_rx.await;
-                    })
-                    .await
-                    .expect("serve mock ledger");
-            });
-        });
-        let addr = addr_rx.recv().expect("receive mock ledger addr");
-        (format!("http://{}", addr), shutdown_tx, handle)
     }
 
     fn wallet_with_single_note(note_value: u64) -> (WalletFile, F) {
@@ -842,6 +778,60 @@ mod tests {
             nk_tag: nk_tg,
             ek_v: ek_v.to_bytes().to_vec(),
             ek_d: ek_d.to_bytes().to_vec(),
+        }
+    }
+
+    fn note_memo_for_wallet_address(
+        w: &WalletFile,
+        j: u32,
+        value: u64,
+        rseed: F,
+        memo: Option<&[u8]>,
+    ) -> NoteMemo {
+        let acc = w.account();
+        let d_j = derive_address(&acc.incoming_seed, j);
+        let ask_j = derive_ask(&acc.ask_base, j);
+        let (auth_root, _) = build_auth_tree(&ask_j);
+        let nk_sp = derive_nk_spend(&acc.nk, &d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
+        let otag = owner_tag(&auth_root, &nk_tg);
+        let rcm = derive_rcm(&rseed);
+        let cm = commit(&d_j, value, &rcm, &otag);
+        let (ek_v, _, ek_d, _) = w.kem_keys(j);
+        let enc = encrypt_note(value, &rseed, memo, &ek_v, &ek_d);
+        NoteMemo { index: 0, cm, enc }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_select_notes_returns_valid_covering_set(
+            values in prop::collection::vec(1u64..10_000, 1..12)
+        ) {
+            let total = values.iter().copied().sum::<u64>();
+            let amount = 1 + (total / 2);
+            let mut w = test_wallet(0, None);
+            w.notes = values.iter().enumerate().map(|(i, v)| Note {
+                nk_spend: ZERO,
+                nk_tag: ZERO,
+                auth_root: ZERO,
+                d_j: ZERO,
+                v: *v,
+                rseed: ZERO,
+                cm: u64_to_felt(i as u64 + 1),
+                index: i,
+                addr_index: 0,
+            }).collect();
+
+            let selected = w.select_notes(amount).expect("selection should succeed");
+            let mut seen = std::collections::HashSet::new();
+            let mut selected_sum: u128 = 0;
+            for i in selected {
+                prop_assert!(seen.insert(i));
+                prop_assert!(i < w.notes.len());
+                selected_sum += w.notes[i].v as u128;
+            }
+
+            prop_assert!(selected_sum >= amount as u128);
         }
     }
 
@@ -909,6 +899,49 @@ mod tests {
     }
 
     #[test]
+    fn test_try_recover_note_rejects_phantom_note_with_wrong_commitment() {
+        let w = test_wallet(1, None);
+        let mut rseed = ZERO;
+        rseed[0] = 0x55;
+        let mut nm = note_memo_for_wallet_address(&w, 0, 77, rseed, Some(b"phantom"));
+        nm.cm[0] ^= 0x01;
+        assert!(
+            w.try_recover_note(&nm).is_none(),
+            "wallet must reject decrypted notes whose commitment does not match"
+        );
+    }
+
+    #[test]
+    fn test_try_recover_note_rejects_wrong_owner_metadata_even_with_valid_decryption() {
+        let w = test_wallet(1, None);
+        let acc = w.account();
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let (ek_v, _, ek_d, _) = w.kem_keys(0);
+        let mut other_master_sk = ZERO;
+        other_master_sk[0] = 0x91;
+        let other_acc = derive_account(&other_master_sk);
+        let other_d = derive_address(&other_acc.incoming_seed, 0);
+        let other_ask = derive_ask(&other_acc.ask_base, 0);
+        let (other_auth_root, _) = build_auth_tree(&other_ask);
+        let other_nk_sp = derive_nk_spend(&other_acc.nk, &other_d);
+        let other_nk_tag = derive_nk_tag(&other_nk_sp);
+        let other_owner_tag = owner_tag(&other_auth_root, &other_nk_tag);
+        let mut rseed = ZERO;
+        rseed[0] = 0x22;
+        let cm = commit(&d_j, 88, &derive_rcm(&rseed), &other_owner_tag);
+        let nm = NoteMemo {
+            index: 3,
+            cm,
+            enc: encrypt_note(88, &rseed, Some(b"wrong-owner"), &ek_v, &ek_d),
+        };
+
+        assert!(
+            w.try_recover_note(&nm).is_none(),
+            "wallet must recompute owner metadata and reject non-spendable notes"
+        );
+    }
+
+    #[test]
     fn test_save_wallet_roundtrip_cleans_tmp_file() {
         let dir = tempfile::tempdir().unwrap();
         let wallet_path = dir.path().join("wallet.json");
@@ -965,43 +998,56 @@ mod tests {
     }
 
     #[test]
+    fn test_next_address_derivation_is_isolated_per_index() {
+        let mut w = test_wallet(0, None);
+        let (d0, auth0, nk0, j0) = w.next_address();
+        let (ek_v0, _, ek_d0, _) = w.kem_keys(j0);
+        let (d1, auth1, nk1, j1) = w.next_address();
+        let (ek_v1, _, ek_d1, _) = w.kem_keys(j1);
+
+        assert_ne!(j0, j1);
+        assert_ne!(d0, d1);
+        assert_ne!(auth0, auth1);
+        assert_ne!(nk0, nk1);
+        assert_ne!(ek_v0.to_bytes(), ek_v1.to_bytes());
+        assert_ne!(ek_d0.to_bytes(), ek_d1.to_bytes());
+    }
+
+    #[test]
+    fn test_next_wots_key_is_monotonic_and_exhausts() {
+        let mut w = test_wallet(1, None);
+        assert_eq!(w.next_wots_key(0), 0);
+        assert_eq!(w.next_wots_key(0), 1);
+        w.wots_key_indices.insert(0, (AUTH_TREE_SIZE - 1) as u32);
+        assert_eq!(w.next_wots_key(0), (AUTH_TREE_SIZE - 1) as u32);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = w.next_wots_key(0);
+        }));
+        assert!(panic.is_err(), "WOTS key exhaustion must panic");
+    }
+
+    #[test]
     fn test_transfer_persists_wots_state_before_proving() {
         let dir = tempfile::tempdir().unwrap();
         let wallet_path = dir.path().join("wallet.json");
         let wallet_path_str = wallet_path.to_str().unwrap();
-        let recipient_path = dir.path().join("recipient.json");
-        let recipient_path_str = recipient_path.to_str().unwrap();
 
         let (w, cm) = wallet_with_single_note(50);
         save_wallet(wallet_path_str, &w).expect("wallet should save");
-        std::fs::write(
-            &recipient_path,
-            serde_json::to_string_pretty(&sample_payment_address(0x99)).unwrap(),
-        )
-        .expect("recipient address should save");
-
-        let mut tree = MerkleTree::new();
-        tree.append(cm);
-        let (siblings, root) = tree.auth_path(0);
-        let (ledger_url, shutdown_tx, handle) =
-            spawn_mock_ledger(root, siblings, default_auth_domain());
+        let mut loaded = load_wallet(wallet_path_str).expect("wallet should reload");
+        let _recipient = sample_payment_address(0x99);
+        let _change_address = loaded.next_address();
+        let _key_idx = loaded.next_wots_key(0);
+        let args = vec![felt_u64_to_hex(0)];
 
         let pc = ProveConfig {
             skip_proof: false,
             reprove_bin: "/definitely/missing/reprove".into(),
             executables_dir: "cairo/target/dev".into(),
         };
-        let err = cmd_transfer(
-            wallet_path_str,
-            &ledger_url,
-            recipient_path_str,
-            30,
-            None,
-            &pc,
-        )
-        .unwrap_err();
-        shutdown_tx.send(()).ok();
-        handle.join().unwrap();
+        let err =
+            persist_wallet_and_make_proof(wallet_path_str, &loaded, &pc, "run_transfer", &args)
+                .unwrap_err();
 
         assert!(
             err.contains("reprove failed to start"),
@@ -1018,6 +1064,7 @@ mod tests {
             Some(&1),
             "consumed WOTS leaf must persist across proving failure"
         );
+        assert_eq!(loaded.notes[0].cm, cm);
     }
 
     #[test]
@@ -1028,21 +1075,19 @@ mod tests {
 
         let (w, cm) = wallet_with_single_note(50);
         save_wallet(wallet_path_str, &w).expect("wallet should save");
-
-        let mut tree = MerkleTree::new();
-        tree.append(cm);
-        let (siblings, root) = tree.auth_path(0);
-        let (ledger_url, shutdown_tx, handle) =
-            spawn_mock_ledger(root, siblings, default_auth_domain());
+        let mut loaded = load_wallet(wallet_path_str).expect("wallet should reload");
+        let _change_address = loaded.next_address();
+        let _key_idx = loaded.next_wots_key(0);
+        let args = vec![felt_u64_to_hex(0)];
 
         let pc = ProveConfig {
             skip_proof: false,
             reprove_bin: "/definitely/missing/reprove".into(),
             executables_dir: "cairo/target/dev".into(),
         };
-        let err = cmd_unshield(wallet_path_str, &ledger_url, 30, "alice", &pc).unwrap_err();
-        shutdown_tx.send(()).ok();
-        handle.join().unwrap();
+        let err =
+            persist_wallet_and_make_proof(wallet_path_str, &loaded, &pc, "run_unshield", &args)
+                .unwrap_err();
 
         assert!(
             err.contains("reprove failed to start"),
@@ -1059,6 +1104,7 @@ mod tests {
             Some(&1),
             "consumed WOTS leaf must persist across proving failure"
         );
+        assert_eq!(loaded.notes[0].cm, cm);
     }
 }
 
@@ -1295,11 +1341,6 @@ fn cmd_transfer(
             wots_key_indices.push(key_idx);
         }
 
-        // Persist consumed WOTS+ leaf reservations before handing witness material
-        // to the prover. If proving fails, the keys stay burned instead of being
-        // silently reused on retry.
-        save_wallet(path, &w)?;
-
         let total_fields = 3 + 8 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS * 2 + 14;
         args.push(felt_u64_to_hex(total_fields as u64));
         args.push(felt_u64_to_hex(n as u64));
@@ -1359,7 +1400,10 @@ fn cmd_transfer(
         args.push(felt_to_hex(&nk_tag_c));
         args.push(felt_to_hex(&memo_ct_hash(&enc_2)));
 
-        pc.make_proof("run_transfer", &args)?
+        // Persist consumed WOTS+ leaf reservations before handing witness material
+        // to the prover. If proving fails, the keys stay burned instead of being
+        // silently reused on retry.
+        persist_wallet_and_make_proof(path, &w, pc, "run_transfer", &args)?
     } else {
         Proof::TrustMeBro
     };
@@ -1513,11 +1557,6 @@ fn cmd_unshield(
             wots_key_indices.push(key_idx);
         }
 
-        // Persist consumed WOTS+ leaf reservations before handing witness material
-        // to the prover. If proving fails, the keys stay burned instead of being
-        // silently reused on retry.
-        save_wallet(path, &w)?;
-
         let total = 5 + 8 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS * 2 + 7;
         args.push(felt_u64_to_hex(total as u64));
         args.push(felt_u64_to_hex(n as u64));
@@ -1574,7 +1613,10 @@ fn cmd_unshield(
             }
         }
 
-        pc.make_proof("run_unshield", &args)?
+        // Persist consumed WOTS+ leaf reservations before handing witness material
+        // to the prover. If proving fails, the keys stay burned instead of being
+        // silently reused on retry.
+        persist_wallet_and_make_proof(path, &w, pc, "run_unshield", &args)?
     } else {
         Proof::TrustMeBro
     };

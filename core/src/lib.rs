@@ -1543,3 +1543,520 @@ pub fn apply_unshield<S: LedgerState>(
 // ═══════════════════════════════════════════════════════════════════════
 // Tests — cross-implementation verification against Cairo
 // ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ml_kem::KeyExport;
+    use proptest::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    fn truncate_felt(mut f: F) -> F {
+        f[31] &= 0x07;
+        f
+    }
+
+    fn u(v: u64) -> F {
+        u64_to_felt(v)
+    }
+
+    fn recompute_root_from_path(leaf: F, index: usize, siblings: &[F]) -> F {
+        let mut current = leaf;
+        let mut idx = index;
+        for sibling in siblings {
+            current = if idx & 1 == 0 {
+                hash_merkle(&current, sibling)
+            } else {
+                hash_merkle(sibling, &current)
+            };
+            idx >>= 1;
+        }
+        current
+    }
+
+    fn sample_account(seed_byte: u8) -> Account {
+        let mut master_sk = ZERO;
+        master_sk[0] = seed_byte;
+        derive_account(&master_sk)
+    }
+
+    fn sample_address_bundle(seed_byte: u8, j: u32) -> (Account, PaymentAddress, Dk, Dk, F) {
+        let acc = sample_account(seed_byte);
+        let d_j = derive_address(&acc.incoming_seed, j);
+        let ask_j = derive_ask(&acc.ask_base, j);
+        let (auth_root, _) = build_auth_tree(&ask_j);
+        let nk_spend = derive_nk_spend(&acc.nk, &d_j);
+        let nk_tag = derive_nk_tag(&nk_spend);
+        let (ek_v, dk_v, ek_d, dk_d) = derive_kem_keys(&acc.incoming_seed, j);
+        let addr = PaymentAddress {
+            d_j,
+            auth_root,
+            nk_tag,
+            ek_v: ek_v.to_bytes().to_vec(),
+            ek_d: ek_d.to_bytes().to_vec(),
+        };
+        (acc, addr, dk_v, dk_d, nk_spend)
+    }
+
+    fn load_ek(bytes: &[u8]) -> Ek {
+        Ek::new(bytes.try_into().expect("fixed-size encapsulation key bytes"))
+            .expect("valid ML-KEM encapsulation key")
+    }
+
+    fn deterministic_note(
+        addr: &PaymentAddress,
+        v: u64,
+        rseed: F,
+        memo: Option<&[u8]>,
+    ) -> (EncryptedNote, F) {
+        let ek_v = load_ek(&addr.ek_v);
+        let ek_d = load_ek(&addr.ek_d);
+        let enc = encrypt_note_deterministic(
+            v,
+            &rseed,
+            memo,
+            &ek_v,
+            &ek_d,
+            &[0x11; 32],
+            &[0x22; 32],
+        );
+        let rcm = derive_rcm(&rseed);
+        let otag = owner_tag(&addr.auth_root, &addr.nk_tag);
+        let cm = commit(&addr.d_j, v, &rcm, &otag);
+        (enc, cm)
+    }
+
+    fn fake_stark(output_preimage: Vec<F>) -> Proof {
+        Proof::Stark {
+            proof_bytes: vec![1],
+            output_preimage,
+            verify_meta: None,
+        }
+    }
+
+    fn shielded_note_setup(
+        seed_byte: u8,
+        sender: &str,
+        amount: u64,
+    ) -> (Ledger, PaymentAddress, F, ShieldResp) {
+        let (_acc, addr, _dk_v, _dk_d, nk_spend) = sample_address_bundle(seed_byte, 0);
+        let mut ledger = Ledger::new();
+        ledger.fund(sender, amount * 2).unwrap();
+        let resp = ledger
+            .shield(&ShieldReq {
+                sender: sender.into(),
+                v: amount,
+                address: addr.clone(),
+                memo: None,
+                proof: Proof::TrustMeBro,
+                client_cm: ZERO,
+                client_enc: None,
+            })
+            .unwrap();
+        (ledger, addr, nk_spend, resp)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct HexSerdeFixture {
+        #[serde(with = "hex_f")]
+        f: F,
+        #[serde(with = "hex_f_vec")]
+        fs: Vec<F>,
+        #[serde(with = "hex_bytes")]
+        bytes: Vec<u8>,
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn prop_u64_felt_roundtrip(v in any::<u64>()) {
+            let felt = u64_to_felt(v);
+            prop_assert_eq!(felt_to_u64(&felt).unwrap(), v);
+            prop_assert_eq!(felt_to_usize(&felt).unwrap(), v as usize);
+        }
+
+        #[test]
+        fn prop_nullifier_depends_on_position(
+            nk_spend in prop::array::uniform32(any::<u8>()),
+            cm in prop::array::uniform32(any::<u8>()),
+            pos_1 in any::<u64>(),
+            pos_2 in any::<u64>(),
+        ) {
+            prop_assume!(pos_1 != pos_2);
+            let nk_spend = truncate_felt(nk_spend);
+            let cm = truncate_felt(cm);
+            prop_assert_ne!(
+                nullifier(&nk_spend, &cm, pos_1),
+                nullifier(&nk_spend, &cm, pos_2)
+            );
+        }
+
+        #[test]
+        fn prop_merkle_auth_path_reconstructs_root(
+            leaves in prop::collection::vec(prop::array::uniform32(any::<u8>()), 1..8),
+            raw_idx in any::<usize>(),
+        ) {
+            let leaves: Vec<F> = leaves.into_iter().map(truncate_felt).collect();
+            let tree = MerkleTree::from_leaves(leaves.clone());
+            let idx = raw_idx % leaves.len();
+            let (siblings, root) = tree.auth_path(idx);
+            prop_assert_eq!(recompute_root_from_path(leaves[idx], idx, &siblings), root);
+        }
+    }
+
+    #[test]
+    fn test_hex_serde_helpers_roundtrip() {
+        let fixture = HexSerdeFixture {
+            f: truncate_felt([0xAB; 32]),
+            fs: vec![truncate_felt([0x11; 32]), truncate_felt([0x22; 32])],
+            bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+
+        let json = serde_json::to_string(&fixture).unwrap();
+        let decoded: HexSerdeFixture = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, fixture);
+    }
+
+    #[test]
+    fn test_felt_helpers_and_tag_encoding() {
+        let mut too_large = ZERO;
+        too_large[8] = 1;
+        assert!(felt_to_u64(&too_large).is_err());
+        assert!(felt_to_usize(&too_large).is_err());
+
+        let tag = felt_tag(b"spend");
+        let mut expected = ZERO;
+        expected[..16].copy_from_slice(&0x7370656e64u128.to_le_bytes());
+        assert_eq!(tag, expected);
+    }
+
+    #[test]
+    fn test_kem_detect_keys_from_root_match_full_derivation() {
+        let acc = sample_account(0x44);
+        let (ek_v, dk_v, ek_d_full, dk_d_full) = derive_kem_keys(&acc.incoming_seed, 3);
+        let detect_root = derive_detect_root(&acc.incoming_seed);
+        let (ek_d_root, dk_d_root) = derive_kem_detect_keys_from_root(&detect_root, 3);
+
+        assert_eq!(ek_d_full.to_bytes(), ek_d_root.to_bytes());
+
+        let rseed = u(42);
+        let enc = encrypt_note_deterministic(
+            77,
+            &rseed,
+            Some(b"det-root"),
+            &ek_v,
+            &ek_d_full,
+            &[0x33; 32],
+            &[0x44; 32],
+        );
+        assert!(detect(&enc, &dk_d_full));
+        assert!(detect(&enc, &dk_d_root));
+        let (value, decrypted_rseed, memo) = decrypt_memo(&enc, &dk_v).unwrap();
+        assert_eq!(value, 77);
+        assert_eq!(decrypted_rseed, rseed);
+        assert_eq!(&memo[..8], b"det-root");
+    }
+
+    #[test]
+    fn test_encrypted_note_validate_rejects_bad_sizes_and_tag() {
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x31, 0);
+        let (enc, _cm) = deterministic_note(&addr, 10, u(3), Some(b"validate"));
+        enc.validate().unwrap();
+
+        let mut bad_ct_d = enc.clone();
+        bad_ct_d.ct_d.pop();
+        assert!(bad_ct_d.validate().unwrap_err().contains("ct_d length"));
+
+        let mut bad_ct_v = enc.clone();
+        bad_ct_v.ct_v.pop();
+        assert!(bad_ct_v.validate().unwrap_err().contains("ct_v length"));
+
+        let mut bad_payload = enc.clone();
+        bad_payload.encrypted_data.pop();
+        assert!(
+            bad_payload
+                .validate()
+                .unwrap_err()
+                .contains("encrypted_data length")
+        );
+
+        let mut bad_tag = enc;
+        bad_tag.tag = 1 << DETECT_K;
+        assert!(bad_tag.validate().unwrap_err().contains("bad detection tag"));
+    }
+
+    #[test]
+    fn test_wots_signature_recovers_authenticated_leaf() {
+        let acc = sample_account(0x55);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let key_idx = 7u32;
+        let msg_hash = hash(b"bind-this-signature");
+
+        let (sig, pk, digits) = wots_sign(&ask_j, key_idx, &msg_hash);
+        let recovered_pk: Vec<F> = sig
+            .iter()
+            .zip(digits.iter())
+            .map(|(sig_part, digit)| hash_chain(sig_part, (WOTS_W - 1) - (*digit as usize)))
+            .collect();
+
+        assert_eq!(recovered_pk, pk);
+
+        let leaf = wots_pk_to_leaf(&recovered_pk);
+        assert_eq!(leaf, auth_leaf_hash(&ask_j, key_idx));
+
+        let (auth_root, leaves) = build_auth_tree(&ask_j);
+        let path = auth_tree_path(&leaves, key_idx as usize);
+        assert_eq!(
+            recompute_root_from_path(leaf, key_idx as usize, &path),
+            auth_root
+        );
+    }
+
+    #[test]
+    fn test_encrypt_note_roundtrip_recomputes_commitment() {
+        let (_acc, addr, dk_v, dk_d, _nk_spend) = sample_address_bundle(0x66, 0);
+        let rseed = u(99);
+        let (enc, cm) = deterministic_note(&addr, 4242, rseed, Some(b"hello"));
+
+        assert!(detect(&enc, &dk_d));
+        let (value, decrypted_rseed, memo) = decrypt_memo(&enc, &dk_v).unwrap();
+        assert_eq!(value, 4242);
+        assert_eq!(decrypted_rseed, rseed);
+        assert_eq!(&memo[..5], b"hello");
+
+        let rcm = derive_rcm(&decrypted_rseed);
+        let otag = owner_tag(&addr.auth_root, &addr.nk_tag);
+        let recomputed = commit(&addr.d_j, value, &rcm, &otag);
+        assert_eq!(recomputed, cm);
+    }
+
+    #[test]
+    fn test_parse_single_task_output_preimage_and_program_hash_validation() {
+        let output_preimage = vec![u(1), u(6), u(12345), u(11), u(22), u(33), u(44)];
+        let parsed = parse_single_task_output_preimage(&output_preimage).unwrap();
+        assert_eq!(parsed.program_hash, &u(12345));
+        assert_eq!(parsed.public_outputs, &output_preimage[3..]);
+        assert_eq!(
+            validate_single_task_program_hash(&output_preimage, &u(12345)).unwrap(),
+            &output_preimage[3..]
+        );
+        assert!(
+            validate_single_task_program_hash(&output_preimage, &u(54321))
+                .unwrap_err()
+                .contains("unexpected circuit program hash")
+        );
+    }
+
+    #[test]
+    fn test_transfer_and_unshield_sighash_are_bound_to_public_fields() {
+        let auth_domain = u(1);
+        let root = u(2);
+        let nullifiers = vec![u(3), u(4)];
+        let cm_1 = u(5);
+        let cm_2 = u(6);
+        let mh_1 = u(7);
+        let mh_2 = u(8);
+        let recipient = u(9);
+
+        let transfer = transfer_sighash(&auth_domain, &root, &nullifiers, &cm_1, &cm_2, &mh_1, &mh_2);
+        assert_ne!(
+            transfer,
+            transfer_sighash(&u(10), &root, &nullifiers, &cm_1, &cm_2, &mh_1, &mh_2)
+        );
+        assert_ne!(
+            transfer,
+            transfer_sighash(&auth_domain, &root, &[u(3), u(40)], &cm_1, &cm_2, &mh_1, &mh_2)
+        );
+
+        let unshield = unshield_sighash(&auth_domain, &root, &nullifiers, 12, &recipient, &cm_1, &mh_1);
+        assert_ne!(
+            unshield,
+            unshield_sighash(&auth_domain, &root, &nullifiers, 13, &recipient, &cm_1, &mh_1)
+        );
+        assert_ne!(
+            unshield,
+            unshield_sighash(&auth_domain, &root, &nullifiers, 12, &u(10), &cm_1, &mh_1)
+        );
+    }
+
+    #[test]
+    fn test_apply_shield_stark_path_updates_balance_and_tree() {
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x71, 0);
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", 200).unwrap();
+
+        let (enc, cm) = deterministic_note(&addr, 125, u(15), Some(b"shield"));
+        let memo_hash = memo_ct_hash(&enc);
+        let root_before = ledger.tree.root();
+
+        let resp = apply_shield(
+            &mut ledger,
+            &ShieldReq {
+                sender: "alice".into(),
+                v: 125,
+                address: addr.clone(),
+                memo: None,
+                proof: fake_stark(vec![u(125), cm, hash(b"alice"), memo_hash]),
+                client_cm: cm,
+                client_enc: Some(enc.clone()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resp.cm, cm);
+        assert_eq!(resp.index, 0);
+        assert_eq!(ledger.balance("alice").unwrap(), 75);
+        assert_eq!(ledger.memos.len(), 1);
+        assert_ne!(ledger.tree.root(), root_before);
+        assert!(ledger.valid_roots.contains(&ledger.tree.root()));
+    }
+
+    #[test]
+    fn test_apply_transfer_stark_path_appends_outputs_and_consumes_nullifier() {
+        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x72, "alice", 90);
+        let root = ledger.tree.root();
+        let auth_domain = ledger.auth_domain;
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (enc_1, cm_1) = deterministic_note(&addr, 40, u(21), Some(b"out-1"));
+        let (enc_2, cm_2) = deterministic_note(&addr, 50, u(22), Some(b"out-2"));
+
+        let resp = apply_transfer(
+            &mut ledger,
+            &TransferReq {
+                root,
+                nullifiers: vec![nf],
+                cm_1,
+                cm_2,
+                enc_1: enc_1.clone(),
+                enc_2: enc_2.clone(),
+                proof: fake_stark(vec![
+                    auth_domain,
+                    root,
+                    nf,
+                    cm_1,
+                    cm_2,
+                    memo_ct_hash(&enc_1),
+                    memo_ct_hash(&enc_2),
+                ]),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resp.index_1, 1);
+        assert_eq!(resp.index_2, 2);
+        assert!(ledger.nullifiers.contains(&nf));
+        assert_eq!(ledger.memos.len(), 3);
+        assert!(ledger.valid_roots.contains(&ledger.tree.root()));
+    }
+
+    #[test]
+    fn test_apply_transfer_rejects_bad_memo_hash_without_mutation() {
+        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x73, "alice", 90);
+        let root = ledger.tree.root();
+        let auth_domain = ledger.auth_domain;
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (enc_1, cm_1) = deterministic_note(&addr, 40, u(31), Some(b"out-1"));
+        let (enc_2, cm_2) = deterministic_note(&addr, 50, u(32), Some(b"out-2"));
+
+        let memos_before = ledger.memos.len();
+        let roots_before = ledger.valid_roots.len();
+        let nullifiers_before = ledger.nullifiers.len();
+        let leaves_before = ledger.tree.leaves.clone();
+
+        let err = apply_transfer(
+            &mut ledger,
+            &TransferReq {
+                root,
+                nullifiers: vec![nf],
+                cm_1,
+                cm_2,
+                enc_1,
+                enc_2,
+                proof: fake_stark(vec![
+                    auth_domain,
+                    root,
+                    nf,
+                    cm_1,
+                    cm_2,
+                    ZERO,
+                    ZERO,
+                ]),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("memo_ct_hash_1 mismatch"));
+        assert_eq!(ledger.memos.len(), memos_before);
+        assert_eq!(ledger.valid_roots.len(), roots_before);
+        assert_eq!(ledger.nullifiers.len(), nullifiers_before);
+        assert_eq!(ledger.tree.leaves, leaves_before);
+    }
+
+    #[test]
+    fn test_apply_unshield_stark_path_with_change_updates_balance_and_note() {
+        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x74, "alice", 80);
+        let root = ledger.tree.root();
+        let auth_domain = ledger.auth_domain;
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (enc_change, cm_change) = deterministic_note(&addr, 30, u(41), Some(b"change"));
+
+        let resp = apply_unshield(
+            &mut ledger,
+            &UnshieldReq {
+                root,
+                nullifiers: vec![nf],
+                v_pub: 50,
+                recipient: "bob".into(),
+                cm_change,
+                enc_change: Some(enc_change.clone()),
+                proof: fake_stark(vec![
+                    auth_domain,
+                    root,
+                    nf,
+                    u(50),
+                    hash(b"bob"),
+                    cm_change,
+                    memo_ct_hash(&enc_change),
+                ]),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resp.change_index, Some(1));
+        assert_eq!(ledger.balance("bob").unwrap(), 50);
+        assert!(ledger.nullifiers.contains(&nf));
+        assert_eq!(ledger.memos.len(), 2);
+        assert!(ledger.valid_roots.contains(&ledger.tree.root()));
+    }
+
+    #[test]
+    fn test_apply_unshield_rejects_balance_overflow_without_mutation() {
+        let (mut ledger, _addr, nk_spend, shield_resp) = shielded_note_setup(0x75, "alice", 80);
+        ledger.set_balance("bob", u64::MAX).unwrap();
+        let root = ledger.tree.root();
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let leaves_before = ledger.tree.leaves.clone();
+        let memos_before = ledger.memos.len();
+
+        let err = apply_unshield(
+            &mut ledger,
+            &UnshieldReq {
+                root,
+                nullifiers: vec![nf],
+                v_pub: 1,
+                recipient: "bob".into(),
+                cm_change: ZERO,
+                enc_change: None,
+                proof: Proof::TrustMeBro,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("public balance overflow"));
+        assert_eq!(ledger.balance("bob").unwrap(), u64::MAX);
+        assert!(!ledger.nullifiers.contains(&nf));
+        assert_eq!(ledger.tree.leaves, leaves_before);
+        assert_eq!(ledger.memos.len(), memos_before);
+    }
+}
