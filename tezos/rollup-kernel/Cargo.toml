@@ -13,5 +13,7 @@ hex = "0.4"
 ml-kem = "0.3.0-rc.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tezos_data_encoding_05 = { package = "tezos_data_encoding", version = "0.5" }
+tezos-smart-rollup-encoding = "0.2.2"
 tzel-core = { path = "../../core" }
 tzel-verifier = { path = "../../verifier" }

@@ -71,8 +71,8 @@ async fn fund_handler(
     Json(req): Json<FundReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut ledger = st.ledger.lock().unwrap();
-    ledger.fund(&req.addr, req.amount).map_err(err)?;
-    eprintln!("[fund] {} += {}", req.addr, req.amount);
+    ledger.fund(&req.recipient, req.amount).map_err(err)?;
+    eprintln!("[fund] {} += {}", req.recipient, req.amount);
     Ok(Json(serde_json::json!({"ok": true})))
 }
 

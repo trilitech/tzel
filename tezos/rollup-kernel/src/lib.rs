@@ -7,16 +7,28 @@
 //! - direct proof verification through the shared verifier crate
 
 use tzel_core::{
-    apply_fund, apply_shield, apply_transfer, apply_unshield, default_auth_domain,
+    apply_deposit, apply_shield, apply_transfer, apply_unshield, apply_withdraw,
+    default_auth_domain,
     canonical_wire::{decode_published_note, encode_published_note},
     hash_merkle,
     kernel_wire::{
         decode_kernel_inbox_message, decode_kernel_result, decode_kernel_verifier_config,
         encode_kernel_result, encode_kernel_verifier_config, kernel_shield_req_to_host,
-        kernel_transfer_req_to_host, kernel_unshield_req_to_host, KernelInboxMessage,
-        KernelResult, KernelVerifierConfig,
+        kernel_transfer_req_to_host, kernel_unshield_req_to_host, kernel_withdraw_req_to_host,
+        KernelBridgeConfig, KernelInboxMessage, KernelResult, KernelVerifierConfig,
     },
-    EncryptedNote, F, Ledger, LedgerState, ZERO, DEPTH,
+    EncryptedNote, F, Ledger, LedgerState, WithdrawalRecord, ZERO, DEPTH,
+};
+use tezos_data_encoding_05::enc::BinWriter as _;
+use tezos_smart_rollup_encoding::{
+    contract::Contract as TezosContract,
+    entrypoint::Entrypoint as TezosEntrypoint,
+    inbox::{InboxMessage as TezosInboxMessage, InternalInboxMessage as TezosInternalInboxMessage},
+    michelson::{
+        ticket::FA2_1Ticket, MichelsonBytes, MichelsonContract, MichelsonInt, MichelsonOption,
+        MichelsonPair,
+    },
+    outbox::{OutboxMessage as TezosOutboxMessage, OutboxMessageTransaction},
 };
 use tzel_verifier::DirectProofVerifier;
 
@@ -35,6 +47,8 @@ const PATH_TREE_ROOT: &[u8] = b"/tzel/v1/state/tree/root";
 const PATH_NULLIFIER_COUNT: &[u8] = b"/tzel/v1/state/nullifiers/count";
 const PATH_VALID_ROOT_COUNT: &[u8] = b"/tzel/v1/state/roots/count";
 const PATH_BALANCE_ACCOUNT_COUNT: &[u8] = b"/tzel/v1/state/balances/count";
+const PATH_WITHDRAWAL_COUNT: &[u8] = b"/tzel/v1/state/withdrawals/count";
+const PATH_BRIDGE_TICKETER: &[u8] = b"/tzel/v1/state/bridge/ticketer";
 const PATH_VERIFIER_CONFIG: &[u8] = b"/tzel/v1/state/verifier_config.bin";
 const PATH_LAST_RESULT: &[u8] = b"/tzel/v1/state/last_result.bin";
 const PATH_TREE_BRANCH_PREFIX: &[u8] = b"/tzel/v1/state/tree/branch/";
@@ -45,6 +59,7 @@ const PATH_VALID_ROOT_PREFIX: &[u8] = b"/tzel/v1/state/roots/by-key/";
 const PATH_VALID_ROOT_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/roots/index/";
 const PATH_BALANCE_PREFIX: &[u8] = b"/tzel/v1/state/balances/by-key/";
 const PATH_BALANCE_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/balances/index/";
+const PATH_WITHDRAWAL_PREFIX: &[u8] = b"/tzel/v1/state/withdrawals/index/";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputMessage {
@@ -62,10 +77,27 @@ pub struct KernelStats {
     pub last_input_len: Option<u32>,
 }
 
+type BridgeDepositTicket = FA2_1Ticket;
+type BridgeDepositPayload = MichelsonPair<MichelsonBytes, BridgeDepositTicket>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedBridgeDeposit {
+    ticketer: String,
+    recipient: String,
+    amount: u64,
+}
+
+#[derive(Clone, Debug)]
+enum ParsedRollupMessage {
+    Kernel(KernelInboxMessage),
+    Deposit(ParsedBridgeDeposit),
+}
+
 pub trait Host {
     fn next_input(&mut self) -> Option<InputMessage>;
     fn read_store(&self, path: &[u8], max_bytes: usize) -> Option<Vec<u8>>;
     fn write_store(&mut self, path: &[u8], value: &[u8]);
+    fn write_output(&mut self, value: &[u8]) -> Result<(), String>;
     fn write_debug(&mut self, message: &str);
 }
 
@@ -101,6 +133,9 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
         }
         if self.host.read_store(PATH_BALANCE_ACCOUNT_COUNT, 8).is_none() {
             self.write_u64(PATH_BALANCE_ACCOUNT_COUNT, 0);
+        }
+        if self.host.read_store(PATH_WITHDRAWAL_COUNT, 8).is_none() {
+            self.write_u64(PATH_WITHDRAWAL_COUNT, 0);
         }
         if self.host.read_store(PATH_VALID_ROOT_COUNT, 8).is_none() {
             let root = self.read_felt(PATH_TREE_ROOT)?.unwrap_or(self.zero_hashes[DEPTH]);
@@ -151,6 +186,19 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
         self.host.write_store(path, value);
     }
 
+    fn read_string(&self, path: &[u8], max_bytes: usize) -> Result<Option<String>, String> {
+        match self.host.read_store(path, max_bytes) {
+            None => Ok(None),
+            Some(bytes) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| format!("invalid UTF-8 at {}", String::from_utf8_lossy(path))),
+        }
+    }
+
+    fn write_string(&mut self, path: &[u8], value: &str) {
+        self.host.write_store(path, value.as_bytes());
+    }
+
     fn write_marker(&mut self, path: &[u8]) {
         self.host.write_store(path, &[1]);
     }
@@ -167,6 +215,12 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
     fn write_account_key_at_index(&mut self, index: u64, addr: &str) {
         let path = indexed_path(PATH_BALANCE_INDEX_PREFIX, index);
         self.host.write_store(&path, addr.as_bytes());
+    }
+
+    fn write_withdrawal_at_index(&mut self, index: u64, record: &WithdrawalRecord) {
+        let path = indexed_path(PATH_WITHDRAWAL_PREFIX, index);
+        self.host
+            .write_store(&path, &encode_withdrawal_record(record));
     }
 }
 
@@ -252,6 +306,19 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
         }
         Ok(())
     }
+
+    fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String> {
+        let index = self.read_u64(PATH_WITHDRAWAL_COUNT)?.unwrap_or(0);
+        self.write_withdrawal_at_index(
+            index,
+            &WithdrawalRecord {
+                recipient: recipient.to_string(),
+                amount,
+            },
+        );
+        self.write_u64(PATH_WITHDRAWAL_COUNT, index + 1);
+        usize::try_from(index).map_err(|_| "withdrawal index does not fit in usize".into())
+    }
 }
 
 fn indexed_path(prefix: &[u8], index: u64) -> Vec<u8> {
@@ -291,6 +358,125 @@ fn balance_path(addr: &str) -> Vec<u8> {
     path.extend_from_slice(PATH_BALANCE_PREFIX);
     path.extend_from_slice(hex::encode(addr.as_bytes()).as_bytes());
     path
+}
+
+fn encode_withdrawal_record(record: &WithdrawalRecord) -> Vec<u8> {
+    let recipient = record.recipient.as_bytes();
+    let mut bytes = Vec::with_capacity(12 + recipient.len());
+    bytes.extend_from_slice(&record.amount.to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(recipient.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(recipient);
+    bytes
+}
+
+fn decode_withdrawal_record(bytes: &[u8]) -> Result<WithdrawalRecord, String> {
+    if bytes.len() < 12 {
+        return Err("withdrawal record too short".into());
+    }
+    let amount = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let recipient_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    if bytes.len() != 12 + recipient_len {
+        return Err("withdrawal record length mismatch".into());
+    }
+    let recipient = String::from_utf8(bytes[12..].to_vec())
+        .map_err(|_| "withdrawal recipient is not UTF-8".to_string())?;
+    Ok(WithdrawalRecord { recipient, amount })
+}
+
+fn encode_withdrawal_outbox_message(
+    ticketer: &str,
+    record: &WithdrawalRecord,
+) -> Result<Vec<u8>, String> {
+    let ticketer = TezosContract::from_b58check(ticketer)
+        .map_err(|_| "invalid bridge ticketer contract".to_string())?;
+    let recipient = TezosContract::from_b58check(&record.recipient)
+        .map_err(|_| "invalid withdrawal recipient contract".to_string())?;
+    let params = MichelsonPair(
+        MichelsonContract(recipient),
+        BridgeDepositTicket::new(
+            ticketer.clone(),
+            MichelsonPair(MichelsonInt::from(0i32), MichelsonOption(None)),
+            record.amount,
+        )
+        .map_err(|e| format!("failed to build withdrawal ticket: {}", e))?,
+    );
+    let message = TezosOutboxMessage::AtomicTransactionBatch(
+        vec![OutboxMessageTransaction {
+            parameters: params,
+            destination: ticketer,
+            entrypoint: TezosEntrypoint::try_from("burn".to_string())
+                .map_err(|_| "invalid burn entrypoint".to_string())?,
+        }]
+        .into(),
+    );
+    let mut bytes = Vec::new();
+    message
+        .bin_write(&mut bytes)
+        .map_err(|e| format!("failed to encode withdrawal outbox message: {}", e))?;
+    Ok(bytes)
+}
+
+fn decode_rollup_message(bytes: &[u8]) -> Result<ParsedRollupMessage, String> {
+    if let Ok((rest, inbox)) = TezosInboxMessage::<BridgeDepositPayload>::parse(bytes) {
+        if rest.is_empty() {
+            return match inbox {
+                TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer)) => {
+                    Ok(ParsedRollupMessage::Deposit(parse_bridge_deposit(transfer)?))
+                }
+                TezosInboxMessage::Internal(_) => {
+                    Err("unsupported internal inbox message".to_string())
+                }
+                TezosInboxMessage::External(payload) => decode_kernel_inbox_message(payload)
+                    .map(ParsedRollupMessage::Kernel),
+            };
+        }
+    }
+    decode_kernel_inbox_message(bytes).map(ParsedRollupMessage::Kernel)
+}
+
+fn parse_bridge_deposit(
+    transfer: tezos_smart_rollup_encoding::inbox::Transfer<BridgeDepositPayload>,
+) -> Result<ParsedBridgeDeposit, String> {
+    let recipient = String::from_utf8((transfer.payload.0).0)
+        .map_err(|_| "deposit receiver is not UTF-8".to_string())?;
+    let ticket = transfer.payload.1;
+    let creator = ticket.creator().0.to_b58check();
+    let ticketer = transfer.sender.to_base58_check();
+    if creator != ticketer {
+        return Err("deposit ticket creator does not match transfer sender".into());
+    }
+    let token_id = ticket.contents().0 .0.clone();
+    if token_id != MichelsonInt::from(0i32).0 {
+        return Err("deposit ticket token_id must be 0".into());
+    }
+    if ticket.contents().1 .0.is_some() {
+        return Err("deposit ticket metadata must be None".into());
+    }
+    let amount = ticket
+        .amount_as::<u64, _>()
+        .map_err(|_| "deposit amount does not fit in u64".to_string())?;
+    Ok(ParsedBridgeDeposit {
+        ticketer,
+        recipient,
+        amount,
+    })
+}
+
+fn validate_bridge_deposit<H: Host>(
+    ledger: &DurableLedgerState<'_, H>,
+    deposit: &ParsedBridgeDeposit,
+) -> Result<(), String> {
+    let configured = ledger
+        .read_string(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)?
+        .ok_or_else(|| "bridge ticketer is not configured".to_string())?;
+    if configured != deposit.ticketer {
+        return Err("deposit sent from unexpected ticketer".into());
+    }
+    Ok(())
 }
 
 pub fn run_with_host<H: Host>(host: &mut H) {
@@ -343,6 +529,7 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     let nullifier_count = read_u64(host, PATH_NULLIFIER_COUNT).unwrap_or(0);
     let valid_root_count = read_u64(host, PATH_VALID_ROOT_COUNT).unwrap_or(0);
     let balance_count = read_u64(host, PATH_BALANCE_ACCOUNT_COUNT).unwrap_or(0);
+    let withdrawal_count = read_u64(host, PATH_WITHDRAWAL_COUNT).unwrap_or(0);
 
     let mut ledger = Ledger::with_auth_domain(auth_domain);
     ledger.tree.leaves.clear();
@@ -350,6 +537,7 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     ledger.valid_roots.clear();
     ledger.balances.clear();
     ledger.memos.clear();
+    ledger.withdrawals.clear();
 
     for i in 0..tree_size {
         let (cm, enc) = decode_published_note(
@@ -395,6 +583,14 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
             String::from_utf8(key_bytes).map_err(|_| "stored balance key is not UTF-8".to_string())?;
         let amount = read_u64(host, &balance_path(&addr)).unwrap_or(0);
         ledger.balances.insert(addr, amount);
+    }
+
+    for i in 0..withdrawal_count {
+        let path = indexed_path(PATH_WITHDRAWAL_PREFIX, i);
+        let bytes = host
+            .read_store(&path, MAX_INPUT_BYTES)
+            .ok_or_else(|| format!("missing persisted withdrawal {}", i))?;
+        ledger.withdrawals.push(decode_withdrawal_record(&bytes)?);
     }
 
     Ok(ledger)
@@ -443,7 +639,7 @@ fn process_input<H: Host>(host: &mut H, input: &InputMessage) {
 }
 
 fn apply_input_message<H: Host>(host: &mut H, input: &InputMessage) -> KernelResult {
-    let message = match decode_kernel_inbox_message(&input.payload) {
+    let message = match decode_rollup_message(&input.payload) {
         Ok(message) => message,
         Err(e) => {
             let msg = format!("invalid inbox message: {}", e);
@@ -461,24 +657,57 @@ fn apply_input_message<H: Host>(host: &mut H, input: &InputMessage) -> KernelRes
     };
 
     let result: Result<KernelResult, String> = match message {
-        KernelInboxMessage::ConfigureVerifier(config) => configure_verifier(&mut ledger, &config)
-            .map(|_| KernelResult::Configured),
-        KernelInboxMessage::Fund(req) => apply_fund(&mut ledger, &req.addr, req.amount).map(|_| KernelResult::Fund),
-        KernelInboxMessage::Shield(req) => (|| -> Result<KernelResult, String> {
+        ParsedRollupMessage::Deposit(req) => (|| -> Result<KernelResult, String> {
+            validate_bridge_deposit(&ledger, &req)?;
+            apply_deposit(&mut ledger, &req.recipient, req.amount).map(|_| KernelResult::Deposit)
+        })(),
+        ParsedRollupMessage::Kernel(KernelInboxMessage::ConfigureVerifier(config)) => {
+            configure_verifier(&mut ledger, &config).map(|_| KernelResult::Configured)
+        }
+        ParsedRollupMessage::Kernel(KernelInboxMessage::ConfigureBridge(config)) => {
+            configure_bridge(&mut ledger, &config).map(|_| KernelResult::Configured)
+        }
+        ParsedRollupMessage::Kernel(KernelInboxMessage::Shield(req)) => {
+            (|| -> Result<KernelResult, String> {
             validate_transition_proof(ledger.host, &req.proof, tzel_core::CircuitKind::Shield)?;
             let req = host_shield_req_for_transition(&req);
             apply_shield(&mut ledger, &req).map(KernelResult::Shield)
-        })(),
-        KernelInboxMessage::Transfer(req) => (|| -> Result<KernelResult, String> {
+        })()
+        }
+        ParsedRollupMessage::Kernel(KernelInboxMessage::Transfer(req)) => {
+            (|| -> Result<KernelResult, String> {
             validate_transition_proof(ledger.host, &req.proof, tzel_core::CircuitKind::Transfer)?;
             let req = host_transfer_req_for_transition(&req);
             apply_transfer(&mut ledger, &req).map(KernelResult::Transfer)
-        })(),
-        KernelInboxMessage::Unshield(req) => (|| -> Result<KernelResult, String> {
+        })()
+        }
+        ParsedRollupMessage::Kernel(KernelInboxMessage::Unshield(req)) => {
+            (|| -> Result<KernelResult, String> {
             validate_transition_proof(ledger.host, &req.proof, tzel_core::CircuitKind::Unshield)?;
             let req = host_unshield_req_for_transition(&req);
             apply_unshield(&mut ledger, &req).map(KernelResult::Unshield)
-        })(),
+        })()
+        }
+        ParsedRollupMessage::Kernel(KernelInboxMessage::Withdraw(req)) => {
+            (|| -> Result<KernelResult, String> {
+            let host_req = kernel_withdraw_req_to_host(&req);
+            let resp = apply_withdraw(&mut ledger, &host_req)?;
+            let record = ledger
+                .host
+                .read_store(
+                    &indexed_path(PATH_WITHDRAWAL_PREFIX, resp.withdrawal_index as u64),
+                    MAX_INPUT_BYTES,
+                )
+                .ok_or_else(|| "missing persisted withdrawal record".to_string())?;
+            let ticketer = ledger
+                .read_string(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)?
+                .ok_or_else(|| "bridge ticketer is not configured".to_string())?;
+            let outbox =
+                encode_withdrawal_outbox_message(&ticketer, &decode_withdrawal_record(&record)?)?;
+            ledger.host.write_output(&outbox)?;
+            Ok(KernelResult::Withdraw(resp))
+        })()
+        }
     };
 
     match result {
@@ -589,6 +818,25 @@ fn configure_verifier<H: Host>(
     Ok(())
 }
 
+fn configure_bridge<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    config: &KernelBridgeConfig,
+) -> Result<(), String> {
+    let ticketer = TezosContract::from_b58check(&config.ticketer)
+        .map_err(|_| "bridge ticketer must be a valid L1 contract".to_string())?;
+    if !matches!(ticketer, TezosContract::Originated(_)) {
+        return Err("bridge ticketer must be a KT1 contract".into());
+    }
+
+    let existing = ledger.read_string(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)?;
+    if !ledger.is_pristine()? && existing.as_deref() != Some(config.ticketer.as_str()) {
+        return Err("cannot change bridge ticketer after ledger state exists".into());
+    }
+
+    ledger.write_string(PATH_BRIDGE_TICKETER, &config.ticketer);
+    Ok(())
+}
+
 fn ledger_debug<H: Host>(host: &mut H, message: &str) {
     host.write_debug(&format!("tzel-rollup-kernel: {}\n", message));
 }
@@ -654,6 +902,7 @@ mod wasm_host {
             src: *const u8,
             num_bytes: usize,
         ) -> i32;
+        fn write_output(src: *const u8, num_bytes: usize) -> i32;
     }
 
     pub struct WasmHost;
@@ -704,6 +953,14 @@ mod wasm_host {
             }
         }
 
+        fn write_output(&mut self, value: &[u8]) -> Result<(), String> {
+            let rc = unsafe { write_output(value.as_ptr(), value.len()) };
+            if rc < 0 {
+                return Err("write_output failed".into());
+            }
+            Ok(())
+        }
+
         fn write_debug(&mut self, message: &str) {
             unsafe { write_debug(message.as_ptr(), message.len()) }
         }
@@ -721,21 +978,38 @@ mod tests {
     use super::*;
     use ml_kem::{ml_kem_768, KeyExport};
     use std::collections::{HashMap, VecDeque};
+    use tezos_data_encoding_05::nom::NomReader as _;
+    use tezos_smart_rollup_encoding::{
+        contract::Contract as TezosContract,
+        inbox::{
+            InboxMessage as TezosInboxMessage, InternalInboxMessage as TezosInternalInboxMessage,
+            Transfer as TezosTransfer,
+        },
+        michelson::{
+            ticket::FA2_1Ticket, MichelsonBytes, MichelsonContract, MichelsonInt,
+            MichelsonOption, MichelsonPair,
+        },
+        outbox::OutboxMessage as TezosOutboxMessage,
+        public_key_hash::PublicKeyHash,
+        smart_rollup::SmartRollupAddress,
+    };
     use tzel_core::{
         build_auth_tree, default_auth_domain, derive_account, derive_address, derive_ask,
         derive_kem_keys, derive_nk_spend, derive_nk_tag, encrypt_note_deterministic,
         kernel_wire::{
             encode_kernel_inbox_message, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
-            KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig,
+            KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig, KernelWithdrawReq,
+            KernelBridgeConfig,
         },
-        commit, derive_rcm, owner_tag, FundReq, PaymentAddress, ProgramHashes,
-        ShieldResp, TransferResp, UnshieldResp, ZERO,
+        commit, derive_rcm, owner_tag, PaymentAddress, ProgramHashes, ShieldResp,
+        TransferResp, UnshieldResp, WithdrawResp, ZERO,
     };
 
     #[derive(Default)]
     struct MockHost {
         inputs: VecDeque<InputMessage>,
         store: HashMap<Vec<u8>, Vec<u8>>,
+        outputs: Vec<Vec<u8>>,
         debug: String,
     }
 
@@ -760,6 +1034,11 @@ mod tests {
 
         fn write_store(&mut self, path: &[u8], value: &[u8]) {
             self.store.insert(path.to_vec(), value.to_vec());
+        }
+
+        fn write_output(&mut self, value: &[u8]) -> Result<(), String> {
+            self.outputs.push(value.to_vec());
+            Ok(())
         }
 
         fn write_debug(&mut self, message: &str) {
@@ -835,17 +1114,14 @@ mod tests {
     }
 
     #[test]
-    fn applies_fund_message_to_shared_ledger_state() {
-        let message = encode_kernel_inbox_message(&KernelInboxMessage::Fund(FundReq {
-            addr: "alice".into(),
-            amount: 75,
-        }))
-        .unwrap();
-        let mut host = MockHost::with_inputs(vec![InputMessage {
+    fn applies_ticket_deposit_message_to_shared_ledger_state() {
+        let mut host = MockHost::default();
+        install_test_bridge(&mut host);
+        host.inputs.push_back(InputMessage {
             level: 1,
             id: 0,
-            payload: message,
-        }]);
+            payload: encode_ticket_deposit_message("alice", 75),
+        });
 
         run_with_host(&mut host);
 
@@ -853,7 +1129,7 @@ mod tests {
         assert_eq!(ledger.auth_domain, default_auth_domain());
         assert_eq!(ledger.balances.get("alice"), Some(&75));
         match read_last_result(&host).unwrap() {
-            KernelResult::Fund => {}
+            KernelResult::Deposit => {}
             other => panic!("unexpected rollup result: {:?}", other),
         }
     }
@@ -863,7 +1139,7 @@ mod tests {
         let mut host = MockHost::default();
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_fund(&mut state, "alice", 50).unwrap();
+            apply_deposit(&mut state, "alice", 50).unwrap();
         }
 
         let config = KernelVerifierConfig {
@@ -1004,11 +1280,93 @@ mod tests {
     }
 
     #[test]
+    fn applies_withdraw_message_and_emits_outbox_payload() {
+        let mut host = MockHost::default();
+        install_test_bridge(&mut host);
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            apply_deposit(&mut state, "bob", 44).unwrap();
+        }
+
+        let message = encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(
+            KernelWithdrawReq {
+                sender: "bob".into(),
+                recipient: sample_l1_receiver().into(),
+                amount: 33,
+            },
+        ))
+        .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 2,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        match read_last_result(&host).unwrap() {
+            KernelResult::Withdraw(WithdrawResp { withdrawal_index }) => {
+                assert_eq!(withdrawal_index, 0)
+            }
+            KernelResult::Error { message } => {
+                panic!("withdraw failed: {} | debug: {}", message, host.debug)
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.balances.get("bob"), Some(&11));
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: sample_l1_receiver().into(),
+                amount: 33,
+            }]
+        );
+        assert_eq!(host.outputs.len(), 1);
+        let outbox = decode_test_withdrawal_outbox(&host.outputs[0]);
+        let batch = match outbox {
+            TezosOutboxMessage::AtomicTransactionBatch(batch) => batch,
+        };
+        assert_eq!(batch.len(), 1);
+        let tx = &batch[0];
+        assert_eq!(tx.destination.to_b58check(), sample_ticketer());
+        assert_eq!(tx.entrypoint.name(), "burn");
+        assert_eq!(tx.parameters.0 .0.to_b58check(), sample_l1_receiver());
+        assert_eq!(tx.parameters.1 .creator().0.to_b58check(), sample_ticketer());
+        assert_eq!(tx.parameters.1.amount_as::<u64, _>().unwrap(), 33);
+    }
+
+    #[test]
+    fn configures_bridge_ticketer_via_kernel_message() {
+        let mut host = MockHost::default();
+        let message = encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(
+            KernelBridgeConfig {
+                ticketer: sample_ticketer().into(),
+            },
+        ))
+        .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 1,
+            id: 0,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let persisted = host
+            .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+            .expect("bridge ticketer persisted");
+        assert_eq!(String::from_utf8(persisted).unwrap(), sample_ticketer());
+        assert!(matches!(read_last_result(&host).unwrap(), KernelResult::Configured));
+    }
+
+    #[test]
     fn rejects_auth_domain_reconfiguration_after_state_exists() {
         let mut host = MockHost::default();
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_fund(&mut state, "alice", 1).unwrap();
+            apply_deposit(&mut state, "alice", 1).unwrap();
         }
 
         let new_domain = sample_felt(0x44);
@@ -1138,6 +1496,75 @@ mod tests {
             PATH_VERIFIER_CONFIG,
             &encode_kernel_verifier_config(&config).unwrap(),
         );
+    }
+
+    fn sample_ticketer() -> &'static str {
+        "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc"
+    }
+
+    fn sample_l1_receiver() -> &'static str {
+        "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx"
+    }
+
+    fn sample_l1_source() -> PublicKeyHash {
+        PublicKeyHash::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN").unwrap()
+    }
+
+    fn sample_rollup_address() -> SmartRollupAddress {
+        SmartRollupAddress::from_b58check("sr1UNDWPUYVeomgG15wn5jSw689EJ4RNnVQa").unwrap()
+    }
+
+    fn install_test_bridge(host: &mut MockHost) {
+        let message = encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(
+            KernelBridgeConfig {
+                ticketer: sample_ticketer().into(),
+            },
+        ))
+        .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 0,
+            id: 0,
+            payload: message,
+        });
+        run_with_host(host);
+    }
+
+    fn encode_ticket_deposit_message(recipient: &str, amount: u64) -> Vec<u8> {
+        let ticketer = TezosContract::from_b58check(sample_ticketer()).unwrap();
+        let sender = match ticketer.clone() {
+            TezosContract::Originated(kt1) => kt1,
+            TezosContract::Implicit(_) => panic!("ticketer must be KT1"),
+        };
+        let payload = MichelsonPair(
+            MichelsonBytes(recipient.as_bytes().to_vec()),
+            FA2_1Ticket::new(
+                ticketer,
+                MichelsonPair(MichelsonInt::from(0i32), MichelsonOption(None)),
+                amount,
+            )
+            .unwrap(),
+        );
+        let transfer = TezosTransfer {
+            payload,
+            sender,
+            source: sample_l1_source(),
+            destination: sample_rollup_address(),
+        };
+        let mut bytes = Vec::new();
+        TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer))
+            .serialize(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    fn decode_test_withdrawal_outbox(
+        bytes: &[u8],
+    ) -> TezosOutboxMessage<MichelsonPair<MichelsonContract, FA2_1Ticket>> {
+        let (rest, decoded) =
+            TezosOutboxMessage::<MichelsonPair<MichelsonContract, FA2_1Ticket>>::nom_read(bytes)
+            .expect("valid outbox encoding");
+        assert!(rest.is_empty(), "outbox encoding should consume all bytes");
+        decoded
     }
 
     fn sample_program_hashes() -> ProgramHashes {

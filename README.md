@@ -161,10 +161,13 @@ It currently:
 - reads raw inbox messages from the WASM host
 - persists basic durable state for inbox stats and the last message seen
 - decodes Tezos Data Encoding inbox messages into shared TzEL request types
-- treats `transfer` as the only fully internal rollup transaction, with `fund`/`shield`/`unshield` handling bridge ingress and egress around it
+- treats `transfer` as the only fully internal rollup transaction, with `deposit`/`shield` and `unshield`/`withdraw` handling rollup ingress and egress around it
 - applies the shared transition logic from `tzel-core`
 - persists path-addressed durable state for notes, bridge balances, roots, nullifiers, and the commitment-tree frontier
 - verifies proofs through the shared verifier path without linking prover code
+
+The current bridge sketch in [`minimal_tez_bridge.md`](/home/arthurb/src/starkprivacy/minimal_tez_bridge.md)
+is informative only.
 
 Build it with:
 

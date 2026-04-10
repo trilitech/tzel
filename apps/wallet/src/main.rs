@@ -1654,7 +1654,7 @@ fn cmd_unshield(
 
 fn cmd_fund(ledger: &str, addr: &str, amount: u64) -> Result<(), String> {
     let req = FundReq {
-        addr: addr.into(),
+        recipient: addr.into(),
         amount,
     };
     let _: serde_json::Value = post_json(&format!("{}/fund", ledger), &req)?;

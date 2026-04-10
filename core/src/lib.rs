@@ -1026,10 +1026,13 @@ impl CircuitKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FundReq {
-    pub addr: String,
+pub struct DepositReq {
+    #[serde(alias = "addr")]
+    pub recipient: String,
     pub amount: u64,
 }
+
+pub type FundReq = DepositReq;
 
 /// Payment address — everything a sender needs to create a note for the recipient.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1109,6 +1112,24 @@ pub struct UnshieldResp {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WithdrawReq {
+    pub sender: String,
+    pub recipient: String,
+    pub amount: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WithdrawResp {
+    pub withdrawal_index: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WithdrawalRecord {
+    pub recipient: String,
+    pub amount: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NoteMemo {
     pub index: usize,
     #[serde(with = "hex_f")]
@@ -1167,6 +1188,7 @@ pub struct Ledger {
     pub balances: HashMap<String, u64>,
     pub valid_roots: HashSet<F>,
     pub memos: Vec<(F, EncryptedNote)>,
+    pub withdrawals: Vec<WithdrawalRecord>,
 }
 
 pub trait LedgerState {
@@ -1178,6 +1200,7 @@ pub trait LedgerState {
     fn insert_nullifier(&mut self, nf: F) -> Result<(), String>;
     fn append_note(&mut self, cm: F, enc: EncryptedNote) -> Result<usize, String>;
     fn snapshot_root(&mut self) -> Result<(), String>;
+    fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String>;
 }
 
 impl Ledger {
@@ -1196,6 +1219,7 @@ impl Ledger {
             balances: HashMap::new(),
             valid_roots: roots,
             memos: vec![],
+            withdrawals: vec![],
         }
     }
 
@@ -1207,8 +1231,12 @@ impl Ledger {
         self.memos.push((cm, enc));
     }
 
+    pub fn deposit(&mut self, recipient: &str, amount: u64) -> Result<(), String> {
+        apply_deposit(self, recipient, amount)
+    }
+
     pub fn fund(&mut self, addr: &str, amount: u64) -> Result<(), String> {
-        apply_fund(self, addr, amount)
+        self.deposit(addr, amount)
     }
 
     pub fn shield(&mut self, req: &ShieldReq) -> Result<ShieldResp, String> {
@@ -1221,6 +1249,10 @@ impl Ledger {
 
     pub fn unshield(&mut self, req: &UnshieldReq) -> Result<UnshieldResp, String> {
         apply_unshield(self, req)
+    }
+
+    pub fn withdraw(&mut self, req: &WithdrawReq) -> Result<WithdrawResp, String> {
+        apply_withdraw(self, req)
     }
 }
 
@@ -1261,14 +1293,31 @@ impl LedgerState for Ledger {
         self.snapshot_root_local();
         Ok(())
     }
+
+    fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String> {
+        let index = self.withdrawals.len();
+        self.withdrawals.push(WithdrawalRecord {
+            recipient: recipient.to_string(),
+            amount,
+        });
+        Ok(index)
+    }
+}
+
+pub fn apply_deposit<S: LedgerState>(
+    state: &mut S,
+    recipient: &str,
+    amount: u64,
+) -> Result<(), String> {
+    let next = state
+        .balance(recipient)?
+        .checked_add(amount)
+        .ok_or_else(|| "public balance overflow".to_string())?;
+    state.set_balance(recipient, next)
 }
 
 pub fn apply_fund<S: LedgerState>(state: &mut S, addr: &str, amount: u64) -> Result<(), String> {
-    let next = state
-        .balance(addr)?
-        .checked_add(amount)
-        .ok_or_else(|| "public balance overflow".to_string())?;
-    state.set_balance(addr, next)
+    apply_deposit(state, addr, amount)
 }
 
 pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<ShieldResp, String> {
@@ -1538,6 +1587,19 @@ pub fn apply_unshield<S: LedgerState>(
     state.set_balance(&req.recipient, next_balance)?;
     state.snapshot_root()?;
     Ok(UnshieldResp { change_index })
+}
+
+pub fn apply_withdraw<S: LedgerState>(
+    state: &mut S,
+    req: &WithdrawReq,
+) -> Result<WithdrawResp, String> {
+    let balance = state.balance(&req.sender)?;
+    if balance < req.amount {
+        return Err("insufficient balance".into());
+    }
+    let withdrawal_index = state.enqueue_withdrawal(&req.recipient, req.amount)?;
+    state.set_balance(&req.sender, balance - req.amount)?;
+    Ok(WithdrawResp { withdrawal_index })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2058,5 +2120,51 @@ mod tests {
         assert!(!ledger.nullifiers.contains(&nf));
         assert_eq!(ledger.tree.leaves, leaves_before);
         assert_eq!(ledger.memos.len(), memos_before);
+    }
+
+    #[test]
+    fn test_apply_withdraw_moves_transparent_balance_into_withdrawal_queue() {
+        let mut ledger = Ledger::new();
+        ledger.deposit("bob", 44).unwrap();
+
+        let resp = apply_withdraw(
+            &mut ledger,
+            &WithdrawReq {
+                sender: "bob".into(),
+                recipient: "tz1-target".into(),
+                amount: 33,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resp.withdrawal_index, 0);
+        assert_eq!(ledger.balance("bob").unwrap(), 11);
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: "tz1-target".into(),
+                amount: 33,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_apply_withdraw_rejects_insufficient_balance_without_mutation() {
+        let mut ledger = Ledger::new();
+        ledger.deposit("bob", 10).unwrap();
+
+        let err = apply_withdraw(
+            &mut ledger,
+            &WithdrawReq {
+                sender: "bob".into(),
+                recipient: "tz1-target".into(),
+                amount: 11,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("insufficient balance"));
+        assert_eq!(ledger.balance("bob").unwrap(), 10);
+        assert!(ledger.withdrawals.is_empty());
     }
 }

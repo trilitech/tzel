@@ -3,15 +3,15 @@ use crate::canonical_wire::{
     wire_to_u64, WireEncryptedNote, WireFelt, WirePaymentAddress, WireU16Le, WireU64Le,
 };
 use crate::{
-    EncryptedNote, ENCRYPTED_NOTE_BYTES, F, FundReq, ML_KEM768_CIPHERTEXT_BYTES, PaymentAddress,
+    EncryptedNote, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES, PaymentAddress,
     ProgramHashes, Proof, ShieldReq, ShieldResp, TransferReq, TransferResp, UnshieldReq,
-    UnshieldResp,
+    UnshieldResp, WithdrawReq, WithdrawResp,
 };
 use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 1;
+pub const KERNEL_WIRE_VERSION: u16 = 4;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
 const MAX_MEMO_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = 8 * 1024 * 1024;
@@ -32,6 +32,11 @@ const MAX_UNSHIELD_PAYLOAD_BYTES: usize =
 pub struct KernelVerifierConfig {
     pub auth_domain: F,
     pub verified_program_hashes: ProgramHashes,
+}
+
+#[derive(Debug, Clone)]
+pub struct KernelBridgeConfig {
+    pub ticketer: String,
 }
 
 #[derive(Debug, Clone)]
@@ -75,21 +80,30 @@ pub struct KernelUnshieldReq {
 }
 
 #[derive(Debug, Clone)]
+pub struct KernelWithdrawReq {
+    pub sender: String,
+    pub recipient: String,
+    pub amount: u64,
+}
+
+#[derive(Debug, Clone)]
 pub enum KernelInboxMessage {
     ConfigureVerifier(KernelVerifierConfig),
-    Fund(FundReq),
+    ConfigureBridge(KernelBridgeConfig),
     Shield(KernelShieldReq),
     Transfer(KernelTransferReq),
     Unshield(KernelUnshieldReq),
+    Withdraw(KernelWithdrawReq),
 }
 
 #[derive(Debug, Clone)]
 pub enum KernelResult {
     Configured,
-    Fund,
+    Deposit,
     Shield(ShieldResp),
     Transfer(TransferResp),
     Unshield(UnshieldResp),
+    Withdraw(WithdrawResp),
     Error { message: String },
 }
 
@@ -152,10 +166,9 @@ struct WireKernelVerifierConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireFundReq {
+struct WireKernelBridgeConfig {
     #[encoding(string = "MAX_ACCOUNT_ID_BYTES")]
-    addr: String,
-    amount: WireU64Le,
+    ticketer: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -196,8 +209,22 @@ struct WireKernelUnshieldReq {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelWithdrawReq {
+    #[encoding(string = "MAX_ACCOUNT_ID_BYTES")]
+    sender: String,
+    #[encoding(string = "MAX_ACCOUNT_ID_BYTES")]
+    recipient: String,
+    amount: WireU64Le,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireUnshieldResp {
     change_index: Option<WireU64Le>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireWithdrawResp {
+    withdrawal_index: WireU64Le,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -223,13 +250,15 @@ enum WireKernelInboxMessage {
     #[encoding(tag = 0)]
     ConfigureVerifier(WireKernelVerifierConfig),
     #[encoding(tag = 1)]
-    Fund(WireFundReq),
+    ConfigureBridge(WireKernelBridgeConfig),
     #[encoding(tag = 2)]
     Shield(WireKernelShieldReq),
     #[encoding(tag = 3)]
     Transfer(WireKernelTransferReq),
     #[encoding(tag = 4)]
     Unshield(WireKernelUnshieldReq),
+    #[encoding(tag = 5)]
+    Withdraw(WireKernelWithdrawReq),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -244,13 +273,15 @@ enum WireKernelResult {
     #[encoding(tag = 0)]
     Configured,
     #[encoding(tag = 1)]
-    Fund,
+    Deposit,
     #[encoding(tag = 2)]
     Shield(WireShieldResp),
     #[encoding(tag = 3)]
     Transfer(WireTransferResp),
     #[encoding(tag = 4)]
     Unshield(WireUnshieldResp),
+    #[encoding(tag = 5)]
+    Withdraw(WireWithdrawResp),
     #[encoding(tag = 255)]
     Error(WireErrorMessage),
 }
@@ -268,7 +299,9 @@ pub fn encode_kernel_inbox_message(message: &KernelInboxMessage) -> Result<Vec<u
             KernelInboxMessage::ConfigureVerifier(cfg) => {
                 WireKernelInboxMessage::ConfigureVerifier(config_to_wire(cfg))
             }
-            KernelInboxMessage::Fund(req) => WireKernelInboxMessage::Fund(fund_req_to_wire(req)),
+            KernelInboxMessage::ConfigureBridge(cfg) => {
+                WireKernelInboxMessage::ConfigureBridge(bridge_config_to_wire(cfg))
+            }
             KernelInboxMessage::Shield(req) => {
                 WireKernelInboxMessage::Shield(kernel_shield_req_to_wire(req)?)
             }
@@ -277,6 +310,9 @@ pub fn encode_kernel_inbox_message(message: &KernelInboxMessage) -> Result<Vec<u
             }
             KernelInboxMessage::Unshield(req) => {
                 WireKernelInboxMessage::Unshield(kernel_unshield_req_to_wire(req)?)
+            }
+            KernelInboxMessage::Withdraw(req) => {
+                WireKernelInboxMessage::Withdraw(kernel_withdraw_req_to_wire(req))
             }
         },
     })
@@ -295,7 +331,9 @@ pub fn decode_kernel_inbox_message(bytes: &[u8]) -> Result<KernelInboxMessage, S
         WireKernelInboxMessage::ConfigureVerifier(cfg) => {
             Ok(KernelInboxMessage::ConfigureVerifier(config_from_wire(cfg)?))
         }
-        WireKernelInboxMessage::Fund(req) => Ok(KernelInboxMessage::Fund(fund_req_from_wire(req)?)),
+        WireKernelInboxMessage::ConfigureBridge(cfg) => {
+            Ok(KernelInboxMessage::ConfigureBridge(bridge_config_from_wire(cfg)?))
+        }
         WireKernelInboxMessage::Shield(req) => {
             Ok(KernelInboxMessage::Shield(kernel_shield_req_from_wire(req)?))
         }
@@ -305,6 +343,9 @@ pub fn decode_kernel_inbox_message(bytes: &[u8]) -> Result<KernelInboxMessage, S
         WireKernelInboxMessage::Unshield(req) => {
             Ok(KernelInboxMessage::Unshield(kernel_unshield_req_from_wire(req)?))
         }
+        WireKernelInboxMessage::Withdraw(req) => {
+            Ok(KernelInboxMessage::Withdraw(kernel_withdraw_req_from_wire(req)?))
+        }
     }
 }
 
@@ -313,13 +354,16 @@ pub fn encode_kernel_result(result: &KernelResult) -> Result<Vec<u8>, String> {
         version: u16_to_wire(KERNEL_WIRE_VERSION),
         result: match result {
             KernelResult::Configured => WireKernelResult::Configured,
-            KernelResult::Fund => WireKernelResult::Fund,
+            KernelResult::Deposit => WireKernelResult::Deposit,
             KernelResult::Shield(resp) => WireKernelResult::Shield(shield_resp_to_wire(resp)?),
             KernelResult::Transfer(resp) => {
                 WireKernelResult::Transfer(transfer_resp_to_wire(resp)?)
             }
             KernelResult::Unshield(resp) => {
                 WireKernelResult::Unshield(unshield_resp_to_wire(resp)?)
+            }
+            KernelResult::Withdraw(resp) => {
+                WireKernelResult::Withdraw(withdraw_resp_to_wire(resp)?)
             }
             KernelResult::Error { message } => WireKernelResult::Error(WireErrorMessage {
                 message: message.clone(),
@@ -339,13 +383,16 @@ pub fn decode_kernel_result(bytes: &[u8]) -> Result<KernelResult, String> {
     }
     match wire.result {
         WireKernelResult::Configured => Ok(KernelResult::Configured),
-        WireKernelResult::Fund => Ok(KernelResult::Fund),
+        WireKernelResult::Deposit => Ok(KernelResult::Deposit),
         WireKernelResult::Shield(resp) => Ok(KernelResult::Shield(shield_resp_from_wire(resp)?)),
         WireKernelResult::Transfer(resp) => {
             Ok(KernelResult::Transfer(transfer_resp_from_wire(resp)?))
         }
         WireKernelResult::Unshield(resp) => {
             Ok(KernelResult::Unshield(unshield_resp_from_wire(resp)?))
+        }
+        WireKernelResult::Withdraw(resp) => {
+            Ok(KernelResult::Withdraw(withdraw_resp_from_wire(resp)?))
         }
         WireKernelResult::Error(err) => Ok(KernelResult::Error {
             message: err.message,
@@ -413,6 +460,14 @@ pub fn kernel_unshield_req_to_host(req: &KernelUnshieldReq) -> UnshieldReq {
     }
 }
 
+pub fn kernel_withdraw_req_to_host(req: &KernelWithdrawReq) -> WithdrawReq {
+    WithdrawReq {
+        sender: req.sender.clone(),
+        recipient: req.recipient.clone(),
+        amount: req.amount,
+    }
+}
+
 fn config_to_wire(config: &KernelVerifierConfig) -> WireKernelVerifierConfig {
     WireKernelVerifierConfig {
         auth_domain: felt_to_wire(&config.auth_domain),
@@ -424,6 +479,18 @@ fn config_from_wire(wire: WireKernelVerifierConfig) -> Result<KernelVerifierConf
     Ok(KernelVerifierConfig {
         auth_domain: wire_to_felt(wire.auth_domain)?,
         verified_program_hashes: program_hashes_from_wire(wire.verified_program_hashes)?,
+    })
+}
+
+fn bridge_config_to_wire(config: &KernelBridgeConfig) -> WireKernelBridgeConfig {
+    WireKernelBridgeConfig {
+        ticketer: config.ticketer.clone(),
+    }
+}
+
+fn bridge_config_from_wire(wire: WireKernelBridgeConfig) -> Result<KernelBridgeConfig, String> {
+    Ok(KernelBridgeConfig {
+        ticketer: wire.ticketer,
     })
 }
 
@@ -576,20 +643,6 @@ fn encoded_felt_list_from_wire(wire: WireEncodedFeltList) -> Result<Vec<F>, Stri
         .into_iter()
         .map(wire_to_felt)
         .collect::<Result<Vec<_>, _>>()
-}
-
-fn fund_req_to_wire(req: &FundReq) -> WireFundReq {
-    WireFundReq {
-        addr: req.addr.clone(),
-        amount: u64_to_wire(req.amount),
-    }
-}
-
-fn fund_req_from_wire(wire: WireFundReq) -> Result<FundReq, String> {
-    Ok(FundReq {
-        addr: wire.addr,
-        amount: wire_to_u64(wire.amount)?,
-    })
 }
 
 fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldReq, String> {
@@ -764,6 +817,40 @@ fn unshield_resp_from_wire(wire: WireUnshieldResp) -> Result<UnshieldResp, Strin
                     .map_err(|_| "change index does not fit in usize".to_string())
             })
             .transpose()?,
+    })
+}
+
+fn kernel_withdraw_req_to_wire(req: &KernelWithdrawReq) -> WireKernelWithdrawReq {
+    WireKernelWithdrawReq {
+        sender: req.sender.clone(),
+        recipient: req.recipient.clone(),
+        amount: u64_to_wire(req.amount),
+    }
+}
+
+fn kernel_withdraw_req_from_wire(wire: WireKernelWithdrawReq) -> Result<KernelWithdrawReq, String> {
+    Ok(KernelWithdrawReq {
+        sender: wire.sender,
+        recipient: wire.recipient,
+        amount: wire_to_u64(wire.amount)?,
+    })
+}
+
+fn withdraw_resp_to_wire(resp: &WithdrawResp) -> Result<WireWithdrawResp, String> {
+    Ok(WireWithdrawResp {
+        withdrawal_index: u64_to_wire(
+            resp.withdrawal_index
+                .try_into()
+                .map_err(|_| "withdrawal index does not fit in u64".to_string())?,
+        ),
+    })
+}
+
+fn withdraw_resp_from_wire(wire: WireWithdrawResp) -> Result<WithdrawResp, String> {
+    Ok(WithdrawResp {
+        withdrawal_index: wire_to_u64(wire.withdrawal_index)?
+            .try_into()
+            .map_err(|_| "withdrawal index does not fit in usize".to_string())?,
     })
 }
 
@@ -1096,6 +1183,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn kernel_inbox_roundtrip_preserves_withdraw_request() {
+        let message = KernelInboxMessage::Withdraw(KernelWithdrawReq {
+            sender: "alice".into(),
+            recipient: "tz1-target".into(),
+            amount: 33,
+        });
+        let encoded = encode_kernel_inbox_message(&message).unwrap();
+        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
+        match decoded {
+            KernelInboxMessage::Withdraw(req) => {
+                assert_eq!(req.sender, "alice");
+                assert_eq!(req.recipient, "tz1-target");
+                assert_eq!(req.amount, 33);
+            }
+            other => panic!("unexpected decoded message: {:?}", other),
+        }
+    }
+
     fn sample_payment_address() -> PaymentAddress {
         let mut master_sk = [0u8; 32];
         master_sk[0] = 7;
@@ -1268,7 +1374,7 @@ mod tests {
         ) {
             let cases = [
                 KernelResult::Configured,
-                KernelResult::Fund,
+                KernelResult::Deposit,
                 KernelResult::Shield(ShieldResp { cm: shield_cm, index: shield_index as usize }),
                 KernelResult::Transfer(TransferResp {
                     index_1: transfer_index_1 as usize,
@@ -1276,6 +1382,9 @@ mod tests {
                 }),
                 KernelResult::Unshield(UnshieldResp {
                     change_index: change_index.map(|x| x as usize),
+                }),
+                KernelResult::Withdraw(WithdrawResp {
+                    withdrawal_index: transfer_index_1 as usize,
                 }),
                 KernelResult::Error { message: message.clone() },
             ];
@@ -1285,7 +1394,7 @@ mod tests {
                 let decoded = decode_kernel_result(&encoded).unwrap();
                 match (decoded, &result) {
                     (KernelResult::Configured, KernelResult::Configured)
-                    | (KernelResult::Fund, KernelResult::Fund) => {}
+                    | (KernelResult::Deposit, KernelResult::Deposit) => {}
                     (KernelResult::Shield(actual), KernelResult::Shield(expected)) => {
                         prop_assert_eq!(actual.cm, expected.cm);
                         prop_assert_eq!(actual.index, expected.index);
@@ -1296,6 +1405,9 @@ mod tests {
                     }
                     (KernelResult::Unshield(actual), KernelResult::Unshield(expected)) => {
                         prop_assert_eq!(actual.change_index, expected.change_index);
+                    }
+                    (KernelResult::Withdraw(actual), KernelResult::Withdraw(expected)) => {
+                        prop_assert_eq!(actual.withdrawal_index, expected.withdrawal_index);
                     }
                     (KernelResult::Error { message: actual }, KernelResult::Error { message: expected }) => {
                         prop_assert_eq!(&actual, expected);
@@ -1530,9 +1642,8 @@ mod tests {
     fn decode_kernel_inbox_message_rejects_wrong_version() {
         let bytes = encode_tze(&WireKernelInboxEnvelope {
             version: u16_to_wire(KERNEL_WIRE_VERSION + 1),
-            message: WireKernelInboxMessage::Fund(WireFundReq {
-                addr: "alice".into(),
-                amount: u64_to_wire(7),
+            message: WireKernelInboxMessage::ConfigureBridge(WireKernelBridgeConfig {
+                ticketer: "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc".into(),
             }),
         })
         .unwrap();
@@ -1544,7 +1655,7 @@ mod tests {
     fn decode_kernel_result_rejects_wrong_version() {
         let bytes = encode_tze(&WireKernelResultEnvelope {
             version: u16_to_wire(KERNEL_WIRE_VERSION + 1),
-            result: WireKernelResult::Fund,
+            result: WireKernelResult::Deposit,
         })
         .unwrap();
         let err = decode_kernel_result(&bytes).unwrap_err();
