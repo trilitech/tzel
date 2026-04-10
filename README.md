@@ -1,6 +1,6 @@
 # TzEL
 
-![TzEL](docs/pq.png)
+<img src="docs/pq.png" alt="TzEL" width="50%">
 
 **Post-quantum private transactions with STARK proofs.**
 
