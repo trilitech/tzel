@@ -19,7 +19,7 @@
 ///
 /// # Note structure
 ///
-///   owner_tag_j = H_owner(auth_root_j, nk_tag_j)
+///   owner_tag_j = H_owner(auth_root_j, pub_seed_j, nk_tag_j)
 ///   cm = H_commit(d_j, v, rcm, owner_tag_j)  — commitment
 ///   nf = H_nf(nk_spend_j, cm, pos)           — nullifier (position-dependent)
 ///
@@ -32,7 +32,7 @@
 ///   - cmmtSP__:  note commitments
 ///   - nkspSP__:  nk_spend_j derivation (per-address secret nullifier key)
 ///   - nktgSP__:  nk_tag_j derivation (per-address public binding tag)
-///   - ownrSP__:  owner_tag_j (fuses auth_root + nk_tag into commitment)
+///   - ownrSP__:  owner_tag_j (fuses auth_root + pub_seed + nk_tag into commitment)
 
 use core::blake::{blake2s_compress, blake2s_finalize};
 use core::box::BoxTrait;
@@ -113,15 +113,6 @@ fn blake2s_iv_wots() -> Box<[u32; 8]> {
     ])
 }
 
-/// PK fold IV — "pkfdSP__".
-/// Dedicated domain for folding WOTS+ public key chains to a leaf hash.
-fn blake2s_iv_pkfold() -> Box<[u32; 8]> {
-    BoxTrait::new([
-        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-        0x510E527F, 0x9B05688C, 0x7BE5B2DB, 0x04BF9D4A,
-    ])
-}
-
 /// Sighash IV — "sighSP__".
 /// Used to compute the transaction sighash that WOTS+ signatures bind to.
 fn blake2s_iv_sighash() -> Box<[u32; 8]> {
@@ -183,6 +174,33 @@ pub fn hash2_generic(a: felt252, b: felt252) -> felt252 {
     hash2_with_iv(blake2s_iv(), a, b)
 }
 
+/// H(a, b, c) — generic one-pass BLAKE2s over 96 bytes.
+pub fn hash3_generic(a: felt252, b: felt252, c: felt252) -> felt252 {
+    let (a0, a1, a2, a3, a4, a5, a6, a7) = felt_to_u32x8(a);
+    let (b0, b1, b2, b3, b4, b5, b6, b7) = felt_to_u32x8(b);
+    let (c0, c1, c2, c3, c4, c5, c6, c7) = felt_to_u32x8(c);
+    let block1 = BoxTrait::new([a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7]);
+    let state = blake2s_compress(blake2s_iv(), 64, block1);
+    let block2 = BoxTrait::new([c0, c1, c2, c3, c4, c5, c6, c7, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let result = blake2s_finalize(state, 96, block2);
+    let [h0, h1, h2, h3, h4, h5, h6, h7] = result.unbox();
+    u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
+}
+
+/// H(a, b, c, d) — generic one-pass BLAKE2s over 128 bytes.
+pub fn hash4_generic(a: felt252, b: felt252, c: felt252, d: felt252) -> felt252 {
+    let (a0, a1, a2, a3, a4, a5, a6, a7) = felt_to_u32x8(a);
+    let (b0, b1, b2, b3, b4, b5, b6, b7) = felt_to_u32x8(b);
+    let (c0, c1, c2, c3, c4, c5, c6, c7) = felt_to_u32x8(c);
+    let (d0, d1, d2, d3, d4, d5, d6, d7) = felt_to_u32x8(d);
+    let block1 = BoxTrait::new([a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7]);
+    let state = blake2s_compress(blake2s_iv(), 64, block1);
+    let block2 = BoxTrait::new([c0, c1, c2, c3, c4, c5, c6, c7, d0, d1, d2, d3, d4, d5, d6, d7]);
+    let result = blake2s_finalize(state, 128, block2);
+    let [h0, h1, h2, h3, h4, h5, h6, h7] = result.unbox();
+    u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
+}
+
 /// H_merkle(a, b) — Merkle tree internal nodes.
 pub fn hash2(a: felt252, b: felt252) -> felt252 {
     hash2_with_iv(blake2s_iv_merkle(), a, b)
@@ -231,13 +249,21 @@ pub fn derive_nk_tag(nk_spend: felt252) -> felt252 {
     u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
 }
 
-/// Compute owner tag: owner_tag_j = H_owner(auth_root_j, nk_tag_j).
+/// Compute owner tag: owner_tag_j = H_owner(auth_root_j, pub_seed_j, nk_tag_j).
 ///
-/// Fuses the auth key tree root and the nullifier binding tag into a single
+/// Fuses the full XMSS public key and the nullifier binding tag into a single
 /// value for the commitment. Binds the note to both the spending authority
-/// (auth_root) and the nullifier key chain (nk_tag). Uses "ownrSP__" domain.
-pub fn owner_tag(auth_root: felt252, nk_tag: felt252) -> felt252 {
-    hash2_with_iv(blake2s_iv_owner(), auth_root, nk_tag)
+/// (`auth_root`, `pub_seed`) and the nullifier key chain (`nk_tag`).
+pub fn owner_tag(auth_root: felt252, auth_pub_seed: felt252, nk_tag: felt252) -> felt252 {
+    let (a0, a1, a2, a3, a4, a5, a6, a7) = felt_to_u32x8(auth_root);
+    let (b0, b1, b2, b3, b4, b5, b6, b7) = felt_to_u32x8(auth_pub_seed);
+    let (c0, c1, c2, c3, c4, c5, c6, c7) = felt_to_u32x8(nk_tag);
+    let block1 = BoxTrait::new([a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7]);
+    let state = blake2s_compress(blake2s_iv_owner(), 64, block1);
+    let block2 = BoxTrait::new([c0, c1, c2, c3, c4, c5, c6, c7, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let result = blake2s_finalize(state, 96, block2);
+    let [h0, h1, h2, h3, h4, h5, h6, h7] = result.unbox();
+    u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
 }
 
 /// Note commitment: cm = H_commit(d_j, v, rcm, owner_tag_j).
@@ -275,11 +301,6 @@ pub fn hash1_wots(a: felt252) -> felt252 {
     let result = blake2s_finalize(blake2s_iv_wots(), 32, msg);
     let [h0, h1, h2, h3, h4, h5, h6, h7] = result.unbox();
     u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
-}
-
-/// WOTS+ PK fold: H_pkfold(a, b). Dedicated domain for folding pk chains.
-pub fn hash2_pkfold(a: felt252, b: felt252) -> felt252 {
-    hash2_with_iv(blake2s_iv_pkfold(), a, b)
 }
 
 // ── WOTS+ sighash support ───────────────────────────────────────────

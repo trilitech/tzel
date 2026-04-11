@@ -2,11 +2,12 @@ use crate::canonical_wire::{
     encode_encrypted_note, encode_note_memo, encode_payment_address, encode_published_note,
 };
 use crate::{
-    build_auth_tree, commit, derive_account, derive_address, derive_ask, derive_kem_detect_seed,
-    derive_kem_keys, derive_kem_view_seed, derive_nk_spend, derive_nk_tag, derive_rcm, hash,
-    hash2_pkfold, hash_chain, hash_merkle, hash_two, kem_keygen_from_seed, memo_ct_hash, nullifier,
-    owner_tag, sighash_fold, Account, EncryptedNote, NoteMemo, PaymentAddress, DETECT_K,
-    ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES, WOTS_CHAINS, WOTS_W, ZERO,
+    auth_key_seed, build_auth_tree, commit, derive_account, derive_address, derive_ask,
+    derive_auth_pub_seed, derive_kem_detect_seed, derive_kem_keys, derive_kem_view_seed,
+    derive_nk_spend, derive_nk_tag, derive_rcm, hash, hash_merkle, hash_two, kem_keygen_from_seed,
+    memo_ct_hash, nullifier, owner_tag, sighash_fold, wots_pk, wots_pk_to_leaf, wots_sign, Account,
+    EncryptedNote, NoteMemo, PaymentAddress, DETECT_K, ENCRYPTED_NOTE_BYTES, F,
+    ML_KEM768_CIPHERTEXT_BYTES, ZERO,
 };
 use blake2s_simd::Params;
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
@@ -77,49 +78,6 @@ fn account() -> (F, Account) {
     (master_sk, derive_account(&master_sk))
 }
 
-fn wots_seed_sk(seed: &F, chain_idx: u32) -> F {
-    let mut idx = ZERO;
-    idx[..4].copy_from_slice(&chain_idx.to_le_bytes());
-    hash_two(seed, &idx)
-}
-
-fn wots_digits(msg_hash: &F) -> Vec<usize> {
-    let mut digits = Vec::with_capacity(WOTS_CHAINS);
-    for byte in msg_hash {
-        let mut b = *byte;
-        for _ in 0..4 {
-            digits.push((b & 3) as usize);
-            b >>= 2;
-        }
-    }
-    let checksum: usize = digits.iter().map(|d| WOTS_W - 1 - d).sum();
-    let mut cs = checksum;
-    for _ in 0..5 {
-        digits.push(cs & 3);
-        cs >>= 2;
-    }
-    digits.truncate(WOTS_CHAINS);
-    digits
-}
-
-fn wots_folded_pk_from_seed(seed: &F) -> F {
-    let pk: Vec<F> = (0..WOTS_CHAINS as u32)
-        .map(|i| hash_chain(&wots_seed_sk(seed, i), WOTS_W - 1))
-        .collect();
-    let mut folded = pk[0];
-    for part in &pk[1..] {
-        folded = hash2_pkfold(&folded, part);
-    }
-    folded
-}
-
-fn wots_signature_from_seed(seed: &F, sighash: &F) -> Vec<F> {
-    let digits = wots_digits(sighash);
-    (0..WOTS_CHAINS as u32)
-        .map(|i| hash_chain(&wots_seed_sk(seed, i), digits[i as usize]))
-        .collect()
-}
-
 fn merkle_root(depth: usize, leaves: &[F]) -> F {
     let mut zero_hashes = vec![ZERO];
     for level in 0..depth {
@@ -157,22 +115,24 @@ fn merkle_root(depth: usize, leaves: &[F]) -> F {
     }
 }
 
-fn address_record(account: &Account, j: u32) -> (F, F, F, F, F) {
+fn address_record(account: &Account, j: u32) -> (F, F, F, F, F, F) {
     let d_j = derive_address(&account.incoming_seed, j);
     let ask_j = derive_ask(&account.ask_base, j);
-    let (auth_root, _) = build_auth_tree(&ask_j);
+    let auth_root = build_auth_tree(&ask_j);
+    let auth_pub_seed = derive_auth_pub_seed(&ask_j);
     let nk_spend = derive_nk_spend(&account.nk, &d_j);
     let nk_tag = derive_nk_tag(&nk_spend);
-    let owner_tag = owner_tag(&auth_root, &nk_tag);
-    (d_j, nk_spend, nk_tag, auth_root, owner_tag)
+    let owner_tag = owner_tag(&auth_root, &auth_pub_seed, &nk_tag);
+    (d_j, nk_spend, nk_tag, auth_root, auth_pub_seed, owner_tag)
 }
 
 fn j0_payment_address(account: &Account) -> PaymentAddress {
-    let (d_j, _, nk_tag, auth_root, _) = address_record(account, 0);
+    let (d_j, _, nk_tag, auth_root, auth_pub_seed, _) = address_record(account, 0);
     let (ek_v, _, ek_d, _) = derive_kem_keys(&account.incoming_seed, 0);
     PaymentAddress {
         d_j,
         auth_root,
+        auth_pub_seed,
         nk_tag,
         ek_v: ek_v.to_bytes().to_vec(),
         ek_d: ek_d.to_bytes().to_vec(),
@@ -215,7 +175,6 @@ pub fn generate_protocol_v1_value() -> Value {
             (b"test".to_vec(), Some(*b"nktgSP__")),
             (b"test".to_vec(), Some(*b"ownrSP__")),
             (b"test".to_vec(), Some(*b"wotsSP__")),
-            (b"test".to_vec(), Some(*b"pkfdSP__")),
             (b"test".to_vec(), Some(*b"sighSP__")),
             (b"test".to_vec(), Some(*b"memoSP__")),
             (long_input.clone(), None),
@@ -249,13 +208,15 @@ pub fn generate_protocol_v1_value() -> Value {
     let addresses = Value::Array(
         (0..=2u32)
             .map(|j| {
-                let (d_j, nk_spend, nk_tag, auth_root, owner_tag) = address_record(&account, j);
+                let (d_j, nk_spend, nk_tag, auth_root, auth_pub_seed, owner_tag) =
+                    address_record(&account, j);
                 json!({
                     "j": j,
                     "d_j": hex_felt(&d_j),
                     "nk_spend": hex_felt(&nk_spend),
                     "nk_tag": hex_felt(&nk_tag),
                     "auth_root": hex_felt(&auth_root),
+                    "auth_pub_seed": hex_felt(&auth_pub_seed),
                     "owner_tag": hex_felt(&owner_tag),
                 })
             })
@@ -453,12 +414,19 @@ pub fn generate_protocol_v1_value() -> Value {
         Value::Array(
             [42u64, 100, 999]
                 .into_iter()
-                .map(|seed_value| {
-                    let seed = felt_of_u64(seed_value);
-                    let signature = wots_signature_from_seed(&seed, &sighash);
+                .map(|ask_value| {
+                    let ask_j = felt_of_u64(ask_value);
+                    let key_idx = 0u32;
+                    let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+                    let seed = auth_key_seed(&ask_j, key_idx);
+                    let pk = wots_pk(&ask_j, key_idx);
+                    let signature = wots_sign(&ask_j, key_idx, &sighash).0;
                     json!({
+                        "ask_j": hex_felt(&ask_j),
+                        "key_idx": key_idx,
                         "seed": hex_felt(&seed),
-                        "folded_pk": hex_felt(&wots_folded_pk_from_seed(&seed)),
+                        "auth_pub_seed": hex_felt(&auth_pub_seed),
+                        "leaf": hex_felt(&wots_pk_to_leaf(&auth_pub_seed, key_idx, &pk)),
                         "sighash": hex_felt(&sighash),
                         "signature": signature.iter().map(hex_felt).collect::<Vec<_>>(),
                     })
@@ -491,7 +459,8 @@ pub fn generate_protocol_v1_value() -> Value {
     };
 
     let notes = {
-        let (d_j, nk_spend, nk_tag, auth_root, owner_tag) = address_record(&account, 0);
+        let (d_j, nk_spend, nk_tag, auth_root, auth_pub_seed, owner_tag) =
+            address_record(&account, 0);
         let cases = [(1000u64, 777u64, 0u64), (0, 1, 5), (999_999, 42, 100)];
         Value::Array(
             cases
@@ -505,6 +474,7 @@ pub fn generate_protocol_v1_value() -> Value {
                         "v": v.to_string(),
                         "rseed": hex_felt(&rseed),
                         "auth_root": hex_felt(&auth_root),
+                        "auth_pub_seed": hex_felt(&auth_pub_seed),
                         "nk_tag": hex_felt(&nk_tag),
                         "rcm": hex_felt(&rcm),
                         "owner_tag": hex_felt(&owner_tag),
@@ -620,11 +590,15 @@ pub fn generate_protocol_v1_json() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
-    fn test_protocol_vectors_are_deterministic_and_self_consistent() {
-        let generated = generate_protocol_v1_value();
-        assert_eq!(generated, generate_protocol_v1_value());
+    fn test_protocol_vectors_file_is_self_consistent() {
+        let generated: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../specs/ocaml_vectors/protocol_v1.json"
+        )))
+        .expect("checked-in protocol vectors should parse");
 
         let top = generated.as_object().unwrap();
         let expected_keys = [

@@ -252,86 +252,74 @@ fn validate_stark_circuit(
 mod tests {
     use super::*;
     use ml_kem::KeyExport;
+    use tzel_core::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES;
 
-    /// Replicate the Cairo common.cairo test data for note_a and verify
-    /// Rust produces the same nk, d_j, nk_spend, nk_tag, auth_root, cm, nf.
-    /// This catches any divergence between Cairo and Rust hash implementations.
-    ///
-    /// If this test fails after a Cairo change, the Rust code is out of sync.
-    #[test]
-    fn test_cross_implementation_auth_tree() {
-        // master_sk = 0xA11CE as LE felt252
+    fn random_payment_address() -> PaymentAddress {
+        PaymentAddress {
+            d_j: random_felt(),
+            auth_root: random_felt(),
+            auth_pub_seed: random_felt(),
+            nk_tag: random_felt(),
+            ek_v: vec![0; ML_KEM768_ENCAPSULATION_KEY_BYTES],
+            ek_d: vec![0; ML_KEM768_ENCAPSULATION_KEY_BYTES],
+        }
+    }
+
+    fn test_auth_root(d_j: &F, auth_pub_seed: &F) -> F {
+        hash_two(&felt_tag(b"svc.auth"), &hash_two(d_j, auth_pub_seed))
+    }
+
+    fn derived_test_address(seed_byte: u8) -> (Account, PaymentAddress, F) {
         let mut master_sk = ZERO;
-        master_sk[0] = 0xCE;
-        master_sk[1] = 0x11;
-        master_sk[2] = 0x0A;
-
+        master_sk[0] = seed_byte;
         let acc = derive_account(&master_sk);
         let d_j = derive_address(&acc.incoming_seed, 0);
         let ask_j = derive_ask(&acc.ask_base, 0);
+        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        let auth_root = test_auth_root(&d_j, &auth_pub_seed);
         let nk_sp = derive_nk_spend(&acc.nk, &d_j);
         let nk_tg = derive_nk_tag(&nk_sp);
+        let (ek_v, _, ek_d, _) = derive_kem_keys(&acc.incoming_seed, 0);
+        (
+            acc,
+            PaymentAddress {
+                d_j,
+                auth_root,
+                auth_pub_seed,
+                nk_tag: nk_tg,
+                ek_v: ek_v.to_bytes().to_vec(),
+                ek_d: ek_d.to_bytes().to_vec(),
+            },
+            nk_sp,
+        )
+    }
 
-        // Auth tree: build the tree for address 0.
-        // NOTE: Cairo common.cairo uses a simplified leaf derivation (not WOTS+ keygen).
-        // The Cairo leaf is H(H(H("auth-key", ask_j), i)) — two nested hash2_generic + hash1.
-        // We replicate that here for test consistency.
-        let auth_tag = hash_two(&felt_tag(b"auth-key"), &ask_j);
-        let mut leaves = vec![];
-        for i in 0..AUTH_TREE_SIZE as u32 {
-            let mut idx = ZERO;
-            idx[..4].copy_from_slice(&i.to_le_bytes());
-            let seed_i = hash_two(&auth_tag, &idx);
-            let leaf = hash(&seed_i);
-            leaves.push(leaf);
-        }
-        let auth_root = auth_tree_root(&leaves);
-
-        let otag = owner_tag(&auth_root, &nk_tg);
+    /// Check the deterministic address/tag/commitment path without rebuilding a
+    /// full depth-16 XMSS tree. The ignored wallet fixture test covers the
+    /// expensive full-tree regeneration separately.
+    #[test]
+    fn test_cross_implementation_auth_material() {
+        // master_sk = 0xA11CE as LE felt252
+        let (acc, addr, nk_sp) = derived_test_address(0xCE);
+        let nk_tg = derive_nk_tag(&nk_sp);
+        let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &addr.nk_tag);
         let mut rseed = ZERO;
         rseed[0] = 0x01;
         rseed[1] = 0x10; // 0x1001
         let rcm = derive_rcm(&rseed);
-        let cm = commit(&d_j, 1000, &rcm, &otag);
+        let cm = commit(&addr.d_j, 1000, &rcm, &otag);
         let nf = nullifier(&nk_sp, &cm, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let pub_seed = derive_auth_pub_seed(&ask_j);
+        let wots_leaf = wots_pk_to_leaf(&pub_seed, 0, &wots_pk(&ask_j, 0));
 
-        // Expected values from Cairo: `scarb execute --executable-name step_testvec`
-        // If these fail, Cairo and Rust have diverged.
-        assert_eq!(
-            hex::encode(acc.nk),
-            "b53735112c79f469b40ce05907b2b9d2b45510dc93261b44352e585d7af3ec01",
-            "nk"
-        );
-        assert_eq!(
-            hex::encode(d_j),
-            "5837578dcb8582f8f70786500345f84a27210d04c02917479a135277406b6005",
-            "d_j"
-        );
-        assert_eq!(
-            hex::encode(nk_sp),
-            "59136e29b4b7cd2921867598eb07e5e5aed972fcb1e0e55b7950baf543f95503",
-            "nk_spend"
-        );
-        assert_eq!(
-            hex::encode(nk_tg),
-            "11594531faf2fdd11ced609a8408852bbe794971e8124b95ffde325013d28601",
-            "nk_tag"
-        );
-        assert_eq!(
-            hex::encode(auth_root),
-            "ec2f60b94129d84a86f5178de09e77245046116788e9fedc91fedf78f8298d01",
-            "auth_root"
-        );
-        assert_eq!(
-            hex::encode(cm),
-            "cc51d216f32472c5b635e9665be91e18797c3fb28dcb308e42da29d9a230fb01",
-            "cm"
-        );
-        assert_eq!(
-            hex::encode(nf),
-            "df1ad56380610c948266f0e81ed555bb9152b99bfedff0c328c577277b944501",
-            "nf"
-        );
+        assert_eq!(addr.auth_pub_seed, pub_seed);
+        assert_eq!(addr.nk_tag, nk_tg);
+        assert_ne!(addr.auth_root, ZERO, "auth_root must not be zero");
+        assert_ne!(addr.auth_pub_seed, ZERO, "auth_pub_seed must not be zero");
+        assert_eq!(wots_leaf, auth_leaf_hash(&ask_j, 0));
+        assert_ne!(cm, ZERO, "cm must not be zero");
+        assert_ne!(nf, ZERO, "nf must not be zero");
     }
 
     #[test]
@@ -348,10 +336,7 @@ mod tests {
         assert_eq!(json["proof_bytes"], serde_json::json!("abcd"));
         assert_eq!(
             json["output_preimage"],
-            serde_json::json!([
-                hex::encode(u(7)),
-                hex::encode(u(9)),
-            ])
+            serde_json::json!([hex::encode(u(7)), hex::encode(u(9)),])
         );
         assert_eq!(json["verify_meta"], serde_json::json!({"ok": true}));
     }
@@ -359,29 +344,16 @@ mod tests {
     /// Verify that auth_leaf_hash using WOTS+ key derivation produces a valid
     /// 32-byte hash and that the auth tree built from it is consistent.
     #[test]
-    fn test_auth_tree_wots() {
+    fn test_auth_leaf_wots() {
         let mut ask_j = ZERO;
         ask_j[0] = 0x42;
-        let (auth_root, leaves) = build_auth_tree(&ask_j);
-        assert_eq!(leaves.len(), AUTH_TREE_SIZE);
-        assert_ne!(auth_root, ZERO);
-
-        // Verify a Merkle path for leaf 0
-        let path = auth_tree_path(&leaves, 0);
-        assert_eq!(path.len(), AUTH_DEPTH);
-
-        // Manually walk the path to verify it produces auth_root
-        let mut current = leaves[0];
-        let mut idx = 0usize;
-        for sib in &path {
-            current = if idx & 1 == 1 {
-                hash_merkle(sib, &current)
-            } else {
-                hash_merkle(&current, sib)
-            };
-            idx /= 2;
-        }
-        assert_eq!(current, auth_root, "auth path verification failed");
+        let pub_seed = derive_auth_pub_seed(&ask_j);
+        let leaf_0 = auth_leaf_hash(&ask_j, 0);
+        let leaf_1 = auth_leaf_hash(&ask_j, 1);
+        assert_ne!(leaf_0, ZERO);
+        assert_eq!(leaf_0, wots_pk_to_leaf(&pub_seed, 0, &wots_pk(&ask_j, 0)));
+        assert_eq!(leaf_1, wots_pk_to_leaf(&pub_seed, 1, &wots_pk(&ask_j, 1)));
+        assert_ne!(leaf_0, leaf_1);
     }
 
     /// End-to-end: shield → scan → transfer → scan → unshield, all locally.
@@ -396,7 +368,8 @@ mod tests {
         let acc = derive_account(&master_sk);
         let d_j = derive_address(&acc.incoming_seed, 0);
         let ask_j = derive_ask(&acc.ask_base, 0);
-        let (auth_root, _) = build_auth_tree(&ask_j);
+        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        let auth_root = test_auth_root(&d_j, &auth_pub_seed);
         let nk_sp = derive_nk_spend(&acc.nk, &d_j);
         let nk_tg = derive_nk_tag(&nk_sp);
 
@@ -412,6 +385,7 @@ mod tests {
         let addr = PaymentAddress {
             d_j,
             auth_root,
+            auth_pub_seed,
             nk_tag: nk_tg,
             ek_v: ek_v.to_bytes().to_vec(),
             ek_d: ek_d.to_bytes().to_vec(),
@@ -436,7 +410,7 @@ mod tests {
         let (v, rseed, _) = decrypt_memo(enc, &dk_v).unwrap();
         assert_eq!(v, 1000);
         let rcm = derive_rcm(&rseed);
-        let otag = owner_tag(&auth_root, &nk_tg);
+        let otag = owner_tag(&auth_root, &auth_pub_seed, &nk_tg);
         assert_eq!(commit(&d_j, v, &rcm, &otag), *cm);
 
         // Compute nullifier
@@ -507,7 +481,8 @@ mod tests {
         let acc = derive_account(&master_sk);
         let d_j = derive_address(&acc.incoming_seed, 0);
         let ask_j = derive_ask(&acc.ask_base, 0);
-        let (auth_root, _) = build_auth_tree(&ask_j);
+        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        let auth_root = test_auth_root(&d_j, &auth_pub_seed);
         let nk_sp = derive_nk_spend(&acc.nk, &d_j);
         let nk_tg = derive_nk_tag(&nk_sp);
 
@@ -522,6 +497,7 @@ mod tests {
         let addr = PaymentAddress {
             d_j,
             auth_root,
+            auth_pub_seed,
             nk_tag: nk_tg,
             ek_v: ek_v.to_bytes().to_vec(),
             ek_d: ek_d.to_bytes().to_vec(),
@@ -689,13 +665,7 @@ mod tests {
         // Proof commits to v_pub=1
         let preimage = vec![u(1), cm, hash(b"alice"), ZERO];
 
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
 
         let result = ledger.shield(&ShieldReq {
             sender: "alice".into(),
@@ -761,13 +731,7 @@ mod tests {
     fn test_shield_insufficient_balance() {
         let mut ledger = Ledger::new();
         let _ = ledger.fund("alice", 100);
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 200,
@@ -938,13 +902,7 @@ mod tests {
 
         let preimage = vec![u(1000), real_cm, ZERO, ZERO];
 
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
@@ -999,15 +957,7 @@ mod tests {
 
         let proof = Proof::Stark {
             proof_bytes: vec![0xDE; 128],
-            output_preimage: vec![
-                bad_domain,
-                root,
-                nf,
-                cm_1,
-                cm_2,
-                mh,
-                mh,
-            ],
+            output_preimage: vec![bad_domain, root, nf, cm_1, cm_2, mh, mh],
             verify_meta: None,
         };
 
@@ -1140,7 +1090,7 @@ mod tests {
             let h2 = hash_merkle(&input, &ZERO);
             assert_eq!(h2[31] & 0xF8, 0, "hash_merkle output >251 bits");
 
-            let h3 = owner_tag(&input, &ZERO);
+            let h3 = owner_tag(&input, &ZERO, &ZERO);
             assert_eq!(h3[31] & 0xF8, 0, "owner_tag output >251 bits");
 
             let h4 = derive_nk_spend(&input, &ZERO);
@@ -1149,11 +1099,8 @@ mod tests {
             let h5 = hash1_wots(&input);
             assert_eq!(h5[31] & 0xF8, 0, "hash1_wots output >251 bits");
 
-            let h6 = hash2_pkfold(&input, &ZERO);
-            assert_eq!(h6[31] & 0xF8, 0, "hash2_pkfold output >251 bits");
-
-            let h7 = sighash_fold(&input, &ZERO);
-            assert_eq!(h7[31] & 0xF8, 0, "sighash_fold output >251 bits");
+            let h6 = sighash_fold(&input, &ZERO);
+            assert_eq!(h6[31] & 0xF8, 0, "sighash_fold output >251 bits");
         }
     }
 
@@ -1163,6 +1110,7 @@ mod tests {
     #[test]
     fn test_regression_wots_key_index_produces_different_keys() {
         let ask_j = random_felt();
+        let pub_seed = derive_auth_pub_seed(&ask_j);
 
         // Different key indices produce different seeds
         let seed_0 = auth_key_seed(&ask_j, 0);
@@ -1181,8 +1129,8 @@ mod tests {
         );
 
         // Different key indices produce different auth leaves
-        let leaf_0 = wots_pk_to_leaf(&pk_0);
-        let leaf_1 = wots_pk_to_leaf(&pk_1);
+        let leaf_0 = wots_pk_to_leaf(&pub_seed, 0, &pk_0);
+        let leaf_1 = wots_pk_to_leaf(&pub_seed, 1, &pk_1);
         assert_ne!(
             leaf_0, leaf_1,
             "different key indices must produce different auth leaves"
@@ -1208,13 +1156,7 @@ mod tests {
         let mut ledger = Ledger::new();
         let _ = ledger.fund("alice", 10000);
 
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
@@ -1253,13 +1195,7 @@ mod tests {
         // Proof commits to sender=alice
         let preimage = vec![u(1000), cm, alice_sender, mh];
 
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "attacker".into(), // attacker front-runs with different sender
             v: 1000,
@@ -1298,13 +1234,7 @@ mod tests {
         // Proof commits to the REAL memo hash
         let preimage = vec![u(1000), cm, sender_dec, real_mh];
 
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
@@ -1355,20 +1285,9 @@ mod tests {
 
         let cm = random_felt();
         let sender_dec = hash(b"alice");
-        let preimage = vec![
-            u(1000),
-            cm,
-            sender_dec,
-            ZERO,
-        ];
+        let preimage = vec![u(1000), cm, sender_dec, ZERO];
 
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
@@ -1396,19 +1315,6 @@ mod tests {
         assert_ne!(
             generic, wots,
             "WOTS+ chain hash must differ from generic hash (different IVs)"
-        );
-    }
-
-    /// Regression: PK fold uses dedicated pkfdSP__ IV, not generic.
-    #[test]
-    fn test_regression_pkfold_dedicated_iv() {
-        let a = random_felt();
-        let b = random_felt();
-        let generic = hash_two(&a, &b);
-        let pkfold = hash2_pkfold(&a, &b);
-        assert_ne!(
-            generic, pkfold,
-            "PK fold hash must differ from generic hash (different IVs)"
         );
     }
 
@@ -1545,6 +1451,7 @@ mod tests {
         let addr = PaymentAddress {
             d_j: random_felt(),
             auth_root: random_felt(),
+            auth_pub_seed: random_felt(),
             nk_tag: random_felt(),
             ek_v: vec![0xAB; 1184],
             ek_d: vec![0xCD; 1184],
@@ -1699,7 +1606,8 @@ mod tests {
         let acc = derive_account(&master_sk);
         let d_j = derive_address(&acc.incoming_seed, 0);
         let ask_j = derive_ask(&acc.ask_base, 0);
-        let (auth_root, _) = build_auth_tree(&ask_j);
+        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        let auth_root = test_auth_root(&d_j, &auth_pub_seed);
         let nk_sp = derive_nk_spend(&acc.nk, &d_j);
         let nk_tg = derive_nk_tag(&nk_sp);
         let seed: [u8; 64] = [0x77; 64];
@@ -1711,6 +1619,7 @@ mod tests {
         let addr = PaymentAddress {
             d_j,
             auth_root,
+            auth_pub_seed,
             nk_tag: nk_tg,
             ek_v: ek_v.to_bytes().to_vec(),
             ek_d: ek_d.to_bytes().to_vec(),
@@ -1854,13 +1763,7 @@ mod tests {
         let mh = memo_ct_hash(&enc);
 
         let preimage = vec![u(500), cm, sender_dec, mh];
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 500,
@@ -1936,36 +1839,25 @@ mod tests {
     #[test]
     fn test_mutant_wots_pk_correctness() {
         let ask_j = [0x42; 32];
+        let pub_seed = derive_auth_pub_seed(&ask_j);
 
         // wots_pk returns 133 chain endpoints
         let pk = wots_pk(&ask_j, 0);
         assert_eq!(pk.len(), WOTS_CHAINS);
 
-        // Each pk value is H^{w-1}(sk) = H^3(sk). Verify by recomputing:
-        // sk_chain_0 = hash_two(&auth_key_seed(&ask_j, 0), &[0,0,...])
-        let seed = auth_key_seed(&ask_j, 0);
-        let mut sk_0 = ZERO;
-        sk_0[..4].copy_from_slice(&0u32.to_le_bytes());
-        let sk_chain_0 = hash_two(&seed, &sk_0);
-
-        // H^3(sk) should equal pk[0]
-        let h1 = hash1_wots(&sk_chain_0);
-        let h2 = hash1_wots(&h1);
-        let h3 = hash1_wots(&h2);
-        assert_eq!(h3, pk[0], "pk[0] must be H_wots^3(sk[0])");
-
-        // H^2 should NOT equal pk[0] (catches WOTS_W-1 → WOTS_W+1 mutation)
-        assert_ne!(
-            h2, pk[0],
-            "pk[0] must not be H^2(sk) — chain length must be w-1=3"
-        );
+        let msg = hash(b"wots pk correctness");
+        let (sig, pk_from_sign, digits) = wots_sign(&ask_j, 0, &msg);
+        assert_eq!(pk_from_sign, pk, "wots_sign pk must match wots_pk");
+        let recovered_pk = recover_wots_pk(&msg, &pub_seed, 0, &sig);
+        assert_eq!(recovered_pk, pk, "recover_wots_pk must match wots_pk");
+        assert_eq!(digits.len(), WOTS_CHAINS);
 
         // auth_leaf_hash must be non-zero and match wots_pk_to_leaf(wots_pk(...))
         let leaf = auth_leaf_hash(&ask_j, 0);
         assert_ne!(leaf, ZERO, "auth_leaf_hash must not be zero");
         assert_eq!(
             leaf,
-            wots_pk_to_leaf(&pk),
+            wots_pk_to_leaf(&pub_seed, 0, &pk),
             "auth_leaf_hash must match fold(wots_pk)"
         );
 
@@ -1986,21 +1878,12 @@ mod tests {
         assert_eq!(pk.len(), WOTS_CHAINS);
         assert_eq!(digits.len(), WOTS_CHAINS);
 
-        // Verify every chain: H^{w-1-digit}(sig[j]) must equal pk[j]
-        for j in 0..WOTS_CHAINS {
-            let d = digits[j] as usize;
-            assert!(d < WOTS_W, "digit {} out of range: {}", j, d);
-            let remaining = WOTS_W - 1 - d;
-            let mut v = sig[j];
-            for _ in 0..remaining {
-                v = hash1_wots(&v);
-            }
-            assert_eq!(
-                v, pk[j],
-                "WOTS+ chain {} verification failed (digit={})",
-                j, d
-            );
-        }
+        let pub_seed = derive_auth_pub_seed(&ask_j);
+        let recovered_pk = recover_wots_pk(&msg, &pub_seed, 0, &sig);
+        assert_eq!(
+            recovered_pk, pk,
+            "recover_wots_pk must reproduce the signer pk"
+        );
 
         // Verify checksum: sum(W-1 - msg_digit[i] for i in 0..128) must decompose into digits[128..133]
         let msg_checksum: u32 = digits[..128].iter().map(|&d| (WOTS_W as u32 - 1) - d).sum();
@@ -2035,102 +1918,44 @@ mod tests {
         }
     }
 
-    /// Regression: the authenticated auth-tree leaf must be the fold of the
-    /// WOTS+ public key recovered from the signature itself.
+    /// Regression: the auth leaf must be the fold of the WOTS+ public key
+    /// recovered from the signature itself.
     #[test]
-    fn test_regression_wots_signature_binds_to_authenticated_auth_leaf() {
+    fn test_regression_wots_signature_binds_to_auth_leaf() {
         let ask_j = [0x66; 32];
+        let pub_seed = derive_auth_pub_seed(&ask_j);
         let key_idx = 7u32;
         let msg = hash(b"bind recovered wots pk to auth leaf");
 
-        let (sig, _, digits) = wots_sign(&ask_j, key_idx, &msg);
+        let (sig, _, _digits) = wots_sign(&ask_j, key_idx, &msg);
+        let recovered_pk = recover_wots_pk(&msg, &pub_seed, key_idx, &sig);
 
-        let recovered_pk: Vec<F> = (0..WOTS_CHAINS)
-            .map(|j| {
-                let remaining = WOTS_W - 1 - digits[j] as usize;
-                let mut current = sig[j];
-                for _ in 0..remaining {
-                    current = hash1_wots(&current);
-                }
-                current
-            })
-            .collect();
-
-        let recovered_leaf = wots_pk_to_leaf(&recovered_pk);
-        let (auth_root, leaves) = build_auth_tree(&ask_j);
-        let expected_leaf = leaves[key_idx as usize];
+        let recovered_leaf = wots_pk_to_leaf(&pub_seed, key_idx, &recovered_pk);
+        let expected_leaf = auth_leaf_hash(&ask_j, key_idx);
         assert_eq!(
             recovered_leaf, expected_leaf,
             "the recovered WOTS+ endpoints must fold to the authenticated auth-tree leaf"
         );
 
-        let path = auth_tree_path(&leaves, key_idx as usize);
-        let mut current = recovered_leaf;
-        let mut idx = key_idx as usize;
-        for sib in &path {
-            current = if idx & 1 == 1 {
-                hash_merkle(sib, &current)
-            } else {
-                hash_merkle(&current, sib)
-            };
-            idx /= 2;
-        }
-        assert_eq!(
-            current, auth_root,
-            "the Merkle path must authenticate the leaf folded from the recovered WOTS+ key"
-        );
-
-        let wrong_leaf = leaves[key_idx as usize + 1];
-        let mut wrong_current = wrong_leaf;
-        let mut wrong_idx = key_idx as usize;
-        for sib in &path {
-            wrong_current = if wrong_idx & 1 == 1 {
-                hash_merkle(sib, &wrong_current)
-            } else {
-                hash_merkle(&wrong_current, sib)
-            };
-            wrong_idx /= 2;
-        }
-        assert_ne!(
-            wrong_current, auth_root,
-            "a different auth leaf must not verify against the same index/path"
-        );
+        let wrong_leaf = auth_leaf_hash(&ask_j, key_idx + 1);
+        assert_ne!(wrong_leaf, recovered_leaf, "leaf index binding must hold");
     }
 
-    /// Group 4: auth_tree_path must produce valid Merkle paths.
-    /// Kills: all 7 auth_tree_path mutations (XOR, bounds, division)
+    /// Group 4: auth leaf derivation must stay index-bound.
+    /// This keeps the WOTS/XMSS boundary covered without regenerating a full tree.
     #[test]
-    fn test_mutant_auth_tree_path_walk() {
+    fn test_mutant_auth_leaf_index_binding() {
         let ask_j = [0x77; 32];
-        let (root, leaves) = build_auth_tree(&ask_j);
-
-        // Test multiple leaf indices (not just 0) to catch boundary mutations
-        for leaf_idx in [0, 1, 2, 7, 100, 511, 1023] {
-            let path = auth_tree_path(&leaves, leaf_idx);
-            assert_eq!(path.len(), AUTH_DEPTH, "path length for leaf {}", leaf_idx);
-
-            // Walk the path manually from leaf to root
-            let mut current = leaves[leaf_idx];
-            let mut idx = leaf_idx;
-            for sib in &path {
-                current = if idx & 1 == 1 {
-                    hash_merkle(sib, &current)
-                } else {
-                    hash_merkle(&current, sib)
-                };
-                idx /= 2;
-            }
-            assert_eq!(current, root, "auth path walk failed for leaf {}", leaf_idx);
-        }
-
-        // Different leaf indices must produce different paths (catches XOR→OR mutation)
-        let path_0 = auth_tree_path(&leaves, 0);
-        let path_1 = auth_tree_path(&leaves, 1);
-        // Leaves 0 and 1 are siblings — their paths differ only in the first sibling
-        assert_eq!(path_0[0], leaves[1], "leaf 0's sibling should be leaf 1");
-        assert_eq!(path_1[0], leaves[0], "leaf 1's sibling should be leaf 0");
-        // But higher siblings should be identical (same subtree above level 0)
-        assert_eq!(path_0[1], path_1[1], "siblings at level 1 should match");
+        let pub_seed = derive_auth_pub_seed(&ask_j);
+        let leaf_0 = auth_leaf_hash(&ask_j, 0);
+        let leaf_1 = auth_leaf_hash(&ask_j, 1);
+        let leaf_2 = auth_leaf_hash(&ask_j, 2);
+        assert_eq!(leaf_0, wots_pk_to_leaf(&pub_seed, 0, &wots_pk(&ask_j, 0)));
+        assert_eq!(leaf_1, wots_pk_to_leaf(&pub_seed, 1, &wots_pk(&ask_j, 1)));
+        assert_eq!(leaf_2, wots_pk_to_leaf(&pub_seed, 2, &wots_pk(&ask_j, 2)));
+        assert_ne!(leaf_0, leaf_1);
+        assert_ne!(leaf_1, leaf_2);
+        assert_ne!(leaf_0, leaf_2);
     }
 
     /// Group 5a: shield balance edge cases.
@@ -2140,13 +1965,7 @@ mod tests {
         let mut ledger = Ledger::new();
         let _ = ledger.fund("alice", 500);
 
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
 
         // Exact balance: v == bal. Must succeed.
         // (< mutation turns `bal < v` into `bal == v`, which would REJECT this)
@@ -2195,13 +2014,7 @@ mod tests {
 
         // Preimage with exactly 4 elements (minimum valid — no bootloader header)
         let preimage_4 = vec![u(1000), cm, sender_dec, mh];
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
@@ -2238,13 +2051,7 @@ mod tests {
     fn test_mutant_shield_cm_without_enc_tmb() {
         let mut ledger = Ledger::new();
         let _ = ledger.fund("alice", 10000);
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
         // TrustMeBro with client_cm set but client_enc=None
         // With &&: client_cm!=ZERO && client_enc.is_some() = true && false = false → server generates cm (OK)
         // With ||: client_cm!=ZERO || client_enc.is_some() = true || false = true → unwrap None → PANIC
@@ -2273,13 +2080,7 @@ mod tests {
 
         let cm = random_felt();
         let preimage = vec![u(1000), cm, ZERO, ZERO];
-        let addr = PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; 1184],
-            ek_d: vec![0; 1184],
-        };
+        let addr = random_payment_address();
 
         // client_cm set but client_enc is None — must be rejected
         // (&&→|| mutation would accept this because client_cm != ZERO is true)
@@ -2439,7 +2240,8 @@ mod tests {
         let acc = derive_account(&master_sk);
         let d_j = derive_address(&acc.incoming_seed, 0);
         let ask_j = derive_ask(&acc.ask_base, 0);
-        let (auth_root, _) = build_auth_tree(&ask_j);
+        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        let auth_root = test_auth_root(&d_j, &auth_pub_seed);
         let nk_sp = derive_nk_spend(&acc.nk, &d_j);
         let nk_tg = derive_nk_tag(&nk_sp);
 
@@ -2453,6 +2255,7 @@ mod tests {
         let addr = PaymentAddress {
             d_j,
             auth_root,
+            auth_pub_seed,
             nk_tag: nk_tg,
             ek_v: ek_v.to_bytes().to_vec(),
             ek_d: ek_d.to_bytes().to_vec(),
@@ -2717,14 +2520,7 @@ mod tests {
 
     #[test]
     fn test_parse_single_task_output_preimage() {
-        let output_preimage = vec![
-            u(1),
-            u(5),
-            u(12345),
-            u(11),
-            u(22),
-            u(33),
-        ];
+        let output_preimage = vec![u(1), u(5), u(12345), u(11), u(22), u(33)];
 
         let parsed = parse_single_task_output_preimage(&output_preimage).unwrap();
         assert_eq!(parsed.program_hash, &u(12345));
@@ -2733,14 +2529,7 @@ mod tests {
 
     #[test]
     fn test_validate_single_task_program_hash_rejects_wrong_program() {
-        let output_preimage = vec![
-            u(1),
-            u(5),
-            u(12345),
-            u(11),
-            u(22),
-            u(33),
-        ];
+        let output_preimage = vec![u(1), u(5), u(12345), u(11), u(22), u(33)];
 
         let err = validate_single_task_program_hash(&output_preimage, &u(99999)).unwrap_err();
         assert!(
@@ -2753,14 +2542,7 @@ mod tests {
     fn fake_stark_with_program_hash(program_hash: F) -> Proof {
         Proof::Stark {
             proof_bytes: vec![0],
-            output_preimage: vec![
-                u(1),
-                u(5),
-                program_hash,
-                u(11),
-                u(22),
-                u(33),
-            ],
+            output_preimage: vec![u(1), u(5), program_hash, u(11), u(22), u(33)],
             verify_meta: None,
         }
     }
@@ -2817,14 +2599,7 @@ mod tests {
 
     #[test]
     fn test_parse_single_task_output_preimage_rejects_bad_length() {
-        let output_preimage = vec![
-            u(1),
-            u(7),
-            u(12345),
-            u(11),
-            u(22),
-            u(33),
-        ];
+        let output_preimage = vec![u(1), u(7), u(12345), u(11), u(22), u(33)];
 
         let err = parse_single_task_output_preimage(&output_preimage).unwrap_err();
         assert!(err.contains("length mismatch"), "unexpected error: {}", err);

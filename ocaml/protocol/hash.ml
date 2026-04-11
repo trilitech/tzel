@@ -40,6 +40,8 @@ let tag_mlkem_v  = felt_tag "mlkem-v"
 let tag_mlkem_v2 = felt_tag "mlkem-v2"
 let tag_mlkem_d  = felt_tag "mlkem-d"
 let tag_mlkem_d2 = felt_tag "mlkem-d2"
+let tag_xmss_sk  = felt_tag "xmss-sk"
+let tag_xmss_ps  = felt_tag "xmss-ps"
 
 (* ── Core hash primitives ── *)
 
@@ -54,6 +56,21 @@ let hash2 a b =
   let buf = Bytes.create 64 in
   Bytes.blit a 0 buf 0 32;
   Bytes.blit b 0 buf 32 32;
+  hash_bytes buf
+
+let hash3 a b c =
+  let buf = Bytes.create 96 in
+  Bytes.blit a 0 buf 0 32;
+  Bytes.blit b 0 buf 32 32;
+  Bytes.blit c 0 buf 64 32;
+  hash_bytes buf
+
+let hash4 a b c d =
+  let buf = Bytes.create 128 in
+  Bytes.blit a 0 buf 0 32;
+  Bytes.blit b 0 buf 32 32;
+  Bytes.blit c 0 buf 64 32;
+  Bytes.blit d 0 buf 96 32;
   hash_bytes buf
 
 (* Personalized BLAKE2s of data, truncated to 251 bits *)
@@ -96,23 +113,17 @@ let hash_nk_spend nk d_j =
 let hash_nk_tag nk_spend =
   hash_personalized "nktgSP__" nk_spend
 
-(* H_owner(auth_root, nk_tag): Owner tag *)
-let hash_owner auth_root nk_tag =
-  let buf = Bytes.create 64 in
+(* H_owner(auth_root, auth_pub_seed, nk_tag): Owner tag *)
+let hash_owner auth_root auth_pub_seed nk_tag =
+  let buf = Bytes.create 96 in
   Bytes.blit auth_root 0 buf 0 32;
-  Bytes.blit nk_tag 0 buf 32 32;
+  Bytes.blit auth_pub_seed 0 buf 32 32;
+  Bytes.blit nk_tag 0 buf 64 32;
   hash_personalized "ownrSP__" buf
 
 (* H_wots(data): WOTS+ chain hash *)
 let hash_wots data =
   hash_personalized "wotsSP__" data
-
-(* H_pkfold(a, b): WOTS+ public key fold *)
-let hash_pkfold a b =
-  let buf = Bytes.create 64 in
-  Bytes.blit a 0 buf 0 32;
-  Bytes.blit b 0 buf 32 32;
-  hash_personalized "pkfdSP__" buf
 
 (* Sighash fold: H_sighash(a, b) *)
 let hash_sighash a b =

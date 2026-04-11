@@ -39,7 +39,6 @@ let gen_blake2s () =
     ("test", "nktgSP__");
     ("test", "ownrSP__");
     ("test", "wotsSP__");
-    ("test", "pkfdSP__");
     ("test", "sighSP__");
     ("test", "memoSP__");
     (* Multi-block input: crosses the 64-byte block boundary *)
@@ -85,6 +84,7 @@ let gen_addresses () =
       "nk_spend", jhex addr.nk_spend;
       "nk_tag", jhex addr.nk_tag;
       "auth_root", jhex addr.auth_root;
+      "auth_pub_seed", jhex addr.auth_pub_seed;
       "owner_tag", jhex ot;
     ]
   ) [0; 1; 2])
@@ -262,19 +262,25 @@ let gen_cross_impl_encrypt () =
 (* ── WOTS+ ── *)
 
 let gen_wots () =
-  let seeds = [Tzel.Felt.of_u64 42; Tzel.Felt.of_u64 100; Tzel.Felt.of_u64 999] in
-  `List (List.map (fun seed ->
-    let pk = Tzel.Wots.keygen seed in
-    let fpk = Tzel.Wots.fold_pk pk in
+  let asks = [Tzel.Felt.of_u64 42; Tzel.Felt.of_u64 100; Tzel.Felt.of_u64 999] in
+  `List (List.map (fun ask_j ->
+    let key_idx = 0 in
+    let seed = Tzel.Keys.derive_auth_key_seed ask_j key_idx in
+    let pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
+    let pk = Tzel.Wots.keygen ~seed ~pub_seed ~key_idx in
+    let leaf = Tzel.Wots.pk_to_leaf ~pub_seed ~key_idx pk in
     let sighash = Tzel.Hash.hash_tag "test-sighash" in
-    let sig_vals = Tzel.Wots.sign seed sighash in
+    let sig_vals = Tzel.Wots.sign ~seed ~pub_seed ~key_idx sighash in
     `Assoc [
+      "ask_j", jhex ask_j;
+      "key_idx", jint key_idx;
       "seed", jhex seed;
-      "folded_pk", jhex fpk;
+      "auth_pub_seed", jhex pub_seed;
+      "leaf", jhex leaf;
       "sighash", jhex sighash;
       "signature", `List (Array.to_list (Array.map jhex sig_vals));
     ]
-  ) seeds)
+  ) asks)
 
 (* ── Merkle ── *)
 
@@ -315,6 +321,7 @@ let gen_notes () =
       "v", jstr (Int64.to_string v);
       "rseed", jhex rseed;
       "auth_root", jhex addr.auth_root;
+      "auth_pub_seed", jhex addr.auth_pub_seed;
       "nk_tag", jhex addr.nk_tag;
       "rcm", jhex note.rcm;
       "owner_tag", jhex note.owner_tag;
@@ -364,7 +371,7 @@ let gen_wire_encoding () =
   let keys = Tzel.Keys.derive master_sk in
   let addr = Tzel.Keys.derive_address keys 0 in
   let pa_wire : Tzel.Encoding.payment_address_wire = {
-    d_j = addr.d_j; auth_root = addr.auth_root; nk_tag = addr.nk_tag;
+    d_j = addr.d_j; auth_root = addr.auth_root; auth_pub_seed = addr.auth_pub_seed; nk_tag = addr.nk_tag;
     ek_v = addr.ek_v; ek_d = addr.ek_d;
   } in
   let pa_bytes = Tzel.Encoding.encode_payment_address pa_wire in

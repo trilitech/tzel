@@ -4,9 +4,9 @@
    WHAT THIS TESTS vs. WHAT IT CAN'T:
 
    Deterministic (tested via byte-exact comparison):
-   - BLAKE2s with all personalizations
+   - BLAKE2s with the active protocol personalizations
    - Full key hierarchy from master_sk
-   - Per-address: d_j, nk_spend, nk_tag, auth_root (1024-leaf WOTS+ tree), owner_tag
+   - Per-address: d_j, nk_spend, nk_tag, auth_root/auth_pub_seed (depth-16 XMSS tree), owner_tag
    - ML-KEM 64-byte seed derivation
    - ML-KEM keygen_det: ek and dk bytes from seed (FIPS 203 deterministic)
    - ML-KEM encaps_derand: ss and ct from (ek, coins) (deterministic given coins)
@@ -103,6 +103,7 @@ let test_address_vectors json =
     check_hex (prefix ^ ".nk_spend") (json_string (json_field "nk_spend" v)) addr.nk_spend;
     check_hex (prefix ^ ".nk_tag") (json_string (json_field "nk_tag" v)) addr.nk_tag;
     check_hex (prefix ^ ".auth_root") (json_string (json_field "auth_root" v)) addr.auth_root;
+    check_hex (prefix ^ ".auth_pub_seed") (json_string (json_field "auth_pub_seed" v)) addr.auth_pub_seed;
     let owner_tag = Tzel.Keys.owner_tag addr in
     check_hex (prefix ^ ".owner_tag") (json_string (json_field "owner_tag" v)) owner_tag
   ) addrs
@@ -220,15 +221,17 @@ let test_wots_vectors json =
   let vectors = json_list (json_field "wots" json) in
   List.iteri (fun i v ->
     let seed = felt_of_hex (json_string (json_field "seed" v)) in
-    let expected_fpk = json_string (json_field "folded_pk" v) in
-    let pk = Tzel.Wots.keygen seed in
-    let fpk = Tzel.Wots.fold_pk pk in
+    let pub_seed = felt_of_hex (json_string (json_field "auth_pub_seed" v)) in
+    let key_idx = 0 in
+    let expected_leaf = json_string (json_field "leaf" v) in
+    let pk = Tzel.Wots.keygen ~seed ~pub_seed ~key_idx in
+    let leaf = Tzel.Wots.pk_to_leaf ~pub_seed ~key_idx pk in
     let prefix = Printf.sprintf "wots[%d]" i in
-    check_hex (prefix ^ ".folded_pk") expected_fpk fpk;
+    check_hex (prefix ^ ".leaf") expected_leaf leaf;
     (try
        let sighash = felt_of_hex (json_string (json_field "sighash" v)) in
        let expected_sig = json_list (json_field "signature" v) in
-       let sig_vals = Tzel.Wots.sign seed sighash in
+       let sig_vals = Tzel.Wots.sign ~seed ~pub_seed ~key_idx sighash in
        List.iteri (fun j expected_chain ->
          check_hex (Printf.sprintf "%s.sig[%d]" prefix j)
            (json_string expected_chain) sig_vals.(j)
@@ -258,9 +261,10 @@ let test_note_vectors json =
     let v_val = Int64.of_string (json_string (json_field "v" v)) in
     let rseed = felt_of_hex (json_string (json_field "rseed" v)) in
     let auth_root = felt_of_hex (json_string (json_field "auth_root" v)) in
+    let auth_pub_seed = felt_of_hex (json_string (json_field "auth_pub_seed" v)) in
     let nk_tag = felt_of_hex (json_string (json_field "nk_tag" v)) in
     let prefix = Printf.sprintf "note[%d]" i in
-    let note = Tzel.Note.create_from_parts ~d_j ~auth_root ~nk_tag ~v:v_val ~rseed in
+    let note = Tzel.Note.create_from_parts ~d_j ~auth_root ~auth_pub_seed ~nk_tag ~v:v_val ~rseed in
     check_hex (prefix ^ ".rcm") (json_string (json_field "rcm" v)) note.rcm;
     check_hex (prefix ^ ".owner_tag") (json_string (json_field "owner_tag" v)) note.owner_tag;
     check_hex (prefix ^ ".cm") (json_string (json_field "cm" v)) note.cm;
@@ -313,7 +317,7 @@ let test_wire_encoding_vectors json =
   let keys = Tzel.Keys.derive master_sk in
   let addr = Tzel.Keys.derive_address keys 0 in
   let pa_wire : Tzel.Encoding.payment_address_wire = {
-    d_j = addr.d_j; auth_root = addr.auth_root; nk_tag = addr.nk_tag;
+    d_j = addr.d_j; auth_root = addr.auth_root; auth_pub_seed = addr.auth_pub_seed; nk_tag = addr.nk_tag;
     ek_v = addr.ek_v; ek_d = addr.ek_d;
   } in
   check_hex "payment_address" expected_pa (Tzel.Encoding.encode_payment_address pa_wire);

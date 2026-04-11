@@ -7,18 +7,16 @@
 ///   [3]  v_pub
 ///   [4]  recipient
 ///   Then per input (N times):
-///     nf, nk_spend, auth_root, auth_index,
+///     nf, nk_spend, auth_root, auth_pub_seed, auth_index,
 ///     d_j, v, rseed, cm_path_idx
 ///   Then per input (N times): TREE_DEPTH cm siblings
 ///   Then per input (N times): AUTH_DEPTH auth siblings
 ///   Then per input (N times): WOTS_CHAINS sig values
-///   Then per input (N times): WOTS_CHAINS pk values
-///   Then change: has_change, d_j, v, rseed, auth_root, nk_tag, memo_ct_hash
+///   Then change: has_change, d_j, v, rseed, auth_root, auth_pub_seed, nk_tag, memo_ct_hash
 
-use tzel::unshield;
 use tzel::merkle;
-
-const WOTS_CHAINS: u32 = 133;
+use tzel::unshield;
+use tzel::xmss_common;
 
 #[executable]
 fn main(args: Array<felt252>) -> Array<felt252> {
@@ -33,6 +31,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let mut nf_list: Array<felt252> = array![];
     let mut nk_spend_list: Array<felt252> = array![];
     let mut auth_root_list: Array<felt252> = array![];
+    let mut auth_pub_seed_list: Array<felt252> = array![];
     let mut auth_idx_list: Array<u64> = array![];
     let mut d_j_list: Array<felt252> = array![];
     let mut v_list: Array<u64> = array![];
@@ -44,6 +43,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         nf_list.append(*args.at(pos)); pos += 1;
         nk_spend_list.append(*args.at(pos)); pos += 1;
         auth_root_list.append(*args.at(pos)); pos += 1;
+        auth_pub_seed_list.append(*args.at(pos)); pos += 1;
         auth_idx_list.append((*args.at(pos)).try_into().unwrap()); pos += 1;
         d_j_list.append(*args.at(pos)); pos += 1;
         v_list.append((*args.at(pos)).try_into().unwrap()); pos += 1;
@@ -62,13 +62,8 @@ fn main(args: Array<felt252>) -> Array<felt252> {
 
     let mut wots_sig: Array<felt252> = array![];
     let mut i: u32 = 0;
-    while i < n * WOTS_CHAINS { wots_sig.append(*args.at(pos)); pos += 1; i += 1; };
+    while i < n * xmss_common::WOTS_CHAINS { wots_sig.append(*args.at(pos)); pos += 1; i += 1; };
 
-    let mut wots_pk: Array<felt252> = array![];
-    let mut i: u32 = 0;
-    while i < n * WOTS_CHAINS { wots_pk.append(*args.at(pos)); pos += 1; i += 1; };
-
-    // Change output
     let has_change_felt: u64 = (*args.at(pos)).try_into().unwrap(); pos += 1;
     assert(has_change_felt <= 1, 'has_change must be 0 or 1');
     let has_change = has_change_felt != 0;
@@ -76,6 +71,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let v_change: u64 = (*args.at(pos)).try_into().unwrap(); pos += 1;
     let rseed_change = *args.at(pos); pos += 1;
     let auth_root_change = *args.at(pos); pos += 1;
+    let auth_pub_seed_change = *args.at(pos); pos += 1;
     let nk_tag_change = *args.at(pos); pos += 1;
     let mh_change = *args.at(pos); pos += 1;
 
@@ -89,8 +85,8 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         recipient,
         nk_spend_list.span(),
         auth_root_list.span(),
+        auth_pub_seed_list.span(),
         wots_sig.span(),
-        wots_pk.span(),
         auth_sibs.span(),
         auth_idx_list.span(),
         d_j_list.span(),
@@ -100,6 +96,6 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         path_idx_list.span(),
         has_change,
         d_j_change, v_change, rseed_change,
-        auth_root_change, nk_tag_change, mh_change,
+        auth_root_change, auth_pub_seed_change, nk_tag_change, mh_change,
     )
 }

@@ -1,4 +1,6 @@
 target/
+.codex
+.codex/
 ocaml/_build/
 ocaml/vendor/mlkem-native/_build/
 ocaml/vendor/mlkem-native/test/build/config.mk

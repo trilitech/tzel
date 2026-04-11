@@ -3,9 +3,9 @@ use crate::canonical_wire::{
     wire_to_u64, WireEncryptedNote, WireFelt, WirePaymentAddress, WireU16Le, WireU64Le,
 };
 use crate::{
-    EncryptedNote, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES, PaymentAddress,
-    ProgramHashes, Proof, ShieldReq, ShieldResp, TransferReq, TransferResp, UnshieldReq,
-    UnshieldResp, WithdrawReq, WithdrawResp,
+    EncryptedNote, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp, TransferReq,
+    TransferResp, UnshieldReq, UnshieldResp, WithdrawReq, WithdrawResp, ENCRYPTED_NOTE_BYTES, F,
+    ML_KEM768_CIPHERTEXT_BYTES,
 };
 use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
@@ -328,24 +328,24 @@ pub fn decode_kernel_inbox_message(bytes: &[u8]) -> Result<KernelInboxMessage, S
         ));
     }
     match wire.message {
-        WireKernelInboxMessage::ConfigureVerifier(cfg) => {
-            Ok(KernelInboxMessage::ConfigureVerifier(config_from_wire(cfg)?))
-        }
-        WireKernelInboxMessage::ConfigureBridge(cfg) => {
-            Ok(KernelInboxMessage::ConfigureBridge(bridge_config_from_wire(cfg)?))
-        }
-        WireKernelInboxMessage::Shield(req) => {
-            Ok(KernelInboxMessage::Shield(kernel_shield_req_from_wire(req)?))
-        }
-        WireKernelInboxMessage::Transfer(req) => {
-            Ok(KernelInboxMessage::Transfer(kernel_transfer_req_from_wire(req)?))
-        }
-        WireKernelInboxMessage::Unshield(req) => {
-            Ok(KernelInboxMessage::Unshield(kernel_unshield_req_from_wire(req)?))
-        }
-        WireKernelInboxMessage::Withdraw(req) => {
-            Ok(KernelInboxMessage::Withdraw(kernel_withdraw_req_from_wire(req)?))
-        }
+        WireKernelInboxMessage::ConfigureVerifier(cfg) => Ok(
+            KernelInboxMessage::ConfigureVerifier(config_from_wire(cfg)?),
+        ),
+        WireKernelInboxMessage::ConfigureBridge(cfg) => Ok(KernelInboxMessage::ConfigureBridge(
+            bridge_config_from_wire(cfg)?,
+        )),
+        WireKernelInboxMessage::Shield(req) => Ok(KernelInboxMessage::Shield(
+            kernel_shield_req_from_wire(req)?,
+        )),
+        WireKernelInboxMessage::Transfer(req) => Ok(KernelInboxMessage::Transfer(
+            kernel_transfer_req_from_wire(req)?,
+        )),
+        WireKernelInboxMessage::Unshield(req) => Ok(KernelInboxMessage::Unshield(
+            kernel_unshield_req_from_wire(req)?,
+        )),
+        WireKernelInboxMessage::Withdraw(req) => Ok(KernelInboxMessage::Withdraw(
+            kernel_withdraw_req_from_wire(req)?,
+        )),
     }
 }
 
@@ -514,6 +514,7 @@ fn payment_address_to_wire(address: &PaymentAddress) -> WirePaymentAddress {
     WirePaymentAddress {
         d_j: felt_to_wire(&address.d_j),
         auth_root: felt_to_wire(&address.auth_root),
+        auth_pub_seed: felt_to_wire(&address.auth_pub_seed),
         nk_tag: felt_to_wire(&address.nk_tag),
         ek_v: address.ek_v.clone(),
         ek_d: address.ek_d.clone(),
@@ -524,6 +525,7 @@ fn payment_address_from_wire(wire: WirePaymentAddress) -> Result<PaymentAddress,
     Ok(PaymentAddress {
         d_j: wire_to_felt(wire.d_j)?,
         auth_root: wire_to_felt(wire.auth_root)?,
+        auth_pub_seed: wire_to_felt(wire.auth_pub_seed)?,
         nk_tag: wire_to_felt(wire.nk_tag)?,
         ek_v: wire.ek_v,
         ek_d: wire.ek_d,
@@ -653,7 +655,11 @@ fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldRe
         memo: req.memo.clone(),
         proof: kernel_proof_to_wire(&req.proof)?,
         client_cm: felt_to_wire(&req.client_cm),
-        client_enc: req.client_enc.as_ref().map(encrypted_note_to_wire).transpose()?,
+        client_enc: req
+            .client_enc
+            .as_ref()
+            .map(encrypted_note_to_wire)
+            .transpose()?,
     })
 }
 
@@ -763,7 +769,11 @@ fn kernel_unshield_req_to_wire(req: &KernelUnshieldReq) -> Result<WireKernelUnsh
     bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.cm_change))?);
     bytes.extend_from_slice(&encode_tze(&encoded_proof_to_wire(&req.proof)?)?);
     bytes.extend_from_slice(&encode_tze(&WireOptionalEncodedNote {
-        note: req.enc_change.as_ref().map(encoded_note_to_wire).transpose()?,
+        note: req
+            .enc_change
+            .as_ref()
+            .map(encoded_note_to_wire)
+            .transpose()?,
     })?);
     Ok(WireKernelUnshieldReq { bytes })
 }
@@ -858,11 +868,7 @@ fn withdraw_resp_from_wire(wire: WireWithdrawResp) -> Result<WithdrawResp, Strin
 mod tests {
     use super::*;
     use crate::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES;
-    use crate::{
-        build_auth_tree, derive_account, derive_address, derive_ask, derive_kem_keys,
-        derive_nk_spend, derive_nk_tag, DETECT_K, ZERO,
-    };
-    use ml_kem::KeyExport;
+    use crate::{DETECT_K, ZERO};
     use proptest::prelude::*;
 
     fn small_string(max_len: usize) -> impl Strategy<Value = String> {
@@ -910,15 +916,19 @@ mod tests {
             arb_felt(),
             arb_felt(),
             arb_felt(),
+            arb_felt(),
             prop::collection::vec(any::<u8>(), ML_KEM768_ENCAPSULATION_KEY_BYTES),
             prop::collection::vec(any::<u8>(), ML_KEM768_ENCAPSULATION_KEY_BYTES),
         )
-            .prop_map(|(d_j, auth_root, nk_tag, ek_v, ek_d)| PaymentAddress {
-                d_j,
-                auth_root,
-                nk_tag,
-                ek_v,
-                ek_d,
+            .prop_map(|(d_j, auth_root, auth_pub_seed, nk_tag, ek_v, ek_d)| {
+                PaymentAddress {
+                    d_j,
+                    auth_root,
+                    auth_pub_seed,
+                    nk_tag,
+                    ek_v,
+                    ek_d,
+                }
             })
     }
 
@@ -928,11 +938,13 @@ mod tests {
             small_string(16),
             prop::collection::vec(any::<u16>(), 0..5),
         )
-            .prop_map(|(n, label, arr)| serde_json::json!({
-                "n": n,
-                "label": label,
-                "arr": arr,
-            }))
+            .prop_map(|(n, label, arr)| {
+                serde_json::json!({
+                    "n": n,
+                    "label": label,
+                    "arr": arr,
+                })
+            })
     }
 
     fn arb_kernel_stark_proof() -> impl Strategy<Value = KernelStarkProof> {
@@ -941,11 +953,13 @@ mod tests {
             prop::collection::vec(arb_felt(), 0..8),
             arb_verify_meta(),
         )
-            .prop_map(|(proof_bytes, output_preimage, verify_meta)| KernelStarkProof {
-                proof_bytes,
-                output_preimage,
-                verify_meta,
-            })
+            .prop_map(
+                |(proof_bytes, output_preimage, verify_meta)| KernelStarkProof {
+                    proof_bytes,
+                    output_preimage,
+                    verify_meta,
+                },
+            )
     }
 
     #[test]
@@ -966,7 +980,10 @@ mod tests {
                 assert_eq!(req.sender, "alice");
                 assert_eq!(req.v, 42);
                 assert_eq!(req.memo.as_deref(), Some("hello"));
-                assert_eq!(req.proof.proof_bytes, sample_kernel_stark_proof().proof_bytes);
+                assert_eq!(
+                    req.proof.proof_bytes,
+                    sample_kernel_stark_proof().proof_bytes
+                );
                 assert_eq!(req.address.d_j, sample_payment_address().d_j);
             }
             other => panic!("unexpected decoded message: {:?}", other),
@@ -988,12 +1005,18 @@ mod tests {
         let decoded = decode_kernel_inbox_message(&encoded).unwrap();
         match decoded {
             KernelInboxMessage::Transfer(req) => {
-                assert_eq!(req.proof.proof_bytes, sample_kernel_stark_proof().proof_bytes);
+                assert_eq!(
+                    req.proof.proof_bytes,
+                    sample_kernel_stark_proof().proof_bytes
+                );
                 assert_eq!(
                     req.proof.output_preimage,
                     sample_kernel_stark_proof().output_preimage
                 );
-                assert_eq!(req.proof.verify_meta, sample_kernel_stark_proof().verify_meta);
+                assert_eq!(
+                    req.proof.verify_meta,
+                    sample_kernel_stark_proof().verify_meta
+                );
             }
             other => panic!("unexpected decoded message: {:?}", other),
         }
@@ -1141,7 +1164,10 @@ mod tests {
         let decoded = decode_kernel_inbox_message(&encoded).unwrap();
         match decoded {
             KernelInboxMessage::Transfer(req) => {
-                assert_eq!(req.proof.proof_bytes, sample_kernel_stark_proof().proof_bytes);
+                assert_eq!(
+                    req.proof.proof_bytes,
+                    sample_kernel_stark_proof().proof_bytes
+                );
                 assert_eq!(req.root, [1u8; 32]);
                 assert_eq!(req.nullifiers, vec![[2u8; 32]]);
                 assert_eq!(req.cm_1, [4u8; 32]);
@@ -1168,7 +1194,10 @@ mod tests {
         let decoded = decode_kernel_inbox_message(&encoded).unwrap();
         match decoded {
             KernelInboxMessage::Unshield(req) => {
-                assert_eq!(req.proof.proof_bytes, sample_kernel_stark_proof().proof_bytes);
+                assert_eq!(
+                    req.proof.proof_bytes,
+                    sample_kernel_stark_proof().proof_bytes
+                );
                 assert_eq!(req.root, [1u8; 32]);
                 assert_eq!(req.nullifiers, vec![[2u8; 32]]);
                 assert_eq!(req.v_pub, 33);
@@ -1203,21 +1232,21 @@ mod tests {
     }
 
     fn sample_payment_address() -> PaymentAddress {
-        let mut master_sk = [0u8; 32];
-        master_sk[0] = 7;
-        let account = derive_account(&master_sk);
-        let d_j = derive_address(&account.incoming_seed, 0);
-        let ask_j = derive_ask(&account.ask_base, 0);
-        let (auth_root, _) = build_auth_tree(&ask_j);
-        let nk_spend = derive_nk_spend(&account.nk, &d_j);
-        let nk_tag = derive_nk_tag(&nk_spend);
-        let (ek_v, _, ek_d, _) = derive_kem_keys(&account.incoming_seed, 0);
+        let mut d_j = [0x11u8; 32];
+        d_j[31] &= 0x07;
+        let mut auth_root = [0x22u8; 32];
+        auth_root[31] &= 0x07;
+        let mut auth_pub_seed = [0x33u8; 32];
+        auth_pub_seed[31] &= 0x07;
+        let mut nk_tag = [0x44u8; 32];
+        nk_tag[31] &= 0x07;
         PaymentAddress {
             d_j,
             auth_root,
+            auth_pub_seed,
             nk_tag,
-            ek_v: ek_v.to_bytes().to_vec(),
-            ek_d: ek_d.to_bytes().to_vec(),
+            ek_v: vec![0x55; ML_KEM768_ENCAPSULATION_KEY_BYTES],
+            ek_d: vec![0x66; ML_KEM768_ENCAPSULATION_KEY_BYTES],
         }
     }
 
@@ -1269,6 +1298,7 @@ mod tests {
             prop_assert_eq!(req.memo, memo);
             prop_assert_eq!(req.address.d_j, address.d_j);
             prop_assert_eq!(req.address.auth_root, address.auth_root);
+            prop_assert_eq!(req.address.auth_pub_seed, address.auth_pub_seed);
             prop_assert_eq!(req.address.nk_tag, address.nk_tag);
             prop_assert_eq!(req.address.ek_v, address.ek_v);
             prop_assert_eq!(req.address.ek_d, address.ek_d);

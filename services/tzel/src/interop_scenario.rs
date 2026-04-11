@@ -71,6 +71,10 @@ struct DerivedScenarioAddress {
     nk_spend: F,
 }
 
+fn interop_auth_root(d_j: &F, auth_pub_seed: &F) -> F {
+    hash_two(&felt_tag(b"interop-auth"), &hash_two(d_j, auth_pub_seed))
+}
+
 fn fixed_felt(seed: u8) -> F {
     let mut out = ZERO;
     for (i, b) in out.iter_mut().enumerate() {
@@ -91,7 +95,8 @@ fn fixed_ephemeral(seed: u8) -> [u8; 32] {
 fn derive_scenario_address(acc: &Account, j: u32) -> DerivedScenarioAddress {
     let d_j = derive_address(&acc.incoming_seed, j);
     let ask_j = derive_ask(&acc.ask_base, j);
-    let (auth_root, _) = build_auth_tree(&ask_j);
+    let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+    let auth_root = interop_auth_root(&d_j, &auth_pub_seed);
     let nk_spend = derive_nk_spend(&acc.nk, &d_j);
     let nk_tag = derive_nk_tag(&nk_spend);
     let (ek_v, _, ek_d, _) = derive_kem_keys(&acc.incoming_seed, j);
@@ -99,6 +104,7 @@ fn derive_scenario_address(acc: &Account, j: u32) -> DerivedScenarioAddress {
         payment: PaymentAddress {
             d_j,
             auth_root,
+            auth_pub_seed,
             nk_tag,
             ek_v: ek_v.to_bytes().to_vec(),
             ek_d: ek_d.to_bytes().to_vec(),
@@ -109,7 +115,7 @@ fn derive_scenario_address(acc: &Account, j: u32) -> DerivedScenarioAddress {
 
 fn commit_for_address(address: &PaymentAddress, v: u64, rseed: &F) -> F {
     let rcm = derive_rcm(rseed);
-    let otag = owner_tag(&address.auth_root, &address.nk_tag);
+    let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
     commit(&address.d_j, v, &rcm, &otag)
 }
 

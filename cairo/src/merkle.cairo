@@ -29,8 +29,8 @@ pub const TREE_DEPTH: u32 = 32;
 pub const TREE_DEPTH: u32 = 48;
 
 /// Depth of the per-address auth key tree.
-/// 2^10 = 1024 one-time signing keys per address.
-pub const AUTH_DEPTH: u32 = 10;
+/// 2^16 = 65536 one-time signing keys per address.
+pub const AUTH_DEPTH: u32 = 16;
 
 /// Assert that `leaf` belongs to a Merkle tree with the given `root`.
 ///

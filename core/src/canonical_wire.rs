@@ -1,6 +1,5 @@
 use crate::{
-    EncryptedNote, NoteMemo, PaymentAddress, ENCRYPTED_NOTE_BYTES, F,
-    ML_KEM768_CIPHERTEXT_BYTES,
+    EncryptedNote, NoteMemo, PaymentAddress, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES,
 };
 use ml_kem::KeyExport;
 use serde_json::json;
@@ -34,6 +33,7 @@ pub(crate) struct WireU16Le {
 pub(crate) struct WirePaymentAddress {
     pub(crate) d_j: WireFelt,
     pub(crate) auth_root: WireFelt,
+    pub(crate) auth_pub_seed: WireFelt,
     pub(crate) nk_tag: WireFelt,
     #[encoding(sized = "ML_KEM768_ENCAPSULATION_KEY_BYTES", bytes)]
     pub(crate) ek_v: Vec<u8>,
@@ -64,7 +64,6 @@ pub(crate) struct WirePublishedNote {
     pub(crate) cm: WireFelt,
     pub(crate) enc: WireEncryptedNote,
 }
-
 
 pub(crate) fn felt_to_wire(f: &F) -> WireFelt {
     WireFelt { bytes: f.to_vec() }
@@ -146,6 +145,7 @@ pub fn encode_payment_address(addr: &PaymentAddress) -> Result<Vec<u8>, String> 
     encode_tze(&WirePaymentAddress {
         d_j: felt_to_wire(&addr.d_j),
         auth_root: felt_to_wire(&addr.auth_root),
+        auth_pub_seed: felt_to_wire(&addr.auth_pub_seed),
         nk_tag: felt_to_wire(&addr.nk_tag),
         ek_v: addr.ek_v.clone(),
         ek_d: addr.ek_d.clone(),
@@ -157,6 +157,7 @@ pub fn decode_payment_address(bytes: &[u8]) -> Result<PaymentAddress, String> {
     Ok(PaymentAddress {
         d_j: wire_to_felt(wire.d_j)?,
         auth_root: wire_to_felt(wire.auth_root)?,
+        auth_pub_seed: wire_to_felt(wire.auth_pub_seed)?,
         nk_tag: wire_to_felt(wire.nk_tag)?,
         ek_v: wire.ek_v,
         ek_d: wire.ek_d,
@@ -258,10 +259,20 @@ const VECTOR_NULLIFIER_POS: u64 = 42;
 const VECTOR_DETECT_EPHEMERAL: [u8; 32] = [0x11; 32];
 const VECTOR_VIEW_EPHEMERAL: [u8; 32] = [0x22; 32];
 const VECTOR_MEMO: &[u8] = b"canonical-wire-vector";
+const VECTOR_AUTH_ROOT_HEX: &str =
+    "e912b13056ff9b95542bdf9086d8082e2df9a915a12c6111ee0313fa0ad28507";
 
 fn sample_felt(fill: u8) -> F {
     let mut out = [fill; 32];
     out[31] &= 0x07;
+    out
+}
+
+fn hex_to_felt(s: &str) -> F {
+    let bytes = hex::decode(s).expect("valid felt hex");
+    assert_eq!(bytes.len(), 32, "felt hex must decode to 32 bytes");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
     out
 }
 
@@ -272,13 +283,15 @@ fn sample_data() -> (PaymentAddress, EncryptedNote, F, NoteMemo, F, F, u64) {
     let j = VECTOR_ADDRESS_INDEX;
     let d_j = crate::derive_address(&acc.incoming_seed, j);
     let ask_j = crate::derive_ask(&acc.ask_base, j);
-    let (auth_root, _) = crate::build_auth_tree(&ask_j);
+    let auth_root = hex_to_felt(VECTOR_AUTH_ROOT_HEX);
+    let auth_pub_seed = crate::derive_auth_pub_seed(&ask_j);
     let nk_spend = crate::derive_nk_spend(&acc.nk, &d_j);
     let nk_tag = crate::derive_nk_tag(&nk_spend);
     let (ek_v, _, ek_d, _) = crate::derive_kem_keys(&acc.incoming_seed, j);
     let address = PaymentAddress {
         d_j,
         auth_root,
+        auth_pub_seed,
         nk_tag,
         ek_v: ek_v.to_bytes().to_vec(),
         ek_d: ek_d.to_bytes().to_vec(),
@@ -299,7 +312,7 @@ fn sample_data() -> (PaymentAddress, EncryptedNote, F, NoteMemo, F, F, u64) {
         &address.d_j,
         v,
         &crate::derive_rcm(&rseed),
-        &crate::owner_tag(&address.auth_root, &address.nk_tag),
+        &crate::owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag),
     );
     let nf = crate::nullifier(&nk_spend, &cm, VECTOR_NULLIFIER_POS);
     let note_memo = NoteMemo {
@@ -334,6 +347,7 @@ pub fn generate_canonical_wire_v1_json() -> String {
         "payment_address": {
             "d_j": hex::encode(address.d_j),
             "auth_root": hex::encode(address.auth_root),
+            "auth_pub_seed": hex::encode(address.auth_pub_seed),
             "nk_tag": hex::encode(address.nk_tag),
             "ek_v": hex::encode(address.ek_v),
             "ek_d": hex::encode(address.ek_d),
@@ -384,6 +398,7 @@ mod tests {
         let decoded = decode_payment_address(&bytes).expect("address should decode");
         assert_eq!(decoded.d_j, address.d_j);
         assert_eq!(decoded.auth_root, address.auth_root);
+        assert_eq!(decoded.auth_pub_seed, address.auth_pub_seed);
         assert_eq!(decoded.nk_tag, address.nk_tag);
         assert_eq!(decoded.ek_v, address.ek_v);
         assert_eq!(decoded.ek_d, address.ek_d);

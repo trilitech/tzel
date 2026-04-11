@@ -76,12 +76,11 @@ Tests raw BLAKE2s-256 with and without personalization.
 | 5 | `"test"` | `"nkspSP__"` | nk_spend personalization |
 | 6 | `"test"` | `"nktgSP__"` | nk_tag personalization |
 | 7 | `"test"` | `"ownrSP__"` | Owner tag personalization |
-| 8 | `"test"` | `"wotsSP__"` | WOTS+ chain personalization |
-| 9 | `"test"` | `"pkfdSP__"` | PK fold personalization |
-| 10 | `"test"` | `"sighSP__"` | Sighash personalization |
-| 11 | `"test"` | `"memoSP__"` | Memo hash personalization |
-| 12 | `"x" * 200` | `""` | Multi-block (>64 bytes) |
-| 13 | `"x" * 200` | `"mrklSP__"` | Multi-block with personalization |
+| 8 | `"test"` | `"wotsSP__"` | WOTS chain personalization |
+| 9 | `"test"` | `"sighSP__"` | Sighash personalization |
+| 10 | `"test"` | `"memoSP__"` | Memo hash personalization |
+| 11 | `"x" * 200` | `""` | Multi-block (>64 bytes) |
+| 12 | `"x" * 200` | `"mrklSP__"` | Multi-block with personalization |
 
 The `input` field in the JSON is the hex encoding of the raw bytes (e.g., `"abc"` → `"616263"`).
 
@@ -117,8 +116,9 @@ Tests per-address derivation for address indices `j = 0, 1, 2`.
 | `d_j` | hex felt | `H(dsk, felt_of_int(j))` |
 | `nk_spend` | hex felt | `H_nksp(nk, d_j)` |
 | `nk_tag` | hex felt | `H_nktg(nk_spend)` |
-| `auth_root` | hex felt | Merkle root of 1024 WOTS+ folded PKs (see spec § Auth Key Tree) |
-| `owner_tag` | hex felt | `H_owner(auth_root, nk_tag)` |
+| `auth_root` | hex felt | Merkle root of `2^AUTH_DEPTH = 65536` XMSS-style auth leaves |
+| `auth_pub_seed` | hex felt | `H(TAG_XMSS_PS, ask_j)` |
+| `owner_tag` | hex felt | `H_owner(auth_root, auth_pub_seed, nk_tag)` |
 
 ---
 
@@ -299,33 +299,40 @@ If any step fails, the intermediate values pinpoint the first divergence.
 
 ## Section: `wots`
 
-Tests WOTS+ w=4 (133 chains) keygen, folding, and signing.
+Tests the XMSS-style WOTS+ spend-auth path for `w=4` (133 chains), including the per-key seed derivation, addressed chain steps, and L-tree leaf compression.
 
-**Array of 3 objects with seeds `felt_of_int(42)`, `felt_of_int(100)`, `felt_of_int(999)`:**
+**Array of 3 objects with `ask_j` in `{felt_of_int(42), felt_of_int(100), felt_of_int(999)}` and `key_idx = 0`:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `seed` | hex felt | WOTS+ seed |
-| `folded_pk` | hex felt | Sequential left-fold of 133 PK endpoints using `H_pkfold` |
+| `ask_j` | hex felt | Address auth secret input |
+| `auth_pub_seed` | hex felt | `H(TAG_XMSS_PS, ask_j)` |
+| `key_idx` | int | XMSS leaf index |
+| `seed` | hex felt | `H(TAG_XMSS_SK, ask_j, felt_of_int(key_idx))` |
+| `leaf` | hex felt | XMSS L-tree root of the recovered WOTS endpoints |
 | `sighash` | hex felt | `H(UTF8("test-sighash"))` — same for all three |
 | `signature` | array of 133 hex felts | `sign(seed, sighash)` output |
 
-**WOTS+ keygen:**
+**XMSS-style WOTS+ keygen:**
 ```
-for i in 0..133:
-    sk_i = H(seed, felt_of_int(i))          // unpersonalized
-    pk_i = H_wots(H_wots(H_wots(sk_i)))     // chain 3 times (w-1 = 3)
-folded_pk = pk_0
-for i in 1..133:
-    folded_pk = H_pkfold(folded_pk, pk_i)
+auth_pub_seed = H(TAG_XMSS_PS, ask_j)
+seed          = H(TAG_XMSS_SK, ask_j, felt_of_int(key_idx))
+
+for chain in 0..132:
+    sk_chain = H(seed, felt_of_int(chain))
+    pk_chain = H_chain^(w-1)(auth_pub_seed, ADRS(chain, step), sk_chain)
+
+leaf = XMSS_LTree(auth_pub_seed, key_idx, pk_0..pk_132)
 ```
 
-**WOTS+ sign:**
+`ADRS(chain, step)` is the packed XMSS address described in [`specs/spec.md`](../spec.md), using the chain role for WOTS chain steps and the L-tree role for the leaf compression.
+
+**XMSS-style WOTS+ sign:**
 ```
 digits = decompose_base4(sighash)   // 128 message + 5 checksum
-for i in 0..133:
-    sk_i = H(seed, felt_of_int(i))
-    sig_i = chain(sk_i, digits[i])  // apply H_wots digits[i] times
+for chain in 0..132:
+    sk_chain = H(seed, felt_of_int(chain))
+    sig_chain = H_chain^digits[chain](auth_pub_seed, ADRS(chain, step), sk_chain)
 ```
 
 ---
@@ -372,9 +379,10 @@ Tests note commitment and nullifier computation.
 | `v` | string | Decimal value |
 | `rseed` | hex felt | Random seed |
 | `auth_root` | hex felt | From address j=0 |
+| `auth_pub_seed` | hex felt | From address j=0 |
 | `nk_tag` | hex felt | From address j=0 |
 | `rcm` | hex felt | `H(TAG_RCM, rseed)` |
-| `owner_tag` | hex felt | `H_owner(auth_root, nk_tag)` |
+| `owner_tag` | hex felt | `H_owner(auth_root, auth_pub_seed, nk_tag)` |
 | `cm` | hex felt | `H_commit(d_j, felt_of_int(v), rcm, owner_tag)` |
 | `nk_spend` | hex felt | From address j=0 |
 | `pos` | int | Leaf position |
@@ -424,7 +432,7 @@ Tests canonical binary serialization byte layout.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `payment_address` | hex | 2464-byte PaymentAddress encoding for address j=0 from `master_sk` |
+| `payment_address` | hex | 2496-byte PaymentAddress encoding for address j=0 from `master_sk` |
 | `encrypted_note` | hex | 3258-byte EncryptedNote with deterministic fill (see below) |
 | `published_note` | hex | 3290-byte PublishedNote |
 | `note_memo` | hex | 3298-byte NoteMemo with `index=42` |
@@ -441,7 +449,7 @@ encrypted_data[i] = (i + 100) % 256  for i in 0..1080
 
 **NoteMemo:** `index = 42` as u64le, then the same `cm` and EncryptedNote.
 
-**PaymentAddress:** the 5-field record for address j=0 derived from `master_sk`: `(d_j, auth_root, nk_tag, ek_v, ek_d)`, serialized in that order as raw bytes.
+**PaymentAddress:** the 6-field record for address j=0 derived from `master_sk`: `(d_j, auth_root, auth_pub_seed, nk_tag, ek_v, ek_d)`, serialized in that order as raw bytes.
 
 ---
 

@@ -37,7 +37,7 @@ master_sk
 │   │   └── ask_j  = H(ask_base, j)               — per-address auth secret
 │   │       └── seed_i = H(H(TAG_AUTH_KEY, ask_j), i_felt) — per-key WOTS+ seed
 │   │           └── pk_i = WOTS+.KeyGen(seed_i)   — 133 chain endpoints (w=4)
-│   │       └── auth_root_j = MerkleRoot(fold(pk_0), ..., fold(pk_{K-1}))
+│   │       └── (auth_root_j, pub_seed_j) = XMSS-style address auth public key
 │
 └── incoming_seed = H(TAG_INCOMING, master_sk)
     ├── dsk         = H(TAG_DSK, incoming_seed)     — diversifier derivation key
@@ -69,14 +69,70 @@ Exact deterministic ML-KEM derivation for interoperability:
 
 ### Auth Key Tree
 
-Each address `j` has a Merkle tree of K one-time WOTS+ public keys (K = 2^AUTH_DEPTH, default AUTH_DEPTH = 10, giving 1024 keys per address). The scheme is a Winternitz-style one-time signature inspired by WOTS+ (RFC 8391 / XMSS), instantiated with BLAKE2s and w=4 (133 hash chains: 128 message + 5 checksum). It uses project-specific domain-separated hash functions (`wotsSP__` for chain hashing, `pkfdSP__` for public key folding) rather than the exact XMSS WOTS+ parameterization, so it should be reviewed as a custom WOTS-like construction rather than treated as standardized XMSS/WOTS+. The tree is constructed at address generation time:
+Each address `j` has a Merkle tree of K one-time XMSS-style public keys (K = 2^AUTH_DEPTH, default AUTH_DEPTH = 16, giving 65536 keys per address). The construction is intentionally close to XMSS / WOTS+ (RFC 8391), but instantiated with BLAKE2s and a simplified single-field ADRS packing that fits the Cairo implementation. The public authentication key for an address is the pair `(auth_root_j, pub_seed_j)`, not just the root.
 
-1. For each index i in 0..K: `seed_i = H(H(TAG_AUTH_KEY, ask_j), i_felt)`
-2. `pk_i = WOTS+.KeyGen(seed_i)` — 133 chain endpoints derived from seed via BLAKE2s hash chains
-3. `leaf_i = fold(pk_0, pk_1, ..., pk_132)` — sequential left-fold of the 133 chain endpoints using `H_pkfold`
-4. `auth_root_j = MerkleRoot(leaf_0, ..., leaf_{K-1})` — binary Merkle tree using `H_merkle` (see Canonical Encodings for tree structure)
+Per-address public seed:
 
-The `auth_root_j` is included in the payment address and bound into commitments via `owner_tag`. Each key is used at most once. When spending, the STARK verifies the WOTS+ signature inside the circuit, recovers the 133 chain endpoints `pk_0..pk_132`, folds those recovered endpoints into `auth_leaf_i = fold(pk_0, ..., pk_132)`, and proves Merkle membership of that exact `auth_leaf_i` in the auth tree. No auth leaf, public key, or signature appears in the public outputs — the STARK proof itself proves spend authorization.
+1. `pub_seed_j = H(TAG_XMSS_PS, ask_j)`
+
+Per-address one-time secret material for key index `i`:
+
+1. `sk_root_i = H(TAG_XMSS_SK, ask_j, i_felt)`
+2. `sk_i[c] = H(sk_root_i, c_felt)` for chain index `c` in `0..132`
+
+WOTS parameters:
+
+- `w = 4`
+- `WOTS_CHAINS = 133` (128 message digits + 5 checksum digits)
+- chain length = `w - 1 = 3`
+
+ADRS packing:
+
+- `ADRS = pack(tag, key_idx, a, b, c)` encoded as one felt252:
+  - bytes `0..8`: 8-byte little-endian ASCII tag constant
+  - bytes `8..12`: `key_idx` little-endian `u32`
+  - bytes `12..16`: `a` little-endian `u32`
+  - bytes `16..20`: `b` little-endian `u32`
+  - bytes `20..24`: `c` little-endian `u32`
+  - remaining bytes zero, with the top felt bits masked to fit felt252
+
+XMSS-style hash roles:
+
+- `H_chain(pub_seed, adrs, x) = H(pub_seed, adrs, x)` using unpersonalized BLAKE2s over the 96 raw bytes
+- `H_node(pub_seed, adrs, left, right) = H(pub_seed, adrs, left, right)` using unpersonalized BLAKE2s over the 128 raw bytes
+- `TAG_XMSS_CHAIN = "xmss-ch"`
+- `TAG_XMSS_LTREE = "xmss-lt"`
+- `TAG_XMSS_TREE = "xmss-tr"`
+
+For key index `i`, chain index `c`, and WOTS digit `d_c`:
+
+1. `pk_i[c] = H_chain^{w-1}(sk_i[c])`, where each chain step uses `ADRS = pack(TAG_XMSS_CHAIN, i, c, step, 0)`
+2. `leaf_i = LTree(pub_seed_j, i, pk_i[0..132])`
+
+`LTree(pub_seed_j, i, ...)` is the standard pairwise compression tree:
+
+- at level `ell`, pair adjacent nodes
+- hash each pair with `H_node(pub_seed_j, pack(TAG_XMSS_LTREE, i, ell, node_idx, 0), left, right)`
+- if a level has odd length, carry the last node upward unchanged
+- repeat until one node remains
+
+The auth tree root is:
+
+- `auth_root_j = XMSSMerkleRoot(pub_seed_j, leaf_0, ..., leaf_{K-1})`
+
+where each internal node at tree level `ell` and node index `node_idx` is:
+
+- `H_node(pub_seed_j, pack(TAG_XMSS_TREE, 0, ell, node_idx, 0), left, right)`
+
+The `auth_root_j` and `pub_seed_j` are both included in the payment address and bound into commitments via `owner_tag`. Each key index is used at most once. When spending, the STARK:
+
+1. computes the sighash from the public outputs
+2. decomposes it into the 133 base-4 WOTS digits
+3. recovers the WOTS public key endpoints by hashing each signature chain forward with `H_chain`
+4. compresses those recovered endpoints with the XMSS L-tree
+5. proves Merkle membership of that exact recovered leaf under `auth_root_j` using `pub_seed_j`
+
+No auth leaf, public key, or signature appears in the public outputs — the STARK proof itself proves spend authorization.
 
 After exhausting all K keys for an address, generate a new address (increment j).
 
@@ -89,7 +145,7 @@ The account-level `nk` never leaves the user's device. Instead, each address der
 
 These are bound into the commitment via an owner tag:
 
-- `owner_tag_j = H_owner(auth_root_j, nk_tag_j)` — fuses auth root + nullifier binding
+- `owner_tag_j = H_owner(auth_root_j, pub_seed_j, nk_tag_j)` — fuses the full XMSS public key + nullifier binding
 
 This ensures the commitment cryptographically binds to the nullifier key material. Given a commitment `cm`, an attacker who wants to spend it with a fake `nk'` would need to find values that produce the same commitment under `H_commit`, which requires a second-preimage. Note that `auth_root_j` is public in the payment address (the sender needs it to create notes) but stays private on-chain (it never appears in proof outputs). The security rests on the collision resistance of `H_owner` and `H_commit`.
 
@@ -104,18 +160,19 @@ This ensures the commitment cryptographically binds to the nullifier key materia
 
 Detection ⊂ incoming view ⊂ full view ⊂ spend. Each level strictly adds capability.
 
-`incoming_seed` and `nk` alone do NOT reconstruct `auth_root_j`, so incoming-view and full-view holders cannot fully validate note spendability from keys alone. Independent note validation requires locally stored address metadata (or exported address records) containing at least `(d_j, auth_root_j, nk_tag_j)` for the recipient addresses being monitored.
+`incoming_seed` and `nk` alone do NOT reconstruct `(auth_root_j, pub_seed_j)`, so incoming-view and full-view holders cannot fully validate note spendability from keys alone. Independent note validation requires locally stored address metadata (or exported address records) containing at least `(d_j, auth_root_j, pub_seed_j, nk_tag_j)` for the recipient addresses being monitored.
 
 ## Payment Address
 
 What the sender receives:
 
 ```
-address_j = (d_j, auth_root_j, nk_tag_j, ek_v_j, ek_d_j)
+address_j = (d_j, auth_root_j, pub_seed_j, nk_tag_j, ek_v_j, ek_d_j)
 ```
 
 - `d_j` — diversifier (32 bytes): identifies the address, appears in the note commitment
 - `auth_root_j` — auth key tree root (32 bytes): bound into the commitment; stays private on-chain
+- `pub_seed_j` — XMSS public seed (32 bytes): part of the address's public spend-auth key, bound into the commitment
 - `nk_tag_j` — nullifier binding tag (32 bytes): binds the commitment to the owner's nullifier key
 - `ek_v_j` — ML-KEM encapsulation key (~1184 bytes): sender encrypts memos with this
 - `ek_d_j` — ML-KEM encapsulation key (~1184 bytes): sender creates detection clues with this
@@ -129,7 +186,7 @@ For circuit purposes, `d_j`, `auth_root_j`, and `nk_tag_j` matter. The ML-KEM ke
 ```
 rseed       — random per-note seed
 rcm         = H(H(TAG_RCM), rseed)                       — commitment randomness
-owner_tag   = H_owner(auth_root_j, nk_tag_j)            — fuses auth root + nullifier binding
+owner_tag   = H_owner(auth_root_j, pub_seed_j, nk_tag_j) — fuses the XMSS public key + nullifier binding
 cm          = H_commit(d_j, v, rcm, owner_tag)           — note commitment
 nf          = H_nf(nk_spend_j, H_nf(cm, pos))           — position-dependent nullifier
 ```
@@ -156,7 +213,7 @@ This prevents an attacker from creating two identical commitments (same d_j, v, 
 
 **Circuit constraints:**
 1. `rcm = H(H(TAG_RCM), rseed)`
-2. `owner_tag = H_owner(auth_root, nk_tag)` where both `auth_root` and `nk_tag` are private inputs from the recipient's payment address
+2. `owner_tag = H_owner(auth_root, pub_seed, nk_tag)` where `auth_root`, `pub_seed`, and `nk_tag` are private inputs from the recipient's payment address
 3. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
 
 `memo_ct_hash` is computed client-side as `H(ct_d || tag || ct_v || encrypted_data)` — covering ALL on-chain note data — and passed into the circuit as a public input.
@@ -171,22 +228,22 @@ Consumes N private notes and creates exactly 2 new private notes. Handles splits
 
 **Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2]`
 
-WOTS+ signature verification happens inside the STARK. No auth leaves, public keys, or signatures appear in the public outputs.
+XMSS-style WOTS+ signature verification happens inside the STARK. No auth leaves, public keys, or signatures appear in the public outputs.
 
 **Circuit constraints:**
 1. For each input i (0..N):
    - `rcm_i = H(H(TAG_RCM), rseed_i)`
    - `nk_tag_i = H_nktg(nk_spend_i)`
-   - `owner_tag_i = H_owner(auth_root_i, nk_tag_i)`
+   - `owner_tag_i = H_owner(auth_root_i, pub_seed_i, nk_tag_i)`
    - `cm_i = H_commit(d_j_i, v_i, rcm_i, owner_tag_i)`
    - Merkle membership of `cm_i` at position `pos_i` against `root` (commitment tree)
    - `nf_i = H_nf(nk_spend_i, H_nf(cm_i, pos_i))`
-   - WOTS+ signature verification: the circuit computes the sighash from the public outputs, decomposes it into 128 base-4 digits + 5 checksum digits, then for each of the 133 chains verifies `H_wots^{w-1-digit}(sig_j) == pk_j`. The digits are NOT witness data — they are deterministically derived inside the circuit.
-   - `auth_leaf_i = fold(pk_0, ..., pk_132)` from those recovered chain endpoints
-   - Merkle membership of that exact `auth_leaf_i` at position `key_idx_i` against `auth_root_i` (auth key tree)
+   - XMSS-style WOTS+ verification: the circuit computes the sighash from the public outputs, decomposes it into 128 base-4 digits + 5 checksum digits, then for each of the 133 chains recovers the final public-key endpoint with `H_chain^{w-1-digit}(sig_j, pub_seed_i, ADRS_j)`. The digits are NOT witness data — they are deterministically derived inside the circuit.
+   - `auth_leaf_i = LTree(pub_seed_i, key_idx_i, pk_0, ..., pk_132)` from those recovered chain endpoints
+   - Merkle membership of that exact `auth_leaf_i` at position `key_idx_i` against `auth_root_i` using the XMSS tree-node hash (auth key tree)
 2. All nullifiers pairwise distinct
 3. For both outputs:
-   - `owner_tag_out = H_owner(auth_root_out, nk_tag_out)` where `auth_root_out` and `nk_tag_out` are private inputs from the recipient's payment address
+   - `owner_tag_out = H_owner(auth_root_out, pub_seed_out, nk_tag_out)` where `auth_root_out`, `pub_seed_out`, and `nk_tag_out` are private inputs from the recipient's payment address
    - `cm_out = H_commit(d_j_out, v_out, rcm_out, owner_tag_out)`
 4. `sum(v_inputs) = v_1 + v_2` (in u128)
 5. All values are u64 (implicit range check)
@@ -207,7 +264,7 @@ Consumes N private notes, releases `v_pub` to a public address, and optionally c
 1. Same per-input verification as Transfer (including auth tree membership proof and WOTS+ signature verification)
 2. All nullifiers pairwise distinct
 3. If change:
-   - `owner_tag_c = H_owner(auth_root_c, nk_tag_c)` where `auth_root_c` and `nk_tag_c` are private inputs
+   - `owner_tag_c = H_owner(auth_root_c, pub_seed_c, nk_tag_c)` where `auth_root_c`, `pub_seed_c`, and `nk_tag_c` are private inputs
    - `cm_change = H_commit(d_j_c, v_change, rcm_c, owner_tag_c)`
 4. If no change: all change witness data constrained to zero (`v_change`, `d_j_change`, `rseed_change`, `auth_root_change`, `nk_tag_change`, `memo_ct_hash_change` = 0) to eliminate prover malleability
 5. `sum(v_inputs) = v_pub + v_change`
@@ -306,10 +363,10 @@ The detection server (with `dk_d_j`) decapsulates `ct_d`, recomputes `tag_u16`, 
 
 Detection and successful memo decryption are only candidate filters. A wallet MUST accept an incoming note as belonging to one of its addresses only if it can match the note against locally known address metadata and recompute the commitment exactly:
 
-1. Select a local address record containing `(d_j, auth_root_j, nk_tag_j)` for the candidate recipient address.
+1. Select a local address record containing `(d_j, auth_root_j, pub_seed_j, nk_tag_j)` for the candidate recipient address.
 2. Decrypt the note to obtain `(v, rseed, memo)`.
 3. Recompute `rcm = H(H(TAG_RCM), rseed)`.
-4. Recompute `owner_tag = H_owner(auth_root_j, nk_tag_j)`.
+4. Recompute `owner_tag = H_owner(auth_root_j, pub_seed_j, nk_tag_j)`.
 5. Recompute `cm_expected = H_commit(d_j, v, rcm, owner_tag)`.
 6. Accept the note only if `cm_expected == cm` from chain data. Otherwise reject it as malformed, non-local, or unspendable.
 
@@ -395,7 +452,6 @@ All hashing uses BLAKE2s-256 truncated to 251 bits, with domain separation via B
 | Per-address nk_tag | `nktgSP__` | `derive_nk_tag` |
 | Owner tag | `ownrSP__` | `owner_tag` |
 | WOTS+ chain hash | `wotsSP__` | `hash1_wots` (in circuit) |
-| WOTS+ PK fold | `pkfdSP__` | `hash2_pkfold` (in circuit) |
 | Sighash | `sighSP__` | `sighash_fold` (in circuit + client) |
 | Memo hash (client-side) | `memoSP__` | -- (not in circuit) |
 
@@ -466,6 +522,7 @@ felt252 := bytes[32]
 PaymentAddress := record {
   d_j:       felt252,
   auth_root: felt252,
+  pub_seed:  felt252,
   nk_tag:    felt252,
   ek_v:      bytes[1184],   // ML-KEM-768 encapsulation key
   ek_d:      bytes[1184]    // ML-KEM-768 encapsulation key
@@ -539,7 +596,7 @@ Both the commitment tree and auth key tree use left-right BLAKE2s Merkle trees:
 ### Position and Index Canonicalization
 
 - **Commitment tree position `pos`:** MUST satisfy `0 <= pos < 2^TREE_DEPTH` (TREE_DEPTH=48). The Cairo circuit enforces this by checking all `path_indices` bits are 0 or 1, and rejecting the path if any bit beyond depth TREE_DEPTH is set (`src/merkle.cairo:77-81`). This prevents alias nullifiers via `pos = real_pos + k*2^TREE_DEPTH`.
-- **Auth tree key index `key_idx`:** MUST satisfy `0 <= key_idx < 2^AUTH_DEPTH` (AUTH_DEPTH=10). The circuit rejects out-of-range indices (`src/merkle.cairo:108`). This prevents aliasing of auth tree leaves.
+- **Auth tree key index `key_idx`:** MUST satisfy `0 <= key_idx < 2^AUTH_DEPTH` (AUTH_DEPTH=16). The circuit rejects out-of-range indices. This prevents aliasing of auth tree leaves.
 - **Values `v`:** MUST be u64. Arithmetic uses u128 to prevent overflow. The circuit enforces this via felt-to-u64 conversion.
 
 ### Memo-Hash Preimage

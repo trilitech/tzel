@@ -101,7 +101,9 @@ fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
         .fund("alice", scenario.initial_alice_balance)
         .expect("fund alice");
 
-    let shield_resp = ledger.shield(&shield_req(&scenario.shield)).expect("shield");
+    let shield_resp = ledger
+        .shield(&shield_req(&scenario.shield))
+        .expect("shield");
     assert_eq!(shield_resp.cm, scenario.shield.cm);
     assert_eq!(shield_resp.index, 0);
 

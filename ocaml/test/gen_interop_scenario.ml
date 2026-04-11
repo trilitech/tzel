@@ -11,6 +11,7 @@ let payment_address_wire_of_addr (addr : Tzel.Keys.address) =
   let wire : Tzel.Encoding.payment_address_wire = {
     d_j = pa.pa_d_j;
     auth_root = pa.pa_auth_root;
+    auth_pub_seed = pa.pa_auth_pub_seed;
     nk_tag = pa.pa_nk_tag;
     ek_v = pa.pa_ek_v;
     ek_d = pa.pa_ek_d;
@@ -30,6 +31,22 @@ let json_felt f = `String (Tzel.Felt.to_hex f)
 
 let json_felt_list xs = `List (List.map json_felt xs)
 
+let test_auth_root d_j auth_pub_seed =
+  Tzel.Hash.hash2 (Tzel.Hash.felt_tag "interop-auth-root")
+    (Tzel.Hash.hash2 d_j auth_pub_seed)
+
+let derive_test_address keys j =
+  let d_j = Tzel.Keys.derive_diversifier keys j in
+  let ask_j = Tzel.Keys.derive_ask keys j in
+  let auth_pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
+  let nk_spend = Tzel.Keys.derive_nk_spend keys d_j in
+  let nk_tag = Tzel.Keys.derive_nk_tag nk_spend in
+  let auth_root = test_auth_root d_j auth_pub_seed in
+  let (ek_v, dk_v) = Tzel.Mlkem.derive_view_keypair keys.view_root j in
+  let (ek_d, dk_d) = Tzel.Mlkem.derive_detect_keypair keys.detect_root j in
+  { Tzel.Keys.index = j; d_j; auth_root; auth_pub_seed; nk_tag; nk_spend; ask_j;
+    ek_v; dk_v; ek_d; dk_d }
+
 let () =
   let auth_domain = Tzel.Hash.hash_bytes (Bytes.of_string "tzel-auth-domain-local-dev-v1") in
   let initial_alice_balance = 100 in
@@ -37,9 +54,9 @@ let () =
   let alice_keys = Tzel.Keys.derive (fixed_felt 0x11) in
   let bob_keys = Tzel.Keys.derive (fixed_felt 0x55) in
 
-  let alice_addr0 = Tzel.Keys.derive_address alice_keys 0 in
-  let alice_addr1 = Tzel.Keys.derive_address alice_keys 1 in
-  let bob_addr0 = Tzel.Keys.derive_address bob_keys 0 in
+  let alice_addr0 = derive_test_address alice_keys 0 in
+  let alice_addr1 = derive_test_address alice_keys 1 in
+  let bob_addr0 = derive_test_address bob_keys 0 in
 
   let shield_rseed = fixed_felt 0x21 in
   let shield_note = Tzel.Note.create alice_addr0 100L shield_rseed in

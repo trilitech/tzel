@@ -40,7 +40,7 @@ let test_blake2s_deterministic () =
 
 let test_blake2s_all_personalizations () =
   let personals = ["mrklSP__"; "nulfSP__"; "cmmtSP__"; "nkspSP__";
-                    "nktgSP__"; "ownrSP__"; "wotsSP__"; "pkfdSP__";
+                    "nktgSP__"; "ownrSP__"; "wotsSP__";
                     "sighSP__"; "memoSP__"] in
   let hashes = List.map (fun p ->
     hex_of_bytes (Tzel.Blake2s.hash_string ~personal:p "same")) personals in
@@ -184,19 +184,14 @@ let test_hash_nk_tag () =
 
 let test_hash_owner () =
   let ar = Tzel.Felt.of_u64 1 in
+  let ps = Tzel.Felt.of_u64 2 in
   let nt = Tzel.Felt.of_u64 2 in
-  let ot = Tzel.Hash.hash_owner ar nt in
+  let ot = Tzel.Hash.hash_owner ar ps nt in
   Alcotest.(check bool) "non-zero" true (not (Tzel.Felt.is_zero ot))
 
 let test_hash_wots () =
   let data = Tzel.Felt.of_u64 42 in
   let h = Tzel.Hash.hash_wots data in
-  Alcotest.(check bool) "non-zero" true (not (Tzel.Felt.is_zero h))
-
-let test_hash_pkfold () =
-  let a = Tzel.Felt.of_u64 1 in
-  let b = Tzel.Felt.of_u64 2 in
-  let h = Tzel.Hash.hash_pkfold a b in
   Alcotest.(check bool) "non-zero" true (not (Tzel.Felt.is_zero h))
 
 let test_hash_sighash () =
@@ -247,48 +242,73 @@ let test_account_id () =
    WOTS+ w=4
    ══════════════════════════════════════════════════════════════════════ *)
 
+let sample_wots_pub_seed seed =
+  Tzel.Hash.hash2 Tzel.Hash.tag_xmss_ps seed
+
 let test_wots_sign_verify () =
   let seed = Tzel.Felt.of_u64 42 in
-  let pk = Tzel.Wots.keygen seed in
+  let pub_seed = sample_wots_pub_seed seed in
+  let key_idx = 0 in
+  let pk = Tzel.Wots.keygen ~seed ~pub_seed ~key_idx in
+  let leaf = Tzel.Wots.pk_to_leaf ~pub_seed ~key_idx pk in
   Alcotest.(check int) "pk length" 133 (Array.length pk);
   let sighash = Tzel.Hash.hash_tag "test-sighash" in
-  let signature = Tzel.Wots.sign seed sighash in
+  let signature = Tzel.Wots.sign ~seed ~pub_seed ~key_idx sighash in
   Alcotest.(check int) "sig length" 133 (Array.length signature);
-  Alcotest.(check bool) "verify" true (Tzel.Wots.verify signature sighash pk)
+  Alcotest.(check bool) "verify" true
+    (Tzel.Wots.verify ~pub_seed ~key_idx signature sighash leaf)
 
 let test_wots_wrong_message () =
   let seed = Tzel.Felt.of_u64 42 in
-  let pk = Tzel.Wots.keygen seed in
+  let pub_seed = sample_wots_pub_seed seed in
+  let key_idx = 0 in
+  let pk = Tzel.Wots.keygen ~seed ~pub_seed ~key_idx in
+  let leaf = Tzel.Wots.pk_to_leaf ~pub_seed ~key_idx pk in
   let sighash = Tzel.Hash.hash_tag "test-sighash" in
   let wrong = Tzel.Hash.hash_tag "wrong-sighash" in
-  let signature = Tzel.Wots.sign seed sighash in
-  Alcotest.(check bool) "reject wrong msg" false (Tzel.Wots.verify signature wrong pk)
+  let signature = Tzel.Wots.sign ~seed ~pub_seed ~key_idx sighash in
+  Alcotest.(check bool) "reject wrong msg" false
+    (Tzel.Wots.verify ~pub_seed ~key_idx signature wrong leaf)
 
 let test_wots_fold_deterministic () =
   let seed = Tzel.Felt.of_u64 100 in
-  let pk1 = Tzel.Wots.keygen seed in
-  let pk2 = Tzel.Wots.keygen seed in
-  Alcotest.(check bool) "fold deterministic" true
-    (Tzel.Felt.equal (Tzel.Wots.fold_pk pk1) (Tzel.Wots.fold_pk pk2))
+  let pub_seed = sample_wots_pub_seed seed in
+  let pk1 = Tzel.Wots.keygen ~seed ~pub_seed ~key_idx:0 in
+  let pk2 = Tzel.Wots.keygen ~seed ~pub_seed ~key_idx:0 in
+  Alcotest.(check bool) "leaf deterministic" true
+    (Tzel.Felt.equal
+       (Tzel.Wots.pk_to_leaf ~pub_seed ~key_idx:0 pk1)
+       (Tzel.Wots.pk_to_leaf ~pub_seed ~key_idx:0 pk2))
 
 let test_wots_different_seeds () =
-  let pk1 = Tzel.Wots.keygen (Tzel.Felt.of_u64 1) in
-  let pk2 = Tzel.Wots.keygen (Tzel.Felt.of_u64 2) in
-  Alcotest.(check bool) "different seeds -> different pks" false
-    (Tzel.Felt.equal (Tzel.Wots.fold_pk pk1) (Tzel.Wots.fold_pk pk2))
+  let seed1 = Tzel.Felt.of_u64 1 in
+  let seed2 = Tzel.Felt.of_u64 2 in
+  let pub_seed1 = sample_wots_pub_seed seed1 in
+  let pub_seed2 = sample_wots_pub_seed seed2 in
+  let pk1 = Tzel.Wots.keygen ~seed:seed1 ~pub_seed:pub_seed1 ~key_idx:0 in
+  let pk2 = Tzel.Wots.keygen ~seed:seed2 ~pub_seed:pub_seed2 ~key_idx:0 in
+  Alcotest.(check bool) "different seeds -> different leaves" false
+    (Tzel.Felt.equal
+       (Tzel.Wots.pk_to_leaf ~pub_seed:pub_seed1 ~key_idx:0 pk1)
+       (Tzel.Wots.pk_to_leaf ~pub_seed:pub_seed2 ~key_idx:0 pk2))
 
 let test_wots_wrong_key () =
   let seed1 = Tzel.Felt.of_u64 1 in
   let seed2 = Tzel.Felt.of_u64 2 in
-  let pk2 = Tzel.Wots.keygen seed2 in
+  let pub_seed2 = sample_wots_pub_seed seed2 in
+  let pk2 = Tzel.Wots.keygen ~seed:seed2 ~pub_seed:pub_seed2 ~key_idx:0 in
+  let leaf2 = Tzel.Wots.pk_to_leaf ~pub_seed:pub_seed2 ~key_idx:0 pk2 in
   let sighash = Tzel.Hash.hash_tag "msg" in
-  let sig1 = Tzel.Wots.sign seed1 sighash in
-  Alcotest.(check bool) "wrong key rejects" false (Tzel.Wots.verify sig1 sighash pk2)
+  let pub_seed1 = sample_wots_pub_seed seed1 in
+  let sig1 = Tzel.Wots.sign ~seed:seed1 ~pub_seed:pub_seed1 ~key_idx:0 sighash in
+  Alcotest.(check bool) "wrong key rejects" false
+    (Tzel.Wots.verify ~pub_seed:pub_seed2 ~key_idx:0 sig1 sighash leaf2)
 
 let test_wots_keygen_deterministic () =
   let seed = Tzel.Felt.of_u64 42 in
-  let pk1 = Tzel.Wots.keygen seed in
-  let pk2 = Tzel.Wots.keygen seed in
+  let pub_seed = sample_wots_pub_seed seed in
+  let pk1 = Tzel.Wots.keygen ~seed ~pub_seed ~key_idx:0 in
+  let pk2 = Tzel.Wots.keygen ~seed ~pub_seed ~key_idx:0 in
   let all_eq = ref true in
   for i = 0 to 132 do
     if not (Tzel.Felt.equal pk1.(i) pk2.(i)) then all_eq := false
@@ -298,36 +318,35 @@ let test_wots_keygen_deterministic () =
 let test_wots_decompose_roundtrip () =
   (* Sign and verify implicitly tests decompose_sighash correctness *)
   let seed = Tzel.Felt.of_u64 77 in
-  let pk = Tzel.Wots.keygen seed in
+  let pub_seed = sample_wots_pub_seed seed in
+  let key_idx = 0 in
+  let pk = Tzel.Wots.keygen ~seed ~pub_seed ~key_idx in
+  let leaf = Tzel.Wots.pk_to_leaf ~pub_seed ~key_idx pk in
   (* Test with various sighash values *)
   for i = 0 to 9 do
     let sh = Tzel.Hash.hash_tag (Printf.sprintf "sighash-%d" i) in
-    let sig_vals = Tzel.Wots.sign seed sh in
+    let sig_vals = Tzel.Wots.sign ~seed ~pub_seed ~key_idx sh in
     Alcotest.(check bool) (Printf.sprintf "verify-%d" i) true
-      (Tzel.Wots.verify sig_vals sh pk)
+      (Tzel.Wots.verify ~pub_seed ~key_idx sig_vals sh leaf)
   done
 
-let test_wots_signature_binds_to_authenticated_auth_leaf () =
+let test_wots_signature_binds_to_auth_leaf () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 123) in
   let ask_j = Tzel.Keys.derive_ask keys 0 in
   let key_idx = 7 in
   let seed = Tzel.Keys.derive_wots_seed ask_j key_idx in
+  let pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
   let sighash = Tzel.Hash.hash_tag "bind-wots-auth-leaf" in
-  let sig_vals = Tzel.Wots.sign seed sighash in
-  let digits = Tzel.Wots.decompose_sighash sighash in
-  let recovered_pk = Array.init Tzel.Wots.n_chains (fun i ->
-    let remaining = Tzel.Wots.chain_max - digits.(i) in
-    Tzel.Wots.chain_hash sig_vals.(i) remaining) in
-  let recovered_leaf = Tzel.Wots.fold_pk recovered_pk in
-  let (root, leaves) = Tzel.Keys.build_auth_tree ask_j in
+  let sig_vals = Tzel.Wots.sign ~seed ~pub_seed ~key_idx sighash in
+  let recovered_pk = Tzel.Wots.recover_pk ~pub_seed ~key_idx sig_vals sighash in
+  let recovered_leaf = Tzel.Wots.pk_to_leaf ~pub_seed ~key_idx recovered_pk in
   Alcotest.(check bool) "recovered leaf matches expected leaf" true
-    (Tzel.Felt.equal recovered_leaf leaves.(key_idx));
-  let path = Tzel.Merkle.auth_path ~depth:Tzel.Keys.auth_depth (Array.to_list leaves) key_idx in
-  Alcotest.(check bool) "recovered leaf path verifies" true
-    (Tzel.Merkle.verify_path ~depth:Tzel.Keys.auth_depth recovered_leaf key_idx path root);
-  let wrong_leaf = leaves.(key_idx + 1) in
-  Alcotest.(check bool) "wrong leaf path rejected" false
-    (Tzel.Merkle.verify_path ~depth:Tzel.Keys.auth_depth wrong_leaf key_idx path root)
+    (Tzel.Felt.equal recovered_leaf (Tzel.Keys.auth_leaf_hash ask_j key_idx));
+  Alcotest.(check bool) "recovered leaf is deterministic" true
+    (Tzel.Felt.equal recovered_leaf (Tzel.Keys.auth_leaf_hash ask_j key_idx));
+  let wrong_leaf = Tzel.Keys.auth_leaf_hash ask_j (key_idx + 1) in
+  Alcotest.(check bool) "wrong leaf rejected" false
+    (Tzel.Felt.equal wrong_leaf recovered_leaf)
 
 (* ══════════════════════════════════════════════════════════════════════
    Merkle
@@ -495,40 +514,57 @@ let test_key_derive_wots_seed () =
   let s1 = Tzel.Keys.derive_wots_seed ask_j 1 in
   Alcotest.(check bool) "different i -> different seed" false (Tzel.Felt.equal s0 s1)
 
-let test_key_build_auth_tree () =
+let test_auth_root d_j auth_pub_seed =
+  Tzel.Hash.hash2 (Tzel.Hash.felt_tag "test-auth-root")
+    (Tzel.Hash.hash2 d_j auth_pub_seed)
+
+let derive_test_address keys j =
+  let d_j = Tzel.Keys.derive_diversifier keys j in
+  let ask_j = Tzel.Keys.derive_ask keys j in
+  let auth_pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
+  let nk_spend = Tzel.Keys.derive_nk_spend keys d_j in
+  let nk_tag = Tzel.Keys.derive_nk_tag nk_spend in
+  let auth_root = test_auth_root d_j auth_pub_seed in
+  let (ek_v, dk_v) = Tzel.Mlkem.derive_view_keypair keys.view_root j in
+  let (ek_d, dk_d) = Tzel.Mlkem.derive_detect_keypair keys.detect_root j in
+  { Tzel.Keys.index = j; d_j; auth_root; auth_pub_seed; nk_tag; nk_spend; ask_j;
+    ek_v; dk_v; ek_d; dk_d }
+
+let test_key_auth_leaf_small_merkle () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 1) in
   let ask_j = Tzel.Keys.derive_ask keys 0 in
-  let (root, leaves) = Tzel.Keys.build_auth_tree ask_j in
+  let depth = 3 in
+  let leaves = List.init (1 lsl depth) (fun i -> Tzel.Keys.auth_leaf_hash ask_j i) in
+  let root = Tzel.Merkle.root_of_leaves ~depth leaves in
+  let leaf = List.nth leaves 5 in
+  let path = Tzel.Merkle.auth_path ~depth leaves 5 in
   Alcotest.(check bool) "root non-zero" true (not (Tzel.Felt.is_zero root));
-  Alcotest.(check int) "1024 leaves" 1024 (Array.length leaves);
-  (* Verify a leaf's Merkle path *)
-  let leaf_list = Array.to_list leaves in
-  let path = Tzel.Merkle.auth_path ~depth:10 leaf_list 42 in
   Alcotest.(check bool) "auth path verifies" true
-    (Tzel.Merkle.verify_path ~depth:10 leaves.(42) 42 path root)
+    (Tzel.Merkle.verify_path ~depth leaf 5 path root)
 
 let test_owner_tag_binding () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 99) in
-  let addr0 = Tzel.Keys.derive_address keys 0 in
-  let addr1 = Tzel.Keys.derive_address keys 1 in
+  let addr0 = derive_test_address keys 0 in
+  let addr1 = derive_test_address keys 1 in
   let ot0 = Tzel.Keys.owner_tag addr0 in
   let ot1 = Tzel.Keys.owner_tag addr1 in
   Alcotest.(check bool) "different addresses -> different tags" false (Tzel.Felt.equal ot0 ot1)
 
 let test_key_to_payment_address () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 1) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let pa = Tzel.Keys.to_payment_address addr in
   Alcotest.(check bool) "d_j" true (Tzel.Felt.equal addr.d_j pa.pa_d_j);
   Alcotest.(check bool) "auth_root" true (Tzel.Felt.equal addr.auth_root pa.pa_auth_root);
+  Alcotest.(check bool) "auth_pub_seed" true (Tzel.Felt.equal addr.auth_pub_seed pa.pa_auth_pub_seed);
   Alcotest.(check bool) "nk_tag" true (Tzel.Felt.equal addr.nk_tag pa.pa_nk_tag);
   Alcotest.(check bool) "ek_v" true (Bytes.equal addr.ek_v pa.pa_ek_v);
   Alcotest.(check bool) "ek_d" true (Bytes.equal addr.ek_d pa.pa_ek_d)
 
 let test_key_address_multiple_indices () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 7) in
-  let addr0 = Tzel.Keys.derive_address keys 0 in
-  let addr1 = Tzel.Keys.derive_address keys 1 in
+  let addr0 = derive_test_address keys 0 in
+  let addr1 = derive_test_address keys 1 in
   Alcotest.(check bool) "different d_j" false (Tzel.Felt.equal addr0.d_j addr1.d_j);
   Alcotest.(check bool) "different auth_root" false
     (Tzel.Felt.equal addr0.auth_root addr1.auth_root);
@@ -540,14 +576,14 @@ let test_key_address_multiple_indices () =
 
 let test_note_commitment () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 99) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let rseed = Tzel.Felt.of_u64 777 in
   let note = Tzel.Note.create addr 1000L rseed in
   Alcotest.(check bool) "cm non-zero" true (not (Tzel.Felt.is_zero note.cm))
 
 let test_note_determinism () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 99) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let rseed = Tzel.Felt.of_u64 777 in
   let n1 = Tzel.Note.create addr 1000L rseed in
   let n2 = Tzel.Note.create addr 1000L rseed in
@@ -556,7 +592,7 @@ let test_note_determinism () =
 
 let test_note_nullifier () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 99) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let rseed = Tzel.Felt.of_u64 777 in
   let note = Tzel.Note.create addr 1000L rseed in
   let nf0 = Tzel.Note.nullifier addr.nk_spend note.cm 0 in
@@ -566,18 +602,18 @@ let test_note_nullifier () =
 
 let test_note_create_from_parts () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 99) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let rseed = Tzel.Felt.of_u64 777 in
   let n1 = Tzel.Note.create addr 1000L rseed in
   let n2 = Tzel.Note.create_from_parts
-    ~d_j:addr.d_j ~auth_root:addr.auth_root ~nk_tag:addr.nk_tag
+    ~d_j:addr.d_j ~auth_root:addr.auth_root ~auth_pub_seed:addr.auth_pub_seed ~nk_tag:addr.nk_tag
     ~v:1000L ~rseed in
   Alcotest.(check bool) "create matches create_from_parts" true
     (Tzel.Felt.equal n1.cm n2.cm)
 
 let test_note_different_values () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 99) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let rseed = Tzel.Felt.of_u64 777 in
   let n1 = Tzel.Note.create addr 1000L rseed in
   let n2 = Tzel.Note.create addr 2000L rseed in
@@ -585,20 +621,20 @@ let test_note_different_values () =
 
 let test_note_different_rseed () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 99) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let n1 = Tzel.Note.create addr 1000L (Tzel.Felt.of_u64 1) in
   let n2 = Tzel.Note.create addr 1000L (Tzel.Felt.of_u64 2) in
   Alcotest.(check bool) "different rseed -> different cm" false (Tzel.Felt.equal n1.cm n2.cm)
 
 let test_note_zero_value () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 99) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let note = Tzel.Note.create addr 0L (Tzel.Felt.of_u64 1) in
   Alcotest.(check bool) "zero value note has cm" true (not (Tzel.Felt.is_zero note.cm))
 
 let test_note_nullifier_different_nk_spend () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 99) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let note = Tzel.Note.create addr 1000L (Tzel.Felt.of_u64 1) in
   let nf1 = Tzel.Note.nullifier addr.nk_spend note.cm 0 in
   let fake_nk = Tzel.Felt.of_u64 999 in
@@ -657,7 +693,7 @@ let test_sighash_transfer_unshield_distinct () =
 
 let test_build_shield () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 200) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let rseed = Tzel.Felt.of_u64 555 in
   let mch = Tzel.Felt.of_u64 0 in
   let (pub, note) = Tzel.Transaction.build_shield
@@ -669,22 +705,22 @@ let test_build_shield () =
 
 let test_build_output () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 200) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let rseed = Tzel.Felt.of_u64 555 in
   let note = Tzel.Transaction.build_output
-    ~d_j:addr.d_j ~auth_root:addr.auth_root ~nk_tag:addr.nk_tag
+    ~d_j:addr.d_j ~auth_root:addr.auth_root ~auth_pub_seed:addr.auth_pub_seed ~nk_tag:addr.nk_tag
     ~v:1000L ~rseed in
   Alcotest.(check bool) "cm non-zero" true (not (Tzel.Felt.is_zero note.cm))
 
 let test_build_transfer_public () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 200) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let rseed = Tzel.Felt.of_u64 555 in
   let out1 = Tzel.Transaction.build_output
-    ~d_j:addr.d_j ~auth_root:addr.auth_root ~nk_tag:addr.nk_tag
+    ~d_j:addr.d_j ~auth_root:addr.auth_root ~auth_pub_seed:addr.auth_pub_seed ~nk_tag:addr.nk_tag
     ~v:600L ~rseed in
   let out2 = Tzel.Transaction.build_output
-    ~d_j:addr.d_j ~auth_root:addr.auth_root ~nk_tag:addr.nk_tag
+    ~d_j:addr.d_j ~auth_root:addr.auth_root ~auth_pub_seed:addr.auth_pub_seed ~nk_tag:addr.nk_tag
     ~v:400L ~rseed:(Tzel.Felt.of_u64 666) in
   let auth_domain = Tzel.Felt.of_u64 1 in
   let root = Tzel.Hash.hash_tag "root" in
@@ -699,9 +735,9 @@ let test_build_transfer_public () =
 
 let test_build_unshield_public () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 200) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let change = Tzel.Transaction.build_output
-    ~d_j:addr.d_j ~auth_root:addr.auth_root ~nk_tag:addr.nk_tag
+    ~d_j:addr.d_j ~auth_root:addr.auth_root ~auth_pub_seed:addr.auth_pub_seed ~nk_tag:addr.nk_tag
     ~v:200L ~rseed:(Tzel.Felt.of_u64 888) in
   let (pub, sighash) = Tzel.Transaction.build_unshield_public
     ~auth_domain:(Tzel.Felt.of_u64 1)
@@ -726,13 +762,13 @@ let test_build_unshield_no_change () =
 
 let test_sign_verify_inputs () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 200) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let rseed = Tzel.Felt.of_u64 555 in
   let note = Tzel.Note.create addr 1000L rseed in
   let sighash = Tzel.Hash.hash_tag "test-sighash" in
   let input : Tzel.Transaction.spend_input = {
     note; pos = 0; nk_spend = addr.nk_spend;
-    auth_root = addr.auth_root; ask_j = addr.ask_j;
+    auth_root = addr.auth_root; auth_pub_seed = addr.auth_pub_seed; ask_j = addr.ask_j;
     key_idx = 0; commitment_path = [||];
   } in
   let signed = Tzel.Transaction.sign_inputs [input] sighash in
@@ -742,11 +778,11 @@ let test_sign_verify_inputs () =
 
 let test_sign_wrong_sighash () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 200) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let note = Tzel.Note.create addr 1000L (Tzel.Felt.of_u64 1) in
   let input : Tzel.Transaction.spend_input = {
     note; pos = 0; nk_spend = addr.nk_spend;
-    auth_root = addr.auth_root; ask_j = addr.ask_j;
+    auth_root = addr.auth_root; auth_pub_seed = addr.auth_pub_seed; ask_j = addr.ask_j;
     key_idx = 0; commitment_path = [||];
   } in
   let signed = Tzel.Transaction.sign_inputs [input] (Tzel.Hash.hash_tag "real") in
@@ -882,7 +918,7 @@ let test_mlkem_derive_keypairs () =
 
 let test_full_note_encrypt_decrypt () =
   let bob_keys = Tzel.Keys.derive (Tzel.Felt.of_u64 200) in
-  let bob_addr = Tzel.Keys.derive_address bob_keys 0 in
+  let bob_addr = derive_test_address bob_keys 0 in
   let v = 42000L in
   let rseed = Tzel.Felt.of_u64 555 in
   let memo = Tzel.Detection.text_memo "Payment for invoice #42" in
@@ -897,7 +933,7 @@ let test_full_note_encrypt_decrypt () =
 
 let test_detection_check () =
   let bob_keys = Tzel.Keys.derive (Tzel.Felt.of_u64 300) in
-  let bob_addr = Tzel.Keys.derive_address bob_keys 0 in
+  let bob_addr = derive_test_address bob_keys 0 in
   let enc = Tzel.Detection.encrypt_note
     ~ek_v:bob_addr.ek_v ~ek_d:bob_addr.ek_d
     ~v:1000L ~rseed:(Tzel.Felt.of_u64 888)
@@ -1005,17 +1041,18 @@ let test_encoding_u64_boundary () =
 
 let test_payment_address_wire () =
   let bob_keys = Tzel.Keys.derive (Tzel.Felt.of_u64 400) in
-  let bob_addr = Tzel.Keys.derive_address bob_keys 0 in
+  let bob_addr = derive_test_address bob_keys 0 in
   let pa = Tzel.Keys.to_payment_address bob_addr in
   let wire_addr : Tzel.Encoding.payment_address_wire = {
     d_j = pa.pa_d_j; auth_root = pa.pa_auth_root;
-    nk_tag = pa.pa_nk_tag; ek_v = pa.pa_ek_v; ek_d = pa.pa_ek_d;
+    auth_pub_seed = pa.pa_auth_pub_seed; nk_tag = pa.pa_nk_tag; ek_v = pa.pa_ek_v; ek_d = pa.pa_ek_d;
   } in
   let encoded = Tzel.Encoding.encode_payment_address wire_addr in
   Alcotest.(check int) "size" Tzel.Encoding.payment_address_size (Bytes.length encoded);
   let decoded = Tzel.Encoding.decode_payment_address encoded in
   Alcotest.(check bool) "d_j" true (Tzel.Felt.equal wire_addr.d_j decoded.d_j);
   Alcotest.(check bool) "auth_root" true (Tzel.Felt.equal wire_addr.auth_root decoded.auth_root);
+  Alcotest.(check bool) "auth_pub_seed" true (Tzel.Felt.equal wire_addr.auth_pub_seed decoded.auth_pub_seed);
   Alcotest.(check bool) "nk_tag" true (Tzel.Felt.equal wire_addr.nk_tag decoded.nk_tag);
   Alcotest.(check bool) "ek_v" true (Bytes.equal wire_addr.ek_v decoded.ek_v);
   Alcotest.(check bool) "ek_d" true (Bytes.equal wire_addr.ek_d decoded.ek_d)
@@ -1058,13 +1095,14 @@ let test_encoding_json_published_note () =
 let test_encoding_json_payment_address () =
   let addr : Tzel.Encoding.payment_address_wire = {
     d_j = Tzel.Felt.of_u64 1; auth_root = Tzel.Felt.of_u64 2;
+    auth_pub_seed = Tzel.Felt.of_u64 3;
     nk_tag = Tzel.Felt.of_u64 3;
     ek_v = Bytes.make 1184 '\x00'; ek_d = Bytes.make 1184 '\x00';
   } in
   let json = Tzel.Encoding.payment_address_to_json addr in
   match json with
   | `Assoc fields ->
-    Alcotest.(check int) "5 fields" 5 (List.length fields)
+    Alcotest.(check int) "6 fields" 6 (List.length fields)
   | _ -> Alcotest.fail "expected Assoc"
 
 let test_encoding_hex_helpers () =
@@ -1087,7 +1125,7 @@ let test_shield_flow () =
   let ledger = Tzel.Ledger.create ~auth_domain in
   Tzel.Ledger.set_balance ledger "alice" 10000L;
   let bob_keys = Tzel.Keys.derive (Tzel.Felt.of_u64 200) in
-  let bob_addr = Tzel.Keys.derive_address bob_keys 0 in
+  let bob_addr = derive_test_address bob_keys 0 in
   let rseed = Tzel.Felt.of_u64 555 in
   let mch = Tzel.Felt.zero in
   let (pub, note) = Tzel.Transaction.build_shield
@@ -1105,7 +1143,7 @@ let test_shield_insufficient_balance () =
   let ledger = Tzel.Ledger.create ~auth_domain in
   Tzel.Ledger.set_balance ledger "alice" 100L;
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 1) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let mch = Tzel.Felt.zero in
   let (pub, _) = Tzel.Transaction.build_shield
     ~sender_string:"alice" ~recipient:addr ~v:500L
@@ -1118,7 +1156,7 @@ let test_shield_sender_mismatch () =
   let ledger = Tzel.Ledger.create ~auth_domain in
   Tzel.Ledger.set_balance ledger "alice" 10000L;
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 1) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let mch = Tzel.Felt.zero in
   let (pub, _) = Tzel.Transaction.build_shield
     ~sender_string:"alice" ~recipient:addr ~v:500L
@@ -1131,7 +1169,7 @@ let test_shield_memo_mismatch () =
   let ledger = Tzel.Ledger.create ~auth_domain in
   Tzel.Ledger.set_balance ledger "alice" 10000L;
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 1) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let mch = Tzel.Felt.zero in
   let (pub, _) = Tzel.Transaction.build_shield
     ~sender_string:"alice" ~recipient:addr ~v:500L
@@ -1145,7 +1183,7 @@ let test_ledger_transfer () =
   let ledger = Tzel.Ledger.create ~auth_domain in
   (* Setup: shield two notes *)
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 1) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   Tzel.Ledger.set_balance ledger "alice" 10000L;
   let mch = Tzel.Felt.zero in
   let (pub1, _) = Tzel.Transaction.build_shield
@@ -1522,7 +1560,7 @@ let test_multi_shield_transfer_unshield () =
   let ledger = Tzel.Ledger.create ~auth_domain in
   Tzel.Ledger.set_balance ledger "alice" 10000L;
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 500) in
-  let addr = Tzel.Keys.derive_address keys 0 in
+  let addr = derive_test_address keys 0 in
   let mch = Tzel.Felt.zero in
   (* Shield 1 *)
   let (pub1, _) = Tzel.Transaction.build_shield
@@ -1600,7 +1638,6 @@ let () =
       Alcotest.test_case "nk_tag" `Quick test_hash_nk_tag;
       Alcotest.test_case "owner" `Quick test_hash_owner;
       Alcotest.test_case "wots" `Quick test_hash_wots;
-      Alcotest.test_case "pkfold" `Quick test_hash_pkfold;
       Alcotest.test_case "sighash" `Quick test_hash_sighash;
       Alcotest.test_case "memo" `Quick test_hash_memo;
       Alcotest.test_case "derive_rcm" `Quick test_derive_rcm;
@@ -1617,7 +1654,7 @@ let () =
       Alcotest.test_case "wrong key" `Quick test_wots_wrong_key;
       Alcotest.test_case "keygen deterministic" `Quick test_wots_keygen_deterministic;
       Alcotest.test_case "decompose roundtrip" `Quick test_wots_decompose_roundtrip;
-      Alcotest.test_case "auth leaf binding" `Quick test_wots_signature_binds_to_authenticated_auth_leaf;
+      Alcotest.test_case "auth leaf binding" `Quick test_wots_signature_binds_to_auth_leaf;
     ];
     "merkle", [
       Alcotest.test_case "zero root" `Quick test_merkle_zero_root;
@@ -1639,7 +1676,7 @@ let () =
       Alcotest.test_case "derive_ask" `Quick test_key_derive_ask;
       Alcotest.test_case "derive nk_spend/tag" `Quick test_key_derive_nk_spend_tag;
       Alcotest.test_case "derive_wots_seed" `Quick test_key_derive_wots_seed;
-      Alcotest.test_case "build_auth_tree" `Quick test_key_build_auth_tree;
+      Alcotest.test_case "auth leaf small merkle" `Quick test_key_auth_leaf_small_merkle;
       Alcotest.test_case "owner tag binding" `Quick test_owner_tag_binding;
       Alcotest.test_case "to_payment_address" `Quick test_key_to_payment_address;
       Alcotest.test_case "multiple indices" `Quick test_key_address_multiple_indices;

@@ -41,6 +41,7 @@ type spend_input = {
   pos : int;
   nk_spend : Felt.t;
   auth_root : Felt.t;
+  auth_pub_seed : Felt.t;
   ask_j : Felt.t;
   key_idx : int;
   commitment_path : Felt.t array;
@@ -50,6 +51,7 @@ type spend_input = {
 type output_desc = {
   d_j : Felt.t;
   auth_root : Felt.t;
+  auth_pub_seed : Felt.t;
   nk_tag : Felt.t;
   v : int64;
   rseed : Felt.t;
@@ -86,9 +88,9 @@ let build_shield ~sender_string ~(recipient : Keys.address)
   (pub, note)
 
 (* Build output notes for transfer *)
-let build_output ~(d_j : Felt.t) ~(auth_root : Felt.t) ~(nk_tag : Felt.t)
+let build_output ~(d_j : Felt.t) ~(auth_root : Felt.t) ~(auth_pub_seed : Felt.t) ~(nk_tag : Felt.t)
     ~(v : int64) ~(rseed : Felt.t) =
-  Note.create_from_parts ~d_j ~auth_root ~nk_tag ~v ~rseed
+  Note.create_from_parts ~d_j ~auth_root ~auth_pub_seed ~nk_tag ~v ~rseed
 
 (* Build transfer public outputs and sighash *)
 let build_transfer_public ~auth_domain ~root ~nullifiers
@@ -121,13 +123,12 @@ let build_unshield_public ~auth_domain ~root ~nullifiers
 (* Sign all inputs with WOTS+ *)
 let sign_inputs (inputs : spend_input list) sighash =
   List.map (fun inp ->
-    let wots_seed = Keys.derive_wots_seed inp.ask_j inp.key_idx in
-    let sig_vals = Wots.sign wots_seed sighash in
+    let wots_seed = Keys.derive_auth_key_seed inp.ask_j inp.key_idx in
+    let sig_vals = Wots.sign ~seed:wots_seed ~pub_seed:inp.auth_pub_seed ~key_idx:inp.key_idx sighash in
     (inp, sig_vals)
   ) inputs
 
 (* Verify a single WOTS+ input signature *)
 let verify_input_sig (inp : spend_input) (sig_vals : Felt.t array) sighash =
-  let wots_seed = Keys.derive_wots_seed inp.ask_j inp.key_idx in
-  let pk = Wots.keygen wots_seed in
-  Wots.verify sig_vals sighash pk
+  let leaf = Keys.auth_leaf_hash inp.ask_j inp.key_idx in
+  Wots.verify ~pub_seed:inp.auth_pub_seed ~key_idx:inp.key_idx sig_vals sighash leaf

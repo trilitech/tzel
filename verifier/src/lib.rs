@@ -41,7 +41,10 @@ impl DirectProofVerifier {
     }
 
     pub fn from_kernel_config(config: &KernelVerifierConfig) -> Result<Self, String> {
-        Ok(Self::verified(false, config.verified_program_hashes.clone()))
+        Ok(Self::verified(
+            false,
+            config.verified_program_hashes.clone(),
+        ))
     }
 
     pub fn validate(&self, proof: &Proof, circuit: CircuitKind) -> Result<(), String> {
@@ -107,7 +110,10 @@ pub fn validate_stark_circuit(
     circuit: CircuitKind,
     hashes: &ProgramHashes,
 ) -> Result<(), String> {
-    let Proof::Stark { output_preimage, .. } = proof else {
+    let Proof::Stark {
+        output_preimage, ..
+    } = proof
+    else {
         return Ok(());
     };
     validate_single_task_program_hash(output_preimage, circuit.expected_program_hash(hashes))
@@ -281,7 +287,9 @@ mod tests {
     #[test]
     fn test_direct_verifier_validate_respects_mode_and_shape() {
         let trust_only = DirectProofVerifier::trust_me_bro_only();
-        trust_only.validate(&Proof::TrustMeBro, CircuitKind::Shield).unwrap();
+        trust_only
+            .validate(&Proof::TrustMeBro, CircuitKind::Shield)
+            .unwrap();
 
         let err = trust_only
             .validate(

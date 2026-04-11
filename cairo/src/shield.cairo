@@ -4,11 +4,11 @@
 ///   [v_pub, cm_new, sender, memo_ct_hash]
 ///
 /// # Constraint
-///   owner_tag = H_owner(auth_root, nk_tag)
+///   owner_tag = H_owner(auth_root, auth_pub_seed, nk_tag)
 ///   rcm = H("rcm", rseed)
 ///   cm_new = H_commit(d_j, v_pub, rcm, owner_tag)
 ///
-/// auth_root and nk_tag come from the recipient's payment address.
+/// auth_root, auth_pub_seed, and nk_tag come from the recipient's payment address.
 /// Neither appears in public outputs — they are private inputs.
 /// Shield requires no spend authorization (sender authenticated by msg.sender).
 
@@ -21,11 +21,12 @@ pub fn verify(
     memo_ct_hash: felt252,
     // private inputs
     auth_root: felt252,
+    auth_pub_seed: felt252,
     nk_tag: felt252,
     d_j: felt252,
     rseed: felt252,
 ) -> Array<felt252> {
-    let otag = hash::owner_tag(auth_root, nk_tag);
+    let otag = hash::owner_tag(auth_root, auth_pub_seed, nk_tag);
     let rcm = hash::derive_rcm(rseed);
     assert(hash::commit(d_j, v_pub, rcm, otag) == cm_new, 'shield: bad commitment');
 

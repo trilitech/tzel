@@ -5,6 +5,7 @@
    PaymentAddress := record {
      d_j:       felt252,
      auth_root: felt252,
+     auth_pub_seed: felt252,
      nk_tag:    felt252,
      ek_v:      bytes[1184],
      ek_d:      bytes[1184]
@@ -50,6 +51,7 @@ type note_memo = {
 type payment_address_wire = {
   d_j : Felt.t;
   auth_root : Felt.t;
+  auth_pub_seed : Felt.t;
   nk_tag : Felt.t;
   ek_v : bytes;  (* 1184 bytes *)
   ek_d : bytes;  (* 1184 bytes *)
@@ -130,26 +132,28 @@ let decode_note_memo buf =
   let nm_enc = decode_encrypted_note (Bytes.sub buf 40 encrypted_note_size) in
   { nm_index; nm_cm; nm_enc }
 
-(* PaymentAddress binary: 32 + 32 + 32 + 1184 + 1184 = 2464 bytes *)
-let payment_address_size = 2464
+(* PaymentAddress binary: 32 + 32 + 32 + 32 + 1184 + 1184 = 2496 bytes *)
+let payment_address_size = 2496
 
 let encode_payment_address addr =
   let buf = Bytes.create payment_address_size in
   Bytes.blit addr.d_j 0 buf 0 32;
   Bytes.blit addr.auth_root 0 buf 32 32;
-  Bytes.blit addr.nk_tag 0 buf 64 32;
-  Bytes.blit addr.ek_v 0 buf 96 1184;
-  Bytes.blit addr.ek_d 0 buf 1280 1184;
+  Bytes.blit addr.auth_pub_seed 0 buf 64 32;
+  Bytes.blit addr.nk_tag 0 buf 96 32;
+  Bytes.blit addr.ek_v 0 buf 128 1184;
+  Bytes.blit addr.ek_d 0 buf 1312 1184;
   buf
 
 let decode_payment_address buf =
   assert (Bytes.length buf >= payment_address_size);
   let d_j = Felt.of_bytes_raw (Bytes.sub buf 0 32) in
   let auth_root = Felt.of_bytes_raw (Bytes.sub buf 32 32) in
-  let nk_tag = Felt.of_bytes_raw (Bytes.sub buf 64 32) in
-  let ek_v = Bytes.sub buf 96 1184 in
-  let ek_d = Bytes.sub buf 1280 1184 in
-  { d_j; auth_root; nk_tag; ek_v; ek_d }
+  let auth_pub_seed = Felt.of_bytes_raw (Bytes.sub buf 64 32) in
+  let nk_tag = Felt.of_bytes_raw (Bytes.sub buf 96 32) in
+  let ek_v = Bytes.sub buf 128 1184 in
+  let ek_d = Bytes.sub buf 1312 1184 in
+  { d_j; auth_root; auth_pub_seed; nk_tag; ek_v; ek_d }
 
 (* Memo hash: H_memo(ct_d || tag_le || ct_v || encrypted_data) *)
 let compute_memo_ct_hash enc =
@@ -184,6 +188,7 @@ let payment_address_to_json addr =
   `Assoc [
     "d_j", `String (hex_of_felt addr.d_j);
     "auth_root", `String (hex_of_felt addr.auth_root);
+    "auth_pub_seed", `String (hex_of_felt addr.auth_pub_seed);
     "nk_tag", `String (hex_of_felt addr.nk_tag);
     "ek_v", `String (hex_of_bytes addr.ek_v);
     "ek_d", `String (hex_of_bytes addr.ek_d);

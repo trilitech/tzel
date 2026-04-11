@@ -16,11 +16,11 @@ Then compare `protocol_v1.generated.json` against the OCaml-produced file in thi
 
 ```
 cd ocaml
-LIBRARY_PATH=$PWD/vendor/mlkem-native/test/build opam exec -- dune exec test/test_vectors.exe
+opam exec -- dune exec test/test_vectors.exe
 ```
 
-The OCaml FFI links against the checked-in `vendor/mlkem-native/test/build/libmlkem768.a`
-archive. If you need to regenerate it locally, run:
+If you need to rebuild the checked-in `vendor/mlkem-native/test/build/libmlkem768.a`
+archive locally, run:
 
 ```
 make -C vendor/mlkem-native test/build/libmlkem768.a
@@ -34,14 +34,14 @@ implementations must produce byte-identical outputs.
 | Category              | Inputs fixed                         | Outputs compared           |
 |-----------------------|--------------------------------------|----------------------------|
 | blake2s               | raw bytes, personalization           | 32-byte hash               |
-| key hierarchy         | master_sk                            | nk, ask_base, dsk, etc.    |
-| per-address keys      | master_sk, j                         | d_j, nk_spend, nk_tag, auth_root |
+| key hierarchy         | master_sk                            | nk, ask_base, dsk, view/detect roots |
+| per-address keys      | master_sk, j                         | d_j, nk_spend, nk_tag, auth_root, auth_pub_seed, owner_tag |
 | ML-KEM seeds          | view_root/detect_root, j             | 64-byte seeds              |
-| WOTS+ keygen          | seed                                 | folded pk                  |
-| WOTS+ sign/verify     | seed, sighash                        | signature values           |
+| XMSS/WOTS+ keygen     | ask_j, auth_pub_seed, key_idx        | per-key seed, leaf         |
+| XMSS/WOTS+ sign/verify| ask_j, auth_pub_seed, key_idx, sighash | signature values         |
 | Merkle tree           | leaf list                            | root                       |
-| note commitment       | d_j, v, rseed, auth_root, nk_tag     | rcm, owner_tag, cm         |
+| note commitment       | d_j, v, rseed, auth_root, auth_pub_seed, nk_tag | rcm, owner_tag, cm |
 | nullifier             | nk_spend, cm, pos                    | nf                         |
 | sighash               | public outputs                       | sighash felt               |
 | account_id            | string                               | felt                       |
-| canonical wire        | PaymentAddress, EncryptedNote, etc.   | binary bytes               |
+| canonical wire        | PaymentAddress, EncryptedNote, etc.  | binary bytes               |

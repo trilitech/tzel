@@ -119,6 +119,30 @@ pub fn hash(data: &[u8]) -> F {
     blake2s_generic(data)
 }
 
+pub(crate) fn blake2s_parts(parts: &[&F]) -> F {
+    let mut state = Params::new().hash_length(32).to_state();
+    for part in parts {
+        state.update(&part[..]);
+    }
+    let digest = state.finalize();
+    let mut out = ZERO;
+    out.copy_from_slice(digest.as_bytes());
+    out[31] &= 0x07;
+    out
+}
+
+pub(crate) fn blake2s_parts_personalized(personal: &[u8; 8], parts: &[&F]) -> F {
+    let mut state = Params::new().hash_length(32).personal(personal).to_state();
+    for part in parts {
+        state.update(&part[..]);
+    }
+    let digest = state.finalize();
+    let mut out = ZERO;
+    out.copy_from_slice(digest.as_bytes());
+    out[31] &= 0x07;
+    out
+}
+
 pub fn hash_two(a: &F, b: &F) -> F {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(a);
@@ -156,11 +180,8 @@ pub fn derive_nk_tag(nk_spend: &F) -> F {
     blake2s(b"nktgSP__", nk_spend)
 }
 
-pub fn owner_tag(auth_root: &F, nk_tag: &F) -> F {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(auth_root);
-    buf[32..].copy_from_slice(nk_tag);
-    blake2s(b"ownrSP__", &buf)
+pub fn owner_tag(auth_root: &F, auth_pub_seed: &F, nk_tag: &F) -> F {
+    blake2s_parts_personalized(b"ownrSP__", &[auth_root, auth_pub_seed, nk_tag])
 }
 
 pub fn commit(d_j: &F, v: u64, rcm: &F, otag: &F) -> F {
@@ -336,190 +357,343 @@ pub fn derive_ask(ask_base: &F, j: u32) -> F {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Auth key tree — Merkle tree of WOTS+ w=4 one-time signing keys
+// Auth key tree — XMSS-style WOTS+ tree with explicit pub_seed
 // ═══════════════════════════════════════════════════════════════════════
 
-pub const AUTH_DEPTH: usize = 10;
-pub const AUTH_TREE_SIZE: usize = 1 << AUTH_DEPTH; // 1024
+pub const AUTH_DEPTH: usize = 16;
+pub const AUTH_TREE_SIZE: usize = 1 << AUTH_DEPTH; // 65536
 pub const WOTS_W: usize = 4;
 pub const WOTS_CHAINS: usize = 133; // 128 msg + 5 checksum
 
-/// Derive the WOTS+ secret key seed for one-time key index i.
-pub fn auth_key_seed(ask_j: &F, i: u32) -> F {
-    let tag = hash_two(&felt_tag(b"auth-key"), ask_j);
-    let mut idx = ZERO;
-    idx[..4].copy_from_slice(&i.to_le_bytes());
-    hash_two(&tag, &idx)
+const TAG_XMSS_CHAIN_U64: u64 = 0x0068632D73736D78;
+const TAG_XMSS_LTREE_U64: u64 = 0x00746C2D73736D78;
+const TAG_XMSS_TREE_U64: u64 = 0x0072742D73736D78;
+
+fn felt_from_u32(v: u32) -> F {
+    let mut out = ZERO;
+    out[..4].copy_from_slice(&v.to_le_bytes());
+    out
 }
 
-/// WOTS+ secret key for chain j of key index i.
+pub fn auth_key_seed(ask_j: &F, key_idx: u32) -> F {
+    blake2s_parts(&[&felt_tag(b"xmss-sk"), ask_j, &felt_from_u32(key_idx)])
+}
+
+pub fn derive_auth_pub_seed(ask_j: &F) -> F {
+    blake2s_parts(&[&felt_tag(b"xmss-ps"), ask_j])
+}
+
 fn wots_sk_chain(ask_j: &F, key_idx: u32, chain_idx: u32) -> F {
-    let seed = auth_key_seed(ask_j, key_idx);
-    let mut cidx = ZERO;
-    cidx[..4].copy_from_slice(&chain_idx.to_le_bytes());
-    hash_two(&seed, &cidx)
+    let root = auth_key_seed(ask_j, key_idx);
+    hash_two(&root, &felt_from_u32(chain_idx))
 }
 
-/// WOTS+ chain hash using dedicated "wotsSP__" personalization.
+pub fn pack_adrs(tag: u64, key_idx: u32, a: u32, b: u32, c: u32) -> F {
+    let mut out = ZERO;
+    out[..8].copy_from_slice(&tag.to_le_bytes());
+    out[8..12].copy_from_slice(&key_idx.to_le_bytes());
+    out[12..16].copy_from_slice(&a.to_le_bytes());
+    out[16..20].copy_from_slice(&b.to_le_bytes());
+    out[20..24].copy_from_slice(&c.to_le_bytes());
+    out[31] &= 0x07;
+    out
+}
+
 pub fn hash1_wots(data: &F) -> F {
     blake2s(b"wotsSP__", data)
 }
 
-/// WOTS+ PK fold using dedicated "pkfdSP__" personalization.
-pub fn hash2_pkfold(a: &F, b: &F) -> F {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(a);
-    buf[32..].copy_from_slice(b);
-    blake2s(b"pkfdSP__", &buf)
-}
-
 pub fn hash_chain(x: &F, n: usize) -> F {
-    let mut v = *x;
+    let mut current = *x;
     for _ in 0..n {
-        v = hash1_wots(&v);
+        current = hash1_wots(&current);
     }
-    v
+    current
 }
 
-/// WOTS+ public key for key index i: 133 chain endpoints.
-pub fn wots_pk(ask_j: &F, key_idx: u32) -> Vec<F> {
-    (0..WOTS_CHAINS as u32)
-        .map(|j| hash_chain(&wots_sk_chain(ask_j, key_idx, j), WOTS_W - 1))
-        .collect()
-}
-
-/// Fold WOTS+ pk chains into a single leaf hash.
-pub fn wots_pk_to_leaf(pk: &[F]) -> F {
-    let mut leaf = pk[0];
-    for i in 1..pk.len() {
-        leaf = hash2_pkfold(&leaf, &pk[i]);
-    }
-    leaf
-}
-
-/// Derive the auth leaf hash for key index i (WOTS+ pk folded to 32 bytes).
-pub fn auth_leaf_hash(ask_j: &F, i: u32) -> F {
-    let pk = wots_pk(ask_j, i);
-    wots_pk_to_leaf(&pk)
-}
-
-/// Build the full auth tree for address j. Returns (auth_root, leaf_hashes).
-pub fn build_auth_tree(ask_j: &F) -> (F, Vec<F>) {
-    let leaves: Vec<F> = (0..AUTH_TREE_SIZE as u32)
-        .map(|i| auth_leaf_hash(ask_j, i))
-        .collect();
-    let root = auth_tree_root(&leaves);
-    (root, leaves)
-}
-
-/// WOTS+ sign: given a message hash, produce signature chains and digits.
-pub fn wots_sign(ask_j: &F, key_idx: u32, msg_hash: &F) -> (Vec<F>, Vec<F>, Vec<u32>) {
-    let log_w = 2; // log2(4)
-
-    // Extract base-4 digits from message hash
+fn wots_digits(msg_hash: &F) -> Vec<u32> {
     let mut digits: Vec<usize> = Vec::new();
     for byte in msg_hash.iter() {
         let mut b = *byte;
         for _ in 0..4 {
-            // 8 / log_w
             digits.push((b & 3) as usize);
-            b >>= log_w;
+            b >>= 2;
         }
     }
-    // Checksum
     let checksum: usize = digits.iter().map(|d| WOTS_W - 1 - d).sum();
     let mut cs = checksum;
     for _ in 0..5 {
-        // checksum chains
         digits.push(cs & 3);
         cs >>= 2;
     }
     digits.truncate(WOTS_CHAINS);
-
-    // Sign: sig[j] = H^{digit[j]}(sk[j])
-    let sig: Vec<F> = (0..WOTS_CHAINS)
-        .map(|j| hash_chain(&wots_sk_chain(ask_j, key_idx, j as u32), digits[j]))
-        .collect();
-
-    // PK: pk[j] = H^{w-1}(sk[j])
-    let pk: Vec<F> = (0..WOTS_CHAINS)
-        .map(|j| hash_chain(&wots_sk_chain(ask_j, key_idx, j as u32), WOTS_W - 1))
-        .collect();
-
-    let digits_u32: Vec<u32> = digits.iter().map(|&d| d as u32).collect();
-    (sig, pk, digits_u32)
+    digits.into_iter().map(|d| d as u32).collect()
 }
 
-/// Compute the Merkle root of an auth tree from its leaves.
-pub fn auth_tree_root(leaves: &[F]) -> F {
-    let mut zh = vec![ZERO];
-    for i in 0..AUTH_DEPTH {
-        zh.push(hash_merkle(&zh[i], &zh[i]));
-    }
-    auth_compute_level(0, leaves, &zh)
+fn xmss_chain_step(x: &F, pub_seed: &F, key_idx: u32, chain_idx: u32, step: u32) -> F {
+    let adrs = pack_adrs(TAG_XMSS_CHAIN_U64, key_idx, chain_idx, step, 0);
+    blake2s_parts(&[pub_seed, &adrs, x])
 }
 
-fn auth_compute_level(depth: usize, level: &[F], zh: &[F]) -> F {
-    if depth == AUTH_DEPTH {
-        return if level.is_empty() {
-            zh[AUTH_DEPTH]
-        } else {
-            level[0]
-        };
+fn xmss_hash_chain(
+    x: &F,
+    pub_seed: &F,
+    key_idx: u32,
+    chain_idx: u32,
+    start: usize,
+    steps: usize,
+) -> F {
+    let mut current = *x;
+    for step in start..(start + steps) {
+        current = xmss_chain_step(&current, pub_seed, key_idx, chain_idx, step as u32);
     }
-    let mut next = vec![];
-    let mut i = 0;
-    loop {
-        let left = if i < level.len() { level[i] } else { zh[depth] };
-        let right = if i + 1 < level.len() {
-            level[i + 1]
-        } else {
-            zh[depth]
-        };
-        next.push(hash_merkle(&left, &right));
-        i += 2;
-        if i >= level.len() && !next.is_empty() {
-            break;
-        }
-    }
-    auth_compute_level(depth + 1, &next, zh)
+    current
 }
 
-/// Extract the auth path (AUTH_DEPTH siblings) for a leaf.
-pub fn auth_tree_path(leaves: &[F], index: usize) -> Vec<F> {
-    let mut zh = vec![ZERO];
-    for i in 0..AUTH_DEPTH {
-        zh.push(hash_merkle(&zh[i], &zh[i]));
-    }
-    let mut level = leaves.to_vec();
-    let mut siblings = vec![];
-    let mut idx = index;
-    for d in 0..AUTH_DEPTH {
-        let sib_idx = idx ^ 1;
-        siblings.push(if sib_idx < level.len() {
-            level[sib_idx]
-        } else {
-            zh[d]
-        });
-        let mut next = vec![];
-        let mut i = 0;
-        loop {
-            let left = if i < level.len() { level[i] } else { zh[d] };
-            let right = if i + 1 < level.len() {
-                level[i + 1]
+fn xmss_node_hash(
+    pub_seed: &F,
+    tag: u64,
+    key_idx: u32,
+    level: u32,
+    node_idx: u32,
+    left: &F,
+    right: &F,
+) -> F {
+    let adrs = pack_adrs(tag, key_idx, level, node_idx, 0);
+    blake2s_parts(&[pub_seed, &adrs, left, right])
+}
+
+pub fn xmss_ltree_node_hash(
+    pub_seed: &F,
+    key_idx: u32,
+    level: u32,
+    node_idx: u32,
+    left: &F,
+    right: &F,
+) -> F {
+    xmss_node_hash(
+        pub_seed,
+        TAG_XMSS_LTREE_U64,
+        key_idx,
+        level,
+        node_idx,
+        left,
+        right,
+    )
+}
+
+pub fn xmss_tree_node_hash(pub_seed: &F, level: u32, node_idx: u32, left: &F, right: &F) -> F {
+    xmss_node_hash(pub_seed, TAG_XMSS_TREE_U64, 0, level, node_idx, left, right)
+}
+
+pub fn wots_pk(ask_j: &F, key_idx: u32) -> Vec<F> {
+    let pub_seed = derive_auth_pub_seed(ask_j);
+    (0..WOTS_CHAINS)
+        .map(|j| {
+            let sk = wots_sk_chain(ask_j, key_idx, j as u32);
+            xmss_hash_chain(&sk, &pub_seed, key_idx, j as u32, 0, WOTS_W - 1)
+        })
+        .collect()
+}
+
+pub fn wots_pk_to_leaf(pub_seed: &F, key_idx: u32, pk: &[F]) -> F {
+    let mut level = 0u32;
+    let mut current = pk.to_vec();
+    while current.len() > 1 {
+        let mut next = Vec::with_capacity(current.len().div_ceil(2));
+        let mut node_idx = 0u32;
+        for pair in current.chunks(2) {
+            if pair.len() == 1 {
+                next.push(pair[0]);
             } else {
-                zh[d]
-            };
-            next.push(hash_merkle(&left, &right));
-            i += 2;
-            if i >= level.len() {
-                break;
+                next.push(xmss_ltree_node_hash(
+                    pub_seed, key_idx, level, node_idx, &pair[0], &pair[1],
+                ));
+                node_idx += 1;
             }
         }
-        level = next;
-        idx /= 2;
+        current = next;
+        level += 1;
     }
-    siblings
+    current[0]
+}
+
+pub fn auth_leaf_hash_with_pub_seed(ask_j: &F, pub_seed: &F, key_idx: u32) -> F {
+    let mut current = [ZERO; WOTS_CHAINS];
+    for (chain_idx, slot) in current.iter_mut().enumerate() {
+        let sk = wots_sk_chain(ask_j, key_idx, chain_idx as u32);
+        *slot = xmss_hash_chain(&sk, pub_seed, key_idx, chain_idx as u32, 0, WOTS_W - 1);
+    }
+
+    let mut level = 0u32;
+    let mut len = WOTS_CHAINS;
+    while len > 1 {
+        let mut write = 0usize;
+        let mut read = 0usize;
+        let mut node_idx = 0u32;
+        while read < len {
+            if read + 1 == len {
+                current[write] = current[read];
+            } else {
+                current[write] = xmss_ltree_node_hash(
+                    pub_seed,
+                    key_idx,
+                    level,
+                    node_idx,
+                    &current[read],
+                    &current[read + 1],
+                );
+                node_idx += 1;
+            }
+            write += 1;
+            read += 2;
+        }
+        len = write;
+        level += 1;
+    }
+    current[0]
+}
+
+pub fn auth_leaf_hash(ask_j: &F, key_idx: u32) -> F {
+    let pub_seed = derive_auth_pub_seed(ask_j);
+    auth_leaf_hash_with_pub_seed(ask_j, &pub_seed, key_idx)
+}
+
+pub fn wots_sign(ask_j: &F, key_idx: u32, msg_hash: &F) -> (Vec<F>, Vec<F>, Vec<u32>) {
+    let pub_seed = derive_auth_pub_seed(ask_j);
+    let digits = wots_digits(msg_hash);
+    let sig: Vec<F> = (0..WOTS_CHAINS)
+        .map(|j| {
+            let sk = wots_sk_chain(ask_j, key_idx, j as u32);
+            xmss_hash_chain(&sk, &pub_seed, key_idx, j as u32, 0, digits[j] as usize)
+        })
+        .collect();
+    let pk = wots_pk(ask_j, key_idx);
+    (sig, pk, digits)
+}
+
+pub fn recover_wots_pk(msg_hash: &F, pub_seed: &F, key_idx: u32, sig: &[F]) -> Vec<F> {
+    let digits = wots_digits(msg_hash);
+    sig.iter()
+        .zip(digits.iter())
+        .enumerate()
+        .map(|(chain_idx, (sig_part, digit))| {
+            xmss_hash_chain(
+                sig_part,
+                pub_seed,
+                key_idx,
+                chain_idx as u32,
+                *digit as usize,
+                (WOTS_W - 1) - (*digit as usize),
+            )
+        })
+        .collect()
+}
+
+pub fn xmss_subtree_root(ask_j: &F, pub_seed: &F, start: u32, height: usize) -> F {
+    if height == 0 {
+        return wots_pk_to_leaf(pub_seed, start, &wots_pk(ask_j, start));
+    }
+    let split = 1u32 << (height - 1);
+    let left = xmss_subtree_root(ask_j, pub_seed, start, height - 1);
+    let right = xmss_subtree_root(ask_j, pub_seed, start + split, height - 1);
+    xmss_tree_node_hash(
+        pub_seed,
+        (height - 1) as u32,
+        start >> height,
+        &left,
+        &right,
+    )
+}
+
+fn xmss_root_and_path_inner(
+    ask_j: &F,
+    pub_seed: &F,
+    start: u32,
+    height: usize,
+    target: u32,
+) -> (F, Option<Vec<F>>) {
+    if height == 0 {
+        let leaf = wots_pk_to_leaf(pub_seed, start, &wots_pk(ask_j, start));
+        let path = (start == target).then(Vec::new);
+        return (leaf, path);
+    }
+
+    let split = 1u32 << (height - 1);
+    let mid = start + split;
+    let (left, left_path) = if target < mid {
+        xmss_root_and_path_inner(ask_j, pub_seed, start, height - 1, target)
+    } else {
+        (xmss_subtree_root(ask_j, pub_seed, start, height - 1), None)
+    };
+    let (right, right_path) = if target >= mid {
+        xmss_root_and_path_inner(ask_j, pub_seed, mid, height - 1, target)
+    } else {
+        (xmss_subtree_root(ask_j, pub_seed, mid, height - 1), None)
+    };
+
+    let root = xmss_tree_node_hash(
+        pub_seed,
+        (height - 1) as u32,
+        start >> height,
+        &left,
+        &right,
+    );
+
+    let path = if let Some(mut path) = left_path {
+        path.push(right);
+        Some(path)
+    } else if let Some(mut path) = right_path {
+        path.push(left);
+        Some(path)
+    } else {
+        None
+    };
+
+    (root, path)
+}
+
+pub fn build_auth_tree(ask_j: &F) -> F {
+    let pub_seed = derive_auth_pub_seed(ask_j);
+    xmss_subtree_root(ask_j, &pub_seed, 0, AUTH_DEPTH)
+}
+
+pub fn auth_tree_path(ask_j: &F, index: usize) -> Vec<F> {
+    let pub_seed = derive_auth_pub_seed(ask_j);
+    let (_, path) = xmss_root_and_path_inner(ask_j, &pub_seed, 0, AUTH_DEPTH, index as u32);
+    path.expect("target leaf must be within auth tree")
+}
+
+pub fn auth_root_and_path(ask_j: &F, index: usize) -> (F, Vec<F>) {
+    let pub_seed = derive_auth_pub_seed(ask_j);
+    let (root, path) = xmss_root_and_path_inner(ask_j, &pub_seed, 0, AUTH_DEPTH, index as u32);
+    (root, path.expect("target leaf must be within auth tree"))
+}
+
+pub fn advance_auth_path(
+    ask_j: &F,
+    pub_seed: &F,
+    current_idx: u32,
+    current_path: &[F],
+) -> Option<Vec<F>> {
+    let next_idx = current_idx.checked_add(1)?;
+    if next_idx as usize >= AUTH_TREE_SIZE {
+        return None;
+    }
+
+    let tau = current_idx.trailing_ones() as usize;
+    let mut next = current_path.to_vec();
+    if tau == 0 {
+        next[0] = auth_leaf_hash(ask_j, current_idx);
+    } else {
+        let start = next_idx - (1u32 << tau);
+        next[tau] = xmss_subtree_root(ask_j, pub_seed, start, tau);
+        for (j, slot) in next.iter_mut().take(tau).enumerate() {
+            let start = next_idx + (1u32 << j);
+            *slot = xmss_subtree_root(ask_j, pub_seed, start, j);
+        }
+    }
+    Some(next)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1042,6 +1216,8 @@ pub struct PaymentAddress {
     #[serde(with = "hex_f")]
     pub auth_root: F,
     #[serde(with = "hex_f")]
+    pub auth_pub_seed: F,
+    #[serde(with = "hex_f")]
     pub nk_tag: F,
     #[serde(with = "hex_bytes")]
     pub ek_v: Vec<u8>,
@@ -1338,7 +1514,9 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
             verify_meta: _,
         } => {
             if req.client_cm == ZERO {
-                return Err("Stark proof requires client_cm (cannot use server-generated cm)".into());
+                return Err(
+                    "Stark proof requires client_cm (cannot use server-generated cm)".into(),
+                );
             }
             if req.client_enc.is_none() {
                 return Err(
@@ -1389,7 +1567,11 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
         .map_err(|_| "invalid ek_d")?;
         let rseed = random_felt();
         let rcm = derive_rcm(&rseed);
-        let otag = owner_tag(&req.address.auth_root, &req.address.nk_tag);
+        let otag = owner_tag(
+            &req.address.auth_root,
+            &req.address.auth_pub_seed,
+            &req.address.nk_tag,
+        );
         let cm = commit(&req.address.d_j, req.v, &rcm, &otag);
         let memo_bytes = req.memo.as_ref().map(|s| s.as_bytes());
         (cm, encrypt_note(req.v, &rseed, memo_bytes, &ek_v, &ek_d))
@@ -1612,6 +1794,7 @@ mod tests {
     use ml_kem::KeyExport;
     use proptest::prelude::*;
     use serde::{Deserialize, Serialize};
+    use std::sync::OnceLock;
 
     fn truncate_felt(mut f: F) -> F {
         f[31] &= 0x07;
@@ -1642,27 +1825,112 @@ mod tests {
         derive_account(&master_sk)
     }
 
-    fn sample_address_bundle(seed_byte: u8, j: u32) -> (Account, PaymentAddress, Dk, Dk, F) {
-        let acc = sample_account(seed_byte);
-        let d_j = derive_address(&acc.incoming_seed, j);
-        let ask_j = derive_ask(&acc.ask_base, j);
-        let (auth_root, _) = build_auth_tree(&ask_j);
-        let nk_spend = derive_nk_spend(&acc.nk, &d_j);
-        let nk_tag = derive_nk_tag(&nk_spend);
-        let (ek_v, dk_v, ek_d, dk_d) = derive_kem_keys(&acc.incoming_seed, j);
-        let addr = PaymentAddress {
-            d_j,
-            auth_root,
-            nk_tag,
-            ek_v: ek_v.to_bytes().to_vec(),
-            ek_d: ek_d.to_bytes().to_vec(),
-        };
-        (acc, addr, dk_v, dk_d, nk_spend)
+    #[derive(Deserialize)]
+    struct WalletFixture {
+        #[serde(with = "hex_f")]
+        master_sk: F,
+        addresses: Vec<WalletFixtureAddress>,
+    }
+
+    #[derive(Deserialize)]
+    struct WalletFixtureAddress {
+        index: u32,
+        #[serde(with = "hex_f")]
+        d_j: F,
+        #[serde(with = "hex_f")]
+        auth_root: F,
+        #[serde(with = "hex_f")]
+        auth_pub_seed: F,
+        #[serde(with = "hex_f")]
+        nk_tag: F,
+        bds: WalletFixtureBds,
+    }
+
+    #[derive(Deserialize)]
+    struct WalletFixtureBds {
+        #[serde(with = "hex_f_vec")]
+        auth_path: Vec<F>,
+    }
+
+    #[derive(Clone)]
+    struct XmssFixture {
+        account: Account,
+        address: PaymentAddress,
+        dk_v: Dk,
+        dk_d: Dk,
+        nk_spend: F,
+        auth_path: Vec<F>,
+    }
+
+    fn xmss_fixture() -> &'static XmssFixture {
+        static FIXTURE: OnceLock<XmssFixture> = OnceLock::new();
+        FIXTURE.get_or_init(|| {
+            let fixture: WalletFixture = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../apps/wallet/testdata/base_wallet_bds.json"
+            )))
+            .expect("wallet BDS fixture should deserialize");
+            let addr = fixture
+                .addresses
+                .first()
+                .expect("wallet fixture should contain address 0");
+            assert_eq!(addr.index, 0, "wallet fixture should start at address 0");
+
+            let account = derive_account(&fixture.master_sk);
+            let derived_d_j = derive_address(&account.incoming_seed, addr.index);
+            assert_eq!(derived_d_j, addr.d_j, "fixture d_j drifted");
+
+            let ask_j = derive_ask(&account.ask_base, addr.index);
+            let derived_pub_seed = derive_auth_pub_seed(&ask_j);
+            assert_eq!(
+                derived_pub_seed, addr.auth_pub_seed,
+                "fixture auth_pub_seed drifted"
+            );
+
+            let nk_spend = derive_nk_spend(&account.nk, &addr.d_j);
+            let nk_tag = derive_nk_tag(&nk_spend);
+            assert_eq!(nk_tag, addr.nk_tag, "fixture nk_tag drifted");
+
+            let (ek_v, dk_v, ek_d, dk_d) = derive_kem_keys(&account.incoming_seed, addr.index);
+            let address = PaymentAddress {
+                d_j: addr.d_j,
+                auth_root: addr.auth_root,
+                auth_pub_seed: addr.auth_pub_seed,
+                nk_tag: addr.nk_tag,
+                ek_v: ek_v.to_bytes().to_vec(),
+                ek_d: ek_d.to_bytes().to_vec(),
+            };
+
+            XmssFixture {
+                account,
+                address,
+                dk_v,
+                dk_d,
+                nk_spend,
+                auth_path: addr.bds.auth_path.clone(),
+            }
+        })
+    }
+
+    fn sample_address_bundle(_seed_byte: u8, j: u32) -> (Account, PaymentAddress, Dk, Dk, F) {
+        assert_eq!(j, 0, "test helper only supports address index 0");
+        let fixture = xmss_fixture();
+        (
+            fixture.account.clone(),
+            fixture.address.clone(),
+            fixture.dk_v.clone(),
+            fixture.dk_d.clone(),
+            fixture.nk_spend,
+        )
     }
 
     fn load_ek(bytes: &[u8]) -> Ek {
-        Ek::new(bytes.try_into().expect("fixed-size encapsulation key bytes"))
-            .expect("valid ML-KEM encapsulation key")
+        Ek::new(
+            bytes
+                .try_into()
+                .expect("fixed-size encapsulation key bytes"),
+        )
+        .expect("valid ML-KEM encapsulation key")
     }
 
     fn deterministic_note(
@@ -1673,17 +1941,10 @@ mod tests {
     ) -> (EncryptedNote, F) {
         let ek_v = load_ek(&addr.ek_v);
         let ek_d = load_ek(&addr.ek_d);
-        let enc = encrypt_note_deterministic(
-            v,
-            &rseed,
-            memo,
-            &ek_v,
-            &ek_d,
-            &[0x11; 32],
-            &[0x22; 32],
-        );
+        let enc =
+            encrypt_note_deterministic(v, &rseed, memo, &ek_v, &ek_d, &[0x11; 32], &[0x22; 32]);
         let rcm = derive_rcm(&rseed);
-        let otag = owner_tag(&addr.auth_root, &addr.nk_tag);
+        let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &addr.nk_tag);
         let cm = commit(&addr.d_j, v, &rcm, &otag);
         (enc, cm)
     }
@@ -1836,43 +2097,66 @@ mod tests {
 
         let mut bad_payload = enc.clone();
         bad_payload.encrypted_data.pop();
-        assert!(
-            bad_payload
-                .validate()
-                .unwrap_err()
-                .contains("encrypted_data length")
-        );
+        assert!(bad_payload
+            .validate()
+            .unwrap_err()
+            .contains("encrypted_data length"));
 
         let mut bad_tag = enc;
         bad_tag.tag = 1 << DETECT_K;
-        assert!(bad_tag.validate().unwrap_err().contains("bad detection tag"));
+        assert!(bad_tag
+            .validate()
+            .unwrap_err()
+            .contains("bad detection tag"));
     }
 
     #[test]
     fn test_wots_signature_recovers_authenticated_leaf() {
-        let acc = sample_account(0x55);
-        let ask_j = derive_ask(&acc.ask_base, 0);
-        let key_idx = 7u32;
+        let fixture = xmss_fixture();
+        let ask_j = derive_ask(&fixture.account.ask_base, 0);
+        let pub_seed = derive_auth_pub_seed(&ask_j);
+        let key_idx = 0u32;
         let msg_hash = hash(b"bind-this-signature");
 
         let (sig, pk, digits) = wots_sign(&ask_j, key_idx, &msg_hash);
-        let recovered_pk: Vec<F> = sig
-            .iter()
-            .zip(digits.iter())
-            .map(|(sig_part, digit)| hash_chain(sig_part, (WOTS_W - 1) - (*digit as usize)))
-            .collect();
+        let recovered_pk = recover_wots_pk(&msg_hash, &pub_seed, key_idx, &sig);
 
         assert_eq!(recovered_pk, pk);
+        assert_eq!(digits, wots_digits(&msg_hash));
 
-        let leaf = wots_pk_to_leaf(&recovered_pk);
+        let leaf = wots_pk_to_leaf(&pub_seed, key_idx, &recovered_pk);
         assert_eq!(leaf, auth_leaf_hash(&ask_j, key_idx));
 
-        let (auth_root, leaves) = build_auth_tree(&ask_j);
-        let path = auth_tree_path(&leaves, key_idx as usize);
-        assert_eq!(
-            recompute_root_from_path(leaf, key_idx as usize, &path),
-            auth_root
-        );
+        let auth_root = fixture.address.auth_root;
+        let path = fixture.auth_path.clone();
+        let mut current = leaf;
+        let mut idx = key_idx;
+        for (level, sibling) in path.iter().enumerate() {
+            let node_idx = idx / 2;
+            current = if idx & 1 == 0 {
+                xmss_node_hash(
+                    &pub_seed,
+                    TAG_XMSS_TREE_U64,
+                    0,
+                    level as u32,
+                    node_idx,
+                    &current,
+                    sibling,
+                )
+            } else {
+                xmss_node_hash(
+                    &pub_seed,
+                    TAG_XMSS_TREE_U64,
+                    0,
+                    level as u32,
+                    node_idx,
+                    sibling,
+                    &current,
+                )
+            };
+            idx /= 2;
+        }
+        assert_eq!(current, auth_root);
     }
 
     #[test]
@@ -1888,7 +2172,7 @@ mod tests {
         assert_eq!(&memo[..5], b"hello");
 
         let rcm = derive_rcm(&decrypted_rseed);
-        let otag = owner_tag(&addr.auth_root, &addr.nk_tag);
+        let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &addr.nk_tag);
         let recomputed = commit(&addr.d_j, value, &rcm, &otag);
         assert_eq!(recomputed, cm);
     }
@@ -1921,20 +2205,45 @@ mod tests {
         let mh_2 = u(8);
         let recipient = u(9);
 
-        let transfer = transfer_sighash(&auth_domain, &root, &nullifiers, &cm_1, &cm_2, &mh_1, &mh_2);
+        let transfer =
+            transfer_sighash(&auth_domain, &root, &nullifiers, &cm_1, &cm_2, &mh_1, &mh_2);
         assert_ne!(
             transfer,
             transfer_sighash(&u(10), &root, &nullifiers, &cm_1, &cm_2, &mh_1, &mh_2)
         );
         assert_ne!(
             transfer,
-            transfer_sighash(&auth_domain, &root, &[u(3), u(40)], &cm_1, &cm_2, &mh_1, &mh_2)
+            transfer_sighash(
+                &auth_domain,
+                &root,
+                &[u(3), u(40)],
+                &cm_1,
+                &cm_2,
+                &mh_1,
+                &mh_2
+            )
         );
 
-        let unshield = unshield_sighash(&auth_domain, &root, &nullifiers, 12, &recipient, &cm_1, &mh_1);
+        let unshield = unshield_sighash(
+            &auth_domain,
+            &root,
+            &nullifiers,
+            12,
+            &recipient,
+            &cm_1,
+            &mh_1,
+        );
         assert_ne!(
             unshield,
-            unshield_sighash(&auth_domain, &root, &nullifiers, 13, &recipient, &cm_1, &mh_1)
+            unshield_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                13,
+                &recipient,
+                &cm_1,
+                &mh_1
+            )
         );
         assert_ne!(
             unshield,
@@ -2035,15 +2344,7 @@ mod tests {
                 cm_2,
                 enc_1,
                 enc_2,
-                proof: fake_stark(vec![
-                    auth_domain,
-                    root,
-                    nf,
-                    cm_1,
-                    cm_2,
-                    ZERO,
-                    ZERO,
-                ]),
+                proof: fake_stark(vec![auth_domain, root, nf, cm_1, cm_2, ZERO, ZERO]),
             },
         )
         .unwrap_err();

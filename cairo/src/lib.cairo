@@ -1,5 +1,6 @@
 pub mod blake_hash;
 pub mod merkle;
+pub mod xmss_common;
 pub mod shield;
 pub mod transfer;
 pub mod unshield;
