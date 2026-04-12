@@ -10,20 +10,23 @@
 ///   Then per input (N times): TREE_DEPTH cm siblings
 ///   Then per input (N times): AUTH_DEPTH auth siblings
 ///   Then per input (N times): WOTS_CHAINS sig values
-///   Then output 1: cm_1, d_j_1, v_1, rseed_1, auth_root_1, auth_pub_seed_1, nk_tag_1, memo_ct_hash_1
-///   Then output 2: cm_2, d_j_2, v_2, rseed_2, auth_root_2, auth_pub_seed_2, nk_tag_2, memo_ct_hash_2
+///   Then output 1: cm_1, d_j_1, v_1, rseed_1, auth_root_1, auth_pub_seed_1, nk_tag_1,
+///   memo_ct_hash_1 Then output 2: cm_2, d_j_2, v_2, rseed_2, auth_root_2, auth_pub_seed_2,
+///   nk_tag_2, memo_ct_hash_2
 
 use tzel::merkle;
-use tzel::transfer;
-use tzel::xmss_common;
+use tzel::{transfer, xmss_common};
 
 #[executable]
 fn main(args: Array<felt252>) -> Array<felt252> {
     let mut pos: u32 = 0;
 
-    let n: u32 = (*args.at(pos)).try_into().unwrap(); pos += 1;
-    let auth_domain = *args.at(pos); pos += 1;
-    let root = *args.at(pos); pos += 1;
+    let n: u32 = (*args.at(pos)).try_into().unwrap();
+    pos += 1;
+    let auth_domain = *args.at(pos);
+    pos += 1;
+    let root = *args.at(pos);
+    pos += 1;
 
     let mut nf_list: Array<felt252> = array![];
     let mut nk_spend_list: Array<felt252> = array![];
@@ -37,47 +40,84 @@ fn main(args: Array<felt252>) -> Array<felt252> {
 
     let mut i: u32 = 0;
     while i < n {
-        nf_list.append(*args.at(pos)); pos += 1;
-        nk_spend_list.append(*args.at(pos)); pos += 1;
-        auth_root_list.append(*args.at(pos)); pos += 1;
-        auth_pub_seed_list.append(*args.at(pos)); pos += 1;
-        auth_idx_list.append((*args.at(pos)).try_into().unwrap()); pos += 1;
-        d_j_list.append(*args.at(pos)); pos += 1;
-        v_list.append((*args.at(pos)).try_into().unwrap()); pos += 1;
-        rseed_list.append(*args.at(pos)); pos += 1;
-        path_idx_list.append((*args.at(pos)).try_into().unwrap()); pos += 1;
+        nf_list.append(*args.at(pos));
+        pos += 1;
+        nk_spend_list.append(*args.at(pos));
+        pos += 1;
+        auth_root_list.append(*args.at(pos));
+        pos += 1;
+        auth_pub_seed_list.append(*args.at(pos));
+        pos += 1;
+        auth_idx_list.append((*args.at(pos)).try_into().unwrap());
+        pos += 1;
+        d_j_list.append(*args.at(pos));
+        pos += 1;
+        v_list.append((*args.at(pos)).try_into().unwrap());
+        pos += 1;
+        rseed_list.append(*args.at(pos));
+        pos += 1;
+        path_idx_list.append((*args.at(pos)).try_into().unwrap());
+        pos += 1;
         i += 1;
-    };
+    }
 
     let mut cm_sibs: Array<felt252> = array![];
     let mut i: u32 = 0;
-    while i < n * merkle::TREE_DEPTH { cm_sibs.append(*args.at(pos)); pos += 1; i += 1; };
+    while i < n * merkle::TREE_DEPTH {
+        cm_sibs.append(*args.at(pos));
+        pos += 1;
+        i += 1;
+    }
 
     let mut auth_sibs: Array<felt252> = array![];
     let mut i: u32 = 0;
-    while i < n * merkle::AUTH_DEPTH { auth_sibs.append(*args.at(pos)); pos += 1; i += 1; };
+    while i < n * merkle::AUTH_DEPTH {
+        auth_sibs.append(*args.at(pos));
+        pos += 1;
+        i += 1;
+    }
 
     let mut wots_sig: Array<felt252> = array![];
     let mut i: u32 = 0;
-    while i < n * xmss_common::WOTS_CHAINS { wots_sig.append(*args.at(pos)); pos += 1; i += 1; };
+    while i < n * xmss_common::WOTS_CHAINS {
+        wots_sig.append(*args.at(pos));
+        pos += 1;
+        i += 1;
+    }
 
-    let cm_1 = *args.at(pos); pos += 1;
-    let d_j_1 = *args.at(pos); pos += 1;
-    let v_1: u64 = (*args.at(pos)).try_into().unwrap(); pos += 1;
-    let rseed_1 = *args.at(pos); pos += 1;
-    let auth_root_1 = *args.at(pos); pos += 1;
-    let auth_pub_seed_1 = *args.at(pos); pos += 1;
-    let nk_tag_1 = *args.at(pos); pos += 1;
-    let mh_1 = *args.at(pos); pos += 1;
+    let cm_1 = *args.at(pos);
+    pos += 1;
+    let d_j_1 = *args.at(pos);
+    pos += 1;
+    let v_1: u64 = (*args.at(pos)).try_into().unwrap();
+    pos += 1;
+    let rseed_1 = *args.at(pos);
+    pos += 1;
+    let auth_root_1 = *args.at(pos);
+    pos += 1;
+    let auth_pub_seed_1 = *args.at(pos);
+    pos += 1;
+    let nk_tag_1 = *args.at(pos);
+    pos += 1;
+    let mh_1 = *args.at(pos);
+    pos += 1;
 
-    let cm_2 = *args.at(pos); pos += 1;
-    let d_j_2 = *args.at(pos); pos += 1;
-    let v_2: u64 = (*args.at(pos)).try_into().unwrap(); pos += 1;
-    let rseed_2 = *args.at(pos); pos += 1;
-    let auth_root_2 = *args.at(pos); pos += 1;
-    let auth_pub_seed_2 = *args.at(pos); pos += 1;
-    let nk_tag_2 = *args.at(pos); pos += 1;
-    let mh_2 = *args.at(pos); pos += 1;
+    let cm_2 = *args.at(pos);
+    pos += 1;
+    let d_j_2 = *args.at(pos);
+    pos += 1;
+    let v_2: u64 = (*args.at(pos)).try_into().unwrap();
+    pos += 1;
+    let rseed_2 = *args.at(pos);
+    pos += 1;
+    let auth_root_2 = *args.at(pos);
+    pos += 1;
+    let auth_pub_seed_2 = *args.at(pos);
+    pos += 1;
+    let nk_tag_2 = *args.at(pos);
+    pos += 1;
+    let mh_2 = *args.at(pos);
+    pos += 1;
 
     assert(pos == args.len(), 'unexpected trailing args');
 
@@ -85,7 +125,8 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         auth_domain,
         root,
         nf_list.span(),
-        cm_1, cm_2,
+        cm_1,
+        cm_2,
         nk_spend_list.span(),
         auth_root_list.span(),
         auth_pub_seed_list.span(),
@@ -97,7 +138,19 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         auth_sibs.span(),
         path_idx_list.span(),
         wots_sig.span(),
-        d_j_1, v_1, rseed_1, auth_root_1, auth_pub_seed_1, nk_tag_1, mh_1,
-        d_j_2, v_2, rseed_2, auth_root_2, auth_pub_seed_2, nk_tag_2, mh_2,
+        d_j_1,
+        v_1,
+        rseed_1,
+        auth_root_1,
+        auth_pub_seed_1,
+        nk_tag_1,
+        mh_1,
+        d_j_2,
+        v_2,
+        rseed_2,
+        auth_root_2,
+        auth_pub_seed_2,
+        nk_tag_2,
+        mh_2,
     )
 }

@@ -26,3 +26,6 @@ default = ["depth48"]
 
 [dependencies]
 cairo_execute = "2.16.1"
+
+[dev-dependencies]
+cairo_test = "2.16.1"

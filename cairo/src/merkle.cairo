@@ -72,7 +72,7 @@ pub fn verify(leaf: felt252, root: felt252, siblings: Span<felt252>, path_indice
         };
 
         i += 1;
-    };
+    }
 
     // Reject if path_indices had bits above TREE_DEPTH. Without this check
     // an attacker could use path_indices = real_pos + k·2^TREE_DEPTH, which
@@ -103,8 +103,111 @@ pub fn verify_auth(leaf: felt252, root: felt252, siblings: Span<felt252>, path_i
             hash2(current, sibling)
         };
         i += 1;
-    };
+    }
 
     assert(idx == 0, 'auth_index out of range');
     assert(current == root, 'auth root mismatch');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AUTH_DEPTH, TREE_DEPTH, hash2, verify, verify_auth};
+
+    fn zero_siblings(depth: u32) -> Array<felt252> {
+        let mut siblings: Array<felt252> = array![];
+        let mut i: u32 = 0;
+        while i < depth {
+            siblings.append(0);
+            i += 1;
+        }
+        siblings
+    }
+
+    fn root_from_path(
+        leaf: felt252, siblings: Span<felt252>, mut path_indices: u64, depth: u32,
+    ) -> felt252 {
+        let mut current = leaf;
+        let mut i: u32 = 0;
+        while i < depth {
+            let sibling = *siblings.at(i);
+            let bit = path_indices & 1;
+            path_indices /= 2;
+            current = if bit == 1 {
+                hash2(sibling, current)
+            } else {
+                hash2(current, sibling)
+            };
+            i += 1;
+        }
+        current
+    }
+
+    fn one_shifted_by(depth: u32) -> u64 {
+        let mut value: u64 = 1;
+        let mut i: u32 = 0;
+        while i < depth {
+            value *= 2;
+            i += 1;
+        }
+        value
+    }
+
+    #[test]
+    fn test_verify_valid_merkle_path_leftmost() {
+        let leaf = 0x1234;
+        let siblings = zero_siblings(TREE_DEPTH);
+        let root = root_from_path(leaf, siblings.span(), 0, TREE_DEPTH);
+        verify(leaf, root, siblings.span(), 0);
+    }
+
+    #[test]
+    fn test_verify_valid_merkle_path_nonzero_index() {
+        let leaf = 0x5678;
+        let siblings = zero_siblings(TREE_DEPTH);
+        let path_indices = 5_u64;
+        let root = root_from_path(leaf, siblings.span(), path_indices, TREE_DEPTH);
+        verify(leaf, root, siblings.span(), path_indices);
+    }
+
+    #[test]
+    #[should_panic(expected: ('merkle root mismatch',))]
+    fn test_verify_rejects_wrong_sibling() {
+        let leaf = 0x4321;
+        let siblings_ok = zero_siblings(TREE_DEPTH);
+        let root = root_from_path(leaf, siblings_ok.span(), 0, TREE_DEPTH);
+        let mut siblings_bad: Array<felt252> = array![1];
+        let mut i: u32 = 1;
+        while i < TREE_DEPTH {
+            siblings_bad.append(0);
+            i += 1;
+        }
+        verify(leaf, root, siblings_bad.span(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected: ('path_indices out of range',))]
+    fn test_verify_rejects_path_indices_aliasing() {
+        let leaf = 0x2222;
+        let siblings = zero_siblings(TREE_DEPTH);
+        let root = root_from_path(leaf, siblings.span(), 0, TREE_DEPTH);
+        verify(leaf, root, siblings.span(), one_shifted_by(TREE_DEPTH));
+    }
+
+    #[test]
+    fn test_verify_auth_valid_path() {
+        let leaf = 0x1357;
+        let siblings = zero_siblings(AUTH_DEPTH);
+        let path_indices = 3_u64;
+        let root = root_from_path(leaf, siblings.span(), path_indices, AUTH_DEPTH);
+        verify_auth(leaf, root, siblings.span(), path_indices);
+    }
+
+    #[test]
+    #[should_panic(expected: ('auth_index out of range',))]
+    fn test_verify_auth_rejects_index_aliasing() {
+        let leaf = 0x2468;
+        let siblings = zero_siblings(AUTH_DEPTH);
+        let root = root_from_path(leaf, siblings.span(), 0, AUTH_DEPTH);
+        verify_auth(leaf, root, siblings.span(), one_shifted_by(AUTH_DEPTH));
+    }
 }

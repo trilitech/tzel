@@ -37,92 +37,113 @@
 use core::blake::{blake2s_compress, blake2s_finalize};
 use core::box::BoxTrait;
 
-// ── Arithmetic helpers ───────────────────────────────────────────────
+// ── Arithmetic helpers
+// ───────────────────────────────────────────────
 const MASK32: u128 = 0xFFFFFFFF;
 const POW32: u128 = 0x100000000;
 const POW64: u128 = 0x10000000000000000;
 const POW96: u128 = 0x1000000000000000000000000;
 
-// ── Personalized BLAKE2s IVs ─────────────────────────────────────────
+// ── Personalized BLAKE2s IVs
+// ─────────────────────────────────────────
 
 /// Generic IV — no personalization. Key derivation only.
 fn blake2s_iv() -> Box<[u32; 8]> {
-    BoxTrait::new([
-        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-        0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
-    ])
+    BoxTrait::new(
+        [
+            0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+            0x5BE0CD19,
+        ],
+    )
 }
 
 /// Merkle-node IV — "mrklSP__".
 fn blake2s_iv_merkle() -> Box<[u32; 8]> {
-    BoxTrait::new([
-        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-        0x510E527F, 0x9B05688C, 0x73E8ABC6, 0x04BF9D4A,
-    ])
+    BoxTrait::new(
+        [
+            0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x73E8ABC6,
+            0x04BF9D4A,
+        ],
+    )
 }
 
 /// Nullifier IV — "nulfSP__".
 fn blake2s_iv_nullifier() -> Box<[u32; 8]> {
-    BoxTrait::new([
-        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-        0x510E527F, 0x9B05688C, 0x79EFACC5, 0x04BF9D4A,
-    ])
+    BoxTrait::new(
+        [
+            0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x79EFACC5,
+            0x04BF9D4A,
+        ],
+    )
 }
 
 /// Commitment IV — "cmmtSP__".
 fn blake2s_iv_commit() -> Box<[u32; 8]> {
-    BoxTrait::new([
-        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-        0x510E527F, 0x9B05688C, 0x6BEEB4C8, 0x04BF9D4A,
-    ])
+    BoxTrait::new(
+        [
+            0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x6BEEB4C8,
+            0x04BF9D4A,
+        ],
+    )
 }
 
 /// nk_spend derivation IV — "nkspSP__".
 /// Derives per-address secret nullifier key from account nk.
 fn blake2s_iv_nk_spend() -> Box<[u32; 8]> {
-    BoxTrait::new([
-        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-        0x510E527F, 0x9B05688C, 0x6FF0B2C5, 0x04BF9D4A,
-    ])
+    BoxTrait::new(
+        [
+            0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x6FF0B2C5,
+            0x04BF9D4A,
+        ],
+    )
 }
 
 /// nk_tag derivation IV — "nktgSP__".
 /// Derives per-address public binding tag from nk_spend.
 fn blake2s_iv_nk_tag() -> Box<[u32; 8]> {
-    BoxTrait::new([
-        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-        0x510E527F, 0x9B05688C, 0x78F7B2C5, 0x04BF9D4A,
-    ])
+    BoxTrait::new(
+        [
+            0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x78F7B2C5,
+            0x04BF9D4A,
+        ],
+    )
 }
 
 /// Owner-tag IV — "ownrSP__".
 /// Fuses auth_root and nk_tag into the commitment.
 fn blake2s_iv_owner() -> Box<[u32; 8]> {
-    BoxTrait::new([
-        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-        0x510E527F, 0x9B05688C, 0x6DEDAEC4, 0x04BF9D4A,
-    ])
+    BoxTrait::new(
+        [
+            0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x6DEDAEC4,
+            0x04BF9D4A,
+        ],
+    )
 }
 
 /// WOTS+ chain hash IV — "wotsSP__".
 /// Dedicated domain for WOTS+ hash chain iterations.
 fn blake2s_iv_wots() -> Box<[u32; 8]> {
-    BoxTrait::new([
-        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-        0x510E527F, 0x9B05688C, 0x6CF7B6DC, 0x04BF9D4A,
-    ])
+    BoxTrait::new(
+        [
+            0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x6CF7B6DC,
+            0x04BF9D4A,
+        ],
+    )
 }
 
 /// Sighash IV — "sighSP__".
 /// Used to compute the transaction sighash that WOTS+ signatures bind to.
 fn blake2s_iv_sighash() -> Box<[u32; 8]> {
-    BoxTrait::new([
-        0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-        0x510E527F, 0x9B05688C, 0x77E4B0D8, 0x04BF9D4A,
-    ])
+    BoxTrait::new(
+        [
+            0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x77E4B0D8,
+            0x04BF9D4A,
+        ],
+    )
 }
 
-// ── Encoding helpers ─────────────────────────────────────────────────
+// ── Encoding helpers
+// ─────────────────────────────────────────────────
 
 fn felt_to_u32x8(val: felt252) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
     let v: u256 = val.into();
@@ -140,7 +161,9 @@ fn felt_to_u32x8(val: felt252) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
     )
 }
 
-fn u32x8_to_felt(h0: u32, h1: u32, h2: u32, h3: u32, h4: u32, h5: u32, h6: u32, h7: u32) -> felt252 {
+fn u32x8_to_felt(
+    h0: u32, h1: u32, h2: u32, h3: u32, h4: u32, h5: u32, h6: u32, h7: u32,
+) -> felt252 {
     let low: u128 = h0.into() + h1.into() * POW32 + h2.into() * POW64 + h3.into() * POW96;
     let h7_masked: u128 = h7.into() & 0x07FFFFFF;
     let high: u128 = h4.into() + h5.into() * POW32 + h6.into() * POW64 + h7_masked * POW96;
@@ -148,7 +171,8 @@ fn u32x8_to_felt(h0: u32, h1: u32, h2: u32, h3: u32, h4: u32, h5: u32, h6: u32, 
     out.try_into().unwrap()
 }
 
-// ── Core hash functions ──────────────────────────────────────────────
+// ── Core hash functions
+// ──────────────────────────────────────────────
 
 /// H(a) — single-element hash (32 bytes, generic IV). Key derivation.
 pub fn hash1(a: felt252) -> felt252 {
@@ -220,7 +244,8 @@ fn hash4(a: felt252, b: felt252, c: felt252, d: felt252) -> felt252 {
     u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
 }
 
-// ── Protocol functions ───────────────────────────────────────────────
+// ── Protocol functions
+// ───────────────────────────────────────────────
 
 /// Derive commitment randomness: rcm = H(H("rcm"), rseed).
 pub fn derive_rcm(rseed: felt252) -> felt252 {
@@ -292,7 +317,8 @@ pub fn nullifier(nk_spend: felt252, cm: felt252, pos: u64) -> felt252 {
     hash2_with_iv(blake2s_iv_nullifier(), nk_spend, cm_pos)
 }
 
-// ── WOTS+ hash functions ────────────────────────────────────────────
+// ── WOTS+ hash functions
+// ────────────────────────────────────────────
 
 /// WOTS+ chain hash: H_wots(x). Dedicated domain for chain iterations.
 pub fn hash1_wots(a: felt252) -> felt252 {
@@ -303,7 +329,8 @@ pub fn hash1_wots(a: felt252) -> felt252 {
     u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
 }
 
-// ── WOTS+ sighash support ───────────────────────────────────────────
+// ── WOTS+ sighash support
+// ───────────────────────────────────────────
 
 /// Fold two values into a sighash using the dedicated sighash IV.
 pub fn sighash_fold(a: felt252, b: felt252) -> felt252 {
@@ -331,9 +358,9 @@ pub fn sighash_to_wots_digits(sighash: felt252) -> Array<u32> {
             checksum += 3 - digit;
             word = word / 4;
             bi += 1;
-        };
+        }
         wi += 1;
-    };
+    }
 
     // Append 5 checksum digits (base-4 encoding of checksum)
     let mut cs = checksum;
@@ -342,7 +369,115 @@ pub fn sighash_to_wots_digits(sighash: felt252) -> Array<u32> {
         digits.append(cs & 3);
         cs = cs / 4;
         ci += 1;
-    };
+    }
 
     digits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{felt_to_u32x8, hash1, hash1_wots, sighash_to_wots_digits, u32x8_to_felt};
+
+    fn checksum_value(digits: Span<u32>) -> u32 {
+        let mut checksum: u32 = 0;
+        let mut i: u32 = 0;
+        while i < 128 {
+            checksum += 3 - *digits.at(i);
+            i += 1;
+        }
+        checksum
+    }
+
+    fn checksum_tail_value(digits: Span<u32>) -> u32 {
+        let mut value: u32 = 0;
+        let mut factor: u32 = 1;
+        let mut i: u32 = 128;
+        while i < 133 {
+            value += *digits.at(i) * factor;
+            factor *= 4;
+            i += 1;
+        }
+        value
+    }
+
+    #[test]
+    fn test_felt_u32x8_roundtrip_zero() {
+        let felt = 0;
+        let (w0, w1, w2, w3, w4, w5, w6, w7) = felt_to_u32x8(felt);
+        assert(w0 == 0, 'w0');
+        assert(w1 == 0, 'w1');
+        assert(w2 == 0, 'w2');
+        assert(w3 == 0, 'w3');
+        assert(w4 == 0, 'w4');
+        assert(w5 == 0, 'w5');
+        assert(w6 == 0, 'w6');
+        assert(w7 == 0, 'w7');
+        assert(u32x8_to_felt(w0, w1, w2, w3, w4, w5, w6, w7) == felt, 'zero rt');
+    }
+
+    #[test]
+    fn test_felt_u32x8_roundtrip_max_felt() {
+        let felt = u32x8_to_felt(
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0x07FFFFFF_u32,
+        );
+        let (w0, w1, w2, w3, w4, w5, w6, w7) = felt_to_u32x8(felt);
+        assert(w0 == 0xFFFFFFFF_u32, 'rt0');
+        assert(w1 == 0xFFFFFFFF_u32, 'rt1');
+        assert(w2 == 0xFFFFFFFF_u32, 'rt2');
+        assert(w3 == 0xFFFFFFFF_u32, 'rt3');
+        assert(w4 == 0xFFFFFFFF_u32, 'rt4');
+        assert(w5 == 0xFFFFFFFF_u32, 'rt5');
+        assert(w6 == 0xFFFFFFFF_u32, 'rt6');
+        assert(w7 == 0x07FFFFFF_u32, 'rt7');
+        assert(u32x8_to_felt(w0, w1, w2, w3, w4, w5, w6, w7) == felt, 'max rt');
+    }
+
+    #[test]
+    fn test_hash1_wots_uses_distinct_domain() {
+        let x = 0x1234;
+        assert(hash1_wots(x) != hash1(x), 'wots iv');
+    }
+
+    #[test]
+    fn test_sighash_digits_zero_checksum() {
+        let digits = sighash_to_wots_digits(0);
+        assert(digits.len() == 133, 'digits len');
+
+        let mut i: u32 = 0;
+        while i < 128 {
+            assert(*digits.at(i) == 0, 'msg zero');
+            i += 1;
+        }
+
+        assert(*digits.at(128) == 0, 'cs0');
+        assert(*digits.at(129) == 0, 'cs1');
+        assert(*digits.at(130) == 0, 'cs2');
+        assert(*digits.at(131) == 2, 'cs3');
+        assert(*digits.at(132) == 1, 'cs4');
+    }
+
+    #[test]
+    fn test_sighash_digits_max_checksum_consistent() {
+        let sighash = u32x8_to_felt(
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0xFFFFFFFF_u32,
+            0x07FFFFFF_u32,
+        );
+        let digits = sighash_to_wots_digits(sighash);
+
+        assert(digits.len() == 133, 'digits len');
+        assert(checksum_value(digits.span()) == checksum_tail_value(digits.span()), 'checksum');
+    }
 }
