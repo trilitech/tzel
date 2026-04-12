@@ -808,19 +808,26 @@ let test_note_determinism () =
   let owner_tag2 = Tzel.Keys.owner_tag addr in
   Alcotest.(check bool) "owner_tag deterministic" true
     (Tzel.Felt.equal owner_tag1 owner_tag2);
+  let expected_rcm = Tzel.Hash.derive_rcm rseed in
   let n1 = Tzel.Note.create addr 1000L rseed in
+  Alcotest.(check bool) "note stores rcm" true
+    (Tzel.Felt.equal expected_rcm n1.rcm);
   Alcotest.(check bool) "note stores owner_tag" true
     (Tzel.Felt.equal owner_tag1 n1.owner_tag);
-  let raw_rseed_cm =
-    Tzel.Hash.hash_commit addr.d_j (Tzel.Felt.of_u64 1000) rseed owner_tag1
-  in
-  Alcotest.(check string) "raw-rseed candidate"
-    (Tzel.Felt.to_hex raw_rseed_cm) (Tzel.Felt.to_hex n1.cm);
+  let explicit_buf = Bytes.make 128 '\x00' in
+  let explicit_v = Tzel.Felt.of_u64 1000 in
+  Bytes.blit addr.d_j 0 explicit_buf 0 32;
+  Bytes.blit explicit_v 0 explicit_buf 32 8;
+  Bytes.blit n1.rcm 0 explicit_buf 64 32;
+  Bytes.blit owner_tag1 0 explicit_buf 96 32;
+  let explicit_cm = Tzel.Hash.hash_personalized "cmmtSP__" explicit_buf in
+  Alcotest.(check bool) "explicit current-layout cm matches note" true
+    (Tzel.Felt.equal explicit_cm n1.cm);
   let manual_cm =
     Tzel.Hash.hash_commit addr.d_j (Tzel.Felt.of_u64 1000) n1.rcm owner_tag1
   in
-  Alcotest.(check string) "manual cm matches note"
-    (Tzel.Felt.to_hex manual_cm) (Tzel.Felt.to_hex n1.cm);
+  Alcotest.(check bool) "manual cm matches note" true
+    (Tzel.Felt.equal manual_cm n1.cm);
   let n2 = Tzel.Note.create addr 1000L rseed in
   Alcotest.(check bool) "cm deterministic" true (Tzel.Felt.equal n1.cm n2.cm);
   Alcotest.(check bool) "rcm deterministic" true (Tzel.Felt.equal n1.rcm n2.rcm)

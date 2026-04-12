@@ -2259,6 +2259,110 @@ mod tests {
         );
     }
 
+    fn blake2s_personalized_iv(personal: &[u8; 8]) -> [u32; 8] {
+        const RFC_BLAKE2S_IV: [u32; 8] = [
+            0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+            0x5BE0CD19,
+        ];
+
+        let mut param = [0u8; 32];
+        param[0] = 32;
+        param[2] = 1;
+        param[3] = 1;
+        param[24..32].copy_from_slice(personal);
+
+        let mut iv = RFC_BLAKE2S_IV;
+        for (word_idx, word) in iv.iter_mut().enumerate() {
+            let base = word_idx * 4;
+            let param_word = u32::from_le_bytes([
+                param[base],
+                param[base + 1],
+                param[base + 2],
+                param[base + 3],
+            ]);
+            *word ^= param_word;
+        }
+        iv
+    }
+
+    #[test]
+    fn test_cairo_precomputed_blake2s_ivs_match_parameter_block_derivation() {
+        let cases = [
+            (
+                *b"\0\0\0\0\0\0\0\0",
+                [
+                    0x6B08E647, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
+                    0x1F83D9AB, 0x5BE0CD19,
+                ],
+            ),
+            (
+                *b"mrklSP__",
+                [
+                    0x6B08E647, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
+                    0x73E8ABC6, 0x04BF9D4A,
+                ],
+            ),
+            (
+                *b"nulfSP__",
+                [
+                    0x6B08E647, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
+                    0x79EFACC5, 0x04BF9D4A,
+                ],
+            ),
+            (
+                *b"cmmtSP__",
+                [
+                    0x6B08E647, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
+                    0x6BEEB4C8, 0x04BF9D4A,
+                ],
+            ),
+            (
+                *b"nkspSP__",
+                [
+                    0x6B08E647, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
+                    0x6FF0B2C5, 0x04BF9D4A,
+                ],
+            ),
+            (
+                *b"nktgSP__",
+                [
+                    0x6B08E647, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
+                    0x78F7B2C5, 0x04BF9D4A,
+                ],
+            ),
+            (
+                *b"ownrSP__",
+                [
+                    0x6B08E647, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
+                    0x6DEDAEC4, 0x04BF9D4A,
+                ],
+            ),
+            (
+                *b"wotsSP__",
+                [
+                    0x6B08E647, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
+                    0x6CF7B6DC, 0x04BF9D4A,
+                ],
+            ),
+            (
+                *b"sighSP__",
+                [
+                    0x6B08E647, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
+                    0x77E4B0D8, 0x04BF9D4A,
+                ],
+            ),
+        ];
+
+        for (personal, expected) in cases {
+            assert_eq!(
+                blake2s_personalized_iv(&personal),
+                expected,
+                "{:?}",
+                personal
+            );
+        }
+    }
+
     #[test]
     fn test_transfer_and_unshield_sighash_are_bound_to_public_fields() {
         let auth_domain = u(1);

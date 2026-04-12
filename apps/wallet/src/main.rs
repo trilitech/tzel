@@ -504,6 +504,15 @@ struct WalletFile {
     wots_key_indices: std::collections::HashMap<u32, u32>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct WalletXmssFloor {
+    #[serde(with = "hex_f")]
+    wallet_fingerprint: F,
+    addr_counter: u32,
+    #[serde(default)]
+    wots_key_indices: std::collections::HashMap<u32, u32>,
+}
+
 impl WalletFile {
     fn account(&self) -> Account {
         derive_account(&self.master_sk)
@@ -718,6 +727,26 @@ impl WalletFile {
         self.notes.iter().map(|n| n.v as u128).sum()
     }
 
+    fn wallet_xmss_floor(&self) -> WalletXmssFloor {
+        let mut wots_key_indices = self.wots_key_indices.clone();
+        for addr in &self.addresses {
+            let next_index = addr
+                .bds
+                .as_ref()
+                .map(|bds| bds.next_index)
+                .unwrap_or(addr.next_auth_index);
+            wots_key_indices
+                .entry(addr.index)
+                .and_modify(|current| *current = (*current).max(next_index))
+                .or_insert(next_index);
+        }
+        WalletXmssFloor {
+            wallet_fingerprint: hash(&self.master_sk),
+            addr_counter: self.addr_counter,
+            wots_key_indices,
+        }
+    }
+
     /// Select notes to cover at least `amount`. Returns indices into self.notes.
     fn select_notes(&self, amount: u64) -> Result<Vec<usize>, String> {
         let mut indexed: Vec<(usize, u64)> = self
@@ -757,6 +786,10 @@ impl Drop for WalletLock {
 
 fn wallet_lock_path(path: &str) -> PathBuf {
     PathBuf::from(format!("{}.lock", path))
+}
+
+fn wallet_xmss_floor_path(path: &str) -> PathBuf {
+    PathBuf::from(format!("{}.xmss-floor", path))
 }
 
 #[cfg(unix)]
@@ -813,6 +846,7 @@ fn load_wallet(path: &str) -> Result<WalletFile, String> {
     let data = std::fs::read_to_string(path).map_err(|e| format!("read wallet: {}", e))?;
     let mut wallet: WalletFile =
         serde_json::from_str(&data).map_err(|e| format!("parse wallet: {}", e))?;
+    enforce_wallet_xmss_floor(path, &wallet)?;
     wallet.materialize_addresses()?;
     Ok(wallet)
 }
@@ -830,7 +864,72 @@ fn save_wallet(path: &str, w: &WalletFile) -> Result<(), String> {
     drop(file);
     std::fs::rename(&tmp, wallet_path).map_err(|e| format!("rename: {}", e))?;
     set_wallet_permissions(wallet_path)?;
-    sync_parent_dir(wallet_path)
+    sync_parent_dir(wallet_path)?;
+    save_wallet_xmss_floor(path, &w.wallet_xmss_floor())
+}
+
+fn save_wallet_xmss_floor(path: &str, floor: &WalletXmssFloor) -> Result<(), String> {
+    let data =
+        serde_json::to_string_pretty(floor).map_err(|e| format!("serialize floor: {}", e))?;
+    let floor_path = wallet_xmss_floor_path(path);
+    let tmp = PathBuf::from(format!("{}.tmp", floor_path.display()));
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create floor tmp: {}", e))?;
+    file.write_all(data.as_bytes())
+        .map_err(|e| format!("write floor tmp: {}", e))?;
+    file.sync_all()
+        .map_err(|e| format!("fsync floor tmp: {}", e))?;
+    drop(file);
+    std::fs::rename(&tmp, &floor_path).map_err(|e| format!("rename floor: {}", e))?;
+    set_wallet_permissions(&floor_path)?;
+    sync_parent_dir(&floor_path)
+}
+
+fn current_wallet_wots_floor(wallet: &WalletFile, addr_index: u32) -> u32 {
+    wallet
+        .wots_key_indices
+        .get(&addr_index)
+        .copied()
+        .or_else(|| {
+            wallet
+                .addresses
+                .iter()
+                .find(|addr| addr.index == addr_index)
+                .map(|addr| {
+                    addr.bds
+                        .as_ref()
+                        .map(|bds| bds.next_index)
+                        .unwrap_or(addr.next_auth_index)
+                })
+        })
+        .unwrap_or(0)
+}
+
+fn enforce_wallet_xmss_floor(path: &str, wallet: &WalletFile) -> Result<(), String> {
+    let floor_path = wallet_xmss_floor_path(path);
+    let Ok(data) = std::fs::read_to_string(&floor_path) else {
+        return Ok(());
+    };
+    let floor: WalletXmssFloor =
+        serde_json::from_str(&data).map_err(|e| format!("parse xmss floor: {}", e))?;
+    if floor.wallet_fingerprint != hash(&wallet.master_sk) {
+        return Ok(());
+    }
+    if wallet.addr_counter < floor.addr_counter {
+        return Err(format!(
+            "wallet appears to be restored from a stale backup: addr_counter {} is behind durable XMSS floor {}",
+            wallet.addr_counter, floor.addr_counter
+        ));
+    }
+    for (addr_index, required_next) in &floor.wots_key_indices {
+        let current_next = current_wallet_wots_floor(wallet, *addr_index);
+        if current_next < *required_next {
+            return Err(format!(
+                "wallet appears to be restored from a stale backup: address {} next_auth_index {} is behind durable XMSS floor {}",
+                addr_index, current_next, required_next
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1739,6 +1838,28 @@ mod tests {
         assert!(!dir.path().join("wallet.json.tmp").exists());
     }
 
+    #[test]
+    fn test_save_wallet_writes_xmss_floor_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let w = test_wallet(1, None);
+
+        save_wallet(wallet_path_str, &w).expect("wallet should save");
+
+        let floor_path = wallet_xmss_floor_path(wallet_path_str);
+        let floor: WalletXmssFloor =
+            serde_json::from_str(&std::fs::read_to_string(&floor_path).expect("read floor"))
+                .expect("parse floor");
+
+        assert_eq!(floor.wallet_fingerprint, hash(&w.master_sk));
+        assert_eq!(floor.addr_counter, w.addr_counter);
+        assert_eq!(
+            floor.wots_key_indices.get(&0),
+            Some(&w.addresses[0].bds.as_ref().unwrap().next_index)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_save_wallet_sets_private_file_mode() {
@@ -1780,6 +1901,31 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.contains("read wallet"));
+    }
+
+    #[test]
+    fn test_load_wallet_rejects_stale_backup_against_xmss_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let backup_path = dir.path().join("wallet-backup.json");
+
+        let original = test_wallet(1, None);
+        save_wallet(wallet_path_str, &original).expect("save original wallet");
+        std::fs::copy(&wallet_path, &backup_path).expect("copy backup");
+
+        let mut advanced = load_wallet(wallet_path_str).expect("reload wallet");
+        let _ = advanced
+            .reserve_next_auth(0)
+            .expect("fixture wallet should advance auth state");
+        save_wallet(wallet_path_str, &advanced).expect("save advanced wallet");
+
+        std::fs::copy(&backup_path, &wallet_path).expect("restore stale wallet file");
+        let err = match load_wallet(wallet_path_str) {
+            Ok(_) => panic!("stale restore should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("stale backup"), "unexpected error: {}", err);
     }
 
     #[test]

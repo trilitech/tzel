@@ -96,7 +96,7 @@ let hash_nf a b =
    v uses the canonical Rust wire/layout: the low 8 bytes store the u64
    value in little-endian form and bytes [40..64) are zero. *)
 let hash_commit d v_felt rcm owner_tag =
-  let buf = Bytes.create 128 in
+  let buf = Bytes.make 128 '\x00' in
   Bytes.blit d 0 buf 0 32;
   Bytes.blit v_felt 0 buf 32 8;
   Bytes.blit rcm 0 buf 64 32;
