@@ -40,6 +40,10 @@ fn free_port() -> u16 {
     counter.fetch_add(1, Ordering::Relaxed)
 }
 
+fn localhost_bind_available() -> bool {
+    std::net::TcpListener::bind("127.0.0.1:0").is_ok()
+}
+
 fn workspace_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -371,16 +375,6 @@ fn generate_shield_proof(
         String::from_utf8_lossy(&out.stderr)
     );
 
-    #[derive(Deserialize)]
-    struct ProofBundleJson {
-        #[serde(with = "hex_bytes")]
-        proof_bytes: Vec<u8>,
-        #[serde(with = "hex_f_vec")]
-        output_preimage: Vec<F>,
-        #[serde(default)]
-        verify_meta: Option<serde_json::Value>,
-    }
-
     let bundle_json = std::fs::read_to_string(proof_file.path()).unwrap();
     let bundle: ProofBundleJson = serde_json::from_str(&bundle_json).unwrap();
 
@@ -393,6 +387,40 @@ fn generate_shield_proof(
         cm,
         enc,
     )
+}
+
+#[derive(Deserialize)]
+struct ProofBundleJson {
+    #[serde(with = "hex_bytes")]
+    proof_bytes: Vec<u8>,
+    #[serde(with = "hex_f_vec")]
+    output_preimage: Vec<F>,
+    #[serde(default)]
+    verify_meta: Option<serde_json::Value>,
+}
+
+fn generate_stark_bundle(executable_filename: &str, args: &[String]) -> ProofBundleJson {
+    let executable = format!("{}/{}", executables_dir(), executable_filename);
+    let args_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(args_file.path(), serde_json::to_string(args).unwrap()).unwrap();
+    let proof_file = tempfile::NamedTempFile::new().unwrap();
+
+    let out = Command::new(build_reprove_bin())
+        .arg(&executable)
+        .arg("--arguments-file")
+        .arg(args_file.path())
+        .arg("--output")
+        .arg(proof_file.path())
+        .output()
+        .expect("failed to run reprover");
+    assert!(
+        out.status.success(),
+        "reprover failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bundle_json = std::fs::read_to_string(proof_file.path()).unwrap();
+    serde_json::from_str(&bundle_json).unwrap()
 }
 
 fn post_json_allow_status<Req: Serialize>(url: &str, body: &Req) -> http::Response<ureq::Body> {
@@ -415,6 +443,10 @@ fn post_json_allow_status<Req: Serialize>(url: &str, body: &Req) -> http::Respon
 #[test]
 fn test_e2e_trust_me_bro() {
     let _guard = integration_test_guard();
+    if !localhost_bind_available() {
+        eprintln!("SKIP: localhost TCP bind unavailable in this environment.");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();
     let alice = dir.join("alice.json").to_str().unwrap().to_string();
@@ -522,6 +554,10 @@ fn test_e2e_trust_me_bro() {
 #[test]
 fn test_ledger_rejects_tmb_by_default() {
     let _guard = integration_test_guard();
+    if !localhost_bind_available() {
+        eprintln!("SKIP: localhost TCP bind unavailable in this environment.");
+        return;
+    }
     if !has_reprover() {
         eprintln!("SKIP: reprover binary or Cairo executables not found.");
         return;
@@ -612,6 +648,10 @@ fn test_ledger_refuses_insecure_startup() {
 #[ignore = "slow real-proof integration"]
 fn test_shield_proof_roundtrip() {
     let _guard = integration_test_guard();
+    if !localhost_bind_available() {
+        eprintln!("SKIP: localhost TCP bind unavailable in this environment.");
+        return;
+    }
     if !has_reprover() {
         eprintln!("SKIP: reprover binary or Cairo executables not found.");
         return;
@@ -661,6 +701,10 @@ fn test_shield_proof_roundtrip() {
 #[ignore = "slow real-proof integration"]
 fn test_transfer_proof_roundtrip() {
     let _guard = integration_test_guard();
+    if !localhost_bind_available() {
+        eprintln!("SKIP: localhost TCP bind unavailable in this environment.");
+        return;
+    }
     if !has_reprover() {
         eprintln!("SKIP: reprover binary or Cairo executables not found.");
         return;
@@ -756,11 +800,46 @@ fn test_transfer_proof_roundtrip() {
     }
 }
 
+/// Slow, ignored by default: prove a max-input transfer witness directly.
+/// This is the explicit guard against N=7 trace-budget or tail-slicing failures.
+#[test]
+#[ignore = "slow real-proof max-input proof"]
+fn test_transfer_7_inputs_proof_roundtrip() {
+    let _guard = integration_test_guard();
+    if !has_reprover() {
+        eprintln!("SKIP: reprover binary or Cairo executables not found.");
+        return;
+    }
+
+    let witness = proof_bench::build_transfer_bench_witness(7);
+    let bundle = generate_stark_bundle("run_transfer.executable.json", &witness.args);
+    let parsed = parse_single_task_output_preimage(&bundle.output_preimage)
+        .expect("bootloader output preimage should parse");
+
+    assert_eq!(
+        parsed.public_outputs,
+        witness.expected_public_outputs.as_slice(),
+        "n=7 transfer proof public outputs must match the witness, including the final nullifier",
+    );
+    assert!(
+        bundle.verify_meta.is_some(),
+        "proof bundle should carry verification metadata"
+    );
+    assert!(
+        !bundle.proof_bytes.is_empty(),
+        "proof bytes should be nonempty"
+    );
+}
+
 /// Focused real-proof test: setup a private note quickly with TrustMeBro, then generate one unshield proof.
 #[test]
 #[ignore = "slow real-proof integration"]
 fn test_unshield_proof_roundtrip() {
     let _guard = integration_test_guard();
+    if !localhost_bind_available() {
+        eprintln!("SKIP: localhost TCP bind unavailable in this environment.");
+        return;
+    }
     if !has_reprover() {
         eprintln!("SKIP: reprover binary or Cairo executables not found.");
         return;

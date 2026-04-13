@@ -1,4 +1,4 @@
-/// Transfer circuit: N→2 JoinSplit (1 ≤ N ≤ 16).
+/// Transfer circuit: N→2 JoinSplit (1 ≤ N ≤ 7).
 ///
 /// # Public outputs
 ///   [auth_domain, root, nf_0..nf_{N-1}, cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2]
@@ -12,7 +12,7 @@
 use tzel::blake_hash as hash;
 use tzel::{merkle, xmss_common};
 
-const MAX_INPUTS: u32 = 16;
+const MAX_INPUTS: u32 = 7;
 
 pub fn verify(
     auth_domain: felt252,
@@ -618,6 +618,352 @@ mod tests {
         }
     }
 
+    fn copy_span(values: Span<felt252>) -> Array<felt252> {
+        let mut copied: Array<felt252> = array![];
+        let mut i: u32 = 0;
+        while i < values.len() {
+            copied.append(*values.at(i));
+            i += 1;
+        }
+        copied
+    }
+
+    fn merkle_nodes_at_level(leaves: Span<felt252>, target_level: u32) -> Array<felt252> {
+        let mut current = copy_span(leaves);
+        let mut level: u32 = 0;
+        while level < target_level {
+            let mut next: Array<felt252> = array![];
+            let mut pair_idx: u32 = 0;
+            while pair_idx < current.len() / 2_u32 {
+                let left = *current.at(pair_idx * 2_u32);
+                let right = *current.at(pair_idx * 2_u32 + 1_u32);
+                next.append(hash::hash2(left, right));
+                pair_idx += 1;
+            }
+            current = next;
+            level += 1;
+        }
+        current
+    }
+
+    fn auth_nodes_at_level(
+        leaves: Span<felt252>, pub_seed: felt252, target_level: u32,
+    ) -> Array<felt252> {
+        let mut current = copy_span(leaves);
+        let mut level: u32 = 0;
+        while level < target_level {
+            let mut next: Array<felt252> = array![];
+            let mut pair_idx: u32 = 0;
+            while pair_idx < current.len() / 2_u32 {
+                let left = *current.at(pair_idx * 2_u32);
+                let right = *current.at(pair_idx * 2_u32 + 1_u32);
+                next
+                    .append(
+                        xmss_common::xmss_node_hash(
+                            pub_seed, TAG_XMSS_TREE_TEST, 0, level, pair_idx, left, right,
+                        ),
+                    );
+                pair_idx += 1;
+            }
+            current = next;
+            level += 1;
+        }
+        current
+    }
+
+    fn build_left_aligned_merkle_root_and_paths(
+        leaves: Span<felt252>, upper_seed: felt252,
+    ) -> (felt252, Array<felt252>) {
+        let leaf_count = leaves.len();
+        assert(leaf_count != 0, 'transfer test empty leaves');
+
+        let mut width = leaf_count;
+        let mut subtree_levels: u32 = 0;
+        while width > 1_u32 {
+            assert(width % 2_u32 == 0, 'transfer test width odd');
+            width /= 2_u32;
+            subtree_levels += 1;
+        }
+
+        let subtree_root = *merkle_nodes_at_level(leaves, subtree_levels).at(0);
+        let mut root = subtree_root;
+        let mut level = subtree_levels;
+        while level < merkle::TREE_DEPTH {
+            let sibling = hash::hash1(level.into() + upper_seed);
+            root = hash::hash2(root, sibling);
+            level += 1;
+        }
+
+        let mut siblings_flat: Array<felt252> = array![];
+        let mut leaf_idx: u32 = 0;
+        while leaf_idx < leaf_count {
+            let mut idx = leaf_idx;
+            let mut path_level: u32 = 0;
+            while path_level < subtree_levels {
+                let nodes = merkle_nodes_at_level(leaves, path_level);
+                let sibling_idx = if idx & 1_u32 == 0 {
+                    idx + 1_u32
+                } else {
+                    idx - 1_u32
+                };
+                siblings_flat.append(*nodes.at(sibling_idx));
+                idx /= 2_u32;
+                path_level += 1;
+            }
+            while path_level < merkle::TREE_DEPTH {
+                siblings_flat.append(hash::hash1(path_level.into() + upper_seed));
+                path_level += 1;
+            }
+            leaf_idx += 1;
+        }
+
+        (root, siblings_flat)
+    }
+
+    fn build_left_aligned_auth_root_and_paths(
+        leaves: Span<felt252>, pub_seed: felt252, upper_seed: felt252,
+    ) -> (felt252, Array<felt252>) {
+        let leaf_count = leaves.len();
+        assert(leaf_count != 0, 'transfer test empty auth leaves');
+
+        let mut width = leaf_count;
+        let mut subtree_levels: u32 = 0;
+        while width > 1_u32 {
+            assert(width % 2_u32 == 0, 'transfer test auth width odd');
+            width /= 2_u32;
+            subtree_levels += 1;
+        }
+
+        let subtree_root = *auth_nodes_at_level(leaves, pub_seed, subtree_levels).at(0);
+        let mut root = subtree_root;
+        let mut level = subtree_levels;
+        while level < merkle::AUTH_DEPTH {
+            let sibling = hash::hash1(level.into() + upper_seed);
+            root =
+                xmss_common::xmss_node_hash(
+                    pub_seed, TAG_XMSS_TREE_TEST, 0, level, 0, root, sibling,
+                );
+            level += 1;
+        }
+
+        let mut siblings_flat: Array<felt252> = array![];
+        let mut leaf_idx: u32 = 0;
+        while leaf_idx < leaf_count {
+            let mut idx = leaf_idx;
+            let mut path_level: u32 = 0;
+            while path_level < subtree_levels {
+                let nodes = auth_nodes_at_level(leaves, pub_seed, path_level);
+                let sibling_idx = if idx & 1_u32 == 0 {
+                    idx + 1_u32
+                } else {
+                    idx - 1_u32
+                };
+                siblings_flat.append(*nodes.at(sibling_idx));
+                idx /= 2_u32;
+                path_level += 1;
+            }
+            while path_level < merkle::AUTH_DEPTH {
+                siblings_flat.append(hash::hash1(path_level.into() + upper_seed));
+                path_level += 1;
+            }
+            leaf_idx += 1;
+        }
+
+        (root, siblings_flat)
+    }
+
+    fn next_power_of_two(mut n: u32) -> u32 {
+        assert(n != 0, 'transfer test next_pow2 zero');
+        let mut width = 1_u32;
+        while width < n {
+            width *= 2_u32;
+        }
+        width
+    }
+
+    fn take_prefix(values: Span<felt252>, count: u32) -> Array<felt252> {
+        let mut out: Array<felt252> = array![];
+        let mut i: u32 = 0;
+        while i < count {
+            out.append(*values.at(i));
+            i += 1;
+        }
+        out
+    }
+
+    fn build_multi_input_fixture(n_inputs: u32) -> TransferFixture {
+        assert(n_inputs != 0, 'transfer test n=0');
+
+        let auth_domain = 0xA001;
+        let auth_pub_seed = 0xA002;
+        let auth_upper_seed = 0xA100;
+        let cm_upper_seed = 0xA200;
+
+        let mut auth_leaves: Array<felt252> = array![];
+        let mut nk_spend_list: Array<felt252> = array![];
+        let mut auth_index_list: Array<u64> = array![];
+        let mut d_j_in_list: Array<felt252> = array![];
+        let mut v_in_list: Array<u64> = array![];
+        let mut rseed_in_list: Array<felt252> = array![];
+
+        let mut input_idx: u32 = 0;
+        while input_idx < n_inputs {
+            let key_base = 0xA300 + input_idx.into() * 0x100;
+            let mut endpoints: Array<felt252> = array![];
+            let mut chain_idx: u32 = 0;
+            while chain_idx < xmss_common::WOTS_CHAINS {
+                let start = hash::hash1(key_base + chain_idx.into());
+                endpoints
+                    .append(
+                        chain_advance(
+                            start, auth_pub_seed, input_idx, chain_idx, xmss_common::WOTS_W - 1,
+                        ),
+                    );
+                chain_idx += 1;
+            }
+            auth_leaves.append(xmss_common::xmss_ltree(auth_pub_seed, input_idx, endpoints.span()));
+            nk_spend_list.append(0xA400 + input_idx.into());
+            auth_index_list.append(input_idx.into());
+            d_j_in_list.append(0xA500 + input_idx.into());
+            v_in_list.append(20_u64 + input_idx.into());
+            rseed_in_list.append(0xA600 + input_idx.into());
+            input_idx += 1;
+        }
+
+        let padded_inputs = next_power_of_two(n_inputs);
+        while auth_leaves.len() < padded_inputs {
+            let pad_idx = auth_leaves.len();
+            let key_base = 0xAF00 + pad_idx.into() * 0x100;
+            let mut endpoints: Array<felt252> = array![];
+            let mut chain_idx: u32 = 0;
+            while chain_idx < xmss_common::WOTS_CHAINS {
+                let start = hash::hash1(key_base + chain_idx.into());
+                endpoints
+                    .append(
+                        chain_advance(
+                            start, auth_pub_seed, pad_idx, chain_idx, xmss_common::WOTS_W - 1,
+                        ),
+                    );
+                chain_idx += 1;
+            }
+            auth_leaves.append(xmss_common::xmss_ltree(auth_pub_seed, pad_idx, endpoints.span()));
+        }
+
+        let (auth_root, auth_siblings_full) = build_left_aligned_auth_root_and_paths(
+            auth_leaves.span(), auth_pub_seed, auth_upper_seed,
+        );
+        let auth_siblings_flat = take_prefix(
+            auth_siblings_full.span(), n_inputs * merkle::AUTH_DEPTH,
+        );
+
+        let mut cm_leaves: Array<felt252> = array![];
+        let mut auth_root_list: Array<felt252> = array![];
+        let mut auth_pub_seed_list: Array<felt252> = array![];
+        let mut cm_path_indices_list: Array<u64> = array![];
+        let mut nf_list: Array<felt252> = array![];
+        let mut total_in: u64 = 0;
+        let mut j: u32 = 0;
+        while j < n_inputs {
+            let nk_spend = *nk_spend_list.at(j);
+            let d_j_in = *d_j_in_list.at(j);
+            let v_in = *v_in_list.at(j);
+            let rseed_in = *rseed_in_list.at(j);
+            let cm_leaf = output_commitment(
+                d_j_in, v_in, rseed_in, auth_root, auth_pub_seed, hash::derive_nk_tag(nk_spend),
+            );
+            cm_leaves.append(cm_leaf);
+            auth_root_list.append(auth_root);
+            auth_pub_seed_list.append(auth_pub_seed);
+            cm_path_indices_list.append(j.into());
+            total_in += v_in;
+            j += 1;
+        }
+
+        while cm_leaves.len() < padded_inputs {
+            let pad_idx = cm_leaves.len();
+            cm_leaves.append(hash::hash1(cm_upper_seed + 0x5000 + pad_idx.into()));
+        }
+
+        let (root, cm_siblings_full) = build_left_aligned_merkle_root_and_paths(
+            cm_leaves.span(), cm_upper_seed,
+        );
+        let cm_siblings_flat = take_prefix(cm_siblings_full.span(), n_inputs * merkle::TREE_DEPTH);
+
+        let mut k: u32 = 0;
+        while k < n_inputs {
+            nf_list.append(hash::nullifier(*nk_spend_list.at(k), *cm_leaves.at(k), k.into()));
+            k += 1;
+        }
+
+        let v_1 = total_in / 2_u64;
+        let v_2 = total_in - v_1;
+
+        let d_j_1 = 0xA701;
+        let rseed_1 = 0xA702;
+        let auth_root_1 = 0xA703;
+        let auth_pub_seed_1 = 0xA704;
+        let nk_tag_1 = 0xA705;
+        let memo_ct_hash_1 = 0xA706;
+        let cm_1 = output_commitment(d_j_1, v_1, rseed_1, auth_root_1, auth_pub_seed_1, nk_tag_1);
+
+        let d_j_2 = 0xA801;
+        let rseed_2 = 0xA802;
+        let auth_root_2 = 0xA803;
+        let auth_pub_seed_2 = 0xA804;
+        let nk_tag_2 = 0xA805;
+        let memo_ct_hash_2 = 0xA806;
+        let cm_2 = output_commitment(d_j_2, v_2, rseed_2, auth_root_2, auth_pub_seed_2, nk_tag_2);
+
+        let sighash = transfer_sighash(
+            auth_domain, root, nf_list.span(), cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2,
+        );
+        let mut wots_sig_flat: Array<felt252> = array![];
+        let mut m: u32 = 0;
+        while m < n_inputs {
+            let key_base = 0xA300 + m.into() * 0x100;
+            let sig = sign_transfer_input(sighash, auth_pub_seed, m, key_base);
+            let mut s: u32 = 0;
+            while s < sig.len() {
+                wots_sig_flat.append(*sig.at(s));
+                s += 1;
+            }
+            m += 1;
+        }
+
+        TransferFixture {
+            auth_domain,
+            root,
+            nf_list,
+            nk_spend_list,
+            auth_root_list,
+            auth_pub_seed_list,
+            auth_index_list,
+            d_j_in_list,
+            v_in_list,
+            rseed_in_list,
+            cm_siblings_flat,
+            auth_siblings_flat,
+            cm_path_indices_list,
+            wots_sig_flat,
+            cm_1,
+            d_j_1,
+            v_1,
+            rseed_1,
+            auth_root_1,
+            auth_pub_seed_1,
+            nk_tag_1,
+            memo_ct_hash_1,
+            cm_2,
+            d_j_2,
+            v_2,
+            rseed_2,
+            auth_root_2,
+            auth_pub_seed_2,
+            nk_tag_2,
+            memo_ct_hash_2,
+        }
+    }
+
     fn build_duplicate_nf_fixture() -> TransferFixture {
         let base = build_fixture_with_values(70_u64, 80_u64, 60_u64);
         let sighash = transfer_sighash(
@@ -771,6 +1117,27 @@ mod tests {
         assert(*outputs.at(5) == fixture.cm_2, 'transfer2 out cm2');
     }
 
+    fn assert_transfer_accepts_multi_input_statement(n_inputs: u32) {
+        let fixture = build_multi_input_fixture(n_inputs);
+        let outputs = run_verify(@fixture);
+        assert(outputs.len() == n_inputs + 6_u32, 'transfer outputs len multi');
+        assert(*outputs.at(0) == fixture.auth_domain, 'transfer multi out domain');
+        assert(*outputs.at(1) == fixture.root, 'transfer multi out root');
+        assert(*outputs.at(2) == *fixture.nf_list.at(0), 'transfer multi out nf0');
+        assert(
+            *outputs.at(1_u32 + n_inputs) == *fixture.nf_list.at(n_inputs - 1_u32),
+            'transfer multi out last nf',
+        );
+        assert(*outputs.at(2_u32 + n_inputs) == fixture.cm_1, 'transfer multi out cm1');
+        assert(*outputs.at(3_u32 + n_inputs) == fixture.cm_2, 'transfer multi out cm2');
+    }
+
+    #[test]
+    fn test_transfer_accepts_multi_input_statement_sizes() {
+        assert_transfer_accepts_multi_input_statement(4_u32);
+        assert_transfer_accepts_multi_input_statement(7_u32);
+    }
+
     #[test]
     #[should_panic(expected: ('xmss auth root mismatch',))]
     fn test_transfer_rejects_public_nullifier_mutation_via_signature_binding() {
@@ -861,6 +1228,15 @@ mod tests {
     #[should_panic(expected: ('transfer: dup nf',))]
     fn test_transfer_rejects_duplicate_nullifiers_after_all_other_checks() {
         let fixture = build_duplicate_nf_fixture();
+        run_verify(@fixture);
+    }
+
+    #[test]
+    #[should_panic(expected: ('xmss auth root mismatch',))]
+    fn test_transfer_rejects_last_input_auth_path_mutation_at_max_inputs() {
+        let mut fixture = build_multi_input_fixture(7_u32);
+        let target = 6_u32 * merkle::AUTH_DEPTH + 3_u32;
+        fixture.auth_siblings_flat = copy_and_mutate(fixture.auth_siblings_flat.span(), target);
         run_verify(@fixture);
     }
 }

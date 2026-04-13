@@ -67,6 +67,19 @@ pub fn prove_single_level(executable_path: &PathBuf) -> Result<(Vec<u8>, Vec<Fel
     Ok((compressed, output_preimage))
 }
 
+/// Same as `prove_single_level` but takes a BigUintAsHex args file path directly.
+pub fn prove_single_level_with_args_file(
+    executable_path: &PathBuf,
+    args_file: Option<PathBuf>,
+) -> Result<(Vec<u8>, Vec<Felt>)> {
+    let (prover_input, output_preimage) = run_privacy_bootloader(executable_path, None, args_file)?;
+    let cairo_proof = prove_cairo::<Blake2sM31MerkleChannel>(prover_input, CAIRO_PROVER_PARAMS)
+        .map_err(|e| anyhow!("{e}"))?;
+    let json_bytes = serde_json::to_vec(&cairo_proof)?;
+    let compressed = zstd::encode_all(&json_bytes[..], 3)?;
+    Ok((compressed, output_preimage))
+}
+
 /// Run a Cairo executable through the privacy bootloader.
 /// `args` is an optional list of felt252 values passed as user_args.
 /// Returns the prover input (execution trace) and public outputs.

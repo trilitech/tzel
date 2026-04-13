@@ -357,8 +357,8 @@
 </li>
 <li><a href="#transaction-types">Transaction Types</a><ul>
 <li><a href="#shield-public-private">Shield (public -&gt; private)</a></li>
-<li><a href="#transfer-n-2-where-1-n-16">Transfer (N-&gt;2, where 1 &lt;= N &lt;= 16)</a></li>
-<li><a href="#unshield-n-withdrawal-optional-change-where-1-n-16">Unshield (N-&gt;withdrawal + optional change, where 1 &lt;= N &lt;= 16)</a></li>
+<li><a href="#transfer-n-2-where-1-n-7">Transfer (N-&gt;2, where 1 &lt;= N &lt;= 7)</a></li>
+<li><a href="#unshield-n-withdrawal-optional-change-where-1-n-7">Unshield (N-&gt;withdrawal + optional change, where 1 &lt;= N &lt;= 7)</a></li>
 </ul>
 </li>
 <li><a href="#contract-consensus-rules">Contract Consensus Rules</a><ul>
@@ -611,7 +611,7 @@ nf          = H_nf(nk_spend_j, H_nf(cm, pos))           — position-dependent n
 <p><code>memo_ct_hash</code> is computed client-side as <code>H(ct_d || tag || ct_v || nonce || encrypted_data)</code> — covering ALL on-chain note data — and passed into the circuit as a public input.</p>
 <p><strong>Contract / ledger checks:</strong> proof valid, sender binding per <a href="#shield-sender-binding">Shield sender binding</a>, <code>H(posted_memo_calldata) == memo_ct_hash</code>.</p>
 <p><strong>State changes:</strong> deduct <code>v_pub</code> from sender, append <code>cm_new</code> to T.</p>
-<h3 id="transfer-n-2-where-1-n-16">Transfer (N-&gt;2, where 1 &lt;= N &lt;= 16)</h3>
+<h3 id="transfer-n-2-where-1-n-7">Transfer (N-&gt;2, where 1 &lt;= N &lt;= 7)</h3>
 <p>Consumes N private notes and creates exactly 2 new private notes. Handles splits (N=1), standard transfers (N=2), and consolidations (N&gt;2) with a single circuit. N is a runtime parameter, not a program parameter — the program hash is the same for all N.</p>
 <p><strong>Public outputs:</strong> <code>[auth_domain, root, nf_0..nf_{N-1}, cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2]</code></p>
 <p>XMSS-style WOTS+ signature verification happens inside the STARK. No auth leaves, public keys, or signatures appear in the public outputs.</p>
@@ -633,7 +633,7 @@ nf          = H_nf(nk_spend_j, H_nf(cm, pos))           — position-dependent n
 4. <code>sum(v_inputs) = v_1 + v_2</code> (in u128)
 5. All values are u64 (implicit range check)</p>
 <p><strong>Contract checks:</strong> proof valid. No signature verification needed — the STARK proof proves spend authorization.</p>
-<h3 id="unshield-n-withdrawal-optional-change-where-1-n-16">Unshield (N-&gt;withdrawal + optional change, where 1 &lt;= N &lt;= 16)</h3>
+<h3 id="unshield-n-withdrawal-optional-change-where-1-n-7">Unshield (N-&gt;withdrawal + optional change, where 1 &lt;= N &lt;= 7)</h3>
 <p>Consumes N private notes, releases <code>v_pub</code> to a public address, and optionally creates one private change note.</p>
 <p><strong>Public outputs:</strong> <code>[auth_domain, root, nf_0..nf_{N-1}, v_pub, recipient_id, cm_change, memo_ct_hash_change]</code></p>
 <p><code>recipient_id</code> is defined in <a href="#public-account-identifier-encoding">Public Account Identifier Encoding</a>.</p>

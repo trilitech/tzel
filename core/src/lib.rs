@@ -1646,7 +1646,7 @@ pub fn apply_transfer<S: LedgerState>(
     req: &TransferReq,
 ) -> Result<TransferResp, String> {
     let n = req.nullifiers.len();
-    if n == 0 || n > 16 {
+    if n == 0 || n > 7 {
         return Err("bad nullifier count".into());
     }
     req.enc_1
@@ -1732,7 +1732,7 @@ pub fn apply_unshield<S: LedgerState>(
     req: &UnshieldReq,
 ) -> Result<UnshieldResp, String> {
     let n = req.nullifiers.len();
-    if n == 0 || n > 16 {
+    if n == 0 || n > 7 {
         return Err("bad nullifier count".into());
     }
     match (req.cm_change == ZERO, req.enc_change.as_ref()) {

@@ -1,6 +1,6 @@
 use crate::{
-    EncryptedNote, NoteMemo, PaymentAddress, ENCRYPTED_NOTE_BYTES, F,
-    ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES,
+    EncryptedNote, NoteMemo, PaymentAddress, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES,
+    NOTE_AEAD_NONCE_BYTES,
 };
 use ml_kem::KeyExport;
 use serde_json::json;

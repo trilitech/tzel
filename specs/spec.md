@@ -222,7 +222,7 @@ This prevents an attacker from creating two identical commitments (same d_j, v, 
 
 **State changes:** deduct `v_pub` from sender, append `cm_new` to T.
 
-### Transfer (N->2, where 1 <= N <= 16)
+### Transfer (N->2, where 1 <= N <= 7)
 
 Consumes N private notes and creates exactly 2 new private notes. Handles splits (N=1), standard transfers (N=2), and consolidations (N>2) with a single circuit. N is a runtime parameter, not a program parameter — the program hash is the same for all N.
 
@@ -250,7 +250,7 @@ XMSS-style WOTS+ signature verification happens inside the STARK. No auth leaves
 
 **Contract checks:** proof valid. No signature verification needed — the STARK proof proves spend authorization.
 
-### Unshield (N->withdrawal + optional change, where 1 <= N <= 16)
+### Unshield (N->withdrawal + optional change, where 1 <= N <= 7)
 
 Consumes N private notes, releases `v_pub` to a public address, and optionally creates one private change note.
 

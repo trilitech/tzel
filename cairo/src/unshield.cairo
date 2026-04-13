@@ -1,4 +1,4 @@
-/// Unshield circuit: N→withdrawal + optional change (1 ≤ N ≤ 16).
+/// Unshield circuit: N→withdrawal + optional change (1 ≤ N ≤ 7).
 ///
 /// # Public outputs
 ///   [auth_domain, root, nf_0..nf_{N-1}, v_pub, recipient_id, cm_change, memo_ct_hash_change]
@@ -9,7 +9,7 @@
 use tzel::blake_hash as hash;
 use tzel::{merkle, xmss_common};
 
-const MAX_INPUTS: u32 = 16;
+const MAX_INPUTS: u32 = 7;
 
 fn change_commitment_or_zero(
     has_change: bool,

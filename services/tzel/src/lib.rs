@@ -2,6 +2,7 @@
 
 pub mod canonical_wire;
 pub mod interop_scenario;
+pub mod proof_bench;
 pub mod protocol_vectors;
 
 pub use tzel_core::*;
@@ -2107,16 +2108,16 @@ mod tests {
         );
     }
 
-    /// Group 5c: transfer and unshield with 16 inputs (max) must succeed, 17 must fail.
+    /// Group 5c: transfer and unshield with 7 inputs (max) must succeed, 8 must fail.
     /// Kills: replace > with ==/>=  in N > MAX_INPUTS check
     #[test]
     fn test_mutant_transfer_max_inputs() {
         let (mut ledger, _, _, root, enc) = setup_with_note();
 
-        // N=16 should be accepted (> mutation turns N > 16 into N == 16, rejecting 16)
-        // We can't easily create 16 real notes, so test the boundary:
-        // N=17 must be rejected
-        let nfs: Vec<F> = (0..17).map(|_| random_felt()).collect();
+        // N=7 should be accepted (> mutation turns N > 7 into N == 7, rejecting 7)
+        // We can't easily create 7 real notes here, so test the boundary:
+        // N=8 must be rejected
+        let nfs: Vec<F> = (0..8).map(|_| random_felt()).collect();
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: nfs,
@@ -2126,14 +2127,14 @@ mod tests {
             enc_2: enc.clone(),
             proof: Proof::TrustMeBro,
         });
-        assert!(r.is_err(), "N=17 transfer must be rejected");
+        assert!(r.is_err(), "N=8 transfer must be rejected");
         assert!(r.unwrap_err().contains("bad nullifier count"));
 
-        // N=16 should pass the count check (may fail on nullifier/root, that's fine)
-        let nfs16: Vec<F> = (0..16).map(|_| random_felt()).collect();
+        // N=7 should pass the count check (may fail on nullifier/root, that's fine)
+        let nfs7: Vec<F> = (0..7).map(|_| random_felt()).collect();
         let r = ledger.transfer(&TransferReq {
             root,
-            nullifiers: nfs16,
+            nullifiers: nfs7,
             cm_1: random_felt(),
             cm_2: random_felt(),
             enc_1: enc.clone(),
@@ -2144,7 +2145,7 @@ mod tests {
         if let Err(e) = &r {
             assert!(
                 !e.contains("bad nullifier count"),
-                "N=16 should pass the count check, got: {}",
+                "N=7 should pass the count check, got: {}",
                 e
             );
         }
@@ -2155,10 +2156,10 @@ mod tests {
     fn test_mutant_unshield_max_inputs() {
         let (mut ledger, _, _, root, _) = setup_with_note();
 
-        let nfs17: Vec<F> = (0..17).map(|_| random_felt()).collect();
+        let nfs8: Vec<F> = (0..8).map(|_| random_felt()).collect();
         let r = ledger.unshield(&UnshieldReq {
             root,
-            nullifiers: nfs17,
+            nullifiers: nfs8,
             v_pub: 100,
             recipient: "alice".into(),
             cm_change: ZERO,
@@ -2168,10 +2169,10 @@ mod tests {
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("bad nullifier count"));
 
-        let nfs16: Vec<F> = (0..16).map(|_| random_felt()).collect();
+        let nfs7: Vec<F> = (0..7).map(|_| random_felt()).collect();
         let r = ledger.unshield(&UnshieldReq {
             root,
-            nullifiers: nfs16,
+            nullifiers: nfs7,
             v_pub: 100,
             recipient: "alice".into(),
             cm_change: ZERO,
@@ -2181,7 +2182,7 @@ mod tests {
         if let Err(e) = &r {
             assert!(
                 !e.contains("bad nullifier count"),
-                "N=16 should pass count check, got: {}",
+                "N=7 should pass count check, got: {}",
                 e
             );
         }

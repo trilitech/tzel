@@ -12,7 +12,8 @@ use anyhow::Result;
 use clap::Parser;
 use tzel_reprover::custom_circuit::ProofBundle;
 use tzel_reprover::{
-    compute_executable_program_hash, prove_single_level, prove_with_args_file,
+    compute_executable_program_hash, prove_single_level, prove_single_level_with_args_file,
+    prove_with_args_file,
 };
 use tracing_subscriber::fmt;
 
@@ -94,7 +95,11 @@ fn main() -> Result<()> {
     if cli.debug_single_level {
         eprintln!("WARNING: single-level mode is NOT zero-knowledge");
         let t_prove = Instant::now();
-        let (compressed, _output_preimage) = prove_single_level(&cli.executable)?;
+        let (compressed, _output_preimage) = if args_file.is_some() {
+            prove_single_level_with_args_file(&cli.executable, args_file)?
+        } else {
+            prove_single_level(&cli.executable)?
+        };
         let prove_ms = t_prove.elapsed().as_millis();
         let peak_mem_kb = get_peak_memory_kb();
         eprintln!("Prove: {}ms, Proof: {} bytes", prove_ms, compressed.len());

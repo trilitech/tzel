@@ -1743,7 +1743,9 @@ mod tests {
 
         run_with_host(&mut host);
 
-        assert!(host.read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES).is_none());
+        assert!(host
+            .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+            .is_none());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("must be a KT1 contract"))
@@ -1795,30 +1797,24 @@ mod tests {
         let encoded = encode_withdrawal_record(&record);
         assert_eq!(decode_withdrawal_record(&encoded).unwrap(), record);
 
-        assert!(
-            decode_withdrawal_record(&encoded[..11])
-                .unwrap_err()
-                .contains("too short")
-        );
+        assert!(decode_withdrawal_record(&encoded[..11])
+            .unwrap_err()
+            .contains("too short"));
 
         let mut bad_len = encoded.clone();
         bad_len[8..12].copy_from_slice(&(999u32).to_le_bytes());
-        assert!(
-            decode_withdrawal_record(&bad_len)
-                .unwrap_err()
-                .contains("length mismatch")
-        );
+        assert!(decode_withdrawal_record(&bad_len)
+            .unwrap_err()
+            .contains("length mismatch"));
 
         let mut bad_utf8 = encode_withdrawal_record(&WithdrawalRecord {
             recipient: "ok".into(),
             amount: 1,
         });
         bad_utf8[12] = 0xFF;
-        assert!(
-            decode_withdrawal_record(&bad_utf8)
-                .unwrap_err()
-                .contains("not UTF-8")
-        );
+        assert!(decode_withdrawal_record(&bad_utf8)
+            .unwrap_err()
+            .contains("not UTF-8"));
     }
 
     #[test]
