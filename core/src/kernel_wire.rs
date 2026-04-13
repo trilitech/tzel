@@ -5,13 +5,13 @@ use crate::canonical_wire::{
 use crate::{
     EncryptedNote, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp, TransferReq,
     TransferResp, UnshieldReq, UnshieldResp, WithdrawReq, WithdrawResp, ENCRYPTED_NOTE_BYTES, F,
-    ML_KEM768_CIPHERTEXT_BYTES,
+    ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES,
 };
 use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 4;
+pub const KERNEL_WIRE_VERSION: u16 = 5;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
 const MAX_MEMO_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = 8 * 1024 * 1024;
@@ -19,7 +19,7 @@ const MAX_OUTPUT_PREIMAGE_ITEMS: usize = 1024;
 const MAX_VERIFY_META_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 const MAX_ENCODED_NOTE_WIRE_BYTES: usize =
-    (ML_KEM768_CIPHERTEXT_BYTES * 2) + ENCRYPTED_NOTE_BYTES + 32;
+    (ML_KEM768_CIPHERTEXT_BYTES * 2) + NOTE_AEAD_NONCE_BYTES + ENCRYPTED_NOTE_BYTES + 32;
 const MAX_ENCODED_PROOF_WIRE_BYTES: usize =
     MAX_PROOF_BYTES + MAX_VERIFY_META_BYTES + (MAX_OUTPUT_PREIMAGE_ITEMS * 64) + 4096;
 const MAX_ENCODED_NULLIFIER_LIST_BYTES: usize = 256 * 1024;
@@ -538,6 +538,7 @@ fn encrypted_note_to_wire(enc: &EncryptedNote) -> Result<WireEncryptedNote, Stri
         ct_d: enc.ct_d.clone(),
         tag: u16_to_wire(enc.tag),
         ct_v: enc.ct_v.clone(),
+        nonce: enc.nonce.clone(),
         encrypted_data: enc.encrypted_data.clone(),
     })
 }
@@ -547,6 +548,7 @@ fn encrypted_note_from_wire(wire: WireEncryptedNote) -> Result<EncryptedNote, St
         ct_d: wire.ct_d,
         tag: wire_to_u16(wire.tag)?,
         ct_v: wire.ct_v,
+        nonce: wire.nonce,
         encrypted_data: wire.encrypted_data,
     };
     enc.validate()?;
@@ -901,12 +903,14 @@ mod tests {
             prop::collection::vec(any::<u8>(), ML_KEM768_CIPHERTEXT_BYTES),
             0u16..((1u16) << DETECT_K),
             prop::collection::vec(any::<u8>(), ML_KEM768_CIPHERTEXT_BYTES),
+            prop::collection::vec(any::<u8>(), NOTE_AEAD_NONCE_BYTES),
             prop::collection::vec(any::<u8>(), ENCRYPTED_NOTE_BYTES),
         )
-            .prop_map(|(ct_d, tag, ct_v, encrypted_data)| EncryptedNote {
+            .prop_map(|(ct_d, tag, ct_v, nonce, encrypted_data)| EncryptedNote {
                 ct_d,
                 tag,
                 ct_v,
+                nonce,
                 encrypted_data,
             })
     }
@@ -1255,6 +1259,7 @@ mod tests {
             ct_d: vec![fill; crate::ML_KEM768_CIPHERTEXT_BYTES],
             tag: 17,
             ct_v: vec![fill ^ 0x5a; crate::ML_KEM768_CIPHERTEXT_BYTES],
+            nonce: vec![fill.wrapping_add(2); crate::NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![fill.wrapping_add(1); crate::ENCRYPTED_NOTE_BYTES],
         }
     }
@@ -1724,6 +1729,7 @@ mod tests {
             ct_d: vec![0; ML_KEM768_CIPHERTEXT_BYTES - 1],
             tag: 0,
             ct_v: vec![0; ML_KEM768_CIPHERTEXT_BYTES],
+            nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0; ENCRYPTED_NOTE_BYTES],
         })
         .unwrap_err();

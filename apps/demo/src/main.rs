@@ -33,7 +33,7 @@ use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
 use ml_kem::kem::{Encapsulate, Kem, TryDecapsulate};
 use ml_kem::ml_kem_768;
 use rand::Rng as _;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 // ═══════════════════════════════════════════════════════════════════════
 // BLAKE2s hashing — uses blake2s_simd with native personalization
@@ -54,6 +54,7 @@ const ZERO: F = [0u8; 32];
 
 /// Detection tag precision: 10-bit tag → ~1/1024 false positive rate.
 const DETECT_K: usize = 10;
+const MAX_VALID_ROOTS: usize = 4096;
 
 /// User memo size: 1024 bytes for arbitrary data (payment refs, messages, etc.).
 /// Padded with zeros if the sender provides less. Set to 0xF6 || zeros for "no memo"
@@ -260,15 +261,27 @@ fn kem_gen() -> (Ek, Dk) {
 ///   ct_d:           1088 bytes  ML-KEM detection ciphertext
 ///   tag:               2 bytes  k-bit detection tag
 ///   ct_v:           1088 bytes  ML-KEM memo ciphertext
+///   nonce:            12 bytes  ChaCha20-Poly1305 nonce
 ///   encrypted_data: 1080 bytes  ChaCha20-Poly1305(v || rseed || user_memo) + 16-byte tag
 ///                  ────────────
-///                   3258 bytes  (~3.2 KB per output note)
+///                   3270 bytes  (~3.2 KB per output note)
 #[derive(Clone)]
 struct EncryptedNote {
     ct_d: Vec<u8>,           // ML-KEM detection ciphertext (~1088 bytes)
     tag: u16,                // k-bit detection tag
     ct_v: Vec<u8>,           // ML-KEM memo ciphertext (~1088 bytes)
+    nonce: Vec<u8>,          // ChaCha20-Poly1305 nonce (12 bytes)
     encrypted_data: Vec<u8>, // AEAD(v:8 || rseed:32 || user_memo:1024) + 16 auth tag
+}
+
+fn derive_note_aead_nonce(aead_key: &F, plaintext: &[u8]) -> [u8; 12] {
+    let mut input = Vec::with_capacity(aead_key.len() + plaintext.len());
+    input.extend_from_slice(aead_key);
+    input.extend_from_slice(plaintext);
+    let digest = blake2s(b"mnonSP__", &input);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&digest[..12]);
+    nonce
 }
 
 /// Encrypt a note for the recipient. The `user_memo` is an arbitrary 1 KB
@@ -308,15 +321,16 @@ fn encrypt_note(
     let (ct_v, ss_v): (ml_kem_768::Ciphertext, _) = ek_v.encapsulate();
     let key = hash(ss_v.as_slice());
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    // Nonce is zero because the key is single-use (fresh KEM encapsulation).
+    let nonce = derive_note_aead_nonce(&key, &plaintext);
     let encrypted_data = cipher
-        .encrypt(Nonce::from_slice(&[0u8; 12]), plaintext.as_slice())
+        .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
         .unwrap();
 
     EncryptedNote {
         ct_d: ct_d.to_vec(),
         tag,
         ct_v: ct_v.to_vec(),
+        nonce: nonce.to_vec(),
         encrypted_data,
     }
 }
@@ -345,7 +359,10 @@ fn decrypt_memo(enc: &EncryptedNote, dk_v: &Dk) -> Option<(u64, F, Vec<u8>)> {
     let key = hash(ss.as_slice());
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
     let pt = cipher
-        .decrypt(Nonce::from_slice(&[0u8; 12]), enc.encrypted_data.as_slice())
+        .decrypt(
+            Nonce::from_slice(enc.nonce.as_slice()),
+            enc.encrypted_data.as_slice(),
+        )
         .ok()?;
     if pt.len() != 8 + 32 + MEMO_SIZE {
         return None;
@@ -618,6 +635,7 @@ struct Chain {
     memo_hashes: HashMap<F, F>,
     balances: HashMap<String, u64>,
     valid_roots: HashSet<F>,
+    root_history: VecDeque<F>,
     memos: Vec<(F, EncryptedNote)>,
 }
 
@@ -625,13 +643,17 @@ impl Chain {
     fn new() -> Self {
         let tree = MerkleTree::new();
         let mut roots = HashSet::new();
-        roots.insert(tree.root());
+        let root = tree.root();
+        roots.insert(root);
+        let mut root_history = VecDeque::new();
+        root_history.push_back(root);
         Self {
             tree,
             nullifiers: HashSet::new(),
             memo_hashes: HashMap::new(),
             balances: HashMap::new(),
             valid_roots: roots,
+            root_history,
             memos: vec![],
         }
     }
@@ -641,7 +663,22 @@ impl Chain {
     }
 
     fn snapshot_root(&mut self) {
-        self.valid_roots.insert(self.tree.root());
+        let root = self.tree.root();
+        if self.valid_roots.contains(&root) {
+            if self.root_history.is_empty() {
+                self.root_history.push_back(root);
+            }
+            return;
+        }
+        self.valid_roots.insert(root);
+        self.root_history.push_back(root);
+        while self.root_history.len() > MAX_VALID_ROOTS {
+            let oldest = self
+                .root_history
+                .pop_front()
+                .expect("root history length checked above");
+            self.valid_roots.remove(&oldest);
+        }
     }
 
     /// Post an encrypted note on-chain: store it and record its memo hash.

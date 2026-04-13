@@ -161,8 +161,9 @@ let test_chacha20_vectors json =
     let value = Int64.of_string (json_string (json_field "v" v)) in
     let rseed = felt_of_hex (json_string (json_field "rseed" v)) in
     let memo = bytes_of_hex (json_string (json_field "memo" v)) in
-    let encrypted = Tzel.Detection.encrypt_memo ~ss_v ~v:value ~rseed ~memo in
-    check_hex (prefix ^ ".encrypted") (json_string (json_field "encrypted_data" v)) encrypted
+    let (nonce, encrypted_data) = Tzel.Detection.encrypt_memo ~ss_v ~v:value ~rseed ~memo in
+    check_hex (prefix ^ ".nonce") (json_string (json_field "nonce" v)) nonce;
+    check_hex (prefix ^ ".encrypted") (json_string (json_field "encrypted_data" v)) encrypted_data
   ) vectors
 
 (* ── Detection tags ── *)
@@ -184,6 +185,7 @@ let test_memo_ct_hash_vectors json =
     ct_d = bytes_of_hex (json_string (json_field "ct_d" v));
     tag = json_int (json_field "tag" v);
     ct_v = bytes_of_hex (json_string (json_field "ct_v" v));
+    nonce = bytes_of_hex (json_string (json_field "nonce" v));
     encrypted_data = bytes_of_hex (json_string (json_field "encrypted_data" v));
   } in
   let mch = Tzel.Encoding.compute_memo_ct_hash enc in
@@ -207,11 +209,12 @@ let test_cross_impl_encrypt_vectors json =
   let value = Int64.of_string (json_string (json_field "v" v)) in
   let rseed = felt_of_hex (json_string (json_field "rseed" v)) in
   let memo = bytes_of_hex (json_string (json_field "memo" v)) in
-  let encrypted_data = Tzel.Detection.encrypt_memo ~ss_v ~v:value ~rseed ~memo in
+  let (nonce, encrypted_data) = Tzel.Detection.encrypt_memo ~ss_v ~v:value ~rseed ~memo in
+  check_hex "nonce" (json_string (json_field "nonce" v)) nonce;
   check_hex "encrypted_data" (json_string (json_field "encrypted_data" v)) encrypted_data;
   let tag = Tzel.Detection.compute_tag ss_d in
   Alcotest.(check int) "tag" (json_int (json_field "tag" v)) tag;
-  let enc : Tzel.Encoding.encrypted_note = { ct_d; tag; ct_v; encrypted_data } in
+  let enc : Tzel.Encoding.encrypted_note = { ct_d; tag; ct_v; nonce; encrypted_data } in
   let mch = Tzel.Encoding.compute_memo_ct_hash enc in
   check_hex "memo_ct_hash" (json_string (json_field "memo_ct_hash" v)) mch
 
@@ -326,6 +329,7 @@ let test_wire_encoding_vectors json =
     ct_d = Bytes.init 1088 (fun i -> Char.chr (i mod 256));
     tag = 42;
     ct_v = Bytes.init 1088 (fun i -> Char.chr ((i + 50) mod 256));
+    nonce = Bytes.make 12 '\xAA';
     encrypted_data = Bytes.init 1080 (fun i -> Char.chr ((i + 100) mod 256));
   } in
   check_hex "encrypted_note" expected_enc (Tzel.Encoding.encode_encrypted_note enc);

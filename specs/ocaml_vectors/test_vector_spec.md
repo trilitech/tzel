@@ -199,7 +199,7 @@ Implementations MUST verify that `decaps(dk, ct) == ss` for each case, where `dk
 
 ## Section: `chacha20`
 
-Tests ChaCha20-Poly1305 AEAD encryption with `nonce = 0` (12 zero bytes).
+Tests ChaCha20-Poly1305 AEAD encryption with the derived note nonce.
 
 **Array of 2 objects:**
 
@@ -210,13 +210,14 @@ Tests ChaCha20-Poly1305 AEAD encryption with `nonce = 0` (12 zero bytes).
 | `v` | string | Value as decimal string |
 | `rseed` | hex felt | 32-byte rseed |
 | `memo` | hex (2048 chars) | 1024-byte memo |
+| `nonce` | hex (24 chars) | 12-byte derived nonce `H_mnon(BLAKE2s(ss_v) || plaintext)[0..12)` |
 | `encrypted_data` | hex (2160 chars) | 1080-byte ciphertext |
 
 **Encryption spec:**
 ```
 aead_key = BLAKE2s-256(ss_v)          // unpersonalized, NOT truncated, raw 32 bytes
-nonce    = 0x000000000000000000000000  // 12 zero bytes
 plaintext = v_le64(8 bytes) || rseed(32 bytes) || memo(1024 bytes)    // 1064 bytes
+nonce    = BLAKE2s-256(personal="mnonSP__", aead_key || plaintext)[0..12)
 encrypted_data = ChaCha20-Poly1305.Encrypt(aead_key, nonce, plaintext)  // 1080 bytes
 ```
 
@@ -244,7 +245,7 @@ Tests detection tag computation.
 
 ## Section: `memo_ct_hash`
 
-Tests `H_memo(ct_d || tag_le || ct_v || encrypted_data)`.
+Tests `H_memo(ct_d || tag_le || ct_v || nonce || encrypted_data)`.
 
 **Single object:**
 
@@ -253,8 +254,9 @@ Tests `H_memo(ct_d || tag_le || ct_v || encrypted_data)`.
 | `ct_d` | hex | 1088 bytes: `byte[i] = i % 256` |
 | `tag` | int | `42` |
 | `ct_v` | hex | 1088 bytes: `byte[i] = (i + 100) % 256` |
+| `nonce` | hex | 12 bytes: `0x44` repeated |
 | `encrypted_data` | hex | 1080 bytes: `byte[i] = (i + 200) % 256` |
-| `memo_ct_hash` | hex felt | `H_memo(ct_d || LE16(42) || ct_v || encrypted_data)` |
+| `memo_ct_hash` | hex felt | `H_memo(ct_d || LE16(42) || ct_v || nonce || encrypted_data)` |
 
 ---
 
@@ -280,18 +282,19 @@ End-to-end test: derives keys from `master_sk`, performs deterministic KEM encap
 | `v` | string | `"42000"` |
 | `rseed` | hex felt | `felt_of_int(777)` |
 | `memo` | hex | `text_memo("cross-impl test")` (1024 bytes) |
+| `nonce` | hex | Derived note nonce |
 | `encrypted_data` | hex | ChaCha20-Poly1305 output (1080 bytes) |
 | `tag` | int | Detection tag from `ss_d` |
-| `memo_ct_hash` | hex felt | `H_memo(ct_d \|\| LE16(tag) \|\| ct_v \|\| encrypted_data)` |
+| `memo_ct_hash` | hex felt | `H_memo(ct_d \|\| LE16(tag) \|\| ct_v \|\| nonce \|\| encrypted_data)` |
 
 **Verification procedure:** an implementation MUST:
 1. Derive `view_seed` and `detect_seed` from `master_sk` and `j=0`
 2. Run `keygen_det` on both seeds, compare `ek_v` and `ek_d`
 3. Run `encaps_derand(ek_v, coins_v)`, compare `ss_v` and `ct_v`
 4. Run `encaps_derand(ek_d, coins_d)`, compare `ss_d` and `ct_d`
-5. Encrypt the memo with `ss_v`, compare `encrypted_data`
+5. Encrypt the memo with `ss_v`, compare `nonce` and `encrypted_data`
 6. Compute detection tag from `ss_d`, compare `tag`
-7. Compute `H_memo(ct_d || LE16(tag) || ct_v || encrypted_data)`, compare `memo_ct_hash`
+7. Compute `H_memo(ct_d || LE16(tag) || ct_v || nonce || encrypted_data)`, compare `memo_ct_hash`
 
 If any step fails, the intermediate values pinpoint the first divergence.
 
@@ -433,15 +436,16 @@ Tests canonical binary serialization byte layout.
 | Field | Type | Description |
 |-------|------|-------------|
 | `payment_address` | hex | 2496-byte PaymentAddress encoding for address j=0 from `master_sk` |
-| `encrypted_note` | hex | 3258-byte EncryptedNote with deterministic fill (see below) |
-| `published_note` | hex | 3290-byte PublishedNote |
-| `note_memo` | hex | 3298-byte NoteMemo with `index=42` |
+| `encrypted_note` | hex | 3270-byte EncryptedNote with deterministic fill (see below) |
+| `published_note` | hex | 3302-byte PublishedNote |
+| `note_memo` | hex | 3310-byte NoteMemo with `index=42` |
 
 **Deterministic EncryptedNote fill:**
 ```
 ct_d[i] = i % 256           for i in 0..1088
 tag = 42
 ct_v[i] = (i + 50) % 256    for i in 0..1088
+nonce[i] = 0xAA             for i in 0..12
 encrypted_data[i] = (i + 100) % 256  for i in 0..1080
 ```
 

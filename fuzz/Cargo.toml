@@ -1,0 +1,44 @@
+[package]
+name = "tzel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+tzel-core = { path = "../core" }
+
+[[bin]]
+name = "decode_wire"
+path = "fuzz_targets/decode_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bootloader_output"
+path = "fuzz_targets/bootloader_output.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "felt_conversions"
+path = "fuzz_targets/felt_conversions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encrypted_note_validate"
+path = "fuzz_targets/encrypted_note_validate.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = []

@@ -211,11 +211,20 @@ static FULL_XMSS_REBUILD_TEST_GUARD: std::sync::OnceLock<std::sync::Mutex<()>> =
 static ALLOW_FULL_XMSS_REBUILD_IN_TESTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+fn full_xmss_test_trap_enabled() -> bool {
+    !ALLOW_FULL_XMSS_REBUILD_IN_TESTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn full_xmss_test_trap_enabled() -> bool {
+    false
+}
+
 fn assert_full_xmss_bds_rebuild_allowed(op: &str, depth: usize) {
     let env_trap = std::env::var_os("TZEL_TRAP_FULL_XMSS_REBUILDS").is_some()
         && std::env::var_os("TZEL_ALLOW_FULL_XMSS_REBUILD").is_none();
-    let test_trap =
-        cfg!(test) && !ALLOW_FULL_XMSS_REBUILD_IN_TESTS.load(std::sync::atomic::Ordering::SeqCst);
+    let test_trap = full_xmss_test_trap_enabled();
     if depth == AUTH_DEPTH && (env_trap || test_trap) {
         panic!(
             "unexpected full depth-{} XMSS/BDS rebuild via {} — default tests must use fixed fixtures or small-depth helpers",

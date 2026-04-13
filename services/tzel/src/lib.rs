@@ -678,6 +678,7 @@ mod tests {
                 ct_d: vec![0; 1088],
                 tag: 0,
                 ct_v: vec![0; 1088],
+                nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
             }),
         });
@@ -914,6 +915,7 @@ mod tests {
                 ct_d: vec![0; 1088],
                 tag: 0,
                 ct_v: vec![0; 1088],
+                nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
             }),
         });
@@ -1188,6 +1190,7 @@ mod tests {
             ct_d: vec![0; 1088],
             tag: 0,
             ct_v: vec![0; 1088],
+            nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0; 1080],
         };
         let mh = memo_ct_hash(&enc);
@@ -1471,12 +1474,14 @@ mod tests {
                 ct_d: vec![0; 1088],
                 tag: 42,
                 ct_v: vec![0; 1088],
+                nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
             },
             enc_2: EncryptedNote {
                 ct_d: vec![0; 1088],
                 tag: 99,
                 ct_v: vec![0; 1088],
+                nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
             },
             proof: Proof::TrustMeBro,
@@ -1554,6 +1559,7 @@ mod tests {
             ct_d: vec![0; 10], // wrong length — should be 1088
             tag: 0,
             ct_v: vec![0; 1088],
+            nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0; 1080],
         };
         assert!(
@@ -1576,6 +1582,7 @@ mod tests {
             ct_d: vec![0; 1088],
             tag: 0,
             ct_v: vec![0; 10], // wrong length
+            nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0; 1080],
         };
         assert!(
@@ -1628,6 +1635,7 @@ mod tests {
             ct_d: vec![0; 10],
             tag: 0,
             ct_v: vec![0; ML_KEM768_CIPHERTEXT_BYTES],
+            nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0; ENCRYPTED_NOTE_BYTES],
         };
         let mut client_cm = ZERO;
@@ -2497,6 +2505,7 @@ mod tests {
             ct_d,
             tag: 42,
             ct_v: vec![0xBB; 1088],
+            nonce: vec![0xDD; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0xCC; 100],
         };
 

@@ -6,23 +6,40 @@
    - Public balance accounts *)
 
 let tree_depth = 48
+let max_valid_roots = 4096
 
 type t = {
   tree : Merkle.tree_with_leaves;
   nullifier_set : (string, unit) Hashtbl.t;
   root_set : (string, unit) Hashtbl.t;
+  root_history : string Queue.t;
   balances : (string, int64) Hashtbl.t;
   auth_domain : Felt.t;
 }
+
+let record_root_with_limit ledger ~max_roots root_hex =
+  if Hashtbl.mem ledger.root_set root_hex then begin
+    if Queue.is_empty ledger.root_history then Queue.push root_hex ledger.root_history
+  end else begin
+    Hashtbl.replace ledger.root_set root_hex ();
+    Queue.push root_hex ledger.root_history;
+    while Queue.length ledger.root_history > max_roots do
+      let oldest = Queue.pop ledger.root_history in
+      Hashtbl.remove ledger.root_set oldest
+    done
+  end
 
 let create ~auth_domain =
   let tree = Merkle.create_with_leaves ~depth:tree_depth in
   let nullifier_set = Hashtbl.create 1024 in
   let root_set = Hashtbl.create 256 in
+  let root_history = Queue.create () in
   let balances = Hashtbl.create 64 in
   let initial_root = Merkle.root_with_leaves tree in
-  Hashtbl.replace root_set (Felt.to_hex initial_root) ();
-  { tree; nullifier_set; root_set; balances; auth_domain }
+  let initial_root_hex = Felt.to_hex initial_root in
+  Hashtbl.replace root_set initial_root_hex ();
+  Queue.push initial_root_hex root_history;
+  { tree; nullifier_set; root_set; root_history; balances; auth_domain }
 
 let get_balance ledger account =
   match Hashtbl.find_opt ledger.balances account with
@@ -38,7 +55,7 @@ let tree_size ledger = Merkle.size_with_leaves ledger.tree
 
 let append_commitment ledger cm =
   let new_root = Merkle.append_with_leaves ledger.tree cm in
-  Hashtbl.replace ledger.root_set (Felt.to_hex new_root) ()
+  record_root_with_limit ledger ~max_roots:max_valid_roots (Felt.to_hex new_root)
 
 let is_valid_root ledger root =
   Hashtbl.mem ledger.root_set (Felt.to_hex root)

@@ -15,6 +15,7 @@
      ct_d:           bytes[1088],
      tag:            u16,
      ct_v:           bytes[1088],
+     nonce:          bytes[12],
      encrypted_data: bytes[1080]
    }
 
@@ -34,6 +35,7 @@ type encrypted_note = {
   ct_d : bytes;           (* 1088 bytes *)
   tag : int;              (* u16 *)
   ct_v : bytes;           (* 1088 bytes *)
+  nonce : bytes;          (* 12 bytes *)
   encrypted_data : bytes; (* 1080 bytes *)
 }
 
@@ -79,15 +81,16 @@ let get_u64_le buf ofs =
   done;
   !r
 
-(* EncryptedNote binary: 1088 + 2 + 1088 + 1080 = 3258 bytes *)
-let encrypted_note_size = 3258
+(* EncryptedNote binary: 1088 + 2 + 1088 + 12 + 1080 = 3270 bytes *)
+let encrypted_note_size = 3270
 
 let encode_encrypted_note enc =
   let buf = Bytes.create encrypted_note_size in
   Bytes.blit enc.ct_d 0 buf 0 1088;
   put_u16_le buf 1088 enc.tag;
   Bytes.blit enc.ct_v 0 buf 1090 1088;
-  Bytes.blit enc.encrypted_data 0 buf 2178 1080;
+  Bytes.blit enc.nonce 0 buf 2178 12;
+  Bytes.blit enc.encrypted_data 0 buf 2190 1080;
   buf
 
 let decode_encrypted_note buf =
@@ -95,11 +98,12 @@ let decode_encrypted_note buf =
   let ct_d = Bytes.sub buf 0 1088 in
   let tag = get_u16_le buf 1088 in
   let ct_v = Bytes.sub buf 1090 1088 in
-  let encrypted_data = Bytes.sub buf 2178 1080 in
-  { ct_d; tag; ct_v; encrypted_data }
+  let nonce = Bytes.sub buf 2178 12 in
+  let encrypted_data = Bytes.sub buf 2190 1080 in
+  { ct_d; tag; ct_v; nonce; encrypted_data }
 
-(* PublishedNote binary: 32 + 3258 = 3290 bytes *)
-let published_note_size = 3290
+(* PublishedNote binary: 32 + 3270 = 3302 bytes *)
+let published_note_size = 3302
 
 let encode_published_note pn =
   let buf = Bytes.create published_note_size in
@@ -114,8 +118,8 @@ let decode_published_note buf =
   let pn_enc = decode_encrypted_note (Bytes.sub buf 32 encrypted_note_size) in
   { pn_cm; pn_enc }
 
-(* NoteMemo binary: 8 + 32 + 3258 = 3298 bytes *)
-let note_memo_size = 3298
+(* NoteMemo binary: 8 + 32 + 3270 = 3310 bytes *)
+let note_memo_size = 3310
 
 let encode_note_memo nm =
   let buf = Bytes.create note_memo_size in
@@ -175,6 +179,7 @@ let encrypted_note_to_json enc =
     "ct_d", `String (hex_of_bytes enc.ct_d);
     "tag", `Int enc.tag;
     "ct_v", `String (hex_of_bytes enc.ct_v);
+    "nonce", `String (hex_of_bytes enc.nonce);
     "encrypted_data", `String (hex_of_bytes enc.encrypted_data);
   ]
 

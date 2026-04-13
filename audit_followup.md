@@ -24,10 +24,10 @@ Disposition of findings from [audit_report.md](/home/arthurb/src/starkprivacy/au
 | `C1` | Fixed | OCaml commitment encoding now matches Rust’s canonical 8-byte `u64` layout and zeroed gap. The OCaml nondeterminism bug from uninitialized gap bytes was also fixed. |
 | `C2` | Partially mitigated | Wallet file permissions are forced to `0600` on Unix, but the wallet is still plaintext and secrets are still not zeroized in memory. README/CLI docs now describe `sp-client` as a developer/test harness rather than a hardened end-user wallet. |
 | `H1` | Partially mitigated | Wallet persistence was already atomic; the new XMSS floor sidecar now catches stale wallet-file restores in the common local case. Full rollback protection still requires stronger external monotonicity. |
-| `M1` | Deferred | Fixed-nonce memo AEAD remains unchanged for now. Any meaningful fix should be thought through with the deterministic test path and spec, not patched casually. |
+| `M1` | Fixed | Note AEAD now carries a 12-byte derived nonce `H_mnon(H(ss_v) || plaintext)[0..12)` on the wire. Rust and OCaml encrypt/decrypt, memo-hash preimages, and canonical encodings were updated together. |
 | `M2` | Fixed | Detection tag comparison was changed to a constant-time style comparison. |
-| `M3` | Deferred | Historical root pruning remains a policy/protocol decision. |
-| `M4` | Deferred | `ml-kem` RC dependency not changed in-tree. |
+| `M3` | Fixed | Historical root retention is now bounded to `MAX_VALID_ROOTS = 4096` in the Rust reference ledger, OCaml ledger, and demo chain, with pruning tests on both Rust and OCaml sides. |
+| `M4` | Mitigated | Upstream still has no `ml-kem` `0.3.0` stable release on crates.io. In-tree dependencies are now pinned exactly to `=0.3.0-rc.2` to avoid silent RC drift until a stable release exists. |
 | `L1` | Fixed | Added a first-principles Rust unit test deriving the Cairo precomputed BLAKE2s IVs from the RFC parameter block and checking the hardcoded constants. |
 | `L2` | Fixed | Rust commitment code now documents the intentional 24-byte zero gap. |
 | `L3` | Accepted | Same-personalization nullifier layering is intentional and unchanged. |
@@ -41,7 +41,7 @@ Disposition of findings from [audit_report.md](/home/arthurb/src/starkprivacy/au
 | --- | --- | --- |
 | `T1` | Fixed | Cairo now has direct unit tests for hash/merkle/XMSS helpers plus statement-level shield/transfer/unshield tests. Mutation-smoke scripts also check that obvious weakened verifier variants are killed by the test suite. |
 | `T2` | Partially fixed | Core crypto property coverage is better than the report counted, more small-depth XMSS/BDS tests were added, and Cairo statement-mutation tests now exercise key binding invariants. More Rust-side invariant/property work is still worthwhile. |
-| `T3` | Deferred | No fuzzing targets added yet. |
+| `T3` | Fixed | Added `cargo-fuzz` targets for canonical wire decoding, bootloader output parsing, felt conversion boundaries, and encrypted-note validation. |
 | `T4` | Resolved | Existing Rust sighash sensitivity coverage already included more fields than the report credited. |
 | `T5` | Resolved | High-index WOTS+ sign/verify tests at `256` and `65535` already exist in Rust. |
 | `T6` | Partially fixed | Wallet unit coverage was expanded substantially around state transitions, BDS behavior, and persistence. Cairo now has direct multi-input transfer/unshield statement tests, but wallet-level multi-input/change witness construction coverage is still not complete. |
@@ -56,5 +56,5 @@ Disposition of findings from [audit_report.md](/home/arthurb/src/starkprivacy/au
 
 1. Add wallet multi-input/change witness unit coverage.
 2. Add a dedicated Rust/OCaml cross-implementation commitment check at `v = u64::MAX`.
-3. Add fuzzing targets for wire decoding, note parsing, and wallet/service boundary inputs.
-4. Decide whether to implement historical root pruning and memo nonce changes as protocol changes rather than local code tweaks.
+3. Add wallet multi-input/change witness unit coverage.
+4. Add a dedicated Rust/OCaml cross-implementation commitment check at `v = u64::MAX`.

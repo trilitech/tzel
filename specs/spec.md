@@ -216,7 +216,7 @@ This prevents an attacker from creating two identical commitments (same d_j, v, 
 2. `owner_tag = H_owner(auth_root, pub_seed, nk_tag)` where `auth_root`, `pub_seed`, and `nk_tag` are private inputs from the recipient's payment address
 3. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
 
-`memo_ct_hash` is computed client-side as `H(ct_d || tag || ct_v || encrypted_data)` — covering ALL on-chain note data — and passed into the circuit as a public input.
+`memo_ct_hash` is computed client-side as `H(ct_d || tag || ct_v || nonce || encrypted_data)` — covering ALL on-chain note data — and passed into the circuit as a public input.
 
 **Contract / ledger checks:** proof valid, sender binding per [Shield sender binding](#shield-sender-binding), `H(posted_memo_calldata) == memo_ct_hash`.
 
@@ -363,7 +363,9 @@ Detection precision `k` is a protocol constant (e.g., k=10). Per note on-chain:
 tag_u16          = LE16(H(ss_d)[0], H(ss_d)[1]) & ((1 << k) - 1)
 tag              = LE16(tag_u16)             — 2-byte little-endian field on chain
 (ss_v, ct_v)     = ML-KEM.Encaps(ek_v_j)     — encapsulate under viewing key
-encrypted_data   = ChaCha20-Poly1305(key=H(ss_v), nonce=0, plaintext=(v || rseed || memo))
+plaintext        = (v || rseed || memo)
+nonce            = H_mnon(H(ss_v) || plaintext)[0..12)
+encrypted_data   = ChaCha20-Poly1305(key=H(ss_v), nonce, plaintext)
 ```
 
 The detection server (with `dk_d_j`) decapsulates `ct_d`, recomputes `tag_u16`, and compares it to the posted little-endian `tag` field. True matches always succeed. Non-matches succeed with probability 2^(-k) (false positives from ML-KEM's implicit rejection).
@@ -393,7 +395,7 @@ The memo is end-to-end encrypted — only the recipient (with `dk_v`) can read i
 
 ## Memo Integrity (Anti-Tampering)
 
-Each circuit includes a `memo_ct_hash` per output note in its public outputs. This is a hash of ALL on-chain note data (`H(ct_d || tag || ct_v || encrypted_data)`), computed **client-side** before proving. The circuit does not compute it — it simply passes it through as a public output. Including the detection ciphertext and tag prevents a relayer from swapping detection data to redirect note discovery.
+Each circuit includes a `memo_ct_hash` per output note in its public outputs. This is a hash of ALL on-chain note data (`H(ct_d || tag || ct_v || nonce || encrypted_data)`), computed **client-side** before proving. The circuit does not compute it — it simply passes it through as a public output. Including the detection ciphertext and tag prevents a relayer from swapping detection data to redirect note discovery.
 
 The on-chain contract verifies `H(posted_calldata) == memo_ct_hash` for each output note. If a malicious relayer or sequencer swaps the encrypted memo data in transit, the hash won't match and the contract rejects the transaction.
 
@@ -406,9 +408,10 @@ cm              —    32 bytes   note commitment
 ct_d            — 1,088 bytes   ML-KEM-768 detection ciphertext
 tag             —     2 bytes   little-endian `u16`; low k bits are the detection tag, high bits are zero
 ct_v            — 1,088 bytes   ML-KEM-768 memo ciphertext
+nonce           —    12 bytes   derived AEAD nonce `H_mnon(H(ss_v) || plaintext)[0..12)`
 encrypted_data  — 1,080 bytes   ChaCha20-Poly1305(v:8 || rseed:32 || memo:1024) + 16 auth tag
                 ---------
-                 3,290 bytes per output note (~3.2 KB)
+                 3,302 bytes per output note (~3.2 KB)
 ```
 
 ## Transaction Format
@@ -549,6 +552,7 @@ EncryptedNote := record {
   ct_d:           bytes[1088],   // ML-KEM-768 ciphertext
   tag:            u16le,         // detection tag, little-endian on the wire
   ct_v:           bytes[1088],   // ML-KEM-768 ciphertext
+  nonce:          bytes[12],     // derived AEAD nonce
   encrypted_data: bytes[1080]    // ChaCha20-Poly1305 ciphertext+tag
 }
 
@@ -621,7 +625,7 @@ Both the commitment tree and auth key tree use left-right BLAKE2s Merkle trees:
 The `memo_ct_hash` public output is defined as:
 
 ```
-memo_ct_hash = H_memo(ct_d || tag_le || ct_v || encrypted_data)
+memo_ct_hash = H_memo(ct_d || tag_le || ct_v || nonce || encrypted_data)
 ```
 
 where:
@@ -629,7 +633,8 @@ where:
 - `ct_d` is the ML-KEM-768 detection ciphertext (1088 bytes)
 - `tag_le` is the 2-byte little-endian encoding of `tag_u16 = LE16(H(ss_d)[0], H(ss_d)[1]) & ((1 << k) - 1)`
 - `ct_v` is the ML-KEM-768 viewing ciphertext (1088 bytes)
+- `nonce` is the 12-byte derived AEAD nonce
 - `encrypted_data` is the ChaCha20-Poly1305 ciphertext (1080 bytes)
 - `H_memo` uses the `memoSP__` personalization, truncated to 251 bits
 
-The on-chain contract verifies that hashing the posted note data (exactly these four fields in this order) produces the `memo_ct_hash` from the proof's public outputs. The commitment (`cm`) is NOT included in this hash — it is verified separately via the commitment binding check.
+The on-chain contract verifies that hashing the posted note data (exactly these five fields in this order) produces the `memo_ct_hash` from the proof's public outputs. The commitment (`cm`) is NOT included in this hash — it is verified separately via the commitment binding check.

@@ -1,5 +1,6 @@
 use crate::{
-    EncryptedNote, NoteMemo, PaymentAddress, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES,
+    EncryptedNote, NoteMemo, PaymentAddress, ENCRYPTED_NOTE_BYTES, F,
+    ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES,
 };
 use ml_kem::KeyExport;
 use serde_json::json;
@@ -7,7 +8,7 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const CANONICAL_WIRE_VERSION: u16 = 1;
+pub const CANONICAL_WIRE_VERSION: u16 = 2;
 pub const FELT252_BYTES: usize = 32;
 pub const ML_KEM768_ENCAPSULATION_KEY_BYTES: usize = 1184;
 
@@ -48,6 +49,8 @@ pub(crate) struct WireEncryptedNote {
     pub(crate) tag: WireU16Le,
     #[encoding(sized = "ML_KEM768_CIPHERTEXT_BYTES", bytes)]
     pub(crate) ct_v: Vec<u8>,
+    #[encoding(sized = "NOTE_AEAD_NONCE_BYTES", bytes)]
+    pub(crate) nonce: Vec<u8>,
     #[encoding(sized = "ENCRYPTED_NOTE_BYTES", bytes)]
     pub(crate) encrypted_data: Vec<u8>,
 }
@@ -170,6 +173,7 @@ pub fn encode_encrypted_note(enc: &EncryptedNote) -> Result<Vec<u8>, String> {
         ct_d: enc.ct_d.clone(),
         tag: u16_to_wire(enc.tag),
         ct_v: enc.ct_v.clone(),
+        nonce: enc.nonce.clone(),
         encrypted_data: enc.encrypted_data.clone(),
     })
 }
@@ -180,6 +184,7 @@ pub fn decode_encrypted_note(bytes: &[u8]) -> Result<EncryptedNote, String> {
         ct_d: wire.ct_d,
         tag: wire_to_u16(wire.tag)?,
         ct_v: wire.ct_v,
+        nonce: wire.nonce,
         encrypted_data: wire.encrypted_data,
     };
     enc.validate()?;
@@ -198,6 +203,7 @@ pub fn encode_note_memo(note: &NoteMemo) -> Result<Vec<u8>, String> {
             ct_d: note.enc.ct_d.clone(),
             tag: u16_to_wire(note.enc.tag),
             ct_v: note.enc.ct_v.clone(),
+            nonce: note.enc.nonce.clone(),
             encrypted_data: note.enc.encrypted_data.clone(),
         },
     })
@@ -212,6 +218,7 @@ pub fn decode_note_memo(bytes: &[u8]) -> Result<NoteMemo, String> {
         ct_d: wire.enc.ct_d,
         tag: wire_to_u16(wire.enc.tag)?,
         ct_v: wire.enc.ct_v,
+        nonce: wire.enc.nonce,
         encrypted_data: wire.enc.encrypted_data,
     };
     enc.validate()?;
@@ -230,6 +237,7 @@ pub fn encode_published_note(cm: &F, enc: &EncryptedNote) -> Result<Vec<u8>, Str
             ct_d: enc.ct_d.clone(),
             tag: u16_to_wire(enc.tag),
             ct_v: enc.ct_v.clone(),
+            nonce: enc.nonce.clone(),
             encrypted_data: enc.encrypted_data.clone(),
         },
     })
@@ -241,6 +249,7 @@ pub fn decode_published_note(bytes: &[u8]) -> Result<(F, EncryptedNote), String>
         ct_d: wire.enc.ct_d,
         tag: wire_to_u16(wire.enc.tag)?,
         ct_v: wire.enc.ct_v,
+        nonce: wire.enc.nonce,
         encrypted_data: wire.enc.encrypted_data,
     };
     enc.validate()?;

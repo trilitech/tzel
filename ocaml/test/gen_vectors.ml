@@ -159,8 +159,9 @@ let gen_mlkem_encaps_derand () =
   ) coins_list)
 
 (* ── ChaCha20-Poly1305 ──
-   Deterministic given (key, nonce=0, plaintext). We test with known
-   key bytes derived from BLAKE2s so both impls can reproduce. *)
+   Deterministic given (key, plaintext) because the nonce is derived as
+   H_mnon(key || plaintext)[0..12). We test with known key bytes derived
+   from BLAKE2s so both impls can reproduce. *)
 
 let gen_chacha20 () =
   let cases = [
@@ -171,14 +172,15 @@ let gen_chacha20 () =
   ] in
   `List (List.mapi (fun i (key_tag, v, rseed, memo) ->
     let ss_v = Tzel.Blake2s.hash_string key_tag in
-    let encrypted = Tzel.Detection.encrypt_memo ~ss_v ~v ~rseed ~memo in
+    let (nonce, encrypted_data) = Tzel.Detection.encrypt_memo ~ss_v ~v ~rseed ~memo in
     `Assoc [
       "case", jint i;
       "ss_v", jhex ss_v;
       "v", jstr (Int64.to_string v);
       "rseed", jhex rseed;
       "memo", jhex memo;
-      "encrypted_data", jhex encrypted;
+      "nonce", jhex nonce;
+      "encrypted_data", jhex encrypted_data;
     ]
   ) cases)
 
@@ -198,13 +200,14 @@ let gen_detection_tags () =
   ) shared_secrets)
 
 (* ── Memo hash (memo_ct_hash) ──
-   H_memo(ct_d || tag_le || ct_v || encrypted_data) is deterministic. *)
+   H_memo(ct_d || tag_le || ct_v || nonce || encrypted_data) is deterministic. *)
 
 let gen_memo_ct_hash () =
   let enc : Tzel.Encoding.encrypted_note = {
     ct_d = Bytes.init 1088 (fun i -> Char.chr (i mod 256));
     tag = 42;
     ct_v = Bytes.init 1088 (fun i -> Char.chr ((i + 100) mod 256));
+    nonce = Bytes.make 12 '\x44';
     encrypted_data = Bytes.init 1080 (fun i -> Char.chr ((i + 200) mod 256));
   } in
   let mch = Tzel.Encoding.compute_memo_ct_hash enc in
@@ -212,6 +215,7 @@ let gen_memo_ct_hash () =
     "ct_d", jhex enc.ct_d;
     "tag", jint enc.tag;
     "ct_v", jhex enc.ct_v;
+    "nonce", jhex enc.nonce;
     "encrypted_data", jhex enc.encrypted_data;
     "memo_ct_hash", jhex mch;
   ]
@@ -235,9 +239,9 @@ let gen_cross_impl_encrypt () =
   let v = 42000L in
   let rseed = Tzel.Felt.of_u64 777 in
   let memo = Tzel.Detection.text_memo "cross-impl test" in
-  let encrypted_data = Tzel.Detection.encrypt_memo ~ss_v ~v ~rseed ~memo in
+  let (nonce, encrypted_data) = Tzel.Detection.encrypt_memo ~ss_v ~v ~rseed ~memo in
   let tag = Tzel.Detection.compute_tag ss_d in
-  let enc : Tzel.Encoding.encrypted_note = { ct_d; tag; ct_v; encrypted_data } in
+  let enc : Tzel.Encoding.encrypted_note = { ct_d; tag; ct_v; nonce; encrypted_data } in
   let mch = Tzel.Encoding.compute_memo_ct_hash enc in
   `Assoc [
     "master_sk", jhex master_sk;
@@ -254,6 +258,7 @@ let gen_cross_impl_encrypt () =
     "v", jstr (Int64.to_string v);
     "rseed", jhex rseed;
     "memo", jhex memo;
+    "nonce", jhex nonce;
     "encrypted_data", jhex encrypted_data;
     "tag", jint tag;
     "memo_ct_hash", jhex mch;
@@ -379,6 +384,7 @@ let gen_wire_encoding () =
     ct_d = Bytes.init 1088 (fun i -> Char.chr (i mod 256));
     tag = 42;
     ct_v = Bytes.init 1088 (fun i -> Char.chr ((i + 50) mod 256));
+    nonce = Bytes.make 12 '\xAA';
     encrypted_data = Bytes.init 1080 (fun i -> Char.chr ((i + 100) mod 256));
   } in
   let enc_bytes = Tzel.Encoding.encode_encrypted_note enc in

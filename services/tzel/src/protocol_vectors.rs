@@ -4,10 +4,10 @@ use crate::canonical_wire::{
 use crate::{
     auth_key_seed, build_auth_tree, commit, derive_account, derive_address, derive_ask,
     derive_auth_pub_seed, derive_kem_detect_seed, derive_kem_keys, derive_kem_view_seed,
-    derive_nk_spend, derive_nk_tag, derive_rcm, hash, hash_merkle, hash_two, kem_keygen_from_seed,
-    memo_ct_hash, nullifier, owner_tag, sighash_fold, wots_pk, wots_pk_to_leaf, wots_sign, Account,
-    EncryptedNote, NoteMemo, PaymentAddress, DETECT_K, ENCRYPTED_NOTE_BYTES, F,
-    ML_KEM768_CIPHERTEXT_BYTES, ZERO,
+    derive_nk_spend, derive_nk_tag, derive_note_aead_nonce, derive_rcm, hash, hash_merkle,
+    hash_two, kem_keygen_from_seed, memo_ct_hash, nullifier, owner_tag, sighash_fold, wots_pk,
+    wots_pk_to_leaf, wots_sign, Account, EncryptedNote, NoteMemo, PaymentAddress, DETECT_K,
+    ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES, ZERO,
 };
 use blake2s_simd::Params;
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
@@ -56,16 +56,23 @@ fn memo_text(s: &str) -> Vec<u8> {
     out
 }
 
-fn encrypt_with_shared_secret(ss_v_raw: &[u8; 32], v: u64, rseed: &F, memo: &[u8]) -> Vec<u8> {
+fn encrypt_with_shared_secret(
+    ss_v_raw: &[u8; 32],
+    v: u64,
+    rseed: &F,
+    memo: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
     let key = raw_blake2s(ss_v_raw, None);
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
     let mut plaintext = Vec::with_capacity(8 + 32 + crate::MEMO_SIZE);
     plaintext.extend_from_slice(&v.to_le_bytes());
     plaintext.extend_from_slice(rseed);
     plaintext.extend_from_slice(memo);
-    cipher
-        .encrypt(Nonce::from_slice(&[0u8; 12]), plaintext.as_slice())
-        .unwrap()
+    let nonce = derive_note_aead_nonce(&key, &plaintext);
+    let encrypted_data = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
+        .unwrap();
+    (nonce.to_vec(), encrypted_data)
 }
 
 fn detection_tag_from_ss(ss_d: &[u8]) -> u16 {
@@ -184,6 +191,7 @@ fn deterministic_wire_note() -> EncryptedNote {
         ct_d,
         tag: 42,
         ct_v,
+        nonce: vec![0xAA; NOTE_AEAD_NONCE_BYTES],
         encrypted_data,
     }
 }
@@ -352,13 +360,15 @@ pub fn generate_protocol_v1_value() -> Value {
             cases
                 .into_iter()
                 .map(|(case, ss_v, v, rseed, memo)| {
-                    let encrypted_data = encrypt_with_shared_secret(&ss_v, v, &rseed, &memo);
+                    let (nonce, encrypted_data) =
+                        encrypt_with_shared_secret(&ss_v, v, &rseed, &memo);
                     json!({
                         "case": case,
                         "ss_v": hex_bytes(ss_v),
                         "v": v.to_string(),
                         "rseed": hex_felt(&rseed),
                         "memo": hex_bytes(&memo),
+                        "nonce": hex_bytes(&nonce),
                         "encrypted_data": hex_bytes(encrypted_data),
                     })
                 })
@@ -398,12 +408,14 @@ pub fn generate_protocol_v1_value() -> Value {
             ct_d: ct_d.clone(),
             tag: 42,
             ct_v: ct_v.clone(),
+            nonce: vec![0xCC; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: encrypted_data.clone(),
         };
         json!({
             "ct_d": hex_bytes(ct_d),
             "tag": 42,
             "ct_v": hex_bytes(ct_v),
+            "nonce": hex_bytes(&enc.nonce),
             "encrypted_data": hex_bytes(encrypted_data),
             "memo_ct_hash": hex_felt(&memo_ct_hash(&enc)),
         })
@@ -417,12 +429,13 @@ pub fn generate_protocol_v1_value() -> Value {
         let v = 42_000u64;
         let rseed = felt_of_u64(777);
         let memo = memo_text("cross-impl test");
-        let encrypted_data =
+        let (nonce, encrypted_data) =
             encrypt_with_shared_secret(ss_v.as_slice().try_into().unwrap(), v, &rseed, &memo);
         let enc = EncryptedNote {
             ct_d: ct_d.to_vec(),
             tag: detection_tag_from_ss(ss_d.as_slice()),
             ct_v: ct_v.to_vec(),
+            nonce: nonce.clone(),
             encrypted_data: encrypted_data.clone(),
         };
         json!({
@@ -440,6 +453,7 @@ pub fn generate_protocol_v1_value() -> Value {
             "v": v.to_string(),
             "rseed": hex_felt(&rseed),
             "memo": hex_bytes(&memo),
+            "nonce": hex_bytes(&nonce),
             "encrypted_data": hex_bytes(&encrypted_data),
             "tag": enc.tag,
             "memo_ct_hash": hex_felt(&memo_ct_hash(&enc)),

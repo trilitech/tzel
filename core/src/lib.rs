@@ -9,7 +9,7 @@ use ml_kem::kem::{Encapsulate, TryDecapsulate};
 use ml_kem::ml_kem_768;
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Core types
@@ -19,7 +19,9 @@ pub type F = [u8; 32];
 pub const ZERO: F = [0u8; 32];
 pub const DETECT_K: usize = 10;
 pub const ML_KEM768_CIPHERTEXT_BYTES: usize = 1088;
+pub const NOTE_AEAD_NONCE_BYTES: usize = 12;
 pub const ENCRYPTED_NOTE_BYTES: usize = 8 + 32 + MEMO_SIZE + 16;
+pub const MAX_VALID_ROOTS: usize = 4096;
 
 /// Generate a random valid felt252 (251-bit value).
 pub fn random_felt() -> F {
@@ -278,13 +280,25 @@ pub fn unshield_sighash(
 /// Covers detection ciphertext, tag, viewing ciphertext, and encrypted payload.
 /// A relayer cannot swap any component without invalidating the hash.
 pub fn memo_ct_hash(enc: &EncryptedNote) -> F {
-    let mut buf =
-        Vec::with_capacity(enc.ct_d.len() + 2 + enc.ct_v.len() + enc.encrypted_data.len());
+    let mut buf = Vec::with_capacity(
+        enc.ct_d.len() + 2 + enc.ct_v.len() + enc.nonce.len() + enc.encrypted_data.len(),
+    );
     buf.extend_from_slice(&enc.ct_d);
     buf.extend_from_slice(&enc.tag.to_le_bytes());
     buf.extend_from_slice(&enc.ct_v);
+    buf.extend_from_slice(&enc.nonce);
     buf.extend_from_slice(&enc.encrypted_data);
     blake2s(b"memoSP__", &buf)
+}
+
+pub fn derive_note_aead_nonce(aead_key: &F, plaintext: &[u8]) -> [u8; NOTE_AEAD_NONCE_BYTES] {
+    let mut input = Vec::with_capacity(aead_key.len() + plaintext.len());
+    input.extend_from_slice(aead_key);
+    input.extend_from_slice(plaintext);
+    let digest = blake2s(b"mnonSP__", &input);
+    let mut nonce = [0u8; NOTE_AEAD_NONCE_BYTES];
+    nonce.copy_from_slice(&digest[..NOTE_AEAD_NONCE_BYTES]);
+    nonce
 }
 
 pub fn short(f: &F) -> String {
@@ -787,6 +801,8 @@ pub struct EncryptedNote {
     #[serde(with = "hex_bytes")]
     pub ct_v: Vec<u8>,
     #[serde(with = "hex_bytes")]
+    pub nonce: Vec<u8>,
+    #[serde(with = "hex_bytes")]
     pub encrypted_data: Vec<u8>,
 }
 
@@ -804,6 +820,13 @@ impl EncryptedNote {
                 "bad ct_v length: got {} bytes, expected {}",
                 self.ct_v.len(),
                 ML_KEM768_CIPHERTEXT_BYTES
+            ));
+        }
+        if self.nonce.len() != NOTE_AEAD_NONCE_BYTES {
+            return Err(format!(
+                "bad nonce length: got {} bytes, expected {}",
+                self.nonce.len(),
+                NOTE_AEAD_NONCE_BYTES
             ));
         }
         if self.encrypted_data.len() != ENCRYPTED_NOTE_BYTES {
@@ -852,14 +875,16 @@ pub fn encrypt_note(
     let (ct_v, ss_v): (ml_kem_768::Ciphertext, _) = ek_v.encapsulate();
     let key = hash(ss_v.as_slice());
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let nonce = derive_note_aead_nonce(&key, &plaintext);
     let encrypted_data = cipher
-        .encrypt(Nonce::from_slice(&[0u8; 12]), plaintext.as_slice())
+        .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
         .unwrap();
 
     EncryptedNote {
         ct_d: ct_d.to_vec(),
         tag,
         ct_v: ct_v.to_vec(),
+        nonce: nonce.to_vec(),
         encrypted_data,
     }
 }
@@ -897,14 +922,16 @@ pub fn encrypt_note_deterministic(
     let (ct_v, ss_v): (ml_kem_768::Ciphertext, _) = ek_v.encapsulate_deterministic(&view_m);
     let key = hash(ss_v.as_slice());
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let nonce = derive_note_aead_nonce(&key, &plaintext);
     let encrypted_data = cipher
-        .encrypt(Nonce::from_slice(&[0u8; 12]), plaintext.as_slice())
+        .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
         .unwrap();
 
     EncryptedNote {
         ct_d: ct_d.to_vec(),
         tag,
         ct_v: ct_v.to_vec(),
+        nonce: nonce.to_vec(),
         encrypted_data,
     }
 }
@@ -926,7 +953,10 @@ pub fn decrypt_memo(enc: &EncryptedNote, dk_v: &Dk) -> Option<(u64, F, Vec<u8>)>
     let key = hash(ss.as_slice());
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
     let pt = cipher
-        .decrypt(Nonce::from_slice(&[0u8; 12]), enc.encrypted_data.as_slice())
+        .decrypt(
+            Nonce::from_slice(enc.nonce.as_slice()),
+            enc.encrypted_data.as_slice(),
+        )
         .ok()?;
     if pt.len() != 8 + 32 + MEMO_SIZE {
         return None;
@@ -1367,6 +1397,8 @@ pub struct Ledger {
     pub nullifiers: HashSet<F>,
     pub balances: HashMap<String, u64>,
     pub valid_roots: HashSet<F>,
+    #[serde(default)]
+    pub root_history: VecDeque<F>,
     pub memos: Vec<(F, EncryptedNote)>,
     pub withdrawals: Vec<WithdrawalRecord>,
 }
@@ -1391,20 +1423,42 @@ impl Ledger {
     pub fn with_auth_domain(auth_domain: F) -> Self {
         let tree = MerkleTree::new();
         let mut roots = HashSet::new();
-        roots.insert(tree.root());
+        let root = tree.root();
+        roots.insert(root);
+        let mut root_history = VecDeque::new();
+        root_history.push_back(root);
         Self {
             auth_domain,
             tree,
             nullifiers: HashSet::new(),
             balances: HashMap::new(),
             valid_roots: roots,
+            root_history,
             memos: vec![],
             withdrawals: vec![],
         }
     }
 
+    fn record_valid_root_with_limit(&mut self, root: F, max_valid_roots: usize) {
+        if self.valid_roots.contains(&root) {
+            if self.root_history.is_empty() {
+                self.root_history.push_back(root);
+            }
+            return;
+        }
+        self.valid_roots.insert(root);
+        self.root_history.push_back(root);
+        while self.root_history.len() > max_valid_roots {
+            let oldest = self
+                .root_history
+                .pop_front()
+                .expect("root history length checked above");
+            self.valid_roots.remove(&oldest);
+        }
+    }
+
     fn snapshot_root_local(&mut self) {
-        self.valid_roots.insert(self.tree.root());
+        self.record_valid_root_with_limit(self.tree.root(), MAX_VALID_ROOTS);
     }
 
     fn post_note_local(&mut self, cm: F, enc: EncryptedNote) {
@@ -2756,5 +2810,23 @@ mod tests {
         assert!(err.contains("insufficient balance"));
         assert_eq!(ledger.balance("bob").unwrap(), 10);
         assert!(ledger.withdrawals.is_empty());
+    }
+
+    #[test]
+    fn test_valid_root_history_prunes_oldest_anchor() {
+        let mut ledger = Ledger::new();
+        let initial_root = ledger.tree.root();
+
+        ledger.record_valid_root_with_limit(u(101), 3);
+        ledger.record_valid_root_with_limit(u(102), 3);
+        assert!(ledger.valid_roots.contains(&initial_root));
+        ledger.record_valid_root_with_limit(u(103), 3);
+
+        assert!(!ledger.valid_roots.contains(&initial_root));
+        assert!(ledger.valid_roots.contains(&u(101)));
+        assert!(ledger.valid_roots.contains(&u(102)));
+        assert!(ledger.valid_roots.contains(&u(103)));
+        assert_eq!(ledger.root_history.len(), 3);
+        assert_eq!(ledger.valid_roots.len(), 3);
     }
 }

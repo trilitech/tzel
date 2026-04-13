@@ -7,7 +7,8 @@
 
    Memo encryption:
      (ss_v, ct_v) = ML-KEM.Encaps(ek_v_j)
-     encrypted_data = ChaCha20-Poly1305(key=H(ss_v), nonce=0, plaintext=(v:8 || rseed:32 || memo:1024))
+     nonce        = H_mnon(H(ss_v) || plaintext)[0..12)
+     encrypted_data = ChaCha20-Poly1305(key=H(ss_v), nonce, plaintext=(v:8 || rseed:32 || memo:1024))
 *)
 
 let detection_precision = 10  (* k = 10 *)
@@ -64,22 +65,27 @@ let decode_plaintext pt =
   let memo = Bytes.sub pt 40 memo_size in
   (!v, rseed, memo)
 
+let derive_note_aead_nonce ~(aead_key : bytes) ~(plaintext : bytes) =
+  let input = Bytes.create (Bytes.length aead_key + Bytes.length plaintext) in
+  Bytes.blit aead_key 0 input 0 (Bytes.length aead_key);
+  Bytes.blit plaintext 0 input (Bytes.length aead_key) (Bytes.length plaintext);
+  Bytes.sub (Hash.hash_personalized "mnonSP__" input) 0 12
+
 (* Encrypt memo data using ChaCha20-Poly1305 *)
 let encrypt_memo ~(ss_v : bytes) ~(v : int64) ~(rseed : Felt.t) ~(memo : bytes) =
-  let key_bytes = Blake2s.hash ss_v in
+  let key_bytes = Hash.hash_bytes ss_v in
   let key = Mirage_crypto.Chacha20.of_secret (Bytes.to_string key_bytes) in
-  let nonce = String.make 12 '\x00' in
   let plaintext = encode_plaintext v rseed memo in
-  let ct = Mirage_crypto.Chacha20.authenticate_encrypt ~key ~nonce
+  let nonce = derive_note_aead_nonce ~aead_key:key_bytes ~plaintext in
+  let ct = Mirage_crypto.Chacha20.authenticate_encrypt ~key ~nonce:(Bytes.to_string nonce)
     (Bytes.to_string plaintext) in
-  Bytes.of_string ct
+  (nonce, Bytes.of_string ct)
 
 (* Decrypt memo data *)
-let decrypt_memo ~(ss_v : bytes) ~(encrypted_data : bytes) =
-  let key_bytes = Blake2s.hash ss_v in
+let decrypt_memo ~(ss_v : bytes) ~(nonce : bytes) ~(encrypted_data : bytes) =
+  let key_bytes = Hash.hash_bytes ss_v in
   let key = Mirage_crypto.Chacha20.of_secret (Bytes.to_string key_bytes) in
-  let nonce = String.make 12 '\x00' in
-  match Mirage_crypto.Chacha20.authenticate_decrypt ~key ~nonce
+  match Mirage_crypto.Chacha20.authenticate_decrypt ~key ~nonce:(Bytes.to_string nonce)
     (Bytes.to_string encrypted_data) with
   | Some pt -> Some (decode_plaintext (Bytes.of_string pt))
   | None -> None
@@ -104,11 +110,11 @@ let encrypt_note ~(ek_v : Mlkem.encapsulation_key) ~(ek_d : Mlkem.encapsulation_
   let (ss_d, ct_d) = Mlkem.encaps ek_d in
   let tag = compute_tag ss_d in
   let (ss_v, ct_v) = Mlkem.encaps ek_v in
-  let encrypted_data = encrypt_memo ~ss_v ~v ~rseed ~memo in
-  let enc : Encoding.encrypted_note = { ct_d; tag; ct_v; encrypted_data } in
+  let (nonce, encrypted_data) = encrypt_memo ~ss_v ~v ~rseed ~memo in
+  let enc : Encoding.encrypted_note = { ct_d; tag; ct_v; nonce; encrypted_data } in
   enc
 
 (* Decrypt a note (recipient with dk_v) *)
 let decrypt_note ~(dk_v : Mlkem.decapsulation_key) (enc : Encoding.encrypted_note) =
   let ss_v = Mlkem.decaps dk_v enc.ct_v in
-  decrypt_memo ~ss_v ~encrypted_data:enc.encrypted_data
+  decrypt_memo ~ss_v ~nonce:enc.nonce ~encrypted_data:enc.encrypted_data

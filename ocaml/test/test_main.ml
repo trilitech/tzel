@@ -1191,9 +1191,9 @@ let test_encrypt_memo_decrypt_memo () =
   let v = 12345L in
   let rseed = Tzel.Felt.of_u64 42 in
   let memo = Tzel.Detection.text_memo "test memo" in
-  let ct = Tzel.Detection.encrypt_memo ~ss_v ~v ~rseed ~memo in
+  let (nonce, ct) = Tzel.Detection.encrypt_memo ~ss_v ~v ~rseed ~memo in
   Alcotest.(check int) "ct size" Tzel.Detection.ciphertext_data_size (Bytes.length ct);
-  match Tzel.Detection.decrypt_memo ~ss_v ~encrypted_data:ct with
+  match Tzel.Detection.decrypt_memo ~ss_v ~nonce ~encrypted_data:ct with
   | None -> Alcotest.fail "decrypt failed"
   | Some (v', rseed', memo') ->
     Alcotest.(check int64) "value" v v';
@@ -1203,10 +1203,10 @@ let test_encrypt_memo_decrypt_memo () =
 let test_decrypt_wrong_key () =
   let ss1 = Tzel.Blake2s.hash_string "key1" in
   let ss2 = Tzel.Blake2s.hash_string "key2" in
-  let ct = Tzel.Detection.encrypt_memo
+  let (nonce, ct) = Tzel.Detection.encrypt_memo
     ~ss_v:ss1 ~v:100L ~rseed:(Tzel.Felt.of_u64 1)
     ~memo:(Tzel.Detection.no_memo ()) in
-  let result = Tzel.Detection.decrypt_memo ~ss_v:ss2 ~encrypted_data:ct in
+  let result = Tzel.Detection.decrypt_memo ~ss_v:ss2 ~nonce ~encrypted_data:ct in
   Alcotest.(check bool) "wrong key -> None" true (result = None)
 
 (* ══════════════════════════════════════════════════════════════════════
@@ -1218,6 +1218,7 @@ let test_encoding_encrypted_note () =
     ct_d = Bytes.make 1088 '\x01';
     tag = 42;
     ct_v = Bytes.make 1088 '\x02';
+    nonce = Bytes.make 12 '\x04';
     encrypted_data = Bytes.make 1080 '\x03';
   } in
   let wire = Tzel.Encoding.encode_encrypted_note enc in
@@ -1226,13 +1227,15 @@ let test_encoding_encrypted_note () =
   Alcotest.(check int) "tag" 42 dec.tag;
   Alcotest.(check bool) "ct_d" true (Bytes.equal enc.ct_d dec.ct_d);
   Alcotest.(check bool) "ct_v" true (Bytes.equal enc.ct_v dec.ct_v);
+  Alcotest.(check bool) "nonce" true (Bytes.equal enc.nonce dec.nonce);
   Alcotest.(check bool) "encrypted_data" true (Bytes.equal enc.encrypted_data dec.encrypted_data)
 
 let test_encoding_published_note () =
   let cm = Tzel.Hash.hash_tag "test-cm" in
   let enc : Tzel.Encoding.encrypted_note = {
     ct_d = Bytes.make 1088 '\xAA'; tag = 1023;
-    ct_v = Bytes.make 1088 '\xBB'; encrypted_data = Bytes.make 1080 '\xCC';
+    ct_v = Bytes.make 1088 '\xBB'; nonce = Bytes.make 12 '\xDD';
+    encrypted_data = Bytes.make 1080 '\xCC';
   } in
   let pn = { Tzel.Encoding.pn_cm = cm; pn_enc = enc } in
   let wire = Tzel.Encoding.encode_published_note pn in
@@ -1245,7 +1248,8 @@ let test_encoding_note_memo () =
   let cm = Tzel.Hash.hash_tag "test-cm" in
   let enc : Tzel.Encoding.encrypted_note = {
     ct_d = Bytes.make 1088 '\x00'; tag = 7;
-    ct_v = Bytes.make 1088 '\x00'; encrypted_data = Bytes.make 1080 '\x00';
+    ct_v = Bytes.make 1088 '\x00'; nonce = Bytes.make 12 '\x00';
+    encrypted_data = Bytes.make 1080 '\x00';
   } in
   let nm = { Tzel.Encoding.nm_index = 42L; nm_cm = cm; nm_enc = enc } in
   let wire = Tzel.Encoding.encode_note_memo nm in
@@ -1302,7 +1306,8 @@ let test_payment_address_wire () =
 let test_memo_ct_hash_deterministic () =
   let enc : Tzel.Encoding.encrypted_note = {
     ct_d = Bytes.make 1088 '\x11'; tag = 42;
-    ct_v = Bytes.make 1088 '\x22'; encrypted_data = Bytes.make 1080 '\x33';
+    ct_v = Bytes.make 1088 '\x22'; nonce = Bytes.make 12 '\x44';
+    encrypted_data = Bytes.make 1080 '\x33';
   } in
   let h1 = Tzel.Encoding.compute_memo_ct_hash enc in
   let h2 = Tzel.Encoding.compute_memo_ct_hash enc in
@@ -1311,12 +1316,13 @@ let test_memo_ct_hash_deterministic () =
 let test_encoding_json_encrypted_note () =
   let enc : Tzel.Encoding.encrypted_note = {
     ct_d = Bytes.make 1088 '\x01'; tag = 42;
-    ct_v = Bytes.make 1088 '\x02'; encrypted_data = Bytes.make 1080 '\x03';
+    ct_v = Bytes.make 1088 '\x02'; nonce = Bytes.make 12 '\x04';
+    encrypted_data = Bytes.make 1080 '\x03';
   } in
   let json = Tzel.Encoding.encrypted_note_to_json enc in
   match json with
   | `Assoc fields ->
-    Alcotest.(check int) "4 fields" 4 (List.length fields);
+    Alcotest.(check int) "5 fields" 5 (List.length fields);
     let tag_val = List.assoc "tag" fields in
     Alcotest.(check int) "tag" 42 (match tag_val with `Int n -> n | _ -> -1)
   | _ -> Alcotest.fail "expected Assoc"
@@ -1325,7 +1331,8 @@ let test_encoding_json_published_note () =
   let cm = Tzel.Hash.hash_tag "cm" in
   let enc : Tzel.Encoding.encrypted_note = {
     ct_d = Bytes.make 1088 '\x00'; tag = 0;
-    ct_v = Bytes.make 1088 '\x00'; encrypted_data = Bytes.make 1080 '\x00';
+    ct_v = Bytes.make 1088 '\x00'; nonce = Bytes.make 12 '\x00';
+    encrypted_data = Bytes.make 1080 '\x00';
   } in
   let pn = { Tzel.Encoding.pn_cm = cm; pn_enc = enc } in
   let json = Tzel.Encoding.published_note_to_json pn in
@@ -1621,6 +1628,21 @@ let test_ledger_root_history () =
   Alcotest.(check bool) "old root still valid" true (Tzel.Ledger.is_valid_root ledger r0);
   Alcotest.(check bool) "fake root invalid" false
     (Tzel.Ledger.is_valid_root ledger (Tzel.Hash.hash_tag "fake"))
+
+let test_ledger_root_history_prunes_oldest () =
+  let ledger = Tzel.Ledger.create ~auth_domain:Tzel.Felt.zero in
+  let initial_root = Tzel.Ledger.current_root ledger in
+  let r1 = Tzel.Felt.of_u64 101 in
+  let r2 = Tzel.Felt.of_u64 102 in
+  let r3 = Tzel.Felt.of_u64 103 in
+  Tzel.Ledger.record_root_with_limit ledger ~max_roots:3 (Tzel.Felt.to_hex r1);
+  Tzel.Ledger.record_root_with_limit ledger ~max_roots:3 (Tzel.Felt.to_hex r2);
+  Alcotest.(check bool) "initial still valid" true (Tzel.Ledger.is_valid_root ledger initial_root);
+  Tzel.Ledger.record_root_with_limit ledger ~max_roots:3 (Tzel.Felt.to_hex r3);
+  Alcotest.(check bool) "initial pruned" false (Tzel.Ledger.is_valid_root ledger initial_root);
+  Alcotest.(check bool) "r1 valid" true (Tzel.Ledger.is_valid_root ledger r1);
+  Alcotest.(check bool) "r2 valid" true (Tzel.Ledger.is_valid_root ledger r2);
+  Alcotest.(check bool) "r3 valid" true (Tzel.Ledger.is_valid_root ledger r3)
 
 let test_ledger_check_nullifiers_empty () =
   let ledger = Tzel.Ledger.create ~auth_domain:Tzel.Felt.zero in
@@ -2090,6 +2112,7 @@ let () =
       Alcotest.test_case "unshield change memo mismatch" `Quick test_ledger_unshield_change_memo_mismatch;
       Alcotest.test_case "balance default" `Quick test_ledger_balance_default;
       Alcotest.test_case "root history" `Quick test_ledger_root_history;
+      Alcotest.test_case "root history prunes oldest" `Quick test_ledger_root_history_prunes_oldest;
       Alcotest.test_case "empty nullifiers" `Quick test_ledger_check_nullifiers_empty;
     ];
     "prover", [
