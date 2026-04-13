@@ -56,5 +56,5 @@ Disposition of findings from [audit_report.md](/home/arthurb/src/starkprivacy/au
 
 1. Add wallet multi-input/change witness unit coverage.
 2. Add a dedicated Rust/OCaml cross-implementation commitment check at `v = u64::MAX`.
-3. Add wallet multi-input/change witness unit coverage.
-4. Add a dedicated Rust/OCaml cross-implementation commitment check at `v = u64::MAX`.
+3. Decide whether the reference ledger needs any operational rate limiting at all, or whether that concern should stay explicitly out of scope.
+4. Decide whether wallet cleanup/submission atomicity is worth addressing in the developer/test client, or simply documenting as a known UX limitation.
