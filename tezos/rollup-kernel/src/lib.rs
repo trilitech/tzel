@@ -706,22 +706,22 @@ fn apply_input_message<H: Host>(host: &mut H, input: &InputMessage) -> KernelRes
         ParsedRollupMessage::Kernel(KernelInboxMessage::Withdraw(req)) => {
             (|| -> Result<KernelResult, String> {
                 let host_req = kernel_withdraw_req_to_host(&req);
-                let resp = apply_withdraw(&mut ledger, &host_req)?;
-                let record = ledger
-                    .host
-                    .read_store(
-                        &indexed_path(PATH_WITHDRAWAL_PREFIX, resp.withdrawal_index as u64),
-                        MAX_INPUT_BYTES,
-                    )
-                    .ok_or_else(|| "missing persisted withdrawal record".to_string())?;
                 let ticketer = ledger
                     .read_string(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)?
                     .ok_or_else(|| "bridge ticketer is not configured".to_string())?;
+                let balance = ledger.balance(&host_req.sender)?;
+                if balance < host_req.amount {
+                    return Err("insufficient balance".into());
+                }
                 let outbox = encode_withdrawal_outbox_message(
                     &ticketer,
-                    &decode_withdrawal_record(&record)?,
+                    &WithdrawalRecord {
+                        recipient: host_req.recipient.clone(),
+                        amount: host_req.amount,
+                    },
                 )?;
                 ledger.host.write_output(&outbox)?;
+                let resp = apply_withdraw(&mut ledger, &host_req)?;
                 Ok(KernelResult::Withdraw(resp))
             })()
         }
@@ -1029,6 +1029,7 @@ mod tests {
         store: HashMap<Vec<u8>, Vec<u8>>,
         outputs: Vec<Vec<u8>>,
         debug: String,
+        fail_output: Option<String>,
     }
 
     impl MockHost {
@@ -1055,6 +1056,9 @@ mod tests {
         }
 
         fn write_output(&mut self, value: &[u8]) -> Result<(), String> {
+            if let Some(message) = self.fail_output.take() {
+                return Err(message);
+            }
             self.outputs.push(value.to_vec());
             Ok(())
         }
@@ -1357,6 +1361,77 @@ mod tests {
     }
 
     #[test]
+    fn withdraw_output_failure_does_not_mutate_ledger() {
+        let mut host = MockHost::default();
+        host.fail_output = Some("outbox full".into());
+        install_test_bridge(&mut host);
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            apply_deposit(&mut state, "bob", 44).unwrap();
+        }
+
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
+                sender: "bob".into(),
+                recipient: sample_l1_receiver().into(),
+                amount: 33,
+            }))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 3,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.balances.get("bob"), Some(&44));
+        assert!(ledger.withdrawals.is_empty());
+        assert!(host.outputs.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => assert!(message.contains("outbox full")),
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn withdraw_invalid_l1_recipient_does_not_mutate_ledger() {
+        let mut host = MockHost::default();
+        install_test_bridge(&mut host);
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            apply_deposit(&mut state, "bob", 44).unwrap();
+        }
+
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
+                sender: "bob".into(),
+                recipient: "not-a-contract".into(),
+                amount: 33,
+            }))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 4,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.balances.get("bob"), Some(&44));
+        assert!(ledger.withdrawals.is_empty());
+        assert!(host.outputs.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("invalid withdrawal recipient contract"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
     fn configures_bridge_ticketer_via_kernel_message() {
         let mut host = MockHost::default();
         let message =
@@ -1413,6 +1488,32 @@ mod tests {
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
+    }
+
+    #[test]
+    fn configures_auth_domain_on_pristine_ledger() {
+        let mut host = MockHost::default();
+        let new_domain = sample_felt(0x55);
+        let config = KernelVerifierConfig {
+            auth_domain: new_domain,
+            verified_program_hashes: sample_program_hashes(),
+        };
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::ConfigureVerifier(config)).unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 8,
+            id: 1,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.auth_domain, new_domain);
+        assert!(matches!(
+            read_last_result(&host).unwrap(),
+            KernelResult::Configured
+        ));
     }
 
     #[test]
@@ -1489,6 +1590,351 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_deposit_from_unexpected_ticketer() {
+        let mut host = MockHost::default();
+        install_test_bridge(&mut host);
+        host.inputs.push_back(InputMessage {
+            level: 9,
+            id: 0,
+            payload: encode_custom_ticket_deposit_message(
+                b"alice".to_vec(),
+                12,
+                sample_other_ticketer(),
+                sample_other_ticketer(),
+                0,
+                None,
+            ),
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert!(ledger.balances.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("unexpected ticketer"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_ticket_deposit_with_nonzero_token_id() {
+        let mut host = MockHost::with_inputs(vec![InputMessage {
+            level: 10,
+            id: 1,
+            payload: encode_custom_ticket_deposit_message(
+                b"alice".to_vec(),
+                12,
+                sample_ticketer(),
+                sample_ticketer(),
+                1,
+                None,
+            ),
+        }]);
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert!(ledger.balances.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("token_id must be 0"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_ticket_deposit_with_creator_sender_mismatch() {
+        let mut host = MockHost::with_inputs(vec![InputMessage {
+            level: 10,
+            id: 4,
+            payload: encode_custom_ticket_deposit_message(
+                b"alice".to_vec(),
+                12,
+                sample_other_ticketer(),
+                sample_ticketer(),
+                0,
+                None,
+            ),
+        }]);
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert!(ledger.balances.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("creator does not match transfer sender"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_ticket_deposit_with_metadata() {
+        let mut host = MockHost::with_inputs(vec![InputMessage {
+            level: 10,
+            id: 2,
+            payload: encode_custom_ticket_deposit_message(
+                b"alice".to_vec(),
+                12,
+                sample_ticketer(),
+                sample_ticketer(),
+                0,
+                Some(vec![0xAA]),
+            ),
+        }]);
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert!(ledger.balances.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("metadata must be None"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_ticket_deposit_with_non_utf8_recipient() {
+        let mut host = MockHost::with_inputs(vec![InputMessage {
+            level: 10,
+            id: 3,
+            payload: encode_custom_ticket_deposit_message(
+                vec![0xFF, 0xFE],
+                12,
+                sample_ticketer(),
+                sample_ticketer(),
+                0,
+                None,
+            ),
+        }]);
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert!(ledger.balances.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("receiver is not UTF-8"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_implicit_bridge_ticketer_configuration() {
+        let mut host = MockHost::default();
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
+                ticketer: sample_l1_receiver().into(),
+            }))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 11,
+            id: 0,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        assert!(host.read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES).is_none());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("must be a KT1 contract"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_bridge_ticketer_reconfiguration_after_state_exists() {
+        let mut host = MockHost::default();
+        install_test_bridge(&mut host);
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            apply_deposit(&mut state, "alice", 3).unwrap();
+        }
+
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
+                ticketer: sample_other_ticketer().into(),
+            }))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 12,
+            id: 0,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let persisted = host
+            .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+            .expect("bridge ticketer persists");
+        assert_eq!(String::from_utf8(persisted).unwrap(), sample_ticketer());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("cannot change bridge ticketer"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn withdrawal_record_roundtrip_and_decode_guards() {
+        let record = WithdrawalRecord {
+            recipient: sample_l1_receiver().into(),
+            amount: 33,
+        };
+        let encoded = encode_withdrawal_record(&record);
+        assert_eq!(decode_withdrawal_record(&encoded).unwrap(), record);
+
+        assert!(
+            decode_withdrawal_record(&encoded[..11])
+                .unwrap_err()
+                .contains("too short")
+        );
+
+        let mut bad_len = encoded.clone();
+        bad_len[8..12].copy_from_slice(&(999u32).to_le_bytes());
+        assert!(
+            decode_withdrawal_record(&bad_len)
+                .unwrap_err()
+                .contains("length mismatch")
+        );
+
+        let mut bad_utf8 = encode_withdrawal_record(&WithdrawalRecord {
+            recipient: "ok".into(),
+            amount: 1,
+        });
+        bad_utf8[12] = 0xFF;
+        assert!(
+            decode_withdrawal_record(&bad_utf8)
+                .unwrap_err()
+                .contains("not UTF-8")
+        );
+    }
+
+    #[test]
+    fn read_ledger_rejects_bad_persisted_auth_domain_length() {
+        let mut host = MockHost::default();
+        host.write_store(PATH_AUTH_DOMAIN, &[1u8; 31]);
+
+        let err = match read_ledger(&host) {
+            Ok(_) => panic!("bad auth_domain must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("bad persisted auth_domain"));
+    }
+
+    #[test]
+    fn read_ledger_rejects_missing_persisted_note() {
+        let mut host = MockHost::default();
+        host.write_store(PATH_TREE_SIZE, &1u64.to_le_bytes());
+
+        let err = match read_ledger(&host) {
+            Ok(_) => panic!("missing persisted note must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("missing persisted note 0"));
+    }
+
+    #[test]
+    fn read_ledger_rejects_bad_persisted_nullifier_width() {
+        let mut host = MockHost::default();
+        host.write_store(PATH_NULLIFIER_COUNT, &1u64.to_le_bytes());
+        host.write_store(&indexed_path(PATH_NULLIFIER_INDEX_PREFIX, 0), &[7u8; 31]);
+
+        let err = match read_ledger(&host) {
+            Ok(_) => panic!("bad persisted nullifier width must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("bad persisted nullifier 0"));
+    }
+
+    #[test]
+    fn read_ledger_rejects_bad_persisted_root_width() {
+        let mut host = MockHost::default();
+        host.write_store(PATH_VALID_ROOT_COUNT, &1u64.to_le_bytes());
+        host.write_store(&indexed_path(PATH_VALID_ROOT_INDEX_PREFIX, 0), &[9u8; 31]);
+
+        let err = match read_ledger(&host) {
+            Ok(_) => panic!("bad persisted root width must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("bad persisted root 0"));
+    }
+
+    #[test]
+    fn read_ledger_rejects_non_utf8_balance_key() {
+        let mut host = MockHost::default();
+        host.write_store(PATH_BALANCE_ACCOUNT_COUNT, &1u64.to_le_bytes());
+        host.write_store(&indexed_path(PATH_BALANCE_INDEX_PREFIX, 0), &[0xFF, 0xFE]);
+
+        let err = match read_ledger(&host) {
+            Ok(_) => panic!("non-UTF-8 balance key must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("not UTF-8"));
+    }
+
+    #[test]
+    fn read_ledger_rejects_missing_persisted_withdrawal() {
+        let mut host = MockHost::default();
+        host.write_store(PATH_WITHDRAWAL_COUNT, &1u64.to_le_bytes());
+
+        let err = match read_ledger(&host) {
+            Ok(_) => panic!("missing persisted withdrawal must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("missing persisted withdrawal 0"));
+    }
+
+    #[test]
+    fn read_ledger_rejects_bad_persisted_withdrawal_record() {
+        let mut host = MockHost::default();
+        host.write_store(PATH_WITHDRAWAL_COUNT, &1u64.to_le_bytes());
+        host.write_store(&indexed_path(PATH_WITHDRAWAL_PREFIX, 0), &[1u8; 11]);
+
+        let err = match read_ledger(&host) {
+            Ok(_) => panic!("bad persisted withdrawal record must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("withdrawal record too short"));
+    }
+
+    #[test]
+    fn read_last_input_returns_none_when_payload_is_missing() {
+        let mut host = MockHost::default();
+        host.write_store(PATH_LAST_INPUT_LEVEL, &7i32.to_le_bytes());
+        host.write_store(PATH_LAST_INPUT_ID, &3i32.to_le_bytes());
+        host.write_store(PATH_LAST_INPUT_LEN, &4u32.to_le_bytes());
+
+        assert!(read_last_input(&host).is_none());
+    }
+
+    #[test]
+    fn read_verifier_config_rejects_invalid_bytes() {
+        let mut host = MockHost::default();
+        host.write_store(PATH_VERIFIER_CONFIG, &[0x01, 0x02, 0x03]);
+
+        assert!(read_verifier_config(&host).is_err());
+    }
+
+    #[test]
+    fn read_last_result_ignores_invalid_bytes() {
+        let mut host = MockHost::default();
+        host.write_store(PATH_LAST_RESULT, &[0xFF, 0x00, 0xAA]);
+
+        assert!(read_last_result(&host).is_none());
+    }
+
     fn sample_payment_address() -> PaymentAddress {
         let mut master_sk = [0u8; 32];
         master_sk[0] = 7;
@@ -1525,6 +1971,10 @@ mod tests {
         "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc"
     }
 
+    fn sample_other_ticketer() -> &'static str {
+        "KT1RJ6PbjHpwc3M5rw5s2Nbmefwbuwbdxton"
+    }
+
     fn sample_l1_receiver() -> &'static str {
         "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx"
     }
@@ -1552,16 +2002,38 @@ mod tests {
     }
 
     fn encode_ticket_deposit_message(recipient: &str, amount: u64) -> Vec<u8> {
-        let ticketer = TezosContract::from_b58check(sample_ticketer()).unwrap();
-        let sender = match ticketer.clone() {
+        encode_custom_ticket_deposit_message(
+            recipient.as_bytes().to_vec(),
+            amount,
+            sample_ticketer(),
+            sample_ticketer(),
+            0,
+            None,
+        )
+    }
+
+    fn encode_custom_ticket_deposit_message(
+        recipient: Vec<u8>,
+        amount: u64,
+        creator_ticketer: &str,
+        sender_ticketer: &str,
+        token_id: i32,
+        metadata: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        let creator = TezosContract::from_b58check(creator_ticketer).unwrap();
+        let sender_contract = TezosContract::from_b58check(sender_ticketer).unwrap();
+        let sender = match sender_contract {
             TezosContract::Originated(kt1) => kt1,
             TezosContract::Implicit(_) => panic!("ticketer must be KT1"),
         };
         let payload = MichelsonPair(
-            MichelsonBytes(recipient.as_bytes().to_vec()),
+            MichelsonBytes(recipient),
             FA2_1Ticket::new(
-                ticketer,
-                MichelsonPair(MichelsonInt::from(0i32), MichelsonOption(None)),
+                creator,
+                MichelsonPair(
+                    MichelsonInt::from(token_id),
+                    MichelsonOption(metadata.map(MichelsonBytes)),
+                ),
                 amount,
             )
             .unwrap(),

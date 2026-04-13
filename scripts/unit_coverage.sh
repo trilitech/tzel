@@ -34,6 +34,8 @@ llvm_bin_for_toolchain() {
 
 export TZEL_TRAP_FULL_XMSS_REBUILDS=1
 
+# Unit coverage only: run default unit-test binaries directly and keep ignored
+# slow tests out of the default coverage/CI path.
 COMPONENTS=(
   "core|cargo test -p tzel-core --lib --no-run --message-format=json|$ROOT/core/src||measure"
   "verifier|cargo +nightly-2025-07-14 test -p tzel-verifier --lib --no-run --message-format=json|$ROOT/verifier/src|+nightly-2025-07-14|measure"
@@ -41,6 +43,7 @@ COMPONENTS=(
   "wallet|cargo test -p tzel-wallet-app --bin sp-client --no-run --message-format=json|$ROOT/apps/wallet/src||measure"
   "ledger|cargo test -p tzel-ledger-app --bin sp-ledger --no-run --message-format=json|$ROOT/apps/ledger/src||measure"
   "demo|cargo test -p tzel-demo --no-run --message-format=json|$ROOT/apps/demo/src||measure"
+  "rollup-kernel|cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --lib --no-run --message-format=json|$ROOT/tezos/rollup-kernel/src|+nightly-2025-07-14|measure"
   "reprover||$ROOT/services/reprover/src|+nightly-2025-07-14|no-unit-tests"
   "prover-app||$ROOT/apps/prover/src|+nightly-2025-07-14|no-unit-tests"
 )
@@ -115,9 +118,8 @@ for line in open(sys.argv[1], "r", encoding="utf-8"):
     exe = obj.get("executable")
     if not exe or exe in seen:
         continue
-    target = obj.get("target") or {}
-    kinds = target.get("kind") or []
-    if "test" in kinds or "lib" in kinds or "bin" in kinds:
+    profile = obj.get("profile") or {}
+    if profile.get("test"):
         seen.add(exe)
         print(exe)
 PY
@@ -200,9 +202,11 @@ for entry in "${COMPONENTS[@]}"; do
 done
 
 OCAML_COVERAGE_DIR="$WORKDIR/ocaml-coverage"
-OCAML_SRC_DIR="$WORKDIR/ocaml-src"
-mkdir -p "$OCAML_COVERAGE_DIR"
+OCAML_REPO_DIR="$WORKDIR/ocaml-repo"
+OCAML_SRC_DIR="$OCAML_REPO_DIR/ocaml"
+mkdir -p "$OCAML_COVERAGE_DIR" "$OCAML_REPO_DIR/specs"
 cp -a "$ROOT/ocaml" "$OCAML_SRC_DIR"
+cp -a "$ROOT/specs/test_vectors" "$OCAML_REPO_DIR/specs/test_vectors"
 rm -rf "$OCAML_SRC_DIR/_build"
 python3 - "$OCAML_SRC_DIR/dune" "$OCAML_SRC_DIR/test/dune" "$ROOT/ocaml/vendor/mlkem-native/test/build" <<'PY'
 from pathlib import Path
@@ -233,12 +237,12 @@ root_new = """(library
 test_old = """(test
  (name test_main)
  (modules test_main)
- (libraries tzel alcotest hex mirage-crypto))
+ (libraries tzel alcotest hex mirage-crypto yojson))
 """
 test_new = """(test
  (name test_main)
  (modules test_main)
- (libraries tzel alcotest hex mirage-crypto)
+ (libraries tzel alcotest hex mirage-crypto yojson)
  (preprocess (pps bisect_ppx)))
 """
 
