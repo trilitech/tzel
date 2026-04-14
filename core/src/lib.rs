@@ -5,8 +5,9 @@ pub mod kernel_wire;
 
 use blake2s_simd::Params;
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
-use ml_kem::kem::{Encapsulate, TryDecapsulate};
+use ml_kem::kem::TryDecapsulate;
 use ml_kem::ml_kem_768;
+#[cfg(not(target_arch = "wasm32"))]
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -24,6 +25,7 @@ pub const ENCRYPTED_NOTE_BYTES: usize = 8 + 32 + MEMO_SIZE + 16;
 pub const MAX_VALID_ROOTS: usize = 4096;
 
 /// Generate a random valid felt252 (251-bit value).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn random_felt() -> F {
     let mut rng = rand::rng();
     let mut f: F = rng.random();
@@ -94,6 +96,24 @@ pub mod hex_bytes {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
         hex::decode(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+pub mod hex_bytes_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(b: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match b {
+            Some(bytes) => s.serialize_some(&hex::encode(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let maybe = Option::<String>::deserialize(d)?;
+        maybe
+            .map(|s| hex::decode(&s).map_err(serde::de::Error::custom))
+            .transpose()
     }
 }
 
@@ -853,39 +873,52 @@ pub fn encrypt_note(
     ek_v: &Ek,
     ek_d: &Ek,
 ) -> EncryptedNote {
-    let (ct_d, ss_d): (ml_kem_768::Ciphertext, _) = ek_d.encapsulate();
-    let tag_hash = hash(ss_d.as_slice());
-    let tag = u16::from_le_bytes([tag_hash[0], tag_hash[1]]) & ((1 << DETECT_K) - 1);
-
-    let mut plaintext = Vec::with_capacity(8 + 32 + MEMO_SIZE);
-    plaintext.extend_from_slice(&v.to_le_bytes());
-    plaintext.extend_from_slice(rseed);
-    let mut memo_padded = vec![0u8; MEMO_SIZE];
-    match user_memo {
-        Some(m) => {
-            let len = m.len().min(MEMO_SIZE);
-            memo_padded[..len].copy_from_slice(&m[..len]);
-        }
-        None => {
-            memo_padded[0] = 0xF6;
-        }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (v, rseed, user_memo, ek_v, ek_d);
+        unreachable!("encrypt_note is not available on wasm32; use client-provided shield notes");
     }
-    plaintext.extend_from_slice(&memo_padded);
 
-    let (ct_v, ss_v): (ml_kem_768::Ciphertext, _) = ek_v.encapsulate();
-    let key = hash(ss_v.as_slice());
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    let nonce = derive_note_aead_nonce(&key, &plaintext);
-    let encrypted_data = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
-        .unwrap();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let detect_ephemeral: [u8; 32] = rand::rng().random();
+        let view_ephemeral: [u8; 32] = rand::rng().random();
+        let detect_m = ml_kem::array::Array::from(detect_ephemeral);
+        let view_m = ml_kem::array::Array::from(view_ephemeral);
+        let (ct_d, ss_d): (ml_kem_768::Ciphertext, _) = ek_d.encapsulate_deterministic(&detect_m);
+        let tag_hash = hash(ss_d.as_slice());
+        let tag = u16::from_le_bytes([tag_hash[0], tag_hash[1]]) & ((1 << DETECT_K) - 1);
 
-    EncryptedNote {
-        ct_d: ct_d.to_vec(),
-        tag,
-        ct_v: ct_v.to_vec(),
-        nonce: nonce.to_vec(),
-        encrypted_data,
+        let mut plaintext = Vec::with_capacity(8 + 32 + MEMO_SIZE);
+        plaintext.extend_from_slice(&v.to_le_bytes());
+        plaintext.extend_from_slice(rseed);
+        let mut memo_padded = vec![0u8; MEMO_SIZE];
+        match user_memo {
+            Some(m) => {
+                let len = m.len().min(MEMO_SIZE);
+                memo_padded[..len].copy_from_slice(&m[..len]);
+            }
+            None => {
+                memo_padded[0] = 0xF6;
+            }
+        }
+        plaintext.extend_from_slice(&memo_padded);
+
+        let (ct_v, ss_v): (ml_kem_768::Ciphertext, _) = ek_v.encapsulate_deterministic(&view_m);
+        let key = hash(ss_v.as_slice());
+        let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+        let nonce = derive_note_aead_nonce(&key, &plaintext);
+        let encrypted_data = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
+            .unwrap();
+
+        EncryptedNote {
+            ct_d: ct_d.to_vec(),
+            tag,
+            ct_v: ct_v.to_vec(),
+            nonce: nonce.to_vec(),
+            encrypted_data,
+        }
     }
 }
 
@@ -1116,10 +1149,9 @@ pub enum Proof {
         /// Public outputs (raw felt252 values) — the circuit commits to these.
         #[serde(with = "hex_f_vec")]
         output_preimage: Vec<F>,
-        /// Verification metadata — everything needed for standalone ~50ms verification.
-        /// Serialized ProofConfig, CircuitConfig, CircuitPublicData.
-        #[serde(default)]
-        verify_meta: Option<serde_json::Value>,
+        /// Verification metadata as a typed binary blob.
+        #[serde(default, with = "hex_bytes_opt")]
+        verify_meta: Option<Vec<u8>>,
     },
 }
 
@@ -1607,6 +1639,15 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
     let (cm, enc) = if req.client_cm != ZERO && req.client_enc.is_some() {
         (req.client_cm, req.client_enc.clone().unwrap())
     } else {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return Err(
+                "shield on wasm requires client_cm and client_enc (kernel cannot fabricate encrypted notes)".into(),
+            );
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
         let ek_v = ml_kem_768::EncapsulationKey::new(
             req.address
                 .ek_v
@@ -1633,6 +1674,7 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
         let cm = commit(&req.address.d_j, req.v, &rcm, &otag);
         let memo_bytes = req.memo.as_ref().map(|s| s.as_bytes());
         (cm, encrypt_note(req.v, &rseed, memo_bytes, &ek_v, &ek_d))
+        }
     };
 
     state.set_balance(&req.sender, bal - req.v)?;

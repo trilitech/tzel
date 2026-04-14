@@ -6,6 +6,14 @@
 //! - inbox-driven state transitions using the shared Rust `Ledger`
 //! - direct proof verification through the shared verifier crate
 
+#[cfg(target_arch = "wasm32")]
+fn tzel_kernel_getrandom_unsupported(_: &mut [u8]) -> Result<(), getrandom::Error> {
+    Err(getrandom::Error::UNSUPPORTED)
+}
+
+#[cfg(target_arch = "wasm32")]
+getrandom::register_custom_getrandom!(tzel_kernel_getrandom_unsupported);
+
 use tezos_data_encoding_05::enc::BinWriter as _;
 use tezos_smart_rollup_encoding::{
     contract::Contract as TezosContract,
@@ -1577,7 +1585,7 @@ mod tests {
         let proof = KernelStarkProof {
             proof_bytes: vec![0x00, 0x11, 0x22],
             output_preimage: vec![[9u8; 32], [10u8; 32]],
-            verify_meta: serde_json::json!({"proof_config": {"foo": 1}}),
+            verify_meta: vec![1, 2, 3],
         };
 
         let err = verifier
@@ -2069,7 +2077,7 @@ mod tests {
         KernelStarkProof {
             proof_bytes: b"kernel-test-skip-verify".to_vec(),
             output_preimage: vec![],
-            verify_meta: serde_json::Value::Null,
+            verify_meta: vec![],
         }
     }
 
@@ -2077,7 +2085,7 @@ mod tests {
         KernelStarkProof {
             proof_bytes: vec![0x00, 0x11, 0x22],
             output_preimage: vec![[9u8; 32], [10u8; 32]],
-            verify_meta: serde_json::json!({"proof_config": {"foo": 1}}),
+            verify_meta: vec![1, 2, 3],
         }
     }
 

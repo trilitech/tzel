@@ -6,6 +6,7 @@ pub mod proof_bench;
 pub mod protocol_vectors;
 
 pub use tzel_core::*;
+use tzel_verifier::{ProofBundle as VerifyProofBundle, decode_verify_meta};
 
 use std::path::{Path, PathBuf};
 
@@ -137,22 +138,18 @@ fn verify_stark_proof(reprove_bin: &str, proof: &Proof) -> Result<(), String> {
 fn encode_verify_bundle_json(
     proof_bytes: &Vec<u8>,
     output_preimage: &Vec<F>,
-    verify_meta: &Option<serde_json::Value>,
-) -> Result<Vec<u8>, serde_json::Error> {
-    #[derive(serde::Serialize)]
-    struct VerifyBundle<'a> {
-        #[serde(with = "hex_bytes")]
-        proof_bytes: &'a Vec<u8>,
-        #[serde(with = "hex_f_vec")]
-        output_preimage: &'a Vec<F>,
-        verify_meta: &'a Option<serde_json::Value>,
-    }
-
-    serde_json::to_vec(&VerifyBundle {
-        proof_bytes,
-        output_preimage,
+    verify_meta: &Option<Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    let verify_meta = verify_meta
+        .as_ref()
+        .map(|bytes| decode_verify_meta(bytes))
+        .transpose()?;
+    serde_json::to_vec(&VerifyProofBundle {
+        proof_bytes: proof_bytes.clone(),
+        output_preimage: output_preimage.clone(),
         verify_meta,
     })
+    .map_err(|e| e.to_string())
 }
 
 fn compute_program_hash(reprove_bin: &str, executable: &Path) -> Result<F, String> {

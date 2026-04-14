@@ -697,6 +697,16 @@ let test_key_xmss_subtree_root_small_depth () =
   Alcotest.(check bool) "small xmss root matches manual reduction" true
     (Tzel.Felt.equal manual_root subtree_root)
 
+let test_key_xmss_subtree_root_height_zero_is_leaf () =
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 18) in
+  let ask_j = Tzel.Keys.derive_ask keys 0 in
+  let pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
+  let key_idx = 7 in
+  let leaf = Tzel.Keys.auth_leaf_hash ask_j key_idx in
+  let subtree_root = Tzel.Keys.xmss_subtree_root ask_j pub_seed key_idx 0 in
+  Alcotest.(check bool) "height-0 subtree root is the auth leaf" true
+    (Tzel.Felt.equal leaf subtree_root)
+
 let test_key_xmss_root_and_path_inner_small_depth () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 19) in
   let ask_j = Tzel.Keys.derive_ask keys 0 in
@@ -725,6 +735,20 @@ let test_key_xmss_root_and_path_inner_nonzero_start () =
     Alcotest.(check bool) (Printf.sprintf "offset xmss path %d" idx) true
       (Tzel.Felt.equal root recomputed)
   done
+
+let test_key_xmss_root_and_path_inner_outside_subtree_returns_none () =
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 23) in
+  let ask_j = Tzel.Keys.derive_ask keys 0 in
+  let pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
+  let start = 8 in
+  let depth = 3 in
+  let target = 3 in
+  let (root, path) = Tzel.Keys.xmss_root_and_path_inner ask_j pub_seed start depth target in
+  let subtree_root = Tzel.Keys.xmss_subtree_root ask_j pub_seed start depth in
+  Alcotest.(check bool) "outside-subtree query returns no path" true
+    (Option.is_none path);
+  Alcotest.(check bool) "outside-subtree root still matches subtree root" true
+    (Tzel.Felt.equal root subtree_root)
 
 let test_key_xmss_subtree_root_nonzero_start () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 25) in
@@ -2060,8 +2084,10 @@ let () =
       Alcotest.test_case "auth seed helpers agree" `Quick test_key_auth_seed_helpers_agree;
       Alcotest.test_case "auth leaf small merkle" `Quick test_key_auth_leaf_small_merkle;
       Alcotest.test_case "xmss subtree root small depth" `Quick test_key_xmss_subtree_root_small_depth;
+      Alcotest.test_case "xmss subtree root height zero" `Quick test_key_xmss_subtree_root_height_zero_is_leaf;
       Alcotest.test_case "xmss root/path inner small depth" `Quick test_key_xmss_root_and_path_inner_small_depth;
       Alcotest.test_case "xmss root/path offset subtree" `Quick test_key_xmss_root_and_path_inner_nonzero_start;
+      Alcotest.test_case "xmss root/path outside subtree" `Quick test_key_xmss_root_and_path_inner_outside_subtree_returns_none;
       Alcotest.test_case "xmss subtree root offset subtree" `Quick test_key_xmss_subtree_root_nonzero_start;
       Alcotest.test_case "xmss node hash domain separation" `Quick test_key_xmss_node_hash_domain_separation;
       Alcotest.test_case "wots pk matches auth leaf" `Quick test_key_wots_pk_matches_auth_leaf_hash;

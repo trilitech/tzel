@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tzel_services::*;
+use tzel_verifier::{ProofBundle as VerifyProofBundle, encode_verify_meta};
 use ureq::{http, RequestExt};
 
 const PROVER_TOOLCHAIN: &str = "+nightly-2025-07-14";
@@ -376,30 +377,24 @@ fn generate_shield_proof(
     );
 
     let bundle_json = std::fs::read_to_string(proof_file.path()).unwrap();
-    let bundle: ProofBundleJson = serde_json::from_str(&bundle_json).unwrap();
+    let bundle: VerifyProofBundle = serde_json::from_str(&bundle_json).unwrap();
 
     (
         Proof::Stark {
             proof_bytes: bundle.proof_bytes,
             output_preimage: bundle.output_preimage,
-            verify_meta: bundle.verify_meta,
+            verify_meta: bundle
+                .verify_meta
+                .map(|meta| encode_verify_meta(&meta))
+                .transpose()
+                .unwrap(),
         },
         cm,
         enc,
     )
 }
 
-#[derive(Deserialize)]
-struct ProofBundleJson {
-    #[serde(with = "hex_bytes")]
-    proof_bytes: Vec<u8>,
-    #[serde(with = "hex_f_vec")]
-    output_preimage: Vec<F>,
-    #[serde(default)]
-    verify_meta: Option<serde_json::Value>,
-}
-
-fn generate_stark_bundle(executable_filename: &str, args: &[String]) -> ProofBundleJson {
+fn generate_stark_bundle(executable_filename: &str, args: &[String]) -> VerifyProofBundle {
     let executable = format!("{}/{}", executables_dir(), executable_filename);
     let args_file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(args_file.path(), serde_json::to_string(args).unwrap()).unwrap();

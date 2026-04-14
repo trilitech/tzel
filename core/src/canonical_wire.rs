@@ -3,6 +3,7 @@ use crate::{
     NOTE_AEAD_NONCE_BYTES,
 };
 use ml_kem::KeyExport;
+#[cfg(not(target_arch = "wasm32"))]
 use serde_json::json;
 use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
@@ -332,6 +333,7 @@ fn sample_data() -> (PaymentAddress, EncryptedNote, F, NoteMemo, F, F, u64) {
     (address, enc, cm, note_memo, nf, rseed, v)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn generate_canonical_wire_v1_json() -> String {
     let mut master_sk = crate::ZERO;
     master_sk[..8].copy_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());

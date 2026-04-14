@@ -10,11 +10,11 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
-use tzel_reprover::custom_circuit::ProofBundle;
 use tzel_reprover::{
     compute_executable_program_hash, prove_single_level, prove_single_level_with_args_file,
     prove_with_args_file,
 };
+use tzel_verifier::ProofBundle;
 use tracing_subscriber::fmt;
 
 #[derive(Parser)]
@@ -137,7 +137,15 @@ fn main() -> Result<()> {
 
         // Write proof bundle (JSON with proof + output_preimage)
         if let Some(path) = cli.output {
-            let bundle = ProofBundle::from_output(&proof_output);
+            let bundle = ProofBundle::from_output_parts(
+                proof_output.proof.clone(),
+                proof_output
+                    .output_preimage
+                    .iter()
+                    .map(|felt| felt.to_bytes_le())
+                    .collect(),
+                proof_output.verify_meta.clone(),
+            );
             let json = serde_json::to_string(&bundle)?;
             fs::write(&path, &json)?;
             eprintln!("Proof bundle written to {:?} ({} bytes)", path, json.len());

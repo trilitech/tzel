@@ -43,7 +43,7 @@ pub struct KernelBridgeConfig {
 pub struct KernelStarkProof {
     pub proof_bytes: Vec<u8>,
     pub output_preimage: Vec<F>,
-    pub verify_meta: serde_json::Value,
+    pub verify_meta: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,18 +115,6 @@ struct WireProgramHashes {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireVerifyMetaJson {
-    #[encoding(dynamic, bytes)]
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireOutputPreimage {
-    #[encoding(dynamic)]
-    items: Vec<WireFelt>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireFeltList {
     #[encoding(dynamic)]
     items: Vec<WireFelt>,
@@ -150,13 +138,9 @@ struct WireEncodedFeltList {
     bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WireStarkProof {
-    #[encoding(dynamic = "MAX_PROOF_BYTES", bytes)]
-    proof_bytes: Vec<u8>,
-    output_preimage: WireOutputPreimage,
-    #[encoding(dynamic = "MAX_VERIFY_META_BYTES")]
-    verify_meta: WireVerifyMetaJson,
+    bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -179,7 +163,7 @@ struct WireKernelShieldReq {
     address: WirePaymentAddress,
     #[encoding(string = "MAX_MEMO_BYTES")]
     memo: Option<String>,
-    proof: WireStarkProof,
+    proof: WireEncodedProof,
     client_cm: WireFelt,
     client_enc: Option<WireEncryptedNote>,
 }
@@ -416,6 +400,27 @@ where
     T::nom_read(bytes).map_err(|e| format!("tezos_data_encoding read failed: {:?}", e))
 }
 
+fn take_u32_be_len(bytes: &mut &[u8], label: &str) -> Result<usize, String> {
+    let raw = take_bytes(bytes, 4, label)?;
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(raw);
+    Ok(u32::from_be_bytes(buf) as usize)
+}
+
+fn take_bytes<'a>(bytes: &mut &'a [u8], len: usize, label: &str) -> Result<&'a [u8], String> {
+    if bytes.len() < len {
+        return Err(format!(
+            "kernel proof payload truncated while reading {}: need {} bytes, have {}",
+            label,
+            len,
+            bytes.len()
+        ));
+    }
+    let (head, tail) = bytes.split_at(len);
+    *bytes = tail;
+    Ok(head)
+}
+
 pub fn kernel_proof_to_host(proof: &KernelStarkProof) -> Proof {
     Proof::Stark {
         proof_bytes: proof.proof_bytes.clone(),
@@ -570,43 +575,74 @@ fn kernel_proof_to_wire(proof: &KernelStarkProof) -> Result<WireStarkProof, Stri
             MAX_OUTPUT_PREIMAGE_ITEMS
         ));
     }
-    let verify_meta = serde_json::to_vec(&proof.verify_meta)
-        .map(|bytes| WireVerifyMetaJson { bytes })
-        .map_err(|e| format!("verify_meta JSON serialization failed: {}", e))?;
-    Ok(WireStarkProof {
-        proof_bytes: proof.proof_bytes.clone(),
-        output_preimage: WireOutputPreimage {
-            items: proof.output_preimage.iter().map(felt_to_wire).collect(),
-        },
-        verify_meta,
-    })
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(proof.proof_bytes.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&proof.proof_bytes);
+    bytes.extend_from_slice(&(proof.output_preimage.len() as u32).to_be_bytes());
+    for felt in &proof.output_preimage {
+        bytes.extend_from_slice(felt);
+    }
+    if proof.verify_meta.len() > MAX_VERIFY_META_BYTES {
+        return Err(format!(
+            "verify_meta too large for kernel wire: {} > {}",
+            proof.verify_meta.len(),
+            MAX_VERIFY_META_BYTES
+        ));
+    }
+    bytes.extend_from_slice(&(proof.verify_meta.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&proof.verify_meta);
+    Ok(WireStarkProof { bytes })
 }
 
 fn kernel_proof_from_wire(proof: WireStarkProof) -> Result<KernelStarkProof, String> {
-    if proof.proof_bytes.len() > MAX_PROOF_BYTES {
+    let mut rest = proof.bytes.as_slice();
+
+    let proof_len = take_u32_be_len(&mut rest, "proof_bytes length")?;
+    if proof_len > MAX_PROOF_BYTES {
         return Err(format!(
             "proof too large for kernel wire: {} > {}",
-            proof.proof_bytes.len(),
+            proof_len,
             MAX_PROOF_BYTES
         ));
     }
-    if proof.output_preimage.items.len() > MAX_OUTPUT_PREIMAGE_ITEMS {
+    let proof_bytes = take_bytes(&mut rest, proof_len, "proof_bytes")?.to_vec();
+
+    let output_preimage_len = take_u32_be_len(&mut rest, "output_preimage length")?;
+    if output_preimage_len > MAX_OUTPUT_PREIMAGE_ITEMS {
         return Err(format!(
             "output_preimage too long for kernel wire: {} > {}",
-            proof.output_preimage.items.len(),
+            output_preimage_len,
             MAX_OUTPUT_PREIMAGE_ITEMS
         ));
     }
+    let mut output_preimage = Vec::with_capacity(output_preimage_len);
+    for _ in 0..output_preimage_len {
+        let felt_bytes = take_bytes(&mut rest, 32, "output_preimage felt")?;
+        let mut felt = [0u8; 32];
+        felt.copy_from_slice(felt_bytes);
+        output_preimage.push(felt);
+    }
+
+    let verify_meta_len = take_u32_be_len(&mut rest, "verify_meta length")?;
+    if verify_meta_len > MAX_VERIFY_META_BYTES {
+        return Err(format!(
+            "verify_meta too large for kernel wire: {} > {}",
+            verify_meta_len,
+            MAX_VERIFY_META_BYTES
+        ));
+    }
+    let verify_meta = take_bytes(&mut rest, verify_meta_len, "verify_meta")?.to_vec();
+
+    if !rest.is_empty() {
+        return Err(format!(
+            "kernel proof payload left {} trailing bytes",
+            rest.len()
+        ));
+    }
     Ok(KernelStarkProof {
-        proof_bytes: proof.proof_bytes,
-        output_preimage: proof
-            .output_preimage
-            .items
-            .into_iter()
-            .map(wire_to_felt)
-            .collect::<Result<Vec<_>, _>>()?,
-        verify_meta: serde_json::from_slice(&proof.verify_meta.bytes)
-            .map_err(|e| format!("verify_meta JSON parse failed: {}", e))?,
+        proof_bytes,
+        output_preimage,
+        verify_meta,
     })
 }
 
@@ -623,13 +659,12 @@ fn encoded_note_from_wire(wire: WireEncodedNote) -> Result<EncryptedNote, String
 
 fn encoded_proof_to_wire(proof: &KernelStarkProof) -> Result<WireEncodedProof, String> {
     Ok(WireEncodedProof {
-        bytes: encode_tze(&kernel_proof_to_wire(proof)?)?,
+        bytes: kernel_proof_to_wire(proof)?.bytes,
     })
 }
 
 fn encoded_proof_from_wire(wire: WireEncodedProof) -> Result<KernelStarkProof, String> {
-    let inner: WireStarkProof = decode_tze(&wire.bytes)?;
-    kernel_proof_from_wire(inner)
+    kernel_proof_from_wire(WireStarkProof { bytes: wire.bytes })
 }
 
 fn encoded_felt_list_to_wire(values: &[F]) -> Result<WireEncodedFeltList, String> {
@@ -655,7 +690,7 @@ fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldRe
         v: u64_to_wire(req.v),
         address: payment_address_to_wire(&req.address),
         memo: req.memo.clone(),
-        proof: kernel_proof_to_wire(&req.proof)?,
+        proof: encoded_proof_to_wire(&req.proof)?,
         client_cm: felt_to_wire(&req.client_cm),
         client_enc: req
             .client_enc
@@ -671,7 +706,7 @@ fn kernel_shield_req_from_wire(wire: WireKernelShieldReq) -> Result<KernelShield
         v: wire_to_u64(wire.v)?,
         address: payment_address_from_wire(wire.address)?,
         memo: wire.memo,
-        proof: kernel_proof_from_wire(wire.proof)?,
+        proof: encoded_proof_from_wire(wire.proof)?,
         client_cm: wire_to_felt(wire.client_cm)?,
         client_enc: wire.client_enc.map(encrypted_note_from_wire).transpose()?,
     })
@@ -936,19 +971,8 @@ mod tests {
             })
     }
 
-    fn arb_verify_meta() -> impl Strategy<Value = serde_json::Value> {
-        (
-            any::<u32>(),
-            small_string(16),
-            prop::collection::vec(any::<u16>(), 0..5),
-        )
-            .prop_map(|(n, label, arr)| {
-                serde_json::json!({
-                    "n": n,
-                    "label": label,
-                    "arr": arr,
-                })
-            })
+    fn arb_verify_meta() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 0..64)
     }
 
     fn arb_kernel_stark_proof() -> impl Strategy<Value = KernelStarkProof> {
@@ -1042,6 +1066,91 @@ mod tests {
     #[test]
     fn encoded_proof_wrapper_roundtrips_for_stark() {
         let proof = sample_kernel_stark_proof();
+        let wire = encoded_proof_to_wire(&proof).unwrap();
+        let encoded = encode_tze(&wire).unwrap();
+        let decoded_wire: WireEncodedProof = decode_tze(&encoded).unwrap();
+        let decoded = encoded_proof_from_wire(decoded_wire).unwrap();
+        assert_eq!(decoded.proof_bytes, proof.proof_bytes);
+        assert_eq!(decoded.output_preimage, proof.output_preimage);
+        assert_eq!(decoded.verify_meta, proof.verify_meta);
+    }
+
+    #[test]
+    fn encoded_proof_wrapper_roundtrips_for_high_bit_verify_meta() {
+        let proof = KernelStarkProof {
+            proof_bytes: vec![0xb1, 0xd0, 0x46, 0xe2],
+            output_preimage: vec![[0x11; 32], [0x22; 32]],
+            verify_meta: vec![0xf7, 0xc3, 0x0c, 0x6e, 0x48, 0xb5, 0x22, 0x26],
+        };
+        let wire = encoded_proof_to_wire(&proof).unwrap();
+        let encoded = encode_tze(&wire).unwrap();
+        let decoded_wire: WireEncodedProof = decode_tze(&encoded).unwrap();
+        let decoded = encoded_proof_from_wire(decoded_wire).unwrap();
+        assert_eq!(decoded.proof_bytes, proof.proof_bytes);
+        assert_eq!(decoded.output_preimage, proof.output_preimage);
+        assert_eq!(decoded.verify_meta, proof.verify_meta);
+    }
+
+    #[test]
+    fn kernel_shield_roundtrips_for_high_bit_verify_meta() {
+        let proof = KernelStarkProof {
+            proof_bytes: vec![0xb1, 0xd0, 0x46, 0xe2],
+            output_preimage: vec![[0x11; 32], [0x22; 32]],
+            verify_meta: vec![0xf7, 0xc3, 0x0c, 0x6e, 0x48, 0xb5, 0x22, 0x26],
+        };
+        let message = KernelInboxMessage::Shield(KernelShieldReq {
+            sender: "alice".to_string(),
+            v: 7,
+            address: sample_payment_address(),
+            memo: None,
+            proof,
+            client_cm: [0x44; 32],
+            client_enc: None,
+        });
+        let encoded = encode_kernel_inbox_message(&message).unwrap();
+        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
+        let KernelInboxMessage::Shield(decoded) = decoded else {
+            panic!("decoded wrong kernel message variant");
+        };
+        assert_eq!(
+            decoded.proof.verify_meta,
+            vec![0xf7, 0xc3, 0x0c, 0x6e, 0x48, 0xb5, 0x22, 0x26]
+        );
+    }
+
+    #[test]
+    fn kernel_shield_roundtrips_for_larger_stark_proof_payloads() {
+        let proof = KernelStarkProof {
+            proof_bytes: (0..70).map(|i| (0x80u8).wrapping_add(i as u8)).collect(),
+            output_preimage: vec![[0x11; 32], [0x22; 32], [0x33; 32], [0x44; 32], [0x55; 32]],
+            verify_meta: (0..32).map(|i| (0xf0u8).wrapping_add(i as u8)).collect(),
+        };
+        let message = KernelInboxMessage::Shield(KernelShieldReq {
+            sender: "alice".to_string(),
+            v: 7,
+            address: sample_payment_address(),
+            memo: None,
+            proof: proof.clone(),
+            client_cm: [0x44; 32],
+            client_enc: None,
+        });
+        let encoded = encode_kernel_inbox_message(&message).unwrap();
+        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
+        let KernelInboxMessage::Shield(decoded) = decoded else {
+            panic!("decoded wrong kernel message variant");
+        };
+        assert_eq!(decoded.proof.proof_bytes, proof.proof_bytes);
+        assert_eq!(decoded.proof.output_preimage, proof.output_preimage);
+        assert_eq!(decoded.proof.verify_meta, proof.verify_meta);
+    }
+
+    #[test]
+    fn encoded_proof_wrapper_roundtrips_for_larger_stark_proof_payloads() {
+        let proof = KernelStarkProof {
+            proof_bytes: (0..70).map(|i| (0x80u8).wrapping_add(i as u8)).collect(),
+            output_preimage: vec![[0x11; 32], [0x22; 32], [0x33; 32], [0x44; 32], [0x55; 32]],
+            verify_meta: (0..32).map(|i| (0xf0u8).wrapping_add(i as u8)).collect(),
+        };
         let wire = encoded_proof_to_wire(&proof).unwrap();
         let encoded = encode_tze(&wire).unwrap();
         let decoded_wire: WireEncodedProof = decode_tze(&encoded).unwrap();
@@ -1268,7 +1377,7 @@ mod tests {
         KernelStarkProof {
             proof_bytes: vec![0xaa, 0xbb, 0xcc],
             output_preimage: vec![[7u8; 32], [8u8; 32]],
-            verify_meta: serde_json::json!({"proof_config": {"foo": 1}}),
+            verify_meta: vec![1, 2, 3, 4],
         }
     }
 
@@ -1702,25 +1811,24 @@ mod tests {
         let proof = KernelStarkProof {
             proof_bytes: vec![1, 2, 3],
             output_preimage: vec![[9u8; 32]; MAX_OUTPUT_PREIMAGE_ITEMS + 1],
-            verify_meta: serde_json::json!({"ok":true}),
+            verify_meta: vec![1, 2, 3],
         };
         let err = kernel_proof_to_wire(&proof).unwrap_err();
         assert!(err.contains("output_preimage too long for kernel wire"));
     }
 
     #[test]
-    fn kernel_proof_from_wire_rejects_invalid_verify_meta_json() {
-        let err = kernel_proof_from_wire(WireStarkProof {
-            proof_bytes: vec![1, 2, 3],
-            output_preimage: WireOutputPreimage {
-                items: vec![felt_to_wire(&ZERO)],
-            },
-            verify_meta: WireVerifyMetaJson {
-                bytes: b"{not-json".to_vec(),
-            },
-        })
-        .unwrap_err();
-        assert!(err.contains("verify_meta JSON parse failed"));
+    fn kernel_proof_from_wire_preserves_verify_meta_bytes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(3u32).to_be_bytes());
+        bytes.extend_from_slice(&[1, 2, 3]);
+        bytes.extend_from_slice(&(1u32).to_be_bytes());
+        bytes.extend_from_slice(&ZERO);
+        bytes.extend_from_slice(&(4u32).to_be_bytes());
+        bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let proof = kernel_proof_from_wire(WireStarkProof { bytes })
+        .unwrap();
+        assert_eq!(proof.verify_meta, vec![0xde, 0xad, 0xbe, 0xef]);
     }
 
     #[test]

@@ -283,6 +283,32 @@ mod tests {
         })
     }
 
+    fn rejecting_tmb_state(auth_domain: F) -> AppState {
+        Arc::new(LedgerState {
+            ledger: Mutex::new(Ledger::with_auth_domain(auth_domain)),
+            proof_verifier: LedgerProofVerifier::verified(
+                false,
+                "unused-reprove-bin".into(),
+                ProgramHashes {
+                    shield: ZERO,
+                    transfer: ZERO,
+                    unshield: ZERO,
+                },
+            ),
+        })
+    }
+
+    fn dummy_payment_address(tag: u16) -> PaymentAddress {
+        PaymentAddress {
+            d_j: u64_to_felt(0x1000 + tag as u64),
+            auth_root: u64_to_felt(0x2000 + tag as u64),
+            auth_pub_seed: u64_to_felt(0x3000 + tag as u64),
+            nk_tag: u64_to_felt(0x4000 + tag as u64),
+            ek_v: vec![0x11; tzel_services::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES],
+            ek_d: vec![0x22; tzel_services::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES],
+        }
+    }
+
     fn dummy_note(tag: u16) -> EncryptedNote {
         EncryptedNote {
             ct_d: vec![0xA5; ML_KEM768_CIPHERTEXT_BYTES],
@@ -445,5 +471,68 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("out of range"));
+    }
+
+    #[tokio::test]
+    async fn test_shield_handler_rejects_trust_me_bro_when_verifier_is_required() {
+        let st = rejecting_tmb_state(default_auth_domain());
+        let err = shield_handler(
+            State(st),
+            Json(ShieldReq {
+                sender: "alice".into(),
+                v: 5,
+                address: dummy_payment_address(1),
+                memo: None,
+                proof: Proof::TrustMeBro,
+                client_cm: ZERO,
+                client_enc: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("TrustMeBro proofs rejected"));
+    }
+
+    #[tokio::test]
+    async fn test_transfer_handler_rejects_trust_me_bro_when_verifier_is_required() {
+        let st = rejecting_tmb_state(default_auth_domain());
+        let err = transfer_handler(
+            State(st),
+            Json(TransferReq {
+                root: ZERO,
+                nullifiers: vec![u64_to_felt(1)],
+                cm_1: u64_to_felt(2),
+                cm_2: u64_to_felt(3),
+                enc_1: dummy_note(7),
+                enc_2: dummy_note(8),
+                proof: Proof::TrustMeBro,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("TrustMeBro proofs rejected"));
+    }
+
+    #[tokio::test]
+    async fn test_unshield_handler_rejects_trust_me_bro_when_verifier_is_required() {
+        let st = rejecting_tmb_state(default_auth_domain());
+        let err = unshield_handler(
+            State(st),
+            Json(UnshieldReq {
+                root: ZERO,
+                nullifiers: vec![u64_to_felt(1)],
+                v_pub: 7,
+                recipient: "bob".into(),
+                cm_change: ZERO,
+                enc_change: None,
+                proof: Proof::TrustMeBro,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("TrustMeBro proofs rejected"));
     }
 }

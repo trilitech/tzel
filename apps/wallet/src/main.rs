@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tzel_services::*;
+use tzel_verifier::{ProofBundle as VerifyProofBundle, encode_verify_meta};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Wallet file
@@ -1243,16 +1244,6 @@ fn generate_proof(
     circuit: &str,
     args: &[String],
 ) -> Result<Proof, String> {
-    #[derive(Deserialize)]
-    struct ProofBundleJson {
-        #[serde(with = "hex_bytes")]
-        proof_bytes: Vec<u8>,
-        #[serde(with = "hex_f_vec")]
-        output_preimage: Vec<F>,
-        #[serde(default)]
-        verify_meta: Option<serde_json::Value>,
-    }
-
     let executable = format!("{}/{}.executable.json", executables_dir, circuit);
     let args_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
     let args_json = serde_json::to_string(&args).map_err(|e| format!("json: {}", e))?;
@@ -1283,7 +1274,7 @@ fn generate_proof(
     // Parse the proof bundle
     let bundle_json =
         std::fs::read_to_string(proof_file.path()).map_err(|e| format!("read proof: {}", e))?;
-    let bundle: ProofBundleJson =
+    let bundle: VerifyProofBundle =
         serde_json::from_str(&bundle_json).map_err(|e| format!("parse proof: {}", e))?;
 
     let proof_kb = bundle.proof_bytes.len() / 1024;
@@ -1296,7 +1287,10 @@ fn generate_proof(
     Ok(Proof::Stark {
         proof_bytes: bundle.proof_bytes,
         output_preimage: bundle.output_preimage,
-        verify_meta: bundle.verify_meta,
+        verify_meta: bundle
+            .verify_meta
+            .map(|meta| encode_verify_meta(&meta))
+            .transpose()?,
     })
 }
 
@@ -1378,7 +1372,28 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
 
     let url = format!("{}/notes?cursor={}", ledger, w.scanned);
     let feed: NotesFeedResp = get_json(&url)?;
+    let nf_resp: NullifiersResp = get_json(&format!("{}/nullifiers", ledger))?;
+    let summary = apply_scan_feed(&mut w, &feed, nf_resp.nullifiers);
+    save_wallet(path, &w)?;
+    println!(
+        "Scanned: {} new notes found, {} spent removed, balance={}",
+        summary.found,
+        summary.spent,
+        w.balance()
+    );
+    Ok(())
+}
 
+struct ScanSummary {
+    found: usize,
+    spent: usize,
+}
+
+fn apply_scan_feed(
+    w: &mut WalletFile,
+    feed: &NotesFeedResp,
+    nullifiers: impl IntoIterator<Item = F>,
+) -> ScanSummary {
     let mut found = 0usize;
     let mut known_notes: std::collections::HashSet<(usize, F)> =
         w.notes.iter().map(|n| (n.index, n.cm)).collect();
@@ -1397,25 +1412,15 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
         }
     }
 
-    // Check which notes have been spent (nullified)
-    let nf_resp: NullifiersResp = get_json(&format!("{}/nullifiers", ledger))?;
-    let nf_set: std::collections::HashSet<F> = nf_resp.nullifiers.into_iter().collect();
+    let nf_set: std::collections::HashSet<F> = nullifiers.into_iter().collect();
     let before = w.notes.len();
     w.notes.retain(|n| {
         let nf = nullifier(&n.nk_spend, &n.cm, n.index as u64);
         !nf_set.contains(&nf)
     });
     let spent = before - w.notes.len();
-
     w.scanned = feed.next_cursor;
-    save_wallet(path, &w)?;
-    println!(
-        "Scanned: {} new notes found, {} spent removed, balance={}",
-        found,
-        spent,
-        w.balance()
-    );
-    Ok(())
+    ScanSummary { found, spent }
 }
 
 #[cfg(test)]
@@ -2480,6 +2485,77 @@ mod tests {
 
         let selected = w.select_notes(30).expect("selection should succeed");
         assert_eq!(selected, vec![1]);
+    }
+
+    #[test]
+    fn test_apply_scan_feed_deduplicates_new_notes_and_prunes_spent_ones() {
+        let mut w = test_wallet(1, None);
+        let existing = wallet_note_for_address(&w, 0, 40, felt_tag(b"wallet-scan-existing"), 5);
+        let spent_nf = nullifier(&existing.nk_spend, &existing.cm, existing.index as u64);
+        w.notes.push(existing.clone());
+
+        let new_rseed = felt_tag(b"wallet-scan-new");
+        let new_nm = note_memo_for_wallet_address(&w, 0, 25, new_rseed, Some(b"fresh"));
+        let (alien_ek_v, _) = kem_keygen_from_seed(&[0x55; 64]);
+        let (alien_ek_d, _) = kem_keygen_from_seed(&[0x77; 64]);
+        let alien_nm = NoteMemo {
+            index: 0,
+            cm: felt_tag(b"wallet-scan-alien-cm"),
+            enc: encrypt_note(
+                77,
+                &felt_tag(b"wallet-scan-alien"),
+                None,
+                &alien_ek_v,
+                &alien_ek_d,
+            ),
+        };
+
+        let feed = NotesFeedResp {
+            notes: vec![
+                NoteMemo {
+                    index: new_nm.index,
+                    cm: new_nm.cm,
+                    enc: new_nm.enc.clone(),
+                },
+                NoteMemo {
+                    index: new_nm.index,
+                    cm: new_nm.cm,
+                    enc: new_nm.enc.clone(),
+                },
+                alien_nm,
+            ],
+            next_cursor: 9,
+        };
+
+        let summary = apply_scan_feed(&mut w, &feed, vec![spent_nf]);
+        assert_eq!(summary.found, 1, "duplicate recovered notes must be coalesced");
+        assert_eq!(summary.spent, 1, "spent existing note must be pruned");
+        assert_eq!(w.scanned, 9, "scan cursor must advance to feed cursor");
+        assert_eq!(w.notes.len(), 1, "only the fresh recoverable note should remain");
+        assert_eq!(w.notes[0].v, 25);
+        assert_eq!(w.notes[0].cm, new_nm.cm);
+    }
+
+    #[test]
+    fn test_apply_scan_feed_drops_newly_recovered_note_if_already_nullified() {
+        let mut w = test_wallet(1, None);
+        let new_rseed = felt_tag(b"wallet-scan-new-spent");
+        let new_nm = note_memo_for_wallet_address(&w, 0, 19, new_rseed, None);
+        let recovered = w
+            .try_recover_note(&new_nm)
+            .expect("fixture note should recover for nullifier check");
+        let spent_nf = nullifier(&recovered.nk_spend, &recovered.cm, recovered.index as u64);
+
+        let feed = NotesFeedResp {
+            notes: vec![new_nm],
+            next_cursor: 4,
+        };
+
+        let summary = apply_scan_feed(&mut w, &feed, vec![spent_nf]);
+        assert_eq!(summary.found, 1, "recovered note is discovered before spent pruning");
+        assert_eq!(summary.spent, 1, "nullified recovered note must be removed immediately");
+        assert!(w.notes.is_empty(), "nullified note must not remain in wallet state");
+        assert_eq!(w.scanned, 4);
     }
 
     #[test]

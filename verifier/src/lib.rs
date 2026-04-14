@@ -1,10 +1,21 @@
+mod bundle;
+
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
 use tzel_core::{
     kernel_wire::{kernel_proof_to_host, KernelStarkProof, KernelVerifierConfig},
     validate_single_task_program_hash, CircuitKind, ProgramHashes, Proof,
 };
-use tzel_reprover::{compute_executable_program_hash, custom_circuit::VerifyMeta, ProofBundle};
+
+pub use bundle::{ProofBundle, VerifyMeta};
+
+#[cfg(not(target_arch = "wasm32"))]
+use cairo_program_runner_lib::hints::compute_program_hash_chain;
+#[cfg(not(target_arch = "wasm32"))]
+use cairo_program_runner_lib::tasks::create_cairo1_program_task;
+#[cfg(not(target_arch = "wasm32"))]
+use cairo_program_runner_lib::types::HashFunc;
 
 #[derive(Debug, Clone)]
 pub struct DirectProofVerifier {
@@ -140,10 +151,7 @@ pub fn verify_stark_bundle(proof: &Proof) -> Result<(), String> {
     let verify_meta = verify_meta
         .clone()
         .ok_or_else(|| "Stark proof missing verify_meta — cannot verify".to_string())
-        .and_then(|value| {
-            serde_json::from_value::<VerifyMeta>(value)
-                .map_err(|e| format!("invalid verify_meta: {}", e))
-        })?;
+        .and_then(|bytes| decode_verify_meta(&bytes))?;
 
     let bundle = ProofBundle {
         proof_bytes: proof_bytes.clone(),
@@ -153,6 +161,25 @@ pub fn verify_stark_bundle(proof: &Proof) -> Result<(), String> {
     bundle.verify().map_err(|e| e.to_string())
 }
 
+pub fn encode_verify_meta(meta: &VerifyMeta) -> Result<Vec<u8>, String> {
+    bincode::serialize(meta).map_err(|e| format!("encode verify_meta failed: {}", e))
+}
+
+pub fn decode_verify_meta(bytes: &[u8]) -> Result<VerifyMeta, String> {
+    bincode::deserialize(bytes).map_err(|e| format!("invalid verify_meta: {}", e))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn compute_executable_program_hash(executable_path: &PathBuf) -> Result<tzel_core::F, String> {
+    let task =
+        create_cairo1_program_task(executable_path, None, None).map_err(|e| e.to_string())?;
+    let program = task.get_program().map_err(|e| e.to_string())?;
+    compute_program_hash_chain(&program, 0, HashFunc::Blake)
+        .map(|felt| felt.to_bytes_le())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_program_hashes(executables_dir: &str) -> Result<ProgramHashes, String> {
     let base = PathBuf::from(executables_dir);
     let shield = base.join(CircuitKind::Shield.executable_filename());
@@ -169,21 +196,19 @@ pub fn load_program_hashes(executables_dir: &str) -> Result<ProgramHashes, Strin
     }
 
     Ok(ProgramHashes {
-        shield: compute_executable_program_hash(&shield)
-            .map_err(|e| e.to_string())?
-            .to_bytes_le(),
-        transfer: compute_executable_program_hash(&transfer)
-            .map_err(|e| e.to_string())?
-            .to_bytes_le(),
-        unshield: compute_executable_program_hash(&unshield)
-            .map_err(|e| e.to_string())?
-            .to_bytes_le(),
+        shield: compute_executable_program_hash(&shield)?,
+        transfer: compute_executable_program_hash(&transfer)?,
+        unshield: compute_executable_program_hash(&unshield)?,
     })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_program_hashes(_executables_dir: &str) -> Result<ProgramHashes, String> {
+    Err("load_program_hashes is not available on wasm targets".into())
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
     use tzel_core::{u64_to_felt, F};
 
     use super::*;
@@ -204,7 +229,7 @@ mod tests {
         Proof::Stark {
             proof_bytes: vec![1, 2, 3],
             output_preimage,
-            verify_meta: Some(json!({"bad":"shape"})),
+            verify_meta: Some(vec![1, 2, 3]),
         }
     }
 
@@ -221,7 +246,7 @@ mod tests {
             &Proof::Stark {
                 proof_bytes: vec![1],
                 output_preimage: vec![f(1), f(2), f(3)],
-                verify_meta: Some(json!({})),
+                verify_meta: Some(vec![0]),
             },
             false,
             false,
@@ -233,7 +258,7 @@ mod tests {
             &Proof::Stark {
                 proof_bytes: vec![],
                 output_preimage: vec![f(1), f(2), f(3)],
-                verify_meta: Some(json!({})),
+                verify_meta: Some(vec![0]),
             },
             false,
             true,
@@ -245,7 +270,7 @@ mod tests {
             &Proof::Stark {
                 proof_bytes: vec![1],
                 output_preimage: vec![],
-                verify_meta: Some(json!({})),
+                verify_meta: Some(vec![0]),
             },
             false,
             true,
@@ -296,7 +321,7 @@ mod tests {
                 &Proof::Stark {
                     proof_bytes: vec![1],
                     output_preimage: vec![f(1), f(4), f(11), f(99), f(100)],
-                    verify_meta: Some(json!({})),
+                    verify_meta: Some(vec![0]),
                 },
                 CircuitKind::Shield,
             )
@@ -323,7 +348,7 @@ mod tests {
                 &KernelStarkProof {
                     proof_bytes: vec![1, 2, 3],
                     output_preimage: vec![f(1), f(4), f(22), f(99), f(100)],
-                    verify_meta: json!({"bad":"shape"}),
+                    verify_meta: vec![1, 2, 3],
                 },
                 CircuitKind::Transfer,
             )

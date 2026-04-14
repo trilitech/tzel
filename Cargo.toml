@@ -9,3 +9,7 @@ members = [
   "tezos/rollup-kernel",
   "verifier",
 ]
+
+[patch.crates-io]
+starknet-ff = { path = "third_party/patched-crates/starknet-ff-0.3.7" }
+lambdaworks-math = { path = "third_party/patched-crates/lambdaworks-math-0.13.0" }

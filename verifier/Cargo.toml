@@ -8,7 +8,21 @@ name = "tzel_verifier"
 path = "src/lib.rs"
 
 [dependencies]
+anyhow = "1"
+bincode = "1.3"
 hex = "0.4"
-serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+starknet-types-core = "=0.2.4"
 tzel-core = { path = "../core" }
-tzel-reprover = { path = "../services/reprover" }
+zstd = "0.13"
+
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c" }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c" }
+stwo-cairo-common = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
+circuit-air = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cairo-program-runner-lib = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
