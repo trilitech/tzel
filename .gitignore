@@ -13,3 +13,5 @@ ocaml/vendor/mlkem-native/test/build/mlkem1024/
 alice.json
 bob.json
 mutants.out*/
+
+third_party/patched-git/
