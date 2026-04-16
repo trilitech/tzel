@@ -1,0 +1,175 @@
+#[cfg(not(feature = "proof-verifier"))]
+fn main() {
+    eprintln!("verified_bridge_fixture_message requires the proof-verifier feature");
+    std::process::exit(1);
+}
+
+#[cfg(feature = "proof-verifier")]
+mod with_verifier {
+    use std::{env, fs};
+
+    use serde::{Deserialize, Serialize};
+    use tzel_core::{
+        kernel_wire::{
+            encode_kernel_inbox_message, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
+            KernelTransferReq, KernelUnshieldReq,
+        },
+        ProgramHashes, Proof, ShieldReq, TransferReq, UnshieldReq, F,
+    };
+
+    #[derive(Debug, Deserialize)]
+    struct VerifiedBridgeFixture {
+        #[serde(with = "tzel_core::hex_f")]
+        auth_domain: F,
+        program_hashes: ProgramHashes,
+        bridge_ticketer: String,
+        withdrawal_recipient: String,
+        shield: ShieldReq,
+        transfer: TransferReq,
+        unshield: UnshieldReq,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct FixtureMetadata<'a> {
+        auth_domain: String,
+        shield_program_hash: String,
+        transfer_program_hash: String,
+        unshield_program_hash: String,
+        bridge_ticketer: &'a str,
+        withdrawal_recipient: &'a str,
+        shield_sender: &'a str,
+        shield_amount: u64,
+    }
+
+    fn usage() -> ! {
+        eprintln!(
+            "usage:\n  verified_bridge_fixture_message metadata [fixture.json]\n  verified_bridge_fixture_message shield-raw [fixture.json]\n  verified_bridge_fixture_message transfer-raw [fixture.json]\n  verified_bridge_fixture_message unshield-raw [fixture.json]"
+        );
+        std::process::exit(2);
+    }
+
+    fn felt_hex(value: &F) -> String {
+        hex::encode(value)
+    }
+
+    fn load_fixture(path: Option<&str>) -> VerifiedBridgeFixture {
+        match path {
+            Some(path) => {
+                let body = fs::read_to_string(path).expect("fixture file should be readable");
+                serde_json::from_str(&body).expect("fixture json should parse")
+            }
+            None => serde_json::from_str(include_str!("../../testdata/verified_bridge_flow.json"))
+                .expect("checked-in fixture should parse"),
+        }
+    }
+
+    fn kernel_proof_from_fixture(proof: &Proof) -> KernelStarkProof {
+        match proof {
+            Proof::Stark {
+                proof_bytes,
+                output_preimage,
+                verify_meta,
+            } => KernelStarkProof {
+                proof_bytes: proof_bytes.clone(),
+                output_preimage: output_preimage.clone(),
+                verify_meta: verify_meta
+                    .clone()
+                    .expect("fixture Stark proof verify_meta"),
+            },
+            Proof::TrustMeBro => panic!("fixture should contain real Stark proofs"),
+        }
+    }
+
+    fn kernel_shield_req_from_fixture(req: &ShieldReq) -> KernelShieldReq {
+        KernelShieldReq {
+            sender: req.sender.clone(),
+            v: req.v,
+            address: req.address.clone(),
+            memo: req.memo.clone(),
+            proof: kernel_proof_from_fixture(&req.proof),
+            client_cm: req.client_cm,
+            client_enc: req.client_enc.clone(),
+        }
+    }
+
+    fn kernel_transfer_req_from_fixture(req: &TransferReq) -> KernelTransferReq {
+        KernelTransferReq {
+            root: req.root,
+            nullifiers: req.nullifiers.clone(),
+            cm_1: req.cm_1,
+            cm_2: req.cm_2,
+            enc_1: req.enc_1.clone(),
+            enc_2: req.enc_2.clone(),
+            proof: kernel_proof_from_fixture(&req.proof),
+        }
+    }
+
+    fn kernel_unshield_req_from_fixture(req: &UnshieldReq) -> KernelUnshieldReq {
+        KernelUnshieldReq {
+            root: req.root,
+            nullifiers: req.nullifiers.clone(),
+            v_pub: req.v_pub,
+            recipient: req.recipient.clone(),
+            cm_change: req.cm_change,
+            enc_change: req.enc_change.clone(),
+            proof: kernel_proof_from_fixture(&req.proof),
+        }
+    }
+
+    fn emit_raw_hex(message: KernelInboxMessage) {
+        let payload = encode_kernel_inbox_message(&message).expect("kernel message should encode");
+        println!("{}", hex::encode(payload));
+    }
+
+    pub fn main() {
+        let mut args = env::args().skip(1);
+        let Some(cmd) = args.next() else {
+            usage();
+        };
+        let fixture = load_fixture(args.next().as_deref());
+        if args.next().is_some() {
+            usage();
+        }
+
+        match cmd.as_str() {
+            "metadata" => {
+                let metadata = FixtureMetadata {
+                    auth_domain: felt_hex(&fixture.auth_domain),
+                    shield_program_hash: felt_hex(&fixture.program_hashes.shield),
+                    transfer_program_hash: felt_hex(&fixture.program_hashes.transfer),
+                    unshield_program_hash: felt_hex(&fixture.program_hashes.unshield),
+                    bridge_ticketer: &fixture.bridge_ticketer,
+                    withdrawal_recipient: &fixture.withdrawal_recipient,
+                    shield_sender: &fixture.shield.sender,
+                    shield_amount: fixture.shield.v,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&metadata)
+                        .expect("fixture metadata should serialize")
+                );
+            }
+            "shield-raw" => {
+                emit_raw_hex(KernelInboxMessage::Shield(kernel_shield_req_from_fixture(
+                    &fixture.shield,
+                )));
+            }
+            "transfer-raw" => {
+                emit_raw_hex(KernelInboxMessage::Transfer(
+                    kernel_transfer_req_from_fixture(&fixture.transfer),
+                ));
+            }
+            "unshield-raw" => {
+                emit_raw_hex(KernelInboxMessage::Unshield(
+                    kernel_unshield_req_from_fixture(&fixture.unshield),
+                ));
+            }
+            _ => usage(),
+        }
+    }
+}
+
+#[cfg(feature = "proof-verifier")]
+fn main() {
+    with_verifier::main();
+}

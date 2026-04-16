@@ -394,7 +394,10 @@ fn maybe_advance_submission(
     let pointer_payload = encode_kernel_inbox_message(&KernelInboxMessage::DalPointer(pointer))?;
     let targeted_bytes =
         encode_targeted_rollup_message(&submission.rollup_address, &pointer_payload)?;
-    let output = inject_direct_message(config, &targeted_bytes, true)?;
+    // The operator only needs successful injection here; callers can wait for
+    // inclusion by tracking the returned operation hash and baking/progressing
+    // the chain as needed.
+    let output = inject_direct_message(config, &targeted_bytes, false)?;
     submission.status = RollupSubmissionStatus::SubmittedToL1;
     submission.operation_hash = extract_operation_hash(&output);
     submission.detail = Some(format!(

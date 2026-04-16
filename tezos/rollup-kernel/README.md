@@ -82,5 +82,22 @@ not allow the L1 ticketer contract to deliver ticket transfers into the inbox.
 The minimal tez bridge contract validated for this flow lives at
 [`tezos/tez_bridge_ticketer.tz`](/home/coder/workspace/tzel/tezos/tez_bridge_ticketer.tz).
 
+Local Octez sandbox smokes:
+
+```bash
+TZEL_RUN_OCTEZ_ROLLUP_SANDBOX=1 \
+  cargo test -p tzel-rollup-kernel --test octez_sandbox -- --ignored --nocapture
+```
+
+```bash
+TZEL_RUN_OCTEZ_ROLLUP_SANDBOX_DAL=1 \
+  cargo test -p tzel-rollup-kernel --test octez_sandbox_dal -- --ignored --nocapture
+```
+
+The DAL smoke requires `octez-dal-node` in addition to the normal sandbox
+dependencies. It spins up a local node, baker, DAL node, rollup node, and
+`tzel-operator`, then submits the checked-in verified shield fixture through the
+operator and waits for the rollup durable state to reflect the shield.
+
 You can then strip it and run it with the Octez smart-rollup debugger as
 described in the Tezos smart-rollup tutorial.

@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tezos_data_encoding_05 = { package = "tezos_data_encoding", version = "0.5" }
 tezos-smart-rollup-encoding = "0.2.2"
 tzel-core = { path = "../../core" }
@@ -25,4 +26,3 @@ getrandom = { version = "0.2.17", features = ["custom"] }
 
 [dev-dependencies]
 ml-kem = "=0.3.0-rc.2"
-serde_json = "1"
