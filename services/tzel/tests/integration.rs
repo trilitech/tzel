@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tzel_services::*;
-use tzel_verifier::{ProofBundle as VerifyProofBundle, encode_verify_meta};
+use tzel_verifier::{encode_verify_meta, ProofBundle as VerifyProofBundle};
 use ureq::{http, RequestExt};
 
 const PROVER_TOOLCHAIN: &str = "+nightly-2025-07-14";

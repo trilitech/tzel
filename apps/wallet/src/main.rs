@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tzel_services::*;
-use tzel_verifier::{ProofBundle as VerifyProofBundle, encode_verify_meta};
+use tzel_verifier::{encode_verify_meta, ProofBundle as VerifyProofBundle};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Wallet file
@@ -2528,10 +2528,17 @@ mod tests {
         };
 
         let summary = apply_scan_feed(&mut w, &feed, vec![spent_nf]);
-        assert_eq!(summary.found, 1, "duplicate recovered notes must be coalesced");
+        assert_eq!(
+            summary.found, 1,
+            "duplicate recovered notes must be coalesced"
+        );
         assert_eq!(summary.spent, 1, "spent existing note must be pruned");
         assert_eq!(w.scanned, 9, "scan cursor must advance to feed cursor");
-        assert_eq!(w.notes.len(), 1, "only the fresh recoverable note should remain");
+        assert_eq!(
+            w.notes.len(),
+            1,
+            "only the fresh recoverable note should remain"
+        );
         assert_eq!(w.notes[0].v, 25);
         assert_eq!(w.notes[0].cm, new_nm.cm);
     }
@@ -2552,9 +2559,18 @@ mod tests {
         };
 
         let summary = apply_scan_feed(&mut w, &feed, vec![spent_nf]);
-        assert_eq!(summary.found, 1, "recovered note is discovered before spent pruning");
-        assert_eq!(summary.spent, 1, "nullified recovered note must be removed immediately");
-        assert!(w.notes.is_empty(), "nullified note must not remain in wallet state");
+        assert_eq!(
+            summary.found, 1,
+            "recovered note is discovered before spent pruning"
+        );
+        assert_eq!(
+            summary.spent, 1,
+            "nullified recovered note must be removed immediately"
+        );
+        assert!(
+            w.notes.is_empty(),
+            "nullified note must not remain in wallet state"
+        );
         assert_eq!(w.scanned, 4);
     }
 

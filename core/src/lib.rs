@@ -1648,32 +1648,32 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-        let ek_v = ml_kem_768::EncapsulationKey::new(
-            req.address
-                .ek_v
-                .as_slice()
-                .try_into()
-                .map_err(|_| "bad ek_v length")?,
-        )
-        .map_err(|_| "invalid ek_v")?;
-        let ek_d = ml_kem_768::EncapsulationKey::new(
-            req.address
-                .ek_d
-                .as_slice()
-                .try_into()
-                .map_err(|_| "bad ek_d length")?,
-        )
-        .map_err(|_| "invalid ek_d")?;
-        let rseed = random_felt();
-        let rcm = derive_rcm(&rseed);
-        let otag = owner_tag(
-            &req.address.auth_root,
-            &req.address.auth_pub_seed,
-            &req.address.nk_tag,
-        );
-        let cm = commit(&req.address.d_j, req.v, &rcm, &otag);
-        let memo_bytes = req.memo.as_ref().map(|s| s.as_bytes());
-        (cm, encrypt_note(req.v, &rseed, memo_bytes, &ek_v, &ek_d))
+            let ek_v = ml_kem_768::EncapsulationKey::new(
+                req.address
+                    .ek_v
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "bad ek_v length")?,
+            )
+            .map_err(|_| "invalid ek_v")?;
+            let ek_d = ml_kem_768::EncapsulationKey::new(
+                req.address
+                    .ek_d
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "bad ek_d length")?,
+            )
+            .map_err(|_| "invalid ek_d")?;
+            let rseed = random_felt();
+            let rcm = derive_rcm(&rseed);
+            let otag = owner_tag(
+                &req.address.auth_root,
+                &req.address.auth_pub_seed,
+                &req.address.nk_tag,
+            );
+            let cm = commit(&req.address.d_j, req.v, &rcm, &otag);
+            let memo_bytes = req.memo.as_ref().map(|s| s.as_bytes());
+            (cm, encrypt_note(req.v, &rseed, memo_bytes, &ek_v, &ek_d))
         }
     };
 

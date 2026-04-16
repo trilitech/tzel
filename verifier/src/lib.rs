@@ -1,4 +1,5 @@
 mod bundle;
+mod verify_meta_codec;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
@@ -158,15 +159,25 @@ pub fn verify_stark_bundle(proof: &Proof) -> Result<(), String> {
         output_preimage: output_preimage.clone(),
         verify_meta: Some(verify_meta),
     };
-    bundle.verify().map_err(|e| e.to_string())
+    bundle.verify().map_err(stringify_bundle_verify_error)
 }
 
 pub fn encode_verify_meta(meta: &VerifyMeta) -> Result<Vec<u8>, String> {
-    bincode::serialize(meta).map_err(|e| format!("encode verify_meta failed: {}", e))
+    verify_meta_codec::encode(meta)
 }
 
 pub fn decode_verify_meta(bytes: &[u8]) -> Result<VerifyMeta, String> {
-    bincode::deserialize(bytes).map_err(|e| format!("invalid verify_meta: {}", e))
+    verify_meta_codec::decode(bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn stringify_bundle_verify_error(_: anyhow::Error) -> String {
+    "stark proof verification failed".into()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stringify_bundle_verify_error(e: anyhow::Error) -> String {
+    e.to_string()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -209,12 +220,33 @@ pub fn load_program_hashes(_executables_dir: &str) -> Result<ProgramHashes, Stri
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
+    use serde::Deserialize;
     use tzel_core::{u64_to_felt, F};
 
     use super::*;
 
+    #[derive(Clone, Deserialize)]
+    struct VerifiedBridgeFixture {
+        program_hashes: ProgramHashes,
+        shield: tzel_core::ShieldReq,
+        transfer: tzel_core::TransferReq,
+        unshield: tzel_core::UnshieldReq,
+    }
+
     fn f(v: u64) -> F {
         u64_to_felt(v)
+    }
+
+    fn verified_bridge_fixture() -> &'static VerifiedBridgeFixture {
+        static FIXTURE: OnceLock<VerifiedBridgeFixture> = OnceLock::new();
+        FIXTURE.get_or_init(|| {
+            serde_json::from_str(include_str!(
+                "../../tezos/rollup-kernel/testdata/verified_bridge_flow.json"
+            ))
+            .expect("checked-in verified bridge fixture should parse")
+        })
     }
 
     fn sample_hashes() -> ProgramHashes {
@@ -375,5 +407,38 @@ mod tests {
         let err = load_program_hashes("/definitely/missing/tzel-executables").unwrap_err();
         assert!(err.contains("missing Cairo executable required for verified mode"));
         assert!(err.contains("run_shield.executable.json"));
+    }
+
+    #[test]
+    fn test_verified_real_bridge_fixture_proofs_validate() {
+        let fixture = verified_bridge_fixture();
+        let verifier = DirectProofVerifier::verified(false, fixture.program_hashes.clone());
+
+        verifier
+            .validate(&fixture.shield.proof, CircuitKind::Shield)
+            .unwrap();
+        verifier
+            .validate(&fixture.transfer.proof, CircuitKind::Transfer)
+            .unwrap();
+        verifier
+            .validate(&fixture.unshield.proof, CircuitKind::Unshield)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_verified_real_bridge_fixture_rejects_tampered_output_preimage() {
+        let fixture = verified_bridge_fixture();
+        let mut proof = fixture.transfer.proof.clone();
+
+        let Proof::Stark {
+            output_preimage, ..
+        } = &mut proof
+        else {
+            panic!("checked-in verified bridge fixture should contain a Stark proof");
+        };
+        output_preimage[0] = f(999);
+
+        let err = verify_stark_bundle(&proof).unwrap_err();
+        assert!(err.contains("output_preimage does not match verified public_output_values"));
     }
 }

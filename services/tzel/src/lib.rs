@@ -6,7 +6,7 @@ pub mod proof_bench;
 pub mod protocol_vectors;
 
 pub use tzel_core::*;
-use tzel_verifier::{ProofBundle as VerifyProofBundle, decode_verify_meta};
+use tzel_verifier::{decode_verify_meta, ProofBundle as VerifyProofBundle};
 
 use std::path::{Path, PathBuf};
 
@@ -251,6 +251,7 @@ mod tests {
     use super::*;
     use ml_kem::KeyExport;
     use tzel_core::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES;
+    use tzel_verifier::{encode_verify_meta, VerifyMeta};
 
     fn random_payment_address() -> PaymentAddress {
         PaymentAddress {
@@ -324,7 +325,35 @@ mod tests {
     fn test_verify_bundle_json_uses_explicit_byte_strings() {
         let proof_bytes = vec![0xAB, 0xCD];
         let output_preimage = vec![u(7), u(9)];
-        let verify_meta = Some(serde_json::json!({"ok": true}));
+        let verify_meta = VerifyMeta {
+            n_pow_bits: 1,
+            n_preprocessed_columns: 2,
+            n_trace_columns: 3,
+            n_interaction_columns: 4,
+            trace_columns_per_component: vec![5, 6],
+            interaction_columns_per_component: vec![7, 8],
+            cumulative_sum_columns: vec![true, false],
+            n_components: 9,
+            fri_log_trace_size: 10,
+            fri_log_blowup: 11,
+            fri_log_last_layer: 12,
+            fri_n_queries: 13,
+            fri_fold_step: 14,
+            interaction_pow_bits: 15,
+            circuit_pow_bits: 16,
+            circuit_fri_log_blowup: 17,
+            circuit_fri_log_last_layer: 18,
+            circuit_fri_n_queries: 19,
+            circuit_fri_fold_step: 20,
+            circuit_lifting: Some(21),
+            output_addresses: vec![22, 23],
+            n_blake_gates: 24,
+            preprocessed_column_ids: vec!["left".into(), "right".into()],
+            preprocessed_root: vec![25, 26, 27, 28, 29, 30, 31, 32],
+            public_output_values: vec![33, 34, 35, 36],
+        };
+        let verify_meta =
+            Some(encode_verify_meta(&verify_meta).expect("verify_meta should encode"));
 
         let encoded = encode_verify_bundle_json(&proof_bytes, &output_preimage, &verify_meta)
             .expect("bundle encoding should succeed");
@@ -336,7 +365,11 @@ mod tests {
             json["output_preimage"],
             serde_json::json!([hex::encode(u(7)), hex::encode(u(9)),])
         );
-        assert_eq!(json["verify_meta"], serde_json::json!({"ok": true}));
+        assert_eq!(json["verify_meta"]["n_pow_bits"], serde_json::json!(1));
+        assert_eq!(
+            json["verify_meta"]["preprocessed_column_ids"],
+            serde_json::json!(["left", "right"])
+        );
     }
 
     /// Verify that auth_leaf_hash using WOTS+ key derivation produces a valid

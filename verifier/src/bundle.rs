@@ -1,29 +1,46 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use circuit_serialize::deserialize::deserialize_proof_with_config;
 use circuits::blake::HashValue;
 use circuits::ivalue::IValue;
 use circuits_stark_verifier::proof::ProofConfig;
 use circuits_stark_verifier::proof_from_stark_proof::pack_into_qm31s;
-use starknet_types_core::hash::Blake2Felt252;
 use starknet_types_core::felt::Felt;
+use starknet_types_core::hash::Blake2Felt252;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::QM31;
 use tzel_core::F as RawF;
+
+const FELT252_N_WORDS: usize = 28;
+const FELT252_BITS_PER_WORD: usize = 9;
 
 fn raw_to_felt(raw: &RawF) -> Felt {
     Felt::from_bytes_le(raw)
 }
 
 fn qm31_to_m31s(q: QM31) -> Vec<u32> {
-    vec![q.0.0.0, q.0.1.0, q.1.0.0, q.1.1.0]
+    vec![q.0 .0 .0, q.0 .1 .0, q.1 .0 .0, q.1 .1 .0]
+}
+
+fn felt252_to_m31_words(value: Felt) -> [M31; FELT252_N_WORDS] {
+    let limbs = value.to_le_digits();
+    std::array::from_fn(|index| {
+        let mask = (1u64 << FELT252_BITS_PER_WORD) - 1;
+        let shift = FELT252_BITS_PER_WORD * index;
+        let low_limb = shift / 64;
+        let shift_low = shift & 0x3f;
+        let high_limb = (shift + FELT252_BITS_PER_WORD - 1) / 64;
+        let word = if low_limb == high_limb {
+            (limbs[low_limb] >> shift_low) & mask
+        } else {
+            ((limbs[low_limb] >> shift_low) | (limbs[high_limb] << (64 - shift_low))) & mask
+        };
+        M31::from(word as u32)
+    })
 }
 
 fn compute_output_hash_values(output_preimage: &[Felt]) -> Vec<u32> {
     let outputs = Blake2Felt252::encode_felt252_data_and_calc_blake_hash(output_preimage);
-    let outputs = stwo_cairo_common::prover_types::cpu::Felt252 {
-        limbs: outputs.to_raw(),
-    }
-    .get_limbs();
+    let outputs = felt252_to_m31_words(outputs);
     let output_qm31s = pack_into_qm31s(outputs.into_iter());
     let output_hash: HashValue<QM31> =
         QM31::blake(output_qm31s.as_slice(), output_qm31s.len() * 16);
@@ -94,7 +111,7 @@ impl ProofBundle {
     }
 
     pub fn verify(&self) -> Result<()> {
-        use circuit_air::verify::{CircuitConfig, CircuitPublicData, verify_circuit};
+        use circuit_air::verify::{verify_circuit, CircuitConfig, CircuitPublicData};
 
         let meta = self
             .verify_meta
@@ -169,11 +186,7 @@ impl ProofBundle {
         };
 
         let public_data = CircuitPublicData {
-            output_values: meta
-                .public_output_values
-                .chunks(4)
-                .map(qm31_from)
-                .collect(),
+            output_values: meta.public_output_values.chunks(4).map(qm31_from).collect(),
         };
 
         let compressed = self.proof_bytes();

@@ -12,6 +12,7 @@ done
 
 WORKDIR="${TZEL_OCTEZ_SANDBOX_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/tzel-octez-sandbox.XXXXXX")}"
 PRESERVE="${TZEL_OCTEZ_SANDBOX_PRESERVE:-0}"
+RUST_TOOLCHAIN="${TZEL_ROLLUP_RUST_TOOLCHAIN:-stable}"
 NODE_RPC_PORT="${TZEL_OCTEZ_NODE_RPC_PORT:-18732}"
 NODE_NET_PORT="${TZEL_OCTEZ_NODE_NET_PORT:-19732}"
 ROLLUP_RPC_PORT="${TZEL_OCTEZ_ROLLUP_RPC_PORT:-18932}"
@@ -185,9 +186,20 @@ activate_alpha() {
 }
 
 build_kernel_and_tools() {
-  rustup target list --installed | grep -qx 'wasm32-unknown-unknown' || rustup target add wasm32-unknown-unknown >/dev/null
-  cargo +nightly-2025-07-14 build -q -p tzel-rollup-kernel --target wasm32-unknown-unknown --release
-  cargo +nightly-2025-07-14 build -q -p tzel-rollup-kernel --bin octez_kernel_message
+  local kernel_cargo_args=()
+  local cargo_toolchain_args=()
+  local rustup_toolchain_args=()
+  if [[ -n "${TZEL_ROLLUP_KERNEL_CARGO_ARGS:-}" ]]; then
+    read -r -a kernel_cargo_args <<< "${TZEL_ROLLUP_KERNEL_CARGO_ARGS}"
+  fi
+  if [[ -n "${RUST_TOOLCHAIN}" ]]; then
+    cargo_toolchain_args=("+${RUST_TOOLCHAIN}")
+    rustup_toolchain_args=(--toolchain "${RUST_TOOLCHAIN}")
+  fi
+  rustup target list --installed "${rustup_toolchain_args[@]}" | grep -qx 'wasm32-unknown-unknown' \
+    || rustup target add "${rustup_toolchain_args[@]}" wasm32-unknown-unknown >/dev/null
+  cargo "${cargo_toolchain_args[@]}" build -q -p tzel-rollup-kernel --target wasm32-unknown-unknown --release "${kernel_cargo_args[@]}"
+  cargo "${cargo_toolchain_args[@]}" build -q -p tzel-rollup-kernel --bin octez_kernel_message "${kernel_cargo_args[@]}"
 }
 
 originate_rollup() {
@@ -234,7 +246,7 @@ send_configure_bridge_message() {
 await_bridge_ticketer() {
   local encoded_ticketer response
   encoded_ticketer="$(printf '%s' "${SAMPLE_TICKETER}" | xxd -ps -c 0)"
-  local url="${ROLLUP_ENDPOINT}/global/block/head/durable/wasm_2_0_0/values?key=/tzel/v1/state/bridge/ticketer&offset=0&length=256"
+  local url="${ROLLUP_ENDPOINT}/global/block/head/durable/wasm_2_0_0/value?key=/tzel/v1/state/bridge/ticketer"
   local i
   for ((i = 0; i < 90; i++)); do
     response="$(curl -fsS "${url}" || true)"

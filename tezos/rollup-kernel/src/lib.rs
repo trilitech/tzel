@@ -37,10 +37,30 @@ use tzel_core::{
     },
     EncryptedNote, Ledger, LedgerState, WithdrawalRecord, DEPTH, F, ZERO,
 };
+#[cfg(feature = "proof-verifier")]
 use tzel_verifier::DirectProofVerifier;
 
 pub const MAX_INPUT_BYTES: usize = 16 * 1024;
 pub const MAX_LEDGER_STATE_BYTES: usize = 4 * 1024 * 1024;
+
+#[cfg(not(feature = "proof-verifier"))]
+#[derive(Debug, Clone)]
+struct DirectProofVerifier;
+
+#[cfg(not(feature = "proof-verifier"))]
+impl DirectProofVerifier {
+    fn from_kernel_config(_config: &KernelVerifierConfig) -> Result<Self, String> {
+        Err("kernel built without proof verifier support".into())
+    }
+
+    fn validate_kernel(
+        &self,
+        _proof: &tzel_core::kernel_wire::KernelStarkProof,
+        _circuit: tzel_core::CircuitKind,
+    ) -> Result<(), String> {
+        Err("kernel built without proof verifier support".into())
+    }
+}
 
 const PATH_RAW_INPUT_COUNT: &[u8] = b"/tzel/v1/stats/raw_input_count";
 const PATH_RAW_INPUT_BYTES: &[u8] = b"/tzel/v1/stats/raw_input_bytes";
@@ -831,6 +851,7 @@ fn configure_verifier<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
     config: &KernelVerifierConfig,
 ) -> Result<(), String> {
+    #[cfg(feature = "proof-verifier")]
     DirectProofVerifier::from_kernel_config(config)?;
 
     if !ledger.is_pristine()? && ledger.auth_domain()? != config.auth_domain {
@@ -1012,7 +1033,7 @@ mod tests {
         },
         michelson::{
             ticket::FA2_1Ticket, MichelsonBytes, MichelsonContract, MichelsonInt, MichelsonOption,
-            MichelsonPair,
+            MichelsonPair, MichelsonUnit,
         },
         outbox::OutboxMessage as TezosOutboxMessage,
         public_key_hash::PublicKeyHash,
@@ -1440,6 +1461,41 @@ mod tests {
     }
 
     #[test]
+    fn withdraw_requires_bridge_configuration_even_with_balance() {
+        let mut host = MockHost::default();
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            apply_deposit(&mut state, "bob", 44).unwrap();
+        }
+
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
+                sender: "bob".into(),
+                recipient: sample_l1_receiver().into(),
+                amount: 33,
+            }))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 5,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.balances.get("bob"), Some(&44));
+        assert!(ledger.withdrawals.is_empty());
+        assert!(host.outputs.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("bridge ticketer is not configured"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
     fn configures_bridge_ticketer_via_kernel_message() {
         let mut host = MockHost::default();
         let message =
@@ -1451,6 +1507,31 @@ mod tests {
             level: 1,
             id: 0,
             payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let persisted = host
+            .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+            .expect("bridge ticketer persisted");
+        assert_eq!(String::from_utf8(persisted).unwrap(), sample_ticketer());
+        assert!(matches!(
+            read_last_result(&host).unwrap(),
+            KernelResult::Configured
+        ));
+    }
+
+    #[test]
+    fn configures_bridge_ticketer_via_wrapped_external_message() {
+        let mut host = MockHost::default();
+        host.inputs.push_back(InputMessage {
+            level: 1,
+            id: 5,
+            payload: encode_external_kernel_message(KernelInboxMessage::ConfigureBridge(
+                KernelBridgeConfig {
+                    ticketer: sample_ticketer().into(),
+                },
+            )),
         });
 
         run_with_host(&mut host);
@@ -1574,6 +1655,54 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "proof-verifier"))]
+    #[test]
+    fn rejects_verified_proofs_when_kernel_build_lacks_verifier_support() {
+        let config = KernelVerifierConfig {
+            auth_domain: sample_felt(0x55),
+            verified_program_hashes: sample_program_hashes(),
+        };
+        let mut host = MockHost::with_inputs(vec![
+            InputMessage {
+                level: 8,
+                id: 1,
+                payload: encode_kernel_inbox_message(&KernelInboxMessage::ConfigureVerifier(
+                    config.clone(),
+                ))
+                .unwrap(),
+            },
+            InputMessage {
+                level: 9,
+                id: 2,
+                payload: encode_kernel_inbox_message(&KernelInboxMessage::Shield(
+                    KernelShieldReq {
+                        sender: "alice".into(),
+                        v: 50,
+                        address: sample_payment_address(),
+                        memo: None,
+                        proof: sample_verified_kernel_proof(),
+                        client_cm: ZERO,
+                        client_enc: None,
+                    },
+                ))
+                .unwrap(),
+            },
+        ]);
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.auth_domain, config.auth_domain);
+        assert!(ledger.tree.leaves.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("kernel built without proof verifier support"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "proof-verifier")]
     #[test]
     fn rejects_invalid_stark_proof_shape_before_transition() {
         let config = KernelVerifierConfig {
@@ -1622,6 +1751,29 @@ mod tests {
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("unexpected ticketer"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_ticket_deposit_before_bridge_configuration() {
+        let mut host = MockHost::with_inputs(vec![InputMessage {
+            level: 9,
+            id: 9,
+            payload: encode_ticket_deposit_message("alice", 12),
+        }]);
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert!(ledger.balances.is_empty());
+        assert!(host
+            .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+            .is_none());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("bridge ticketer is not configured"))
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
@@ -1791,6 +1943,65 @@ mod tests {
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("cannot change bridge ticketer"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn allows_bridge_ticketer_reconfiguration_to_same_value_after_state_exists() {
+        let mut host = MockHost::default();
+        install_test_bridge(&mut host);
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            apply_deposit(&mut state, "alice", 3).unwrap();
+        }
+
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
+                ticketer: sample_ticketer().into(),
+            }))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 12,
+            id: 1,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let persisted = host
+            .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+            .expect("bridge ticketer persists");
+        assert_eq!(String::from_utf8(persisted).unwrap(), sample_ticketer());
+        assert_eq!(read_ledger(&host).unwrap().balances.get("alice"), Some(&3));
+        assert!(matches!(
+            read_last_result(&host).unwrap(),
+            KernelResult::Configured
+        ));
+    }
+
+    #[test]
+    fn rejects_ticket_deposit_that_overflows_public_balance() {
+        let mut host = MockHost::default();
+        install_test_bridge(&mut host);
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            state.set_balance("alice", u64::MAX).unwrap();
+        }
+        host.inputs.push_back(InputMessage {
+            level: 13,
+            id: 0,
+            payload: encode_ticket_deposit_message("alice", 1),
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.balances.get("alice"), Some(&u64::MAX));
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("public balance overflow"))
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
@@ -2050,6 +2261,15 @@ mod tests {
         };
         let mut bytes = Vec::new();
         TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer))
+            .serialize(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    fn encode_external_kernel_message(message: KernelInboxMessage) -> Vec<u8> {
+        let payload = encode_kernel_inbox_message(&message).unwrap();
+        let mut bytes = Vec::new();
+        TezosInboxMessage::<MichelsonUnit>::External(payload.as_slice())
             .serialize(&mut bytes)
             .unwrap();
         bytes

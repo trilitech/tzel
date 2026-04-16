@@ -601,8 +601,7 @@ fn kernel_proof_from_wire(proof: WireStarkProof) -> Result<KernelStarkProof, Str
     if proof_len > MAX_PROOF_BYTES {
         return Err(format!(
             "proof too large for kernel wire: {} > {}",
-            proof_len,
-            MAX_PROOF_BYTES
+            proof_len, MAX_PROOF_BYTES
         ));
     }
     let proof_bytes = take_bytes(&mut rest, proof_len, "proof_bytes")?.to_vec();
@@ -611,8 +610,7 @@ fn kernel_proof_from_wire(proof: WireStarkProof) -> Result<KernelStarkProof, Str
     if output_preimage_len > MAX_OUTPUT_PREIMAGE_ITEMS {
         return Err(format!(
             "output_preimage too long for kernel wire: {} > {}",
-            output_preimage_len,
-            MAX_OUTPUT_PREIMAGE_ITEMS
+            output_preimage_len, MAX_OUTPUT_PREIMAGE_ITEMS
         ));
     }
     let mut output_preimage = Vec::with_capacity(output_preimage_len);
@@ -627,8 +625,7 @@ fn kernel_proof_from_wire(proof: WireStarkProof) -> Result<KernelStarkProof, Str
     if verify_meta_len > MAX_VERIFY_META_BYTES {
         return Err(format!(
             "verify_meta too large for kernel wire: {} > {}",
-            verify_meta_len,
-            MAX_VERIFY_META_BYTES
+            verify_meta_len, MAX_VERIFY_META_BYTES
         ));
     }
     let verify_meta = take_bytes(&mut rest, verify_meta_len, "verify_meta")?.to_vec();
@@ -1826,8 +1823,7 @@ mod tests {
         bytes.extend_from_slice(&ZERO);
         bytes.extend_from_slice(&(4u32).to_be_bytes());
         bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        let proof = kernel_proof_from_wire(WireStarkProof { bytes })
-        .unwrap();
+        let proof = kernel_proof_from_wire(WireStarkProof { bytes }).unwrap();
         assert_eq!(proof.verify_meta, vec![0xde, 0xad, 0xbe, 0xef]);
     }
 
