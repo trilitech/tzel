@@ -11,13 +11,15 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 5;
+pub const KERNEL_WIRE_VERSION: u16 = 6;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
 const MAX_MEMO_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT_PREIMAGE_ITEMS: usize = 1024;
 const MAX_VERIFY_META_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
+const MAX_DAL_CHUNK_POINTERS: usize = 256;
+const MAX_DAL_CHUNK_LIST_BYTES: usize = 64 * 1024;
 const MAX_ENCODED_NOTE_WIRE_BYTES: usize =
     (ML_KEM768_CIPHERTEXT_BYTES * 2) + NOTE_AEAD_NONCE_BYTES + ENCRYPTED_NOTE_BYTES + 32;
 const MAX_ENCODED_PROOF_WIRE_BYTES: usize =
@@ -86,6 +88,28 @@ pub struct KernelWithdrawReq {
     pub amount: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KernelDalPayloadKind {
+    Shield,
+    Transfer,
+    Unshield,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelDalChunkPointer {
+    pub published_level: u64,
+    pub slot_index: u8,
+    pub payload_len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelDalPayloadPointer {
+    pub kind: KernelDalPayloadKind,
+    pub chunks: Vec<KernelDalChunkPointer>,
+    pub payload_len: u64,
+    pub payload_hash: F,
+}
+
 #[derive(Debug, Clone)]
 pub enum KernelInboxMessage {
     ConfigureVerifier(KernelVerifierConfig),
@@ -94,6 +118,7 @@ pub enum KernelInboxMessage {
     Transfer(KernelTransferReq),
     Unshield(KernelUnshieldReq),
     Withdraw(KernelWithdrawReq),
+    DalPointer(KernelDalPayloadPointer),
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +160,12 @@ struct WireEncodedProof {
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireEncodedFeltList {
     #[encoding(dynamic = "MAX_ENCODED_NULLIFIER_LIST_BYTES", bytes)]
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireEncodedDalChunkList {
+    #[encoding(dynamic = "MAX_DAL_CHUNK_LIST_BYTES", bytes)]
     bytes: Vec<u8>,
 }
 
@@ -202,6 +233,38 @@ struct WireKernelWithdrawReq {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+#[encoding(tags = "u8")]
+enum WireKernelDalPayloadKind {
+    #[encoding(tag = 0)]
+    Shield,
+    #[encoding(tag = 1)]
+    Transfer,
+    #[encoding(tag = 2)]
+    Unshield,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelDalChunkPointer {
+    published_level: WireU64Le,
+    slot_index: u8,
+    payload_len: WireU64Le,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelDalChunkList {
+    #[encoding(dynamic = "MAX_DAL_CHUNK_POINTERS")]
+    items: Vec<WireKernelDalChunkPointer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelDalPayloadPointer {
+    kind: WireKernelDalPayloadKind,
+    chunks: WireEncodedDalChunkList,
+    payload_hash: WireFelt,
+    payload_len: WireU64Le,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireUnshieldResp {
     change_index: Option<WireU64Le>,
 }
@@ -243,6 +306,8 @@ enum WireKernelInboxMessage {
     Unshield(WireKernelUnshieldReq),
     #[encoding(tag = 5)]
     Withdraw(WireKernelWithdrawReq),
+    #[encoding(tag = 6)]
+    DalPointer(WireKernelDalPayloadPointer),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -298,6 +363,9 @@ pub fn encode_kernel_inbox_message(message: &KernelInboxMessage) -> Result<Vec<u
             KernelInboxMessage::Withdraw(req) => {
                 WireKernelInboxMessage::Withdraw(kernel_withdraw_req_to_wire(req))
             }
+            KernelInboxMessage::DalPointer(pointer) => {
+                WireKernelInboxMessage::DalPointer(kernel_dal_payload_pointer_to_wire(pointer)?)
+            }
         },
     })
 }
@@ -329,6 +397,9 @@ pub fn decode_kernel_inbox_message(bytes: &[u8]) -> Result<KernelInboxMessage, S
         )),
         WireKernelInboxMessage::Withdraw(req) => Ok(KernelInboxMessage::Withdraw(
             kernel_withdraw_req_from_wire(req)?,
+        )),
+        WireKernelInboxMessage::DalPointer(pointer) => Ok(KernelInboxMessage::DalPointer(
+            kernel_dal_payload_pointer_from_wire(pointer)?,
         )),
     }
 }
@@ -496,6 +567,96 @@ fn bridge_config_to_wire(config: &KernelBridgeConfig) -> WireKernelBridgeConfig 
 fn bridge_config_from_wire(wire: WireKernelBridgeConfig) -> Result<KernelBridgeConfig, String> {
     Ok(KernelBridgeConfig {
         ticketer: wire.ticketer,
+    })
+}
+
+fn kernel_dal_payload_kind_to_wire(kind: &KernelDalPayloadKind) -> WireKernelDalPayloadKind {
+    match kind {
+        KernelDalPayloadKind::Shield => WireKernelDalPayloadKind::Shield,
+        KernelDalPayloadKind::Transfer => WireKernelDalPayloadKind::Transfer,
+        KernelDalPayloadKind::Unshield => WireKernelDalPayloadKind::Unshield,
+    }
+}
+
+fn kernel_dal_payload_kind_from_wire(
+    kind: WireKernelDalPayloadKind,
+) -> Result<KernelDalPayloadKind, String> {
+    Ok(match kind {
+        WireKernelDalPayloadKind::Shield => KernelDalPayloadKind::Shield,
+        WireKernelDalPayloadKind::Transfer => KernelDalPayloadKind::Transfer,
+        WireKernelDalPayloadKind::Unshield => KernelDalPayloadKind::Unshield,
+    })
+}
+
+fn kernel_dal_chunk_pointer_to_wire(pointer: &KernelDalChunkPointer) -> WireKernelDalChunkPointer {
+    WireKernelDalChunkPointer {
+        published_level: u64_to_wire(pointer.published_level),
+        slot_index: pointer.slot_index,
+        payload_len: u64_to_wire(pointer.payload_len),
+    }
+}
+
+fn kernel_dal_chunk_pointer_from_wire(
+    wire: WireKernelDalChunkPointer,
+) -> Result<KernelDalChunkPointer, String> {
+    Ok(KernelDalChunkPointer {
+        published_level: wire_to_u64(wire.published_level)?,
+        slot_index: wire.slot_index,
+        payload_len: wire_to_u64(wire.payload_len)?,
+    })
+}
+
+fn kernel_dal_payload_pointer_to_wire(
+    pointer: &KernelDalPayloadPointer,
+) -> Result<WireKernelDalPayloadPointer, String> {
+    if pointer.chunks.is_empty() {
+        return Err("kernel DAL pointer requires at least one chunk".into());
+    }
+    if pointer.chunks.len() > MAX_DAL_CHUNK_POINTERS {
+        return Err(format!(
+            "kernel DAL pointer has too many chunks: {} > {}",
+            pointer.chunks.len(),
+            MAX_DAL_CHUNK_POINTERS
+        ));
+    }
+    let chunks = pointer
+        .chunks
+        .iter()
+        .map(kernel_dal_chunk_pointer_to_wire)
+        .collect::<Vec<_>>();
+    Ok(WireKernelDalPayloadPointer {
+        kind: kernel_dal_payload_kind_to_wire(&pointer.kind),
+        chunks: WireEncodedDalChunkList {
+            bytes: encode_tze(&WireKernelDalChunkList { items: chunks })?,
+        },
+        payload_hash: felt_to_wire(&pointer.payload_hash),
+        payload_len: u64_to_wire(pointer.payload_len),
+    })
+}
+
+fn kernel_dal_payload_pointer_from_wire(
+    wire: WireKernelDalPayloadPointer,
+) -> Result<KernelDalPayloadPointer, String> {
+    let chunks: WireKernelDalChunkList = decode_tze(&wire.chunks.bytes)?;
+    if chunks.items.is_empty() {
+        return Err("kernel DAL pointer requires at least one chunk".into());
+    }
+    if chunks.items.len() > MAX_DAL_CHUNK_POINTERS {
+        return Err(format!(
+            "kernel DAL pointer has too many chunks: {} > {}",
+            chunks.items.len(),
+            MAX_DAL_CHUNK_POINTERS
+        ));
+    }
+    Ok(KernelDalPayloadPointer {
+        kind: kernel_dal_payload_kind_from_wire(wire.kind)?,
+        chunks: chunks
+            .items
+            .into_iter()
+            .map(kernel_dal_chunk_pointer_from_wire)
+            .collect::<Result<Vec<_>, _>>()?,
+        payload_hash: wire_to_felt(wire.payload_hash)?,
+        payload_len: wire_to_u64(wire.payload_len)?,
     })
 }
 
@@ -1339,6 +1500,42 @@ mod tests {
             }
             other => panic!("unexpected decoded message: {:?}", other),
         }
+    }
+
+    #[test]
+    fn kernel_inbox_roundtrip_preserves_dal_pointer() {
+        let message = KernelInboxMessage::DalPointer(KernelDalPayloadPointer {
+            kind: KernelDalPayloadKind::Transfer,
+            chunks: vec![
+                KernelDalChunkPointer {
+                    published_level: 101,
+                    slot_index: 3,
+                    payload_len: 4096,
+                },
+                KernelDalChunkPointer {
+                    published_level: 102,
+                    slot_index: 7,
+                    payload_len: 512,
+                },
+            ],
+            payload_len: 4608,
+            payload_hash: [0xA5; 32],
+        });
+        let encoded = encode_kernel_inbox_message(&message).unwrap();
+        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
+        let KernelInboxMessage::DalPointer(pointer) = decoded else {
+            panic!("unexpected decoded message");
+        };
+        assert_eq!(pointer.kind, KernelDalPayloadKind::Transfer);
+        assert_eq!(pointer.chunks.len(), 2);
+        assert_eq!(pointer.chunks[0].published_level, 101);
+        assert_eq!(pointer.chunks[0].slot_index, 3);
+        assert_eq!(pointer.chunks[0].payload_len, 4096);
+        assert_eq!(pointer.chunks[1].published_level, 102);
+        assert_eq!(pointer.chunks[1].slot_index, 7);
+        assert_eq!(pointer.chunks[1].payload_len, 512);
+        assert_eq!(pointer.payload_len, 4608);
+        assert_eq!(pointer.payload_hash, [0xA5; 32]);
     }
 
     fn sample_payment_address() -> PaymentAddress {

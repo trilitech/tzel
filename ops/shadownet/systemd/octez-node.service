@@ -1,0 +1,20 @@
+[Unit]
+Description=Octez Node (Shadownet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tzel
+EnvironmentFile=/etc/tzel/shadownet.env
+ExecStart=${TZEL_OCTEZ_NODE_BIN} run \
+  --data-dir=${TZEL_OCTEZ_NODE_DATA_DIR} \
+  --rpc-addr=${TZEL_OCTEZ_NODE_RPC_ADDR} \
+  --net-addr=${TZEL_OCTEZ_NODE_NET_ADDR} \
+  --history-mode=rolling
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

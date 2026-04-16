@@ -1,0 +1,24 @@
+[Unit]
+Description=TzEL Rollup Operator
+After=network-online.target octez-dal-node.service octez-rollup-node.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tzel
+EnvironmentFile=/etc/tzel/shadownet.env
+ExecStart=${TZEL_OPERATOR_BIN} \
+  --listen=${TZEL_OPERATOR_LISTEN} \
+  --source-alias=${TZEL_SOURCE_ALIAS} \
+  --state-dir=${TZEL_OPERATOR_STATE_DIR} \
+  --octez-client-bin=${TZEL_OCTEZ_CLIENT_BIN} \
+  --octez-client-dir=${TZEL_OCTEZ_CLIENT_DIR} \
+  --octez-node-endpoint=${TZEL_L1_RPC_URL} \
+  --dal-node-endpoint=http://${TZEL_DAL_RPC_ADDR} \
+  --reconcile-interval-secs=${TZEL_OPERATOR_RECONCILE_INTERVAL_SECS}
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

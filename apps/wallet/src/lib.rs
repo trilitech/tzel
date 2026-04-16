@@ -4,17 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tezos_data_encoding_05::enc::BinWriter as _;
-use tezos_smart_rollup_encoding::{
-    inbox::ExternalMessageFrame,
-    smart_rollup::SmartRollupAddress,
+use tezos_smart_rollup_encoding::{inbox::ExternalMessageFrame, smart_rollup::SmartRollupAddress};
+use tzel_services::kernel_wire::{
+    encode_kernel_inbox_message, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
+    KernelTransferReq, KernelUnshieldReq, KernelWithdrawReq,
 };
 use tzel_services::operator_api::{
     RollupSubmissionKind, RollupSubmissionStatus, RollupSubmissionTransport,
     SubmitRollupMessageReq, SubmitRollupMessageResp,
-};
-use tzel_services::kernel_wire::{
-    encode_kernel_inbox_message, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
-    KernelTransferReq, KernelUnshieldReq, KernelWithdrawReq,
 };
 use tzel_services::*;
 use tzel_verifier::{encode_verify_meta, ProofBundle as VerifyProofBundle};
@@ -1494,10 +1491,7 @@ impl<'a> RollupRpc<'a> {
     }
 }
 
-fn encode_targeted_rollup_message(
-    rollup_address: &str,
-    payload: &[u8],
-) -> Result<Vec<u8>, String> {
+fn encode_targeted_rollup_message(rollup_address: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
     let address = SmartRollupAddress::from_b58check(rollup_address)
         .map_err(|_| format!("invalid rollup address: {}", rollup_address))?;
     let frame = ExternalMessageFrame::Targetted {
@@ -1533,6 +1527,9 @@ fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
         KernelInboxMessage::Withdraw(_)
         | KernelInboxMessage::ConfigureVerifier(_)
         | KernelInboxMessage::ConfigureBridge(_) => RollupSubmissionKind::Withdraw,
+        KernelInboxMessage::DalPointer(_) => {
+            unreachable!("wallet should not submit raw DAL pointer messages")
+        }
     }
 }
 
@@ -1559,12 +1556,23 @@ fn submit_kernel_message_via_operator(
     let status = match submission.status {
         RollupSubmissionStatus::SubmittedToL1 => "submitted_to_l1",
         RollupSubmissionStatus::PendingDal => "pending_dal",
+        RollupSubmissionStatus::CommitmentIncluded => "commitment_included",
+        RollupSubmissionStatus::Attested => "attested",
         RollupSubmissionStatus::Failed => "failed",
     };
     let mut lines = vec![
         format!("Operator submission id: {}", submission.id),
         format!("Status: {} via {}", status, transport),
     ];
+    if !submission.dal_chunks.is_empty() {
+        lines.push(format!("DAL chunks: {}", submission.dal_chunks.len()));
+        for (index, chunk) in submission.dal_chunks.iter().enumerate() {
+            lines.push(format!(
+                "  chunk {}: slot {} level {} bytes {} commitment {}",
+                index, chunk.slot_index, chunk.published_level, chunk.payload_len, chunk.commitment
+            ));
+        }
+    }
     if let Some(detail) = submission.detail {
         lines.push(detail);
     }
@@ -1572,7 +1580,12 @@ fn submit_kernel_message_via_operator(
         output: lines.join("\n"),
         operation_hash: submission.operation_hash,
         submission_id: Some(submission.id),
-        pending_dal: matches!(submission.status, RollupSubmissionStatus::PendingDal),
+        pending_dal: matches!(
+            submission.status,
+            RollupSubmissionStatus::PendingDal
+                | RollupSubmissionStatus::CommitmentIncluded
+                | RollupSubmissionStatus::Attested
+        ),
     })
 }
 
@@ -1581,10 +1594,7 @@ fn load_operator_submission(
     submission_id: &str,
 ) -> Result<SubmitRollupMessageResp, String> {
     let base = operator_url.trim_end_matches('/');
-    get_json(&format!(
-        "{}/v1/rollup/submissions/{}",
-        base, submission_id
-    ))
+    get_json(&format!("{}/v1/rollup/submissions/{}", base, submission_id))
 }
 
 fn indexed_durable_key(prefix: &str, index: u64) -> String {
@@ -1592,7 +1602,11 @@ fn indexed_durable_key(prefix: &str, index: u64) -> String {
 }
 
 fn balance_durable_key(account: &str) -> String {
-    format!("{}{}", DURABLE_BALANCE_PREFIX, hex::encode(account.as_bytes()))
+    format!(
+        "{}{}",
+        DURABLE_BALANCE_PREFIX,
+        hex::encode(account.as_bytes())
+    )
 }
 
 fn parse_rollup_rpc_bytes(raw: &str) -> Result<Vec<u8>, String> {
@@ -3943,16 +3957,16 @@ fn cmd_bridge_deposit(
     Ok(())
 }
 
-fn cmd_operator_status(
-    profile: &WalletNetworkProfile,
-    submission_id: &str,
-) -> Result<(), String> {
+fn cmd_operator_status(profile: &WalletNetworkProfile, submission_id: &str) -> Result<(), String> {
     let operator_url = profile
         .operator_url
         .as_deref()
         .ok_or_else(|| "this wallet profile has no operator_url configured".to_string())?;
     let resp = load_operator_submission(operator_url, submission_id)?;
-    println!("{}", serde_json::to_string_pretty(&resp.submission).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&resp.submission).unwrap()
+    );
     Ok(())
 }
 

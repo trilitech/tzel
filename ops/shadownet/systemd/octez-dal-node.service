@@ -1,0 +1,23 @@
+[Unit]
+Description=Octez DAL Node (Shadownet)
+After=network-online.target octez-node.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tzel
+EnvironmentFile=/etc/tzel/shadownet.env
+ExecStart=${TZEL_DAL_NODE_BIN} run \
+  --data-dir=${TZEL_DAL_DATA_DIR} \
+  --endpoint=${TZEL_L1_RPC_URL} \
+  --rpc-addr=${TZEL_DAL_RPC_ADDR} \
+  --net-addr=${TZEL_DAL_NET_ADDR} \
+  --public-addr=${TZEL_DAL_PUBLIC_ADDR} \
+  --operator-profiles=${TZEL_DAL_OPERATOR_PROFILES} \
+  --fetch-trusted-setup=true
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

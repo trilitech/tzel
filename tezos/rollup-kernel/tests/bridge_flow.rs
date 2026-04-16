@@ -31,8 +31,8 @@ use tzel_core::kernel_wire::{
 #[cfg(feature = "proof-verifier")]
 use tzel_core::{ProgramHashes, Proof, ShieldReq, TransferReq, UnshieldReq, F};
 use tzel_rollup_kernel::{
-    read_last_input, read_last_result, read_ledger, read_stats, run_with_host, Host, InputMessage,
-    MAX_INPUT_BYTES,
+    read_last_input, read_last_result, read_ledger, read_stats, run_with_host, DalParameters,
+    Host, InputMessage, MAX_INPUT_BYTES,
 };
 
 const PATH_BRIDGE_TICKETER: &[u8] = b"/tzel/v1/state/bridge/ticketer";
@@ -84,6 +84,20 @@ impl Host for TestHost {
 
     fn rollup_address(&self) -> Vec<u8> {
         sample_rollup_address().hash().as_ref().clone()
+    }
+
+    fn reveal_dal_parameters(&self) -> Result<DalParameters, String> {
+        Err("DAL is not configured in bridge_flow test host".into())
+    }
+
+    fn reveal_dal_page(
+        &self,
+        _published_level: i32,
+        _slot_index: u8,
+        _page_index: u16,
+        _max_bytes: usize,
+    ) -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
     }
 }
 

@@ -1,0 +1,27 @@
+[Unit]
+Description=Octez Smart Rollup Node (Shadownet)
+After=network-online.target octez-node.service octez-dal-node.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tzel
+EnvironmentFile=/etc/tzel/shadownet.env
+ExecStart=${TZEL_ROLLUP_NODE_BIN} \
+  -d ${TZEL_OCTEZ_CLIENT_DIR} \
+  -E ${TZEL_L1_RPC_URL} \
+  run \
+  --data-dir=${TZEL_ROLLUP_DATA_DIR} \
+  --mode=observer \
+  --rollup=${TZEL_ROLLUP_ADDRESS} \
+  --rpc-addr=${TZEL_ROLLUP_RPC_HOST} \
+  --rpc-port=${TZEL_ROLLUP_RPC_PORT} \
+  --dal-node=http://${TZEL_DAL_RPC_ADDR} \
+  --log-kernel-debug \
+  --no-degraded
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

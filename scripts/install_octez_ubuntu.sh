@@ -30,12 +30,14 @@ apt-get install -y \
   octez-client \
   octez-node \
   octez-baker \
+  octez-dal-node \
   octez-smart-rollup-node
 
 echo
 echo "Installed Octez binaries:"
 octez-client --version
 octez-node --version
+octez-dal-node --version
 octez-smart-rollup-node --version
 if command -v octez-smart-rollup-wasm-debugger >/dev/null 2>&1; then
   octez-smart-rollup-wasm-debugger --version
