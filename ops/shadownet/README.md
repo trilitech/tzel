@@ -7,6 +7,7 @@ operator machine that runs:
 - `octez-dal-node`
 - `octez-smart-rollup-node`
 - `tzel-operator`
+- optionally `tzel-detect` for delegated watch-only scanning
 
 ## Why A Public Box Matters
 
@@ -28,14 +29,14 @@ by the rest of the DAL network. In practice that means:
 - `shadownet.env.example`
   - single environment file shared by all services
 - `systemd/*.service`
-  - systemd unit templates for the four long-running processes
+  - systemd unit templates for the long-running rollup processes and optional detection service
 - `../prover/`
   - standard prover deployment paths plus preflight for `reprove` and the Cairo executables
 - `../../scripts/install_tzel_binaries.sh`
-  - installs `tzel-operator`, `tzel-wallet`, `sp-client`, `octez_kernel_message`,
+  - installs `tzel-operator`, `tzel-wallet`, `tzel-detect`, `sp-client`, `octez_kernel_message`,
     `verified_bridge_fixture_message`, `reprove`, and the Cairo executable JSON files
 - `../../scripts/shadownet_operator_preflight.sh`
-  - checks binaries, env vars, and local service RPCs
+  - checks binaries, env vars, and local service RPCs, including `tzel-detect` when enabled
 - `../../scripts/shadownet_live_e2e_smoke.sh`
   - uses two disposable wallets to run `deposit -> shield -> send -> unshield -> withdraw`
     against the configured public box
@@ -61,6 +62,8 @@ by the rest of the DAL network. In practice that means:
 8. Reload and start services.
    - `sudo systemctl daemon-reload`
    - `sudo systemctl enable --now octez-node octez-dal-node octez-rollup-node tzel-operator`
+   - optionally enable `tzel-detect` after creating a watch wallet and setting `TZEL_DETECT_ENABLE=1`
+   - `sudo systemctl enable --now tzel-detect`
 9. Run preflight.
    - `./scripts/shadownet_operator_preflight.sh /etc/tzel/shadownet.env`
 10. Run a wallet-facing smoke once the rollup is configured.
@@ -72,6 +75,7 @@ by the rest of the DAL network. In practice that means:
 - DAL node RPC: `http://127.0.0.1:10732`
 - rollup node RPC: `http://127.0.0.1:28944`
 - operator HTTP: `http://127.0.0.1:8787`
+- detection HTTP: `http://127.0.0.1:8789` when enabled
 
 ## Firewall
 
@@ -82,6 +86,30 @@ At minimum, allow inbound TCP for:
 
 Keep the RPC endpoints bound to loopback unless you explicitly want remote
 access.
+
+## Optional Detection Service
+
+For delegated watch-only scanning, export watch material from a spending wallet:
+
+```bash
+/usr/local/bin/tzel-wallet --wallet alice.json export-view --out alice.view.json
+/usr/local/bin/tzel-wallet --wallet /var/lib/tzel/watch/alice.watch.json watch init --material alice.view.json
+/usr/local/bin/tzel-wallet --wallet /var/lib/tzel/watch/alice.watch.json profile init-shadownet \
+  --rollup-node-url http://127.0.0.1:28944 \
+  --rollup-address "$TZEL_ROLLUP_ADDRESS" \
+  --bridge-ticketer "$TZEL_BRIDGE_TICKETER" \
+  --operator-url http://127.0.0.1:8787 \
+  --source-alias "$TZEL_SOURCE_ALIAS"
+```
+
+Then set these in `/etc/tzel/shadownet.env`:
+
+- `TZEL_DETECT_ENABLE=1`
+- `TZEL_DETECT_WALLET=/var/lib/tzel/watch/alice.watch.json`
+- optionally `TZEL_DETECT_LISTEN` and `TZEL_DETECT_INTERVAL_SECS`
+
+The service only exposes sanitized watch status. It does not serve the embedded
+viewing or detection material over HTTP.
 
 ## Wallet Diagnosis
 

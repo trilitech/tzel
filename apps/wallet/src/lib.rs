@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use ml_kem::KeyExport;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tezos_data_encoding_05::enc::BinWriter as _;
@@ -544,6 +544,109 @@ struct PendingSpend {
     operation_hash: Option<String>,
 }
 
+const WATCH_WALLET_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WatchAddressRecord {
+    index: u32,
+    #[serde(with = "hex_f")]
+    d_j: F,
+    #[serde(with = "hex_f")]
+    auth_root: F,
+    #[serde(with = "hex_f")]
+    auth_pub_seed: F,
+    #[serde(with = "hex_f")]
+    nk_tag: F,
+}
+
+impl From<&WalletAddressState> for WatchAddressRecord {
+    fn from(value: &WalletAddressState) -> Self {
+        Self {
+            index: value.index,
+            d_j: value.d_j,
+            auth_root: value.auth_root,
+            auth_pub_seed: value.auth_pub_seed,
+            nk_tag: value.nk_tag,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum WatchKeyMaterial {
+    Detect {
+        version: u16,
+        #[serde(with = "hex_f")]
+        detect_root: F,
+        addr_count: u32,
+    },
+    View {
+        version: u16,
+        #[serde(with = "hex_f")]
+        incoming_seed: F,
+        addresses: Vec<WatchAddressRecord>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct DetectedNoteRecord {
+    index: usize,
+    addr_index: u32,
+    #[serde(with = "hex_f")]
+    cm: F,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ViewedNoteRecord {
+    index: usize,
+    addr_index: u32,
+    #[serde(with = "hex_f")]
+    cm: F,
+    value: u64,
+    #[serde(default, with = "hex_bytes")]
+    memo: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum WatchWalletFile {
+    Detect {
+        version: u16,
+        #[serde(with = "hex_f")]
+        detect_root: F,
+        addr_count: u32,
+        scanned: usize,
+        matches: Vec<DetectedNoteRecord>,
+    },
+    View {
+        version: u16,
+        #[serde(with = "hex_f")]
+        incoming_seed: F,
+        addresses: Vec<WatchAddressRecord>,
+        scanned: usize,
+        notes: Vec<ViewedNoteRecord>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WatchWalletStatus {
+    mode: &'static str,
+    scanned: usize,
+    tracked: usize,
+    incoming_total: u128,
+    spend_status: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    matches: Vec<DetectedNoteRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<ViewedNoteRecord>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct WatchSyncSummary {
+    found: usize,
+    next_cursor: usize,
+}
+
 impl WalletFile {
     fn account(&self) -> Account {
         derive_account(&self.master_sk)
@@ -845,6 +948,188 @@ impl WalletFile {
     }
 }
 
+impl WatchKeyMaterial {
+    fn from_detect_wallet(wallet: &WalletFile) -> Self {
+        let detect_root = derive_detect_root(&wallet.account().incoming_seed);
+        Self::Detect {
+            version: WATCH_WALLET_VERSION,
+            detect_root,
+            addr_count: wallet.addr_counter,
+        }
+    }
+
+    fn from_view_wallet(wallet: &WalletFile) -> Self {
+        let addresses = wallet
+            .addresses
+            .iter()
+            .map(WatchAddressRecord::from)
+            .collect();
+        Self::View {
+            version: WATCH_WALLET_VERSION,
+            incoming_seed: wallet.account().incoming_seed,
+            addresses,
+        }
+    }
+}
+
+impl WatchWalletFile {
+    fn from_material(material: WatchKeyMaterial) -> Self {
+        match material {
+            WatchKeyMaterial::Detect {
+                version,
+                detect_root,
+                addr_count,
+            } => Self::Detect {
+                version,
+                detect_root,
+                addr_count,
+                scanned: 0,
+                matches: Vec::new(),
+            },
+            WatchKeyMaterial::View {
+                version,
+                incoming_seed,
+                addresses,
+            } => Self::View {
+                version,
+                incoming_seed,
+                addresses,
+                scanned: 0,
+                notes: Vec::new(),
+            },
+        }
+    }
+
+    fn status(&self) -> WatchWalletStatus {
+        match self {
+            WatchWalletFile::Detect {
+                scanned, matches, ..
+            } => WatchWalletStatus {
+                mode: "detect",
+                scanned: *scanned,
+                tracked: matches.len(),
+                incoming_total: 0,
+                spend_status: "candidate_matches_only",
+                matches: matches.clone(),
+                notes: Vec::new(),
+            },
+            WatchWalletFile::View { scanned, notes, .. } => WatchWalletStatus {
+                mode: "view",
+                scanned: *scanned,
+                tracked: notes.len(),
+                incoming_total: notes.iter().map(|note| note.value as u128).sum(),
+                spend_status: "unavailable_without_spend_key",
+                matches: Vec::new(),
+                notes: notes.clone(),
+            },
+        }
+    }
+}
+
+fn detect_record_for_note(
+    detect_root: &F,
+    addr_count: u32,
+    nm: &NoteMemo,
+) -> Option<DetectedNoteRecord> {
+    for addr_index in 0..addr_count {
+        let (_, dk_d) = derive_kem_detect_keys_from_root(detect_root, addr_index);
+        if detect(&nm.enc, &dk_d) {
+            return Some(DetectedNoteRecord {
+                index: nm.index,
+                addr_index,
+                cm: nm.cm,
+            });
+        }
+    }
+    None
+}
+
+fn view_record_for_note(
+    incoming_seed: &F,
+    addresses: &[WatchAddressRecord],
+    nm: &NoteMemo,
+) -> Option<ViewedNoteRecord> {
+    for addr in addresses {
+        let (_, dk_v, _, dk_d) = derive_kem_keys(incoming_seed, addr.index);
+        if !detect(&nm.enc, &dk_d) {
+            continue;
+        }
+        let Some((value, rseed, memo)) = decrypt_memo(&nm.enc, &dk_v) else {
+            continue;
+        };
+        let rcm = derive_rcm(&rseed);
+        let owner = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &addr.nk_tag);
+        if commit(&addr.d_j, value, &rcm, &owner) != nm.cm {
+            continue;
+        }
+        return Some(ViewedNoteRecord {
+            index: nm.index,
+            addr_index: addr.index,
+            cm: nm.cm,
+            value,
+            memo: trim_decrypted_memo(memo),
+        });
+    }
+    None
+}
+
+fn trim_decrypted_memo(mut memo: Vec<u8>) -> Vec<u8> {
+    while memo.last().copied() == Some(0) {
+        memo.pop();
+    }
+    memo
+}
+
+fn apply_watch_feed(watch: &mut WatchWalletFile, feed: &NotesFeedResp) -> WatchSyncSummary {
+    let mut summary = WatchSyncSummary {
+        found: 0,
+        next_cursor: feed.next_cursor,
+    };
+    match watch {
+        WatchWalletFile::Detect {
+            detect_root,
+            addr_count,
+            scanned,
+            matches,
+            ..
+        } => {
+            let mut known: std::collections::HashSet<(usize, F)> =
+                matches.iter().map(|m| (m.index, m.cm)).collect();
+            for nm in &feed.notes {
+                let Some(record) = detect_record_for_note(detect_root, *addr_count, nm) else {
+                    continue;
+                };
+                if known.insert((record.index, record.cm)) {
+                    matches.push(record);
+                    summary.found += 1;
+                }
+            }
+            *scanned = feed.next_cursor;
+        }
+        WatchWalletFile::View {
+            incoming_seed,
+            addresses,
+            scanned,
+            notes,
+            ..
+        } => {
+            let mut known: std::collections::HashSet<(usize, F)> =
+                notes.iter().map(|n| (n.index, n.cm)).collect();
+            for nm in &feed.notes {
+                let Some(record) = view_record_for_note(incoming_seed, addresses, nm) else {
+                    continue;
+                };
+                if known.insert((record.index, record.cm)) {
+                    notes.push(record);
+                    summary.found += 1;
+                }
+            }
+            *scanned = feed.next_cursor;
+        }
+    }
+    summary
+}
+
 fn note_nullifier(note: &Note) -> F {
     nullifier(&note.nk_spend, &note.cm, note.index as u64)
 }
@@ -927,6 +1212,29 @@ fn load_wallet(path: &str) -> Result<WalletFile, String> {
     Ok(wallet)
 }
 
+fn load_private_json<T: DeserializeOwned>(path: &str, label: &str) -> Result<T, String> {
+    warn_if_wallet_permissions_are_too_open(path);
+    let data = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", label, e))?;
+    serde_json::from_str(&data).map_err(|e| format!("parse {}: {}", label, e))
+}
+
+fn save_private_json<T: Serialize>(path: &str, value: &T, label: &str) -> Result<(), String> {
+    let data =
+        serde_json::to_string_pretty(value).map_err(|e| format!("serialize {}: {}", label, e))?;
+    let output_path = std::path::Path::new(path);
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path));
+    let mut file =
+        std::fs::File::create(&tmp).map_err(|e| format!("create {} tmp: {}", label, e))?;
+    file.write_all(data.as_bytes())
+        .map_err(|e| format!("write {} tmp: {}", label, e))?;
+    file.sync_all()
+        .map_err(|e| format!("fsync {} tmp: {}", label, e))?;
+    drop(file);
+    std::fs::rename(&tmp, output_path).map_err(|e| format!("rename {}: {}", label, e))?;
+    set_wallet_permissions(output_path)?;
+    sync_parent_dir(output_path)
+}
+
 fn save_wallet(path: &str, w: &WalletFile) -> Result<(), String> {
     let data = serde_json::to_string_pretty(w).map_err(|e| format!("serialize: {}", e))?;
     // Durable write: fsync temp file, rename atomically, then fsync the parent
@@ -942,6 +1250,14 @@ fn save_wallet(path: &str, w: &WalletFile) -> Result<(), String> {
     set_wallet_permissions(wallet_path)?;
     sync_parent_dir(wallet_path)?;
     save_wallet_xmss_floor(path, &w.wallet_xmss_floor())
+}
+
+fn load_watch_wallet(path: &str) -> Result<WatchWalletFile, String> {
+    load_private_json(path, "watch wallet")
+}
+
+fn save_watch_wallet(path: &str, watch: &WatchWalletFile) -> Result<(), String> {
+    save_private_json(path, watch, "watch wallet")
 }
 
 fn save_wallet_xmss_floor(path: &str, floor: &WalletXmssFloor) -> Result<(), String> {
@@ -1887,9 +2203,15 @@ enum Cmd {
     /// Derive a new payment address
     Address,
     /// Export detection key (for delegation)
-    ExportDetect,
-    /// Export viewing keys (incoming_seed + kem_seed_v)
-    ExportView,
+    ExportDetect {
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Export viewing material for delegated scanning and note validation.
+    ExportView {
+        #[arg(long)]
+        out: Option<String>,
+    },
     /// Scan ledger for new notes
     Scan {
         #[arg(short, long, default_value = "http://localhost:8080")]
@@ -1978,7 +2300,7 @@ fn run(cli: Cli) -> Result<(), String> {
         | Cmd::Shield { .. }
         | Cmd::Transfer { .. }
         | Cmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
-        Cmd::ExportDetect | Cmd::ExportView | Cmd::Balance | Cmd::Fund { .. } => None,
+        Cmd::ExportDetect { .. } | Cmd::ExportView { .. } | Cmd::Balance | Cmd::Fund { .. } => None,
     };
     let pc = ProveConfig {
         skip_proof: cli.trust_me_bro,
@@ -1988,8 +2310,8 @@ fn run(cli: Cli) -> Result<(), String> {
     match cli.cmd {
         Cmd::Keygen => cmd_keygen(&cli.wallet),
         Cmd::Address => cmd_address(&cli.wallet),
-        Cmd::ExportDetect => cmd_export_detect(&cli.wallet),
-        Cmd::ExportView => cmd_export_view(&cli.wallet),
+        Cmd::ExportDetect { out } => cmd_export_detect(&cli.wallet, out.as_deref()),
+        Cmd::ExportView { out } => cmd_export_view(&cli.wallet, out.as_deref()),
         Cmd::Scan { ledger } => cmd_scan(&cli.wallet, &ledger),
         Cmd::Balance => cmd_balance(&cli.wallet),
         Cmd::Shield {
@@ -2121,9 +2443,42 @@ enum UserCmd {
         submission_id: String,
     },
     /// Export detection material for delegated scanning.
-    ExportDetect,
-    /// Export viewing material for delegated scanning and decryption.
-    ExportView,
+    ExportDetect {
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Export viewing material for delegated scanning and note validation.
+    ExportView {
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Manage a watch-only detection or viewing wallet.
+    Watch {
+        #[command(subcommand)]
+        cmd: UserWatchCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserWatchCmd {
+    /// Initialize a watch-only wallet from exported detection or viewing material.
+    Init {
+        #[arg(long)]
+        material: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Sync a watch-only wallet directly from rollup durable state.
+    Sync {
+        /// Keep polling until interrupted.
+        #[arg(long)]
+        watch: bool,
+        /// Poll interval for `watch sync --watch`.
+        #[arg(long, default_value_t = 5)]
+        interval_secs: u64,
+    },
+    /// Show sanitized watch-only state.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -2167,6 +2522,99 @@ pub fn tzel_wallet_entry() {
     }
 }
 
+#[derive(Parser)]
+#[command(
+    name = "tzel-detect",
+    about = "TzEL watch-only detection/viewing service"
+)]
+struct DetectServiceCli {
+    #[arg(short, long, default_value = "watch.json")]
+    wallet: String,
+    #[arg(long, default_value = "127.0.0.1:8789")]
+    bind: String,
+    #[arg(long, default_value_t = 5)]
+    interval_secs: u64,
+}
+
+#[derive(Clone)]
+struct DetectServiceState {
+    wallet: String,
+    sync_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Serialize)]
+struct DetectServiceSyncResp {
+    summary: WatchSyncSummary,
+    status: WatchWalletStatus,
+}
+
+pub fn tzel_detect_entry() {
+    let cli = DetectServiceCli::parse();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    if let Err(e) = runtime.block_on(run_detect_service(cli)) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+async fn run_detect_service(cli: DetectServiceCli) -> Result<(), String> {
+    validate_detection_service_wallet(&cli.wallet)?;
+    let state = DetectServiceState {
+        wallet: cli.wallet.clone(),
+        sync_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    let background_state = state.clone();
+    let interval_secs = cli.interval_secs.max(1);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let _guard = background_state.sync_lock.lock().await;
+            let _ = run_detection_service_once(&background_state.wallet);
+        }
+    });
+
+    let app = axum::Router::new()
+        .route("/healthz", axum::routing::get(detect_service_healthz))
+        .route("/v1/status", axum::routing::get(detect_service_get_status))
+        .route("/v1/sync", axum::routing::post(detect_service_post_sync))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&cli.bind)
+        .await
+        .map_err(|e| format!("bind detection service {}: {}", cli.bind, e))?;
+    println!("Detection service listening on http://{}", cli.bind);
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| format!("run detection service: {}", e))
+}
+
+async fn detect_service_healthz() -> &'static str {
+    "ok"
+}
+
+async fn detect_service_get_status(
+    axum::extract::State(state): axum::extract::State<DetectServiceState>,
+) -> Result<axum::Json<WatchWalletStatus>, (axum::http::StatusCode, String)> {
+    load_detection_service_status(&state.wallet)
+        .map(axum::Json)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn detect_service_post_sync(
+    axum::extract::State(state): axum::extract::State<DetectServiceState>,
+) -> Result<axum::Json<DetectServiceSyncResp>, (axum::http::StatusCode, String)> {
+    let _guard = state.sync_lock.lock().await;
+    let (status, summary) = run_detection_service_once(&state.wallet)
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(axum::Json(DetectServiceSyncResp { summary, status }))
+}
+
 fn run_user(cli: UserCli) -> Result<(), String> {
     let _wallet_lock = match &cli.cmd {
         UserCmd::Init
@@ -2181,8 +2629,14 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         | UserCmd::Deposit { .. }
         | UserCmd::Status { .. }
         | UserCmd::Withdraw { .. }
-        | UserCmd::ExportDetect
-        | UserCmd::ExportView => None,
+        | UserCmd::ExportDetect { .. }
+        | UserCmd::ExportView { .. } => None,
+        UserCmd::Watch { cmd } => match cmd {
+            UserWatchCmd::Init { .. } | UserWatchCmd::Sync { .. } => {
+                Some(acquire_wallet_lock(&cli.wallet)?)
+            }
+            UserWatchCmd::Show => None,
+        },
     };
 
     let pc = ProveConfig {
@@ -2251,8 +2705,9 @@ fn run_user(cli: UserCli) -> Result<(), String> {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_operator_status(&profile, &submission_id)
         }
-        UserCmd::ExportDetect => cmd_export_detect(&cli.wallet),
-        UserCmd::ExportView => cmd_export_view(&cli.wallet),
+        UserCmd::ExportDetect { out } => cmd_export_detect(&cli.wallet, out.as_deref()),
+        UserCmd::ExportView { out } => cmd_export_view(&cli.wallet, out.as_deref()),
+        UserCmd::Watch { cmd } => run_watch_wallet(&cli.wallet, cmd),
     }
 }
 
@@ -2439,30 +2894,165 @@ fn cmd_address(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_export_detect(path: &str) -> Result<(), String> {
+fn write_json_stdout_or_file<T: Serialize>(value: &T, out: Option<&str>) -> Result<(), String> {
+    let data = serde_json::to_string_pretty(value).map_err(|e| format!("serialize json: {}", e))?;
+    if let Some(path) = out {
+        save_private_json(path, value, "export")?;
+        println!("Wrote {}", path);
+    } else {
+        println!("{data}");
+    }
+    Ok(())
+}
+
+fn cmd_export_detect(path: &str, out: Option<&str>) -> Result<(), String> {
     let w = load_wallet(path)?;
-    let acc = w.account();
-    let detect_root = derive_detect_root(&acc.incoming_seed);
     // Export detection root only: holder can derive per-address dk_d_j
-    // for any j, but cannot derive viewing keys or decrypt memos.
+    // for known address indices, but cannot decrypt memos or spend.
+    let exported = WatchKeyMaterial::from_detect_wallet(&w);
+    write_json_stdout_or_file(&exported, out)
+}
+
+fn cmd_export_view(path: &str, out: Option<&str>) -> Result<(), String> {
+    let w = load_wallet(path)?;
+    // Export incoming_seed plus public address metadata so delegated viewers
+    // can decrypt and validate incoming notes without spend authority.
+    let exported = WatchKeyMaterial::from_view_wallet(&w);
+    write_json_stdout_or_file(&exported, out)
+}
+
+fn load_watch_material(path: &str) -> Result<WatchKeyMaterial, String> {
+    load_private_json(path, "watch material")
+}
+
+fn cmd_watch_init(path: &str, material_path: &str, force: bool) -> Result<(), String> {
+    let output_path = Path::new(path);
+    if output_path.exists() && !force {
+        return Err(format!(
+            "watch wallet {} already exists; pass --force to overwrite",
+            path
+        ));
+    }
+    let material = load_watch_material(material_path)?;
+    let watch = WatchWalletFile::from_material(material);
+    save_watch_wallet(path, &watch)?;
+    println!("Watch wallet created: {}", path);
+    Ok(())
+}
+
+fn sync_watch_wallet_once(
+    path: &str,
+    profile: &WalletNetworkProfile,
+) -> Result<WatchSyncSummary, String> {
+    let mut watch = load_watch_wallet(path)?;
+    let cursor = match &watch {
+        WatchWalletFile::Detect { scanned, .. } | WatchWalletFile::View { scanned, .. } => *scanned,
+    };
+    let rollup = RollupRpc::new(profile);
+    let feed = rollup.load_notes_since(cursor).map_err(|e| {
+        format!(
+            "watch sync failed: {}. Run `tzel-wallet --wallet {} profile show` to confirm the saved rollup profile.",
+            e, path
+        )
+    })?;
+    let summary = apply_watch_feed(&mut watch, &feed);
+    save_watch_wallet(path, &watch)?;
+    Ok(summary)
+}
+
+fn cmd_watch_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), String> {
+    let summary = sync_watch_wallet_once(path, profile)?;
+    let watch = load_watch_wallet(path)?;
+    let status = watch.status();
+    match status.mode {
+        "detect" => println!(
+            "Watch sync: {} new candidate matches, cursor={}, tracked={}, mode={}",
+            summary.found, status.scanned, status.tracked, status.mode
+        ),
+        "view" => println!(
+            "Watch sync: {} new validated notes, cursor={}, tracked={}, incoming_total={}, spend_status={}",
+            summary.found,
+            status.scanned,
+            status.tracked,
+            status.incoming_total,
+            status.spend_status
+        ),
+        _ => println!(
+            "Watch sync: {} new records, cursor={}, tracked={}",
+            summary.found, status.scanned, status.tracked
+        ),
+    }
+    Ok(())
+}
+
+fn cmd_watch_sync_watch(
+    path: &str,
+    profile: &WalletNetworkProfile,
+    interval_secs: u64,
+) -> Result<(), String> {
+    loop {
+        cmd_watch_sync(path, profile)?;
+        std::thread::sleep(std::time::Duration::from_secs(interval_secs.max(1)));
+    }
+}
+
+fn cmd_watch_show(path: &str) -> Result<(), String> {
+    let watch = load_watch_wallet(path)?;
     println!(
-        "{{\"detect_root\":\"{}\",\"addr_count\":{},\"mode\":\"detect\"}}",
-        hex::encode(detect_root),
-        w.addr_counter
+        "{}",
+        serde_json::to_string_pretty(&watch.status())
+            .map_err(|e| format!("serialize watch status: {}", e))?
     );
     Ok(())
 }
 
-fn cmd_export_view(path: &str) -> Result<(), String> {
-    let w = load_wallet(path)?;
-    let acc = w.account();
-    // Export incoming_seed: holder can derive per-address dk_v_j and dk_d_j
-    // for any j, enabling full viewing (decrypt + detect) but not spending.
-    println!(
-        "{{\"incoming_seed\":\"{}\",\"addr_count\":{}}}",
-        hex::encode(acc.incoming_seed),
-        w.addr_counter
-    );
+fn run_watch_wallet(path: &str, cmd: UserWatchCmd) -> Result<(), String> {
+    match cmd {
+        UserWatchCmd::Init { material, force } => cmd_watch_init(path, &material, force),
+        UserWatchCmd::Sync {
+            watch,
+            interval_secs,
+        } => {
+            let profile = load_required_network_profile(path)?;
+            if watch {
+                cmd_watch_sync_watch(path, &profile, interval_secs)
+            } else {
+                cmd_watch_sync(path, &profile)
+            }
+        }
+        UserWatchCmd::Show => cmd_watch_show(path),
+    }
+}
+
+fn detect_service_status(path: &str) -> Result<WatchWalletStatus, String> {
+    Ok(load_watch_wallet(path)?.status())
+}
+
+fn detect_service_sync_once(
+    path: &str,
+    profile: &WalletNetworkProfile,
+) -> Result<WatchSyncSummary, String> {
+    let _lock = acquire_wallet_lock(path)?;
+    sync_watch_wallet_once(path, profile)
+}
+
+pub fn run_detection_service_once(
+    path: &str,
+) -> Result<(WatchWalletStatus, WatchSyncSummary), String> {
+    let profile = load_required_network_profile(path)?;
+    let summary = detect_service_sync_once(path, &profile)?;
+    let status = detect_service_status(path)?;
+    Ok((status, summary))
+}
+
+pub fn load_detection_service_status(path: &str) -> Result<WatchWalletStatus, String> {
+    detect_service_status(path)
+}
+
+pub fn validate_detection_service_wallet(path: &str) -> Result<(), String> {
+    match load_watch_wallet(path)? {
+        WatchWalletFile::Detect { .. } | WatchWalletFile::View { .. } => {}
+    }
     Ok(())
 }
 
@@ -2597,7 +3187,7 @@ mod tests {
 
     pub(super) fn rollup_profile_for_url(base_url: &str) -> WalletNetworkProfile {
         WalletNetworkProfile {
-            network: "test".into(),
+            network: "shadownet".into(),
             rollup_node_url: base_url.into(),
             rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
             bridge_ticketer: "KT1Jg4fj5wwnKHuW8aa9uDX6dRYBdjXhm2sJ".into(),
@@ -2885,6 +3475,496 @@ mod tests {
             detect_root, acc.incoming_seed,
             "detect export material must not expose incoming_seed"
         );
+    }
+
+    #[test]
+    fn test_view_export_includes_address_metadata() {
+        let w = test_wallet(2, None);
+        let material = WatchKeyMaterial::from_view_wallet(&w);
+        let WatchKeyMaterial::View {
+            incoming_seed,
+            addresses,
+            ..
+        } = material
+        else {
+            panic!("expected view material");
+        };
+        assert_eq!(incoming_seed, w.account().incoming_seed);
+        assert_eq!(addresses.len(), 2);
+        for (expected, exported) in w.addresses.iter().zip(addresses.iter()) {
+            assert_eq!(exported.index, expected.index);
+            assert_eq!(exported.d_j, expected.d_j);
+            assert_eq!(exported.auth_root, expected.auth_root);
+            assert_eq!(exported.auth_pub_seed, expected.auth_pub_seed);
+            assert_eq!(exported.nk_tag, expected.nk_tag);
+        }
+    }
+
+    #[test]
+    fn test_detect_material_matches_wallet_note() {
+        let w = test_wallet(1, None);
+        let material = WatchKeyMaterial::from_detect_wallet(&w);
+        let WatchKeyMaterial::Detect {
+            detect_root,
+            addr_count,
+            ..
+        } = material
+        else {
+            panic!("expected detect material");
+        };
+        let nm = note_memo_for_wallet_address(&w, 0, 55, felt_tag(b"watch-detect"), None);
+        let detected = detect_record_for_note(&detect_root, addr_count, &nm)
+            .expect("wallet note should match");
+        assert_eq!(detected.addr_index, 0);
+        assert_eq!(detected.index, nm.index);
+        assert_eq!(detected.cm, nm.cm);
+    }
+
+    #[test]
+    fn test_view_material_recovers_and_validates_note() {
+        let w = test_wallet(1, None);
+        let material = WatchKeyMaterial::from_view_wallet(&w);
+        let WatchKeyMaterial::View {
+            incoming_seed,
+            addresses,
+            ..
+        } = material
+        else {
+            panic!("expected view material");
+        };
+        let nm =
+            note_memo_for_wallet_address(&w, 0, 77, felt_tag(b"watch-view"), Some(b"watch-memo"));
+        let recovered = view_record_for_note(&incoming_seed, &addresses, &nm)
+            .expect("view material should recover wallet note");
+        assert_eq!(recovered.addr_index, 0);
+        assert_eq!(recovered.index, nm.index);
+        assert_eq!(recovered.cm, nm.cm);
+        assert_eq!(recovered.value, 77);
+        assert_eq!(recovered.memo, b"watch-memo");
+    }
+
+    #[test]
+    fn test_view_material_rejects_wrong_commitment() {
+        let w = test_wallet(1, None);
+        let material = WatchKeyMaterial::from_view_wallet(&w);
+        let WatchKeyMaterial::View {
+            incoming_seed,
+            addresses,
+            ..
+        } = material
+        else {
+            panic!("expected view material");
+        };
+        let mut nm =
+            note_memo_for_wallet_address(&w, 0, 77, felt_tag(b"watch-bad-cm"), Some(b"bad"));
+        nm.cm[0] ^= 0x01;
+        assert!(view_record_for_note(&incoming_seed, &addresses, &nm).is_none());
+    }
+
+    proptest! {
+        #[test]
+        fn prop_view_material_recovers_wallet_notes(
+            value in 1u64..1_000_000u64,
+            memo in prop::collection::vec(any::<u8>(), 0..32),
+            mut rseed in any::<[u8; 32]>(),
+        ) {
+            rseed[31] &= 0x07;
+            let w = test_wallet(1, None);
+            let material = WatchKeyMaterial::from_view_wallet(&w);
+            let WatchKeyMaterial::View {
+                incoming_seed,
+                addresses,
+                ..
+            } = material else {
+                panic!("expected view material");
+            };
+            let memo_opt = if memo.is_empty() {
+                None
+            } else {
+                Some(memo.as_slice())
+            };
+            let expected_memo = if memo.is_empty() {
+                vec![0xF6]
+            } else {
+                trim_decrypted_memo(memo.clone())
+            };
+            let nm = note_memo_for_wallet_address(&w, 0, value, rseed, memo_opt);
+            let recovered = view_record_for_note(&incoming_seed, &addresses, &nm)
+                .expect("wallet note should recover with viewing material");
+            prop_assert_eq!(recovered.addr_index, 0);
+            prop_assert_eq!(recovered.value, value);
+            prop_assert_eq!(recovered.cm, nm.cm);
+            prop_assert_eq!(recovered.memo, expected_memo);
+        }
+
+        #[test]
+        fn prop_view_status_sums_values_without_leaking_secrets(
+            values in prop::collection::vec(0u16..10_000u16, 0..12),
+        ) {
+            let notes: Vec<ViewedNoteRecord> = values
+                .iter()
+                .enumerate()
+                .map(|(idx, value)| {
+                    let mut cm = ZERO;
+                    cm[..8].copy_from_slice(&(idx as u64).to_le_bytes());
+                    ViewedNoteRecord {
+                        index: idx,
+                        addr_index: (idx % 3) as u32,
+                        cm,
+                        value: *value as u64,
+                        memo: vec![idx as u8],
+                    }
+                })
+                .collect();
+            let watch = WatchWalletFile::View {
+                version: WATCH_WALLET_VERSION,
+                incoming_seed: felt_tag(b"watch-status-seed"),
+                addresses: Vec::new(),
+                scanned: values.len(),
+                notes,
+            };
+
+            let status = watch.status();
+            let status_json = serde_json::to_string(&status).expect("serialize watch status");
+            prop_assert_eq!(status.mode, "view");
+            prop_assert_eq!(status.tracked, values.len());
+            prop_assert_eq!(
+                status.incoming_total,
+                values.iter().map(|value| *value as u128).sum::<u128>()
+            );
+            prop_assert!(!status_json.contains("incoming_seed"));
+            prop_assert!(!status_json.contains("detect_root"));
+        }
+    }
+
+    #[test]
+    fn test_apply_watch_feed_detect_deduplicates_and_advances_cursor() {
+        let w = test_wallet(1, None);
+        let mut state = WatchWalletFile::from_material(WatchKeyMaterial::from_detect_wallet(&w));
+        let note = note_memo_for_wallet_address(&w, 0, 12, felt_tag(b"watch-detect-feed"), None);
+        let feed = NotesFeedResp {
+            notes: vec![note.clone(), note],
+            next_cursor: 9,
+        };
+
+        let first = apply_watch_feed(&mut state, &feed);
+        assert_eq!(first.found, 1);
+        assert_eq!(first.next_cursor, 9);
+        let status = state.status();
+        assert_eq!(status.scanned, 9);
+        assert_eq!(status.tracked, 1);
+
+        let second = apply_watch_feed(&mut state, &feed);
+        assert_eq!(second.found, 0);
+        assert_eq!(state.status().tracked, 1);
+    }
+
+    #[test]
+    fn test_apply_watch_feed_view_tracks_incoming_total() {
+        let w = test_wallet(1, None);
+        let mut state = WatchWalletFile::from_material(WatchKeyMaterial::from_view_wallet(&w));
+        let note_1 = note_memo_for_wallet_address(&w, 0, 12, felt_tag(b"watch-view-1"), None);
+        let note_2 =
+            note_memo_for_wallet_address(&w, 0, 18, felt_tag(b"watch-view-2"), Some(b"memo"));
+        let mut alien =
+            note_memo_for_wallet_address(&w, 0, 99, felt_tag(b"watch-view-alien"), None);
+        alien.cm[0] ^= 0x01;
+        let feed = NotesFeedResp {
+            notes: vec![note_1, alien, note_2],
+            next_cursor: 7,
+        };
+
+        let summary = apply_watch_feed(&mut state, &feed);
+        assert_eq!(summary.found, 2);
+        let status = state.status();
+        assert_eq!(status.mode, "view");
+        assert_eq!(status.scanned, 7);
+        assert_eq!(status.tracked, 2);
+        assert_eq!(status.incoming_total, 30);
+        assert_eq!(status.notes.len(), 2);
+        assert_eq!(status.notes[1].memo, b"memo");
+    }
+
+    #[test]
+    fn test_apply_watch_feed_view_is_idempotent() {
+        let w = test_wallet(1, None);
+        let mut state = WatchWalletFile::from_material(WatchKeyMaterial::from_view_wallet(&w));
+        let note =
+            note_memo_for_wallet_address(&w, 0, 27, felt_tag(b"watch-view-repeat"), Some(b"dup"));
+        let feed = NotesFeedResp {
+            notes: vec![note.clone(), note],
+            next_cursor: 11,
+        };
+
+        let first = apply_watch_feed(&mut state, &feed);
+        let second = apply_watch_feed(&mut state, &feed);
+        let status = state.status();
+
+        assert_eq!(first.found, 1);
+        assert_eq!(second.found, 0);
+        assert_eq!(status.mode, "view");
+        assert_eq!(status.scanned, 11);
+        assert_eq!(status.tracked, 1);
+        assert_eq!(status.incoming_total, 27);
+        assert_eq!(status.notes[0].memo, b"dup");
+    }
+
+    #[test]
+    fn test_watch_init_from_view_export_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let watch_path = dir.path().join("watch.json");
+        let material_path = dir.path().join("watch.view.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let watch_path_str = watch_path.to_str().unwrap();
+        let material_path_str = material_path.to_str().unwrap();
+
+        let w = test_wallet(2, None);
+        save_wallet(wallet_path_str, &w).expect("save wallet");
+        cmd_export_view(wallet_path_str, Some(material_path_str)).expect("export view");
+        cmd_watch_init(watch_path_str, material_path_str, false).expect("init watch wallet");
+
+        let watch = load_watch_wallet(watch_path_str).expect("load watch wallet");
+        match watch {
+            WatchWalletFile::View {
+                version,
+                incoming_seed,
+                addresses,
+                scanned,
+                notes,
+            } => {
+                assert_eq!(version, WATCH_WALLET_VERSION);
+                assert_eq!(incoming_seed, w.account().incoming_seed);
+                assert_eq!(addresses.len(), 2);
+                assert_eq!(scanned, 0);
+                assert!(notes.is_empty());
+            }
+            WatchWalletFile::Detect { .. } => panic!("expected view watch wallet"),
+        }
+    }
+
+    #[test]
+    fn test_watch_init_from_detect_export_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let watch_path = dir.path().join("watch.json");
+        let material_path = dir.path().join("watch.detect.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let watch_path_str = watch_path.to_str().unwrap();
+        let material_path_str = material_path.to_str().unwrap();
+
+        let w = test_wallet(3, None);
+        save_wallet(wallet_path_str, &w).expect("save wallet");
+        cmd_export_detect(wallet_path_str, Some(material_path_str)).expect("export detect");
+        cmd_watch_init(watch_path_str, material_path_str, false).expect("init watch wallet");
+
+        let watch = load_watch_wallet(watch_path_str).expect("load watch wallet");
+        match watch {
+            WatchWalletFile::Detect {
+                version,
+                detect_root,
+                addr_count,
+                scanned,
+                matches,
+            } => {
+                assert_eq!(version, WATCH_WALLET_VERSION);
+                assert_eq!(detect_root, derive_detect_root(&w.account().incoming_seed));
+                assert_eq!(addr_count, 3);
+                assert_eq!(scanned, 0);
+                assert!(matches.is_empty());
+            }
+            WatchWalletFile::View { .. } => panic!("expected detect watch wallet"),
+        }
+    }
+
+    #[test]
+    fn test_watch_init_force_overwrites_existing_wallet_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let watch_path = dir.path().join("watch.json");
+        let view_path = dir.path().join("watch.view.json");
+        let detect_path = dir.path().join("watch.detect.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let watch_path_str = watch_path.to_str().unwrap();
+        let view_path_str = view_path.to_str().unwrap();
+        let detect_path_str = detect_path.to_str().unwrap();
+
+        let w = test_wallet(2, None);
+        save_wallet(wallet_path_str, &w).expect("save wallet");
+        cmd_export_view(wallet_path_str, Some(view_path_str)).expect("export view");
+        cmd_export_detect(wallet_path_str, Some(detect_path_str)).expect("export detect");
+        cmd_watch_init(watch_path_str, view_path_str, false).expect("init view watch");
+
+        let err = cmd_watch_init(watch_path_str, detect_path_str, false)
+            .expect_err("re-init without force should fail");
+        assert!(err.contains("already exists"));
+
+        cmd_watch_init(watch_path_str, detect_path_str, true).expect("force overwrite watch");
+        match load_watch_wallet(watch_path_str).expect("load overwritten watch") {
+            WatchWalletFile::Detect { addr_count, .. } => assert_eq!(addr_count, 2),
+            WatchWalletFile::View { .. } => panic!("expected detect watch wallet after overwrite"),
+        }
+    }
+
+    #[test]
+    fn test_run_detection_service_once_view_mode_syncs_and_sanitizes_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let watch_path = dir.path().join("watch.json");
+        let material_path = dir.path().join("watch.view.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let watch_path_str = watch_path.to_str().unwrap();
+        let material_path_str = material_path.to_str().unwrap();
+
+        let w = test_wallet(1, None);
+        let note =
+            note_memo_for_wallet_address(&w, 0, 91, felt_tag(b"watch-service-view"), Some(b"hi"));
+        let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
+            .expect("published note should encode");
+        let note_key = indexed_durable_key(DURABLE_NOTE_PREFIX, 0);
+
+        save_wallet(wallet_path_str, &w).expect("save wallet");
+        cmd_export_view(wallet_path_str, Some(material_path_str)).expect("export view");
+        cmd_watch_init(watch_path_str, material_path_str, false).expect("init watch wallet");
+
+        let routes = HashMap::from([
+            (
+                "/global/block/head/durable/wasm_2_0_0/length?key=/tzel/v1/state/tree/size".into(),
+                (200, "8".into()),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/value?key=/tzel/v1/state/tree/size".into(),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
+                    note_key
+                ),
+                (200, encoded.len().to_string()),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    note_key
+                ),
+                (200, format!("\"{}\"", hex::encode(encoded))),
+            ),
+        ]);
+        let base_url = spawn_mock_http_server(routes);
+        let profile = rollup_profile_for_url(&base_url);
+        let profile_path = default_network_profile_path(watch_path_str);
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        let (status, summary) =
+            run_detection_service_once(watch_path_str).expect("detection service sync");
+        assert_eq!(summary.found, 1);
+        assert_eq!(summary.next_cursor, 1);
+        assert_eq!(status.mode, "view");
+        assert_eq!(status.tracked, 1);
+        assert_eq!(status.incoming_total, 91);
+        assert_eq!(status.notes.len(), 1);
+        assert_eq!(status.notes[0].memo, b"hi");
+
+        let status_json = serde_json::to_string(&status).expect("serialize status");
+        assert!(!status_json.contains("incoming_seed"));
+        assert!(!status_json.contains("detect_root"));
+    }
+
+    #[test]
+    fn test_run_detection_service_once_detect_mode_syncs_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let watch_path = dir.path().join("watch.json");
+        let material_path = dir.path().join("watch.detect.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let watch_path_str = watch_path.to_str().unwrap();
+        let material_path_str = material_path.to_str().unwrap();
+
+        let w = test_wallet(1, None);
+        let note = note_memo_for_wallet_address(&w, 0, 73, felt_tag(b"watch-service-detect"), None);
+        let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
+            .expect("published note should encode");
+        let note_key = indexed_durable_key(DURABLE_NOTE_PREFIX, 0);
+
+        save_wallet(wallet_path_str, &w).expect("save wallet");
+        cmd_export_detect(wallet_path_str, Some(material_path_str)).expect("export detect");
+        cmd_watch_init(watch_path_str, material_path_str, false).expect("init watch wallet");
+
+        let routes = HashMap::from([
+            (
+                "/global/block/head/durable/wasm_2_0_0/length?key=/tzel/v1/state/tree/size".into(),
+                (200, "8".into()),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/value?key=/tzel/v1/state/tree/size".into(),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
+                    note_key
+                ),
+                (200, encoded.len().to_string()),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    note_key
+                ),
+                (200, format!("\"{}\"", hex::encode(encoded))),
+            ),
+        ]);
+        let base_url = spawn_mock_http_server(routes);
+        let profile = rollup_profile_for_url(&base_url);
+        let profile_path = default_network_profile_path(watch_path_str);
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        let (status, summary) =
+            run_detection_service_once(watch_path_str).expect("detection service sync");
+        assert_eq!(summary.found, 1);
+        assert_eq!(status.mode, "detect");
+        assert_eq!(status.incoming_total, 0);
+        assert_eq!(status.spend_status, "candidate_matches_only");
+        assert_eq!(status.matches.len(), 1);
+        assert_eq!(status.matches[0].cm, note.cm);
+    }
+
+    #[test]
+    fn test_load_detection_service_status_is_sanitized() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let watch_path = dir.path().join("watch.json");
+        let material_path = dir.path().join("watch.view.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let watch_path_str = watch_path.to_str().unwrap();
+        let material_path_str = material_path.to_str().unwrap();
+
+        let w = test_wallet(1, None);
+        save_wallet(wallet_path_str, &w).expect("save wallet");
+        cmd_export_view(wallet_path_str, Some(material_path_str)).expect("export view");
+        cmd_watch_init(watch_path_str, material_path_str, false).expect("init watch wallet");
+
+        let status = load_detection_service_status(watch_path_str).expect("load service status");
+        let status_json = serde_json::to_string(&status).expect("serialize status");
+        assert_eq!(status.mode, "view");
+        assert_eq!(status.tracked, 0);
+        assert_eq!(status.incoming_total, 0);
+        assert!(!status_json.contains("incoming_seed"));
+        assert!(!status_json.contains("detect_root"));
+        assert!(!status_json.contains("auth_root"));
+    }
+
+    #[test]
+    fn test_validate_detection_service_wallet_rejects_private_wallet_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        save_wallet(wallet_path_str, &test_wallet(1, None)).expect("save private wallet");
+        let err = validate_detection_service_wallet(wallet_path_str)
+            .expect_err("private spending wallet must not validate as watch wallet");
+        assert!(err.contains("parse watch wallet"));
     }
 
     #[test]

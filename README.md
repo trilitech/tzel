@@ -53,6 +53,7 @@ For deployment-oriented installs with standard paths instead of a workspace chec
 
 - operator box: `ops/shadownet/README.md`
 - prover layout: `ops/prover/README.md`
+- watch-only detection service: `docs/wallet_detection_service.md`
 - shared binary installer: `./scripts/install_tzel_binaries.sh --prefix /usr/local --executables-dir /opt/tzel/cairo/target/dev`
 - live public-box smoke: `TZEL_SMOKE_L1_RECIPIENT=tz1... ./scripts/shadownet_live_e2e_smoke.sh /etc/tzel/shadownet.env`
 

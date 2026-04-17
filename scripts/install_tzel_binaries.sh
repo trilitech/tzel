@@ -14,8 +14,9 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/install_tzel_binaries.sh [options]
 
-Build and install the deployable TzEL binaries, rollup helper binaries, and the
-Cairo executable JSON files needed by the prover and wallet.
+Build and install the deployable TzEL binaries, rollup helper binaries, the
+watch-only detection service, and the Cairo executable JSON files needed by the
+prover and wallet.
 
 Options:
   --prefix PATH             Install binaries into PATH/bin (default: /usr/local)
@@ -99,7 +100,7 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
   require_cmd "$SCARB_BIN"
 
   build_cargo "" build --release -p tzel-services --bin tzel-operator
-  build_cargo "" build --release -p tzel-wallet-app --bin tzel-wallet
+  build_cargo "" build --release -p tzel-wallet-app --bin tzel-wallet --bin tzel-detect
   if [[ $INSTALL_SP_CLIENT -eq 1 ]]; then
     build_cargo "" build --release -p tzel-wallet-app --bin sp-client
   fi
@@ -118,6 +119,7 @@ if [[ $BUILD_ONLY -eq 1 ]]; then
   echo "built release artifacts in:"
   echo "  - $ROOT_DIR/target/release/tzel-operator"
   echo "  - $ROOT_DIR/target/release/tzel-wallet"
+  echo "  - $ROOT_DIR/target/release/tzel-detect"
   if [[ $INSTALL_SP_CLIENT -eq 1 ]]; then
     echo "  - $ROOT_DIR/target/release/sp-client"
   fi
@@ -133,6 +135,7 @@ install -d "$BIN_DIR" "$EXECUTABLES_DEST"
 
 install -m 0755 "$ROOT_DIR/target/release/tzel-operator" "$BIN_DIR/tzel-operator"
 install -m 0755 "$ROOT_DIR/target/release/tzel-wallet" "$BIN_DIR/tzel-wallet"
+install -m 0755 "$ROOT_DIR/target/release/tzel-detect" "$BIN_DIR/tzel-detect"
 if [[ $INSTALL_SP_CLIENT -eq 1 ]]; then
   install -m 0755 "$ROOT_DIR/target/release/sp-client" "$BIN_DIR/sp-client"
 fi
@@ -151,6 +154,7 @@ done
 echo "installed binaries into $BIN_DIR"
 echo "  - tzel-operator"
 echo "  - tzel-wallet"
+echo "  - tzel-detect"
 if [[ $INSTALL_SP_CLIENT -eq 1 ]]; then
   echo "  - sp-client"
 fi

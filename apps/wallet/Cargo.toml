@@ -11,7 +11,12 @@ path = "src/bin/sp-client.rs"
 name = "tzel-wallet"
 path = "src/bin/tzel-wallet.rs"
 
+[[bin]]
+name = "tzel-detect"
+path = "src/bin/tzel-detect.rs"
+
 [dependencies]
+axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 ml-kem = { version = "=0.3.0-rc.2", features = ["getrandom"] }
@@ -20,6 +25,7 @@ serde_json = "1"
 tempfile = "3"
 tezos-smart-rollup-encoding = "0.2.2"
 tezos_data_encoding_05 = { package = "tezos_data_encoding", version = "0.5" }
+tokio = { version = "1", features = ["full"] }
 tzel-services = { path = "../../services/tzel" }
 tzel-verifier = { path = "../../verifier" }
 ureq = { version = "3", features = ["json"] }

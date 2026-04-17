@@ -5327,6 +5327,7 @@ dependencies = [
 name = "tzel-wallet-app"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "hex",
  "ml-kem",
@@ -5336,6 +5337,7 @@ dependencies = [
  "tempfile",
  "tezos-smart-rollup-encoding",
  "tezos_data_encoding 0.5.2",
+ "tokio",
  "tzel-services",
  "tzel-verifier",
  "ureq",

@@ -72,6 +72,27 @@ check_http "dal profiles" "http://$TZEL_DAL_RPC_ADDR/profiles"
 check_http "rollup head" "http://$TZEL_ROLLUP_RPC_HOST:$TZEL_ROLLUP_RPC_PORT/global/block/head/hash"
 check_http "operator health" "http://$TZEL_OPERATOR_LISTEN/healthz"
 
+if [[ "${TZEL_DETECT_ENABLE:-0}" == "1" ]]; then
+  detect_required_vars=(
+    TZEL_DETECT_BIN
+    TZEL_DETECT_WALLET
+    TZEL_DETECT_LISTEN
+  )
+  for var in "${detect_required_vars[@]}"; do
+    if [[ -z "${!var:-}" ]]; then
+      echo "missing required detect env var: $var" >&2
+      exit 1
+    fi
+  done
+  check_cmd "tzel-detect" "$TZEL_DETECT_BIN"
+  if [[ ! -f "$TZEL_DETECT_WALLET" ]]; then
+    echo "missing detect wallet file: $TZEL_DETECT_WALLET" >&2
+    exit 1
+  fi
+  echo "ok: detect wallet -> $TZEL_DETECT_WALLET"
+  check_http "detect health" "http://$TZEL_DETECT_LISTEN/healthz"
+fi
+
 echo "public DAL address: $TZEL_DAL_PUBLIC_ADDR"
 echo "rollup address: $TZEL_ROLLUP_ADDRESS"
 echo "preflight passed"

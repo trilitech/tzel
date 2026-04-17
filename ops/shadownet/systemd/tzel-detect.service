@@ -1,0 +1,19 @@
+[Unit]
+Description=TzEL Watch-Only Detection Service
+After=network-online.target octez-rollup-node.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tzel
+EnvironmentFile=/etc/tzel/shadownet.env
+ExecStart=${TZEL_DETECT_BIN} \
+  --wallet=${TZEL_DETECT_WALLET} \
+  --bind=${TZEL_DETECT_LISTEN} \
+  --interval-secs=${TZEL_DETECT_INTERVAL_SECS}
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
