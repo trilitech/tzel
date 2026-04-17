@@ -627,6 +627,28 @@ pub fn recover_wots_pk(msg_hash: &F, pub_seed: &F, key_idx: u32, sig: &[F]) -> V
         .collect()
 }
 
+pub fn verify_wots_signature_against_leaf(
+    msg_hash: &F,
+    pub_seed: &F,
+    key_idx: u32,
+    sig: &[F],
+    expected_leaf: &F,
+) -> Result<(), String> {
+    if sig.len() != WOTS_CHAINS {
+        return Err(format!(
+            "bad WOTS signature length: got {}, expected {}",
+            sig.len(),
+            WOTS_CHAINS
+        ));
+    }
+    let recovered_pk = recover_wots_pk(msg_hash, pub_seed, key_idx, sig);
+    let recovered_leaf = wots_pk_to_leaf(pub_seed, key_idx, &recovered_pk);
+    if &recovered_leaf != expected_leaf {
+        return Err("configuration signature verification failed".into());
+    }
+    Ok(())
+}
+
 pub fn xmss_subtree_root(ask_j: &F, pub_seed: &F, start: u32, height: usize) -> F {
     if height == AUTH_DEPTH && start == 0 {
         assert_full_xmss_rebuild_allowed("xmss_subtree_root");
