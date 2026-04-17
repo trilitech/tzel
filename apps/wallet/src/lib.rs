@@ -929,7 +929,7 @@ impl WalletFile {
             .filter(|(_, note)| !pending.contains(&note_nullifier(note)))
             .map(|(i, n)| (i, n.v))
             .collect();
-        indexed.sort_by(|a, b| b.1.cmp(&a.1)); // largest first
+        indexed.sort_by(|a, b| b.1.cmp(&a.1));
         let mut sum = 0u128;
         let mut selected = vec![];
         for (i, v) in indexed {
@@ -2775,12 +2775,10 @@ fn felt_to_hex(f: &F) -> String {
     // Convert LE bytes to big integer, then to hex
     let mut val = [0u8; 32];
     val.copy_from_slice(f);
-    // Reverse to big-endian for hex display
     let mut be = [0u8; 32];
     for i in 0..32 {
         be[i] = val[31 - i];
     }
-    // Strip leading zeros
     let hex_str = hex::encode(be);
     let trimmed = hex_str.trim_start_matches('0');
     if trimmed.is_empty() {
@@ -7039,7 +7037,7 @@ mod network_profile_tests {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Wallet HTTP server (trust-me-bro mode)
+// Wallet HTTP server
 // ═══════════════════════════════════════════════════════════════════════
 
 pub fn wallet_server_entry() {
@@ -7057,7 +7055,7 @@ pub fn wallet_server_entry() {
     let mut wallet_path = "wallet.json".to_string();
     let mut ledger_url = "http://localhost:8080".to_string();
     let mut port: u16 = 8081;
-    let mut trust_me_bro = false;
+    let mut skip_proof = false;
     let mut proving_service: Option<String> = None;
 
     let mut i = 1;
@@ -7075,8 +7073,8 @@ pub fn wallet_server_entry() {
             port = v.parse().unwrap_or(8081);
         } else if arg == "--port" {
             i += 1; if i < args.len() { port = args[i].parse().unwrap_or(8081); }
-        } else if arg == "--trust-me-bro" {
-            trust_me_bro = true;
+        } else if arg == "--skip-proof" {
+            skip_proof = true;
         } else if let Some(v) = arg.strip_prefix("--proving-service=") {
             proving_service = Some(v.to_string());
         } else if arg == "--proving-service" {
@@ -7086,13 +7084,12 @@ pub fn wallet_server_entry() {
     }
 
     let pc = ProveConfig {
-        skip_proof: trust_me_bro,
+        skip_proof,
         reprove_bin: String::new(),
         executables_dir: String::new(),
         proving_service_url: proving_service,
     };
 
-    // Create wallet if it does not exist.
     if !std::path::Path::new(&wallet_path).exists() {
         cmd_keygen(&wallet_path).expect("failed to create wallet");
     }
@@ -7113,11 +7110,13 @@ pub fn wallet_server_entry() {
     async fn address_handler(
         State(st): State<WalletState>,
     ) -> Result<Json<PaymentAddress>, (StatusCode, String)> {
-        let mut guard = st.lock().unwrap();
-        let (ref mut w, ref path, _, _) = *guard;
-        let (_, addr) = w.next_address().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        save_wallet(path, w).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        Ok(Json(addr))
+        tokio::task::block_in_place(|| {
+            let mut guard = st.lock().unwrap();
+            let (ref mut w, ref path, _, _) = *guard;
+            let (_, addr) = w.next_address().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            save_wallet(path, w).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            Ok(Json(addr))
+        })
     }
 
     #[derive(serde::Deserialize)]
@@ -7184,7 +7183,7 @@ pub fn wallet_server_entry() {
             };
 
             let resp: ShieldResp = post_json(&format!("{}/shield", ledger), &req)
-                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
 
             // Save only after successful POST so a failed shield doesn't
             // permanently consume an address slot on disk.
@@ -7218,8 +7217,6 @@ pub fn wallet_server_entry() {
                 prepare_transfer_with_proof(w, path, ledger, root, &body.to, body.amount, None, pc)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
             };
-
-            save_wallet(path, w).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
             let resp: TransferResp = post_json(&format!("{}/transfer", ledger), &prepared.req)
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
@@ -7257,8 +7254,6 @@ pub fn wallet_server_entry() {
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
             };
 
-            save_wallet(path, w).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
             let resp: UnshieldResp = post_json(&format!("{}/unshield", ledger), &prepared.req)
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
 
@@ -7293,19 +7288,19 @@ pub fn wallet_server_entry() {
         })
     }
 
-    let mode = if trust_me_bro {
-        "trust-me-bro".to_string()
+    let mode = if skip_proof {
+        "skip-proof".to_string()
     } else if let Some(ref url) = pc.proving_service_url {
         format!("proving-service={}", url)
     } else {
-        "trust-me-bro (default)".to_string()
+        "skip-proof (default)".to_string()
     };
 
     let state: WalletState = Arc::new(Mutex::new((wallet, wallet_path, ledger_url, pc)));
 
     let app = Router::new()
         .route("/balance", get(balance_handler))
-        .route("/address", get(address_handler))
+        .route("/address", post(address_handler))
         .route("/shield", post(shield_handler))
         .route("/transfer", post(transfer_handler))
         .route("/unshield", post(unshield_handler))

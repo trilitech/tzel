@@ -43,7 +43,7 @@ export async function getWalletBalance(): Promise<number> {
 }
 
 export async function getWalletAddress(): Promise<Record<string, unknown>> {
-  return walletFetch('/address')
+  return walletFetch('/address', { method: 'POST' })
 }
 
 export async function walletShield(sender: string, amount: number): Promise<void> {

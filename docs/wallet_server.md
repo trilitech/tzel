@@ -15,7 +15,7 @@ wallet-server \
   --wallet=/path/to/wallet.json \
   --ledger=http://<tzel-operator>:8787 \
   --port=8081 \
-  --trust-me-bro          # skip STARK proofs (demo/dev only)
+  --skip-proof            # skip STARK proofs (demo/dev only)
 ```
 
 With a real proving service:
@@ -40,9 +40,9 @@ Returns the available private balance.
 { "private_balance": 1000000 }
 ```
 
-### `GET /wallet/address`
+### `POST /address`
 
-Generates (or returns) the next unused payment address. The address is a JSON blob containing the KEM public keys and diversifier needed for a sender to encrypt a note to this wallet.
+Generates the next payment address and persists the wallet. The address is a JSON blob containing the KEM public keys and diversifier needed for a sender to encrypt a note to this wallet. Each call advances the address counter — share the result with senders and call again to get a fresh address.
 
 ### `POST /scan`
 
@@ -83,7 +83,7 @@ Withdraws private funds to a public L1 address.
 
 ### Prerequisites
 
-- A running `tzel-operator` connected to an L1 node (or use the `--trust-me-bro` flag to skip proofs)
+- A running `tzel-operator` connected to an L1 node (or use the `--skip-proof` flag to skip proofs)
 - A funded L1 address in the octez-client keychain (for shield)
 
 ### Step-by-step
@@ -91,7 +91,7 @@ Withdraws private funds to a public L1 address.
 1. **Start the wallet server**
 
 ```bash
-wallet-server --wallet=/tmp/test-wallet.json --ledger=http://localhost:8787 --port=8081 --trust-me-bro
+wallet-server --wallet=/tmp/test-wallet.json --ledger=http://localhost:8787 --port=8081 --skip-proof
 ```
 
 2. **Check balance** (should be 0 on a fresh wallet)
@@ -103,7 +103,7 @@ curl http://localhost:8081/balance
 3. **Get a payment address**
 
 ```bash
-curl http://localhost:8081/wallet/address
+curl -X POST http://localhost:8081/address
 ```
 
 4. **Shield funds**
