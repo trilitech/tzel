@@ -55,13 +55,14 @@ struct Cli {
     dal_node_endpoint: Option<String>,
     #[arg(long)]
     octez_protocol: Option<String>,
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = 5)]
     reconcile_interval_secs: u64,
 }
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<OperatorConfig>,
+    advance_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -129,6 +130,7 @@ struct ReconcileSummary {
 }
 
 const MAX_DAL_CHUNK_ATTEMPTS: u32 = 8;
+const MAX_WAITING_ATTESTATION_LEVEL_AGE: i32 = 12;
 
 fn main() {
     let cli = Cli::parse();
@@ -158,11 +160,12 @@ async fn run(cli: Cli) -> Result<(), String> {
             id_counter: AtomicU64::new(0),
             slot_counter: AtomicU64::new(0),
         }),
+        advance_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
-    reconcile_pending_submissions(&state.config)?;
     tokio::spawn(reconcile_loop(
         state.config.clone(),
+        state.advance_lock.clone(),
         Duration::from_secs(cli.reconcile_interval_secs.max(1)),
     ));
 
@@ -184,14 +187,21 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn reconcile_loop(config: Arc<OperatorConfig>, interval: Duration) {
+async fn reconcile_loop(
+    config: Arc<OperatorConfig>,
+    advance_lock: Arc<tokio::sync::Mutex<()>>,
+    interval: Duration,
+) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        let _guard = advance_lock.lock().await;
         let config_for_reconcile = config.clone();
-        match tokio::task::spawn_blocking(move || reconcile_pending_submissions(&config_for_reconcile))
-            .await
+        match tokio::task::spawn_blocking(move || {
+            reconcile_pending_submissions(&config_for_reconcile)
+        })
+        .await
         {
             Err(err) => eprintln!("reconciler join error: {}", err),
             Ok(Err(err)) => eprintln!("reconciler: {}", err),
@@ -211,10 +221,16 @@ async fn submit_rollup_message(
     State(state): State<AppState>,
     Json(req): Json<SubmitRollupMessageReq>,
 ) -> Result<Json<SubmitRollupMessageResp>, (StatusCode, String)> {
+    let _guard = state.advance_lock.lock().await;
     let config = state.config.clone();
     let submission = tokio::task::spawn_blocking(move || process_submission(&config, req))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("submission task failed: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("submission task failed: {}", e),
+            )
+        })?
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     Ok(Json(SubmitRollupMessageResp { submission }))
 }
@@ -224,29 +240,19 @@ async fn get_rollup_submission(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<SubmitRollupMessageResp>, (StatusCode, String)> {
     let config = state.config.clone();
-    let mut stored = tokio::task::spawn_blocking({
+    let stored = tokio::task::spawn_blocking({
         let config = config.clone();
         let id = id.clone();
         move || load_stored_submission(&config.state_dir, &id)
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load submission task failed: {}", e)))?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("load submission task failed: {}", e),
+        )
+    })?
     .map_err(map_load_submission_err)?;
-    stored = tokio::task::spawn_blocking({
-        let config = config.clone();
-        move || maybe_advance_submission(&config, stored)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("advance submission task failed: {}", e)))?
-    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
-    tokio::task::spawn_blocking({
-        let config = config.clone();
-        let stored = stored.clone();
-        move || persist_submission(&config, &stored)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("persist submission task failed: {}", e)))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(SubmitRollupMessageResp {
         submission: stored.submission,
     }))
@@ -329,6 +335,7 @@ fn load_stored_submission(state_dir: &Path, id: &str) -> Result<StoredSubmission
     Ok(stored)
 }
 
+#[cfg(test)]
 fn load_submission(state_dir: &Path, id: &str) -> Result<RollupSubmission, String> {
     load_stored_submission(state_dir, id).map(|stored| stored.submission)
 }
@@ -435,8 +442,8 @@ fn maybe_advance_submission(
 
     align_chunk_attempts(&mut stored);
     let mut status_lines = Vec::with_capacity(stored.submission.dal_chunks.len());
-    let mut unattested_indices = Vec::new();
-    let mut waiting_for_attestation = false;
+    let mut retry_indices: Vec<(usize, String)> = Vec::new();
+    let mut waiting_indices = Vec::new();
     for (idx, chunk) in stored.submission.dal_chunks.iter().enumerate() {
         let status =
             fetch_dal_slot_status(dal_node_endpoint, chunk.published_level, chunk.slot_index)?;
@@ -445,19 +452,46 @@ fn maybe_advance_submission(
             chunk.slot_index, chunk.published_level, status
         ));
         if status == "unattested" {
-            unattested_indices.push(idx);
+            retry_indices.push((idx, "unattested".into()));
         } else if status != "attested" {
+            waiting_indices.push(idx);
+        }
+    }
+
+    let mut waiting_for_attestation = false;
+    if !waiting_indices.is_empty() {
+        if let Some(octez_node_endpoint) = config.octez_node_endpoint.as_deref() {
+            match fetch_head_level(octez_node_endpoint) {
+                Ok(head_level) => {
+                    for idx in waiting_indices {
+                        let published_level = stored.submission.dal_chunks[idx].published_level;
+                        let age = head_level.saturating_sub(published_level);
+                        if age >= MAX_WAITING_ATTESTATION_LEVEL_AGE {
+                            retry_indices.push((
+                                idx,
+                                format!("stale waiting_attestation after {} levels", age),
+                            ));
+                        } else {
+                            waiting_for_attestation = true;
+                        }
+                    }
+                }
+                Err(_) => {
+                    waiting_for_attestation = true;
+                }
+            }
+        } else {
             waiting_for_attestation = true;
         }
     }
 
-    if !unattested_indices.is_empty() {
+    if !retry_indices.is_empty() {
         let payload = stored
             .payload
             .as_deref()
             .ok_or_else(|| "DAL submission payload is unavailable for retry".to_string())?;
-        let mut republished_lines = Vec::with_capacity(unattested_indices.len());
-        for idx in unattested_indices {
+        let mut republished_lines = Vec::with_capacity(retry_indices.len());
+        for (idx, reason) in retry_indices {
             let attempts = stored.chunk_attempts.get(idx).copied().unwrap_or(1);
             if attempts >= MAX_DAL_CHUNK_ATTEMPTS {
                 stored.submission.status = RollupSubmissionStatus::Failed;
@@ -471,10 +505,11 @@ fn maybe_advance_submission(
             let chunk_bytes = submission_chunk_bytes(payload, &stored.submission, idx)?;
             let published_chunk = publish_dal_chunk(config, chunk_bytes)?;
             republished_lines.push(format!(
-                "republished chunk[{idx}] attempt {} -> slot {} level {}",
+                "republished chunk[{idx}] attempt {} -> slot {} level {} ({})",
                 attempts + 1,
                 published_chunk.slot_index,
-                published_chunk.published_level
+                published_chunk.published_level,
+                reason
             ));
             stored.submission.dal_chunks[idx] = published_chunk;
             stored.chunk_attempts[idx] = attempts + 1;
@@ -482,7 +517,7 @@ fn maybe_advance_submission(
         update_submission_commitment_summary(&mut stored.submission)?;
         stored.submission.status = RollupSubmissionStatus::CommitmentIncluded;
         stored.submission.detail = Some(format!(
-            "Republished {} unattested DAL chunk(s)\n{}\n{}",
+            "Republished {} DAL chunk(s)\n{}\n{}",
             republished_lines.len(),
             republished_lines.join("\n"),
             status_lines.join("\n")
@@ -802,6 +837,21 @@ fn fetch_block_level(endpoint: &str, block_hash: &str) -> Result<i32, String> {
     Ok(header.level)
 }
 
+fn fetch_head_level(endpoint: &str) -> Result<i32, String> {
+    let url = format!(
+        "{}/chains/main/blocks/head/header",
+        endpoint.trim_end_matches('/')
+    );
+    let resp = ureq::get(&url)
+        .call()
+        .map_err(|e| format!("block head header request failed: {}", e))?;
+    let header: BlockHeaderResp = resp
+        .into_body()
+        .read_json()
+        .map_err(|e| format!("parse block head header: {}", e))?;
+    Ok(header.level)
+}
+
 fn fetch_dal_slot_status(
     endpoint: &str,
     published_level: i32,
@@ -1016,8 +1066,8 @@ fn persist_submission(config: &OperatorConfig, stored: &StoredSubmission) -> Res
     let path = submission_path(&config.state_dir, &stored.submission.id);
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
     let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {}", e))?;
-    let body =
-        serde_json::to_string_pretty(&stored).map_err(|e| format!("serialize submission: {}", e))?;
+    let body = serde_json::to_string_pretty(&stored)
+        .map_err(|e| format!("serialize submission: {}", e))?;
     file.write_all(body.as_bytes())
         .map_err(|e| format!("write tmp: {}", e))?;
     file.sync_all().map_err(|e| format!("fsync tmp: {}", e))?;
@@ -1416,7 +1466,7 @@ mod tests {
             .detail
             .as_deref()
             .unwrap()
-            .contains("Republished 1 unattested DAL chunk(s)"));
+            .contains("Republished 1 DAL chunk(s)"));
     }
 
     #[test]
@@ -1530,7 +1580,86 @@ mod tests {
             .detail
             .as_deref()
             .unwrap()
-            .contains("Republished 1 unattested DAL chunk(s)"));
+            .contains("Republished 1 DAL chunk(s)"));
+    }
+
+    #[test]
+    fn stale_waiting_attestation_republishes_chunk() {
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooStaleHash123456789ABCDEFG'\necho 'Operation found in block BLStaleHash123456789ABCDEFG'\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/levels/101/slots/3/status".into(),
+                (200, "\"waiting_attestation\"".into()),
+            ),
+            (
+                "/chains/main/blocks/head/header".into(),
+                (200, "{\"level\":114}".into()),
+            ),
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1stale\",\"commitment_proof\":\"proof-stale\"}".into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/BLStaleHash123456789ABCDEFG/header".into(),
+                (200, "{\"level\":222}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let submission = RollupSubmission {
+            id: "sub-stale".into(),
+            kind: RollupSubmissionKind::Shield,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            status: RollupSubmissionStatus::CommitmentIncluded,
+            transport: RollupSubmissionTransport::Dal,
+            operation_hash: Some("ooCommitmentHash123456789ABCDEFG".into()),
+            dal_chunks: vec![RollupDalChunk {
+                slot_index: 3,
+                published_level: 101,
+                payload_len: 8,
+                commitment: "commitment-1".into(),
+                operation_hash: Some("ooChunkOne123456789ABCDEFG".into()),
+            }],
+            commitment: Some("commitment-1".into()),
+            published_level: Some(101),
+            slot_index: Some(3),
+            payload_hash: Some(hex::encode([0x69; 32])),
+            payload_len: 8,
+            detail: None,
+        };
+
+        let advanced = maybe_advance_submission(
+            &config,
+            stored_submission(submission, Some(vec![0x42; 8]), &[1]),
+        )
+        .unwrap();
+        assert_eq!(
+            advanced.submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
+        assert_eq!(advanced.chunk_attempts, vec![2]);
+        assert_eq!(advanced.submission.dal_chunks[0].slot_index, 0);
+        assert_eq!(advanced.submission.dal_chunks[0].published_level, 222);
+        assert!(advanced
+            .submission
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("stale waiting_attestation"));
     }
 
     #[test]
@@ -1670,7 +1799,7 @@ mod tests {
             .detail
             .as_deref()
             .unwrap()
-            .contains("Republished 1 unattested DAL chunk(s)"));
+            .contains("Republished 1 DAL chunk(s)"));
     }
 
     #[test]

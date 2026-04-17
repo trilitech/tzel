@@ -1219,6 +1219,10 @@ const DURABLE_AUTH_DOMAIN: &str = "/tzel/v1/state/auth_domain";
 const DURABLE_TREE_SIZE: &str = "/tzel/v1/state/tree/size";
 const DURABLE_TREE_ROOT: &str = "/tzel/v1/state/tree/root";
 const DURABLE_NOTE_PREFIX: &str = "/tzel/v1/state/notes/";
+const DURABLE_NOTE_LEN_SUFFIX: &str = "/len";
+const DURABLE_NOTE_CHUNK_PREFIX: &str = "/chunk/";
+const DURABLE_NOTE_CHUNK_BYTES: usize = 1024;
+const MAX_PUBLISHED_NOTE_BYTES: usize = 4 * 1024 * 1024;
 const DURABLE_NULLIFIER_COUNT: &str = "/tzel/v1/state/nullifiers/count";
 const DURABLE_NULLIFIER_INDEX_PREFIX: &str = "/tzel/v1/state/nullifiers/index/";
 const DURABLE_BALANCE_COUNT: &str = "/tzel/v1/state/balances/count";
@@ -1326,6 +1330,55 @@ impl<'a> RollupRpc<'a> {
         parse_rollup_rpc_bytes(&raw).map_err(|e| format!("decode durable value at {}: {}", key, e))
     }
 
+    fn read_published_note_bytes(&self, index: u64) -> Result<Option<Vec<u8>>, String> {
+        let direct_key = indexed_durable_key(DURABLE_NOTE_PREFIX, index);
+        if self.read_durable_length(&direct_key)?.is_some() {
+            let bytes = self.read_durable_bytes(&direct_key)?;
+            if bytes.len() > MAX_PUBLISHED_NOTE_BYTES {
+                return Err(format!(
+                    "durable note {} at {} exceeds max supported size {}",
+                    index, direct_key, MAX_PUBLISHED_NOTE_BYTES
+                ));
+            }
+            return Ok(Some(bytes));
+        }
+
+        let len_key = indexed_durable_note_len_key(index);
+        if self.read_durable_length(&len_key)?.is_none() {
+            return Ok(None);
+        }
+
+        let total_len_u64 = self.read_u64(&len_key)?;
+        let total_len = usize::try_from(total_len_u64).map_err(|_| {
+            format!(
+                "chunked durable note {} length does not fit in usize",
+                index
+            )
+        })?;
+        if total_len > MAX_PUBLISHED_NOTE_BYTES {
+            return Err(format!(
+                "chunked durable note {} length {} exceeds max supported size {}",
+                index, total_len, MAX_PUBLISHED_NOTE_BYTES
+            ));
+        }
+        let chunk_count = total_len.div_ceil(DURABLE_NOTE_CHUNK_BYTES);
+        let mut bytes = Vec::with_capacity(total_len);
+        for chunk_index in 0..chunk_count {
+            let chunk_key = indexed_durable_note_chunk_key(index, chunk_index);
+            let mut chunk = self.read_durable_bytes(&chunk_key)?;
+            bytes.append(&mut chunk);
+        }
+        if bytes.len() != total_len {
+            return Err(format!(
+                "chunked durable note {} length mismatch: expected {}, got {}",
+                index,
+                total_len,
+                bytes.len()
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
     fn read_u64(&self, key: &str) -> Result<u64, String> {
         let bytes = self.read_durable_bytes(key)?;
         if bytes.len() != 8 {
@@ -1373,14 +1426,13 @@ impl<'a> RollupRpc<'a> {
 
         let mut notes = Vec::with_capacity(count - cursor);
         for i in cursor..count {
-            let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64);
-            if self.read_durable_length(&key)?.is_none() {
+            let Some(bytes) = self.read_published_note_bytes(i as u64)? else {
+                let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64);
                 return Err(format!(
                     "rollup durable state is missing note {} at {} while tree size is {}. This usually means the deployed rollup kernel does not persist published note payloads, or the rollup node is not serving the expected durable state.",
                     i, key, count
                 ));
-            }
-            let bytes = self.read_durable_bytes(&key)?;
+            };
             let (cm, enc) = canonical_wire::decode_published_note(&bytes)?;
             notes.push(NoteMemo { index: i, cm, enc });
         }
@@ -1666,6 +1718,22 @@ fn format_rollup_submission(submission: &RollupSubmission) -> String {
 
 fn indexed_durable_key(prefix: &str, index: u64) -> String {
     format!("{}{index:016x}", prefix)
+}
+
+fn indexed_durable_note_len_key(index: u64) -> String {
+    format!(
+        "{}{}",
+        indexed_durable_key(DURABLE_NOTE_PREFIX, index),
+        DURABLE_NOTE_LEN_SUFFIX
+    )
+}
+
+fn indexed_durable_note_chunk_key(index: u64, chunk_index: usize) -> String {
+    format!(
+        "{}{}{chunk_index:08x}",
+        indexed_durable_key(DURABLE_NOTE_PREFIX, index),
+        DURABLE_NOTE_CHUNK_PREFIX
+    )
 }
 
 fn balance_durable_key(account: &str) -> String {
@@ -2463,6 +2531,9 @@ fn apply_scan_feed(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
@@ -2476,6 +2547,69 @@ mod tests {
         ALLOW_FULL_XMSS_REBUILD_IN_TESTS.store(false, std::sync::atomic::Ordering::SeqCst);
         drop(guard);
         result
+    }
+
+    pub(super) fn spawn_mock_http_server(routes: HashMap<String, (u16, String)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock http server");
+        let addr = listener.local_addr().expect("mock server local addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                let mut buffer = [0u8; 8192];
+                let read = match stream.read(&mut buffer) {
+                    Ok(read) => read,
+                    Err(_) => continue,
+                };
+                if read == 0 {
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, body) = routes
+                    .get(path)
+                    .cloned()
+                    .unwrap_or_else(|| (404, "null".to_string()));
+                let status_text = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    _ => "Unknown",
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    status_text,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    pub(super) fn rollup_profile_for_url(base_url: &str) -> WalletNetworkProfile {
+        WalletNetworkProfile {
+            network: "test".into(),
+            rollup_node_url: base_url.into(),
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            bridge_ticketer: "KT1Jg4fj5wwnKHuW8aa9uDX6dRYBdjXhm2sJ".into(),
+            public_account: "alice".into(),
+            operator_url: None,
+            source_alias: "alice".into(),
+            octez_client_bin: "octez-client".into(),
+            octez_client_dir: None,
+            octez_node_endpoint: None,
+            octez_protocol: None,
+            burn_cap: "1".into(),
+        }
     }
 
     fn rebuild_address_state(master_sk: &F, j: u32, next_auth_index: u32) -> WalletAddressState {
@@ -2548,7 +2682,10 @@ mod tests {
         xmss_tree_node_hash(pub_seed, height - 1, start_idx >> height, &left, &right)
     }
 
-    fn test_wallet(addr_counter: u32, legacy: Option<([u8; 64], [u8; 64])>) -> WalletFile {
+    pub(super) fn test_wallet(
+        addr_counter: u32,
+        legacy: Option<([u8; 64], [u8; 64])>,
+    ) -> WalletFile {
         let base = base_test_wallet();
         let (kem_seed_v, kem_seed_d) = legacy
             .map(|(v, d)| (v.to_vec(), d.to_vec()))
@@ -2597,7 +2734,7 @@ mod tests {
         (w, cm)
     }
 
-    fn note_memo_for_wallet_address(
+    pub(super) fn note_memo_for_wallet_address(
         w: &WalletFile,
         j: u32,
         value: u64,
@@ -4076,7 +4213,7 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
         .min(4);
     for index in 0..note_check_limit {
         let key = indexed_durable_key(DURABLE_NOTE_PREFIX, index as u64);
-        if rollup.read_durable_length(&key)?.is_none() {
+        if rollup.read_published_note_bytes(index as u64)?.is_none() {
             return Err(format!(
                 "rollup durable note {} is missing at {} while tree size is {}. This deployment cannot serve private note sync correctly.",
                 index, key, tree_size
@@ -4091,9 +4228,12 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
 fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), String> {
     let mut w = load_wallet(path)?;
     let rollup = RollupRpc::new(profile);
-    let feed = rollup
-        .load_notes_since(w.scanned)
-        .map_err(|e| format!("sync failed: {}. Run `tzel-wallet check` for a fuller diagnosis.", e))?;
+    let feed = rollup.load_notes_since(w.scanned).map_err(|e| {
+        format!(
+            "sync failed: {}. Run `tzel-wallet check` for a fuller diagnosis.",
+            e
+        )
+    })?;
     let nullifiers = rollup.load_nullifiers()?;
     let summary = apply_scan_feed(&mut w, &feed, nullifiers);
     save_wallet(path, &w)?;
@@ -5384,6 +5524,7 @@ fn cmd_fund(ledger: &str, addr: &str, amount: u64) -> Result<(), String> {
 #[cfg(test)]
 mod network_profile_tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn network_profile_roundtrip_persists_shadownet_settings() {
@@ -5446,6 +5587,125 @@ mod network_profile_tests {
             parse_rollup_rpc_bytes("\"tz1Alice\"").expect("utf8"),
             b"tz1Alice"
         );
+    }
+
+    #[test]
+    fn rollup_rpc_load_notes_since_reads_chunked_note_payloads() {
+        let wallet = super::tests::test_wallet(1, None);
+        let mut rseed = ZERO;
+        rseed[0] = 0x55;
+        let note_memo =
+            super::tests::note_memo_for_wallet_address(&wallet, 0, 77, rseed, Some(b"chunked"));
+        let encoded = canonical_wire::encode_published_note(&note_memo.cm, &note_memo.enc)
+            .expect("published note should encode");
+        assert!(encoded.len() > DURABLE_NOTE_CHUNK_BYTES);
+
+        let note_len_key = indexed_durable_note_len_key(0);
+        let mut routes = HashMap::from([
+            (
+                "/global/block/head/durable/wasm_2_0_0/length?key=/tzel/v1/state/tree/size".into(),
+                (200, "8".into()),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/value?key=/tzel/v1/state/tree/size".into(),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/length?key=/tzel/v1/state/notes/0000000000000000".into(),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
+                    note_len_key
+                ),
+                (200, "8".into()),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    note_len_key
+                ),
+                (
+                    200,
+                    format!("\"{}\"", hex::encode((encoded.len() as u64).to_le_bytes())),
+                ),
+            ),
+        ]);
+        for (chunk_index, chunk) in encoded.chunks(DURABLE_NOTE_CHUNK_BYTES).enumerate() {
+            routes.insert(
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_note_chunk_key(0, chunk_index)
+                ),
+                (200, format!("\"{}\"", hex::encode(chunk))),
+            );
+        }
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        let feed = rollup
+            .load_notes_since(0)
+            .expect("chunked note should load");
+        assert_eq!(feed.next_cursor, 1);
+        assert_eq!(feed.notes.len(), 1);
+        assert_eq!(feed.notes[0].index, note_memo.index);
+        assert_eq!(feed.notes[0].cm, note_memo.cm);
+        assert_eq!(feed.notes[0].enc.tag, note_memo.enc.tag);
+        assert_eq!(feed.notes[0].enc.ct_d, note_memo.enc.ct_d);
+        assert_eq!(feed.notes[0].enc.ct_v, note_memo.enc.ct_v);
+        assert_eq!(feed.notes[0].enc.nonce, note_memo.enc.nonce);
+        assert_eq!(
+            feed.notes[0].enc.encrypted_data,
+            note_memo.enc.encrypted_data
+        );
+    }
+
+    #[test]
+    fn rollup_rpc_rejects_oversized_chunked_note_lengths() {
+        let note_len_key = indexed_durable_note_len_key(0);
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                "/global/block/head/durable/wasm_2_0_0/length?key=/tzel/v1/state/tree/size".into(),
+                (200, "8".into()),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/value?key=/tzel/v1/state/tree/size".into(),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/length?key=/tzel/v1/state/notes/0000000000000000".into(),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
+                    note_len_key
+                ),
+                (200, "8".into()),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    note_len_key
+                ),
+                (
+                    200,
+                    format!(
+                        "\"{}\"",
+                        hex::encode(((MAX_PUBLISHED_NOTE_BYTES as u64) + 1).to_le_bytes())
+                    ),
+                ),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        let err = rollup
+            .load_notes_since(0)
+            .expect_err("oversized note length should fail");
+        assert!(err.contains("exceeds max supported size"));
     }
 
     #[test]

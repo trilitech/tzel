@@ -86,6 +86,8 @@ const PATH_VERIFIER_CONFIG: &[u8] = b"/tzel/v1/state/verifier_config.bin";
 const PATH_LAST_RESULT: &[u8] = b"/tzel/v1/state/last_result.bin";
 const PATH_TREE_BRANCH_PREFIX: &[u8] = b"/tzel/v1/state/tree/branch/";
 const PATH_NOTE_PREFIX: &[u8] = b"/tzel/v1/state/notes/";
+const PATH_NOTE_LEN_SUFFIX: &[u8] = b"/len";
+const PATH_NOTE_CHUNK_PREFIX: &[u8] = b"/chunk/";
 const PATH_NULLIFIER_PREFIX: &[u8] = b"/tzel/v1/state/nullifiers/by-key/";
 const PATH_NULLIFIER_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/nullifiers/index/";
 const PATH_VALID_ROOT_PREFIX: &[u8] = b"/tzel/v1/state/roots/by-key/";
@@ -96,6 +98,7 @@ const PATH_WITHDRAWAL_PREFIX: &[u8] = b"/tzel/v1/state/withdrawals/index/";
 const MAX_STORE_STRING_BYTES: usize = 256;
 const MAX_STORE_BINARY_BYTES: usize = 1024;
 const MAX_STORED_INPUT_PAYLOAD_BYTES: usize = 2048;
+const MAX_NOTE_CHUNK_BYTES: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputMessage {
@@ -334,7 +337,7 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
         }
 
         let encoded = encode_published_note(&cm, &enc)?;
-        self.host.write_store(&note_path(count), &encoded);
+        write_note_payload(self.host, count, &encoded);
 
         let mut current = cm;
         let mut index = count;
@@ -393,6 +396,34 @@ fn indexed_path(prefix: &[u8], index: u64) -> Vec<u8> {
 
 fn note_path(index: u64) -> Vec<u8> {
     indexed_path(PATH_NOTE_PREFIX, index)
+}
+
+fn note_length_path(index: u64) -> Vec<u8> {
+    let mut path = note_path(index);
+    path.extend_from_slice(PATH_NOTE_LEN_SUFFIX);
+    path
+}
+
+fn note_chunk_path(index: u64, chunk_index: usize) -> Vec<u8> {
+    let mut path = note_path(index);
+    path.extend_from_slice(PATH_NOTE_CHUNK_PREFIX);
+    path.extend_from_slice(format!("{:08x}", chunk_index).as_bytes());
+    path
+}
+
+fn write_note_payload<H: Host>(host: &mut H, index: u64, encoded: &[u8]) {
+    if encoded.len() <= MAX_NOTE_CHUNK_BYTES {
+        host.write_store(&note_path(index), encoded);
+        return;
+    }
+
+    host.write_store(
+        &note_length_path(index),
+        &(encoded.len() as u64).to_le_bytes(),
+    );
+    for (chunk_index, chunk) in encoded.chunks(MAX_NOTE_CHUNK_BYTES).enumerate() {
+        host.write_store(&note_chunk_path(index, chunk_index), chunk);
+    }
 }
 
 fn branch_path(level: usize) -> Vec<u8> {
@@ -632,11 +663,9 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     ledger.withdrawals.clear();
 
     for i in 0..tree_size {
-        let (cm, enc) = decode_published_note(
-            &host
-                .read_store(&note_path(i), MAX_LEDGER_STATE_BYTES)
-                .ok_or_else(|| format!("missing persisted note {}", i))?,
-        )?;
+        let note_bytes =
+            read_persisted_note(host, i).ok_or_else(|| format!("missing persisted note {}", i))?;
+        let (cm, enc) = decode_published_note(&note_bytes)?;
         ledger.tree.leaves.push(cm);
         ledger.memos.push((cm, enc));
     }
@@ -687,6 +716,31 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     }
 
     Ok(ledger)
+}
+
+fn read_persisted_note<H: Host>(host: &H, index: u64) -> Option<Vec<u8>> {
+    if let Some(bytes) = host.read_store(&note_path(index), MAX_LEDGER_STATE_BYTES) {
+        return Some(bytes);
+    }
+
+    let len_bytes = host.read_store(&note_length_path(index), 8)?;
+    if len_bytes.len() != 8 {
+        return None;
+    }
+    let total_len = usize::try_from(u64::from_le_bytes(len_bytes.try_into().ok()?)).ok()?;
+    if total_len > MAX_LEDGER_STATE_BYTES {
+        return None;
+    }
+    let chunk_count = total_len.div_ceil(MAX_NOTE_CHUNK_BYTES);
+    let mut bytes = Vec::with_capacity(total_len);
+    for chunk_index in 0..chunk_count {
+        let chunk = host.read_store(&note_chunk_path(index, chunk_index), MAX_NOTE_CHUNK_BYTES)?;
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != total_len {
+        return None;
+    }
+    Some(bytes)
 }
 
 pub fn read_verifier_config<H: Host>(host: &H) -> Result<Option<KernelVerifierConfig>, String> {
@@ -1648,6 +1702,74 @@ mod tests {
     }
 
     #[test]
+    fn persists_large_shield_note_in_chunked_durable_keys() {
+        let mut host = MockHost::default();
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            apply_deposit(&mut state, "alice", 50).unwrap();
+        }
+
+        let config = KernelVerifierConfig {
+            auth_domain: default_auth_domain(),
+            verified_program_hashes: sample_program_hashes(),
+        };
+        host.write_store(
+            PATH_VERIFIER_CONFIG,
+            &encode_kernel_verifier_config(&config).unwrap(),
+        );
+
+        let address = sample_payment_address();
+        let rseed = sample_felt(0x55);
+        let enc = sample_encrypted_note(&address, 50, rseed, b"chunked shield note");
+        let cm = sample_commitment(&address, 50, rseed);
+        let encoded = encode_published_note(&cm, &enc).unwrap();
+        assert!(encoded.len() > MAX_NOTE_CHUNK_BYTES);
+
+        let shield_req = KernelShieldReq {
+            sender: "alice".into(),
+            v: 50,
+            address,
+            memo: Some("chunked shield note".into()),
+            proof: sample_kernel_test_proof(),
+            client_cm: cm,
+            client_enc: Some(enc),
+        };
+        let message = encode_kernel_inbox_message(&KernelInboxMessage::Shield(shield_req)).unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 2,
+            id: 1,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        assert!(!host.store.contains_key(&note_path(0)));
+        let len_path = note_length_path(0);
+        assert_eq!(
+            host.store.get(&len_path),
+            Some(&(encoded.len() as u64).to_le_bytes().to_vec())
+        );
+        for (chunk_index, chunk) in encoded.chunks(MAX_NOTE_CHUNK_BYTES).enumerate() {
+            assert_eq!(
+                host.store
+                    .get(&note_chunk_path(0, chunk_index))
+                    .map(|bytes| bytes.as_slice()),
+                Some(chunk)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_chunked_note_lengths_beyond_ledger_limit() {
+        let mut host = MockHost::default();
+        host.write_store(
+            &note_length_path(0),
+            &((MAX_LEDGER_STATE_BYTES as u64) + 1).to_le_bytes(),
+        );
+        assert!(read_persisted_note(&host, 0).is_none());
+    }
+
+    #[test]
     fn applies_shield_message_from_dal_pointer() {
         let mut host = MockHost::default();
         {
@@ -1825,8 +1947,8 @@ mod tests {
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.tree.leaves, vec![cm_1, cm_2]);
         assert!(ledger.nullifiers.contains(&nf));
-        assert!(host.store.contains_key(&note_path(0)));
-        assert!(host.store.contains_key(&note_path(1)));
+        assert!(read_persisted_note(&host, 0).is_some());
+        assert!(read_persisted_note(&host, 1).is_some());
         assert!(host.store.contains_key(&nullifier_path(&nf)));
         assert!(host.store.contains_key(&branch_path(0)));
         assert!(host.store.contains_key(&PATH_TREE_ROOT.to_vec()));
@@ -1880,7 +2002,7 @@ mod tests {
         assert!(ledger.nullifiers.contains(&nf));
         assert!(host.store.contains_key(&balance_path("bob")));
         assert!(host.store.contains_key(&nullifier_path(&nf)));
-        assert!(host.store.contains_key(&note_path(0)));
+        assert!(read_persisted_note(&host, 0).is_some());
     }
 
     #[test]
