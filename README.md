@@ -180,8 +180,7 @@ It:
 Build it with:
 
 ```bash
-rustup target add wasm32-unknown-unknown
-cargo build -p tzel-rollup-kernel --target wasm32-unknown-unknown --release
+./scripts/build_rollup_kernel_release.sh
 ```
 
 ## Known limitations

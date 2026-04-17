@@ -49,8 +49,7 @@ tzel-wallet --wallet alice.watch.json profile init-shadownet \
   --rollup-address sr1... \
   --bridge-ticketer KT1... \
   --source-alias alice \
-  --public-account alice \
-  --operator-url http://127.0.0.1:8787
+  --public-account alice
 ```
 
 ## Sync Manually

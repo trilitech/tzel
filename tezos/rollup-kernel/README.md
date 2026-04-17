@@ -55,8 +55,7 @@ in-kernel without linking prover code.
 Build the kernel WASM:
 
 ```bash
-rustup target add wasm32-unknown-unknown
-cargo build -p tzel-rollup-kernel --target wasm32-unknown-unknown --release
+./scripts/build_rollup_kernel_release.sh
 ```
 
 The resulting kernel is at:
@@ -64,6 +63,10 @@ The resulting kernel is at:
 ```text
 target/wasm32-unknown-unknown/release/tzel_rollup_kernel.wasm
 ```
+
+That helper also generates or reuses rollup configuration-admin material under
+`target/rollup-config-admin/` and bakes the derived public values into the
+release kernel build.
 
 For live bridge deposits, originate the rollup with a ticket-bearing parameter
 type:

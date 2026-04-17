@@ -1586,7 +1586,38 @@ fn load_network_profile(path: &Path) -> Result<WalletNetworkProfile, String> {
     serde_json::from_str(&data).map_err(|e| format!("parse network profile: {}", e))
 }
 
+fn validate_network_profile(profile: &WalletNetworkProfile) -> Result<(), String> {
+    let has_operator_url = profile.operator_url.is_some();
+    let has_operator_token = profile
+        .operator_bearer_token
+        .as_ref()
+        .map(|token| !token.trim().is_empty())
+        .unwrap_or(false);
+    match (has_operator_url, has_operator_token) {
+        (true, false) => Err(
+            "operator_url requires operator_bearer_token; pass both or neither".into(),
+        ),
+        (false, true) => Err(
+            "operator_bearer_token requires operator_url; pass both or neither".into(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn redacted_network_profile(profile: &WalletNetworkProfile) -> WalletNetworkProfile {
+    let mut redacted = profile.clone();
+    if redacted.operator_bearer_token.is_some() {
+        redacted.operator_bearer_token = Some("<redacted>".into());
+    }
+    redacted
+}
+
+fn display_network_profile_json(profile: &WalletNetworkProfile) -> String {
+    serde_json::to_string_pretty(&redacted_network_profile(profile)).unwrap()
+}
+
 fn save_network_profile(path: &Path, profile: &WalletNetworkProfile) -> Result<(), String> {
+    validate_network_profile(profile)?;
     let data =
         serde_json::to_string_pretty(profile).map_err(|e| format!("serialize profile: {}", e))?;
     let (tmp, mut file) = create_private_temp_file(path, "network profile")?;
@@ -1613,6 +1644,7 @@ fn load_required_network_profile(wallet_path: &str) -> Result<WalletNetworkProfi
             profile.network
         ));
     }
+    validate_network_profile(&profile)?;
     Ok(profile)
 }
 
@@ -2583,9 +2615,9 @@ enum UserProfileCmd {
         rollup_address: String,
         #[arg(long)]
         bridge_ticketer: String,
-        #[arg(long)]
+        #[arg(long, requires = "operator_bearer_token")]
         operator_url: Option<String>,
-        #[arg(long)]
+        #[arg(long, requires = "operator_url")]
         operator_bearer_token: Option<String>,
         #[arg(long)]
         source_alias: String,
@@ -2845,12 +2877,12 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
             );
             save_network_profile(&path, &profile)?;
             println!("Saved {} profile to {}", profile.network, path.display());
-            println!("{}", serde_json::to_string_pretty(&profile).unwrap());
+            println!("{}", display_network_profile_json(&profile));
             Ok(())
         }
         UserProfileCmd::Show => {
             let profile = load_network_profile(&path)?;
-            println!("{}", serde_json::to_string_pretty(&profile).unwrap());
+            println!("{}", display_network_profile_json(&profile));
             Ok(())
         }
     }
@@ -6775,6 +6807,75 @@ mod network_profile_tests {
         let loaded = load_required_network_profile(wallet_path_str).expect("saved profile");
         assert_eq!(loaded, saved);
         assert_eq!(loaded.public_account, "bootstrap1");
+    }
+
+    #[test]
+    fn save_network_profile_rejects_operator_url_without_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile_path = dir.path().join("wallet.network.json");
+        let profile = shadownet_profile(
+            "https://saved-rollup.example".into(),
+            "sr1SavedRollup".into(),
+            "KT1SavedTicketer".into(),
+            Some("https://operator.shadownet.example".into()),
+            None,
+            "bootstrap1".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let err = save_network_profile(&profile_path, &profile).unwrap_err();
+        assert!(err.contains("operator_url requires operator_bearer_token"));
+    }
+
+    #[test]
+    fn load_required_network_profile_rejects_saved_operator_url_without_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let profile_path = default_network_profile_path(wallet_path_str);
+        let bad_profile = serde_json::json!({
+            "network": "shadownet",
+            "rollup_node_url": "https://saved-rollup.example",
+            "rollup_address": "sr1SavedRollup",
+            "bridge_ticketer": "KT1SavedTicketer",
+            "operator_url": "https://operator.shadownet.example",
+            "source_alias": "bootstrap1",
+            "public_account": "bootstrap1",
+            "octez_client_bin": "octez-client",
+            "burn_cap": "1"
+        });
+        std::fs::write(&profile_path, serde_json::to_string_pretty(&bad_profile).unwrap())
+            .expect("write bad profile");
+
+        let err = load_required_network_profile(wallet_path_str).unwrap_err();
+        assert!(err.contains("operator_url requires operator_bearer_token"));
+    }
+
+    #[test]
+    fn display_network_profile_redacts_operator_bearer_token() {
+        let profile = shadownet_profile(
+            "https://saved-rollup.example".into(),
+            "sr1SavedRollup".into(),
+            "KT1SavedTicketer".into(),
+            Some("https://operator.shadownet.example".into()),
+            Some("operator-secret".into()),
+            "bootstrap1".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let displayed = display_network_profile_json(&profile);
+        assert!(displayed.contains("\"operator_bearer_token\": \"<redacted>\""));
+        assert!(!displayed.contains("operator-secret"));
     }
 
     #[cfg(unix)]

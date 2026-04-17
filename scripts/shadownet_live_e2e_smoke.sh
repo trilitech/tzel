@@ -32,6 +32,7 @@ required_vars=(
   TZEL_ROLLUP_RPC_HOST
   TZEL_ROLLUP_RPC_PORT
   TZEL_OPERATOR_LISTEN
+  TZEL_OPERATOR_BEARER_TOKEN_FILE
 )
 
 for var in "${required_vars[@]}"; do
@@ -43,6 +44,10 @@ done
 
 if [[ -z "${TZEL_SMOKE_L1_RECIPIENT:-}" ]]; then
   echo "set TZEL_SMOKE_L1_RECIPIENT to a tz1/KT1 withdrawal recipient" >&2
+  exit 1
+fi
+if [[ ! -f "${TZEL_OPERATOR_BEARER_TOKEN_FILE}" ]]; then
+  echo "missing operator bearer token file: ${TZEL_OPERATOR_BEARER_TOKEN_FILE}" >&2
   exit 1
 fi
 
@@ -176,6 +181,7 @@ init_profile() {
     --rollup-address "${TZEL_ROLLUP_ADDRESS}" \
     --bridge-ticketer "${TZEL_BRIDGE_TICKETER}" \
     --operator-url "${OPERATOR_URL}" \
+    --operator-bearer-token "$(cat "${TZEL_OPERATOR_BEARER_TOKEN_FILE}")" \
     --source-alias "${TZEL_SOURCE_ALIAS}" \
     --public-account "${public_account}" \
     --octez-client-bin "${TZEL_OCTEZ_CLIENT_BIN}" \

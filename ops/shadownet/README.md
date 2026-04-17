@@ -29,6 +29,8 @@ by the rest of the DAL network. In practice that means:
 - `../../scripts/install_tzel_binaries.sh`
   - installs `tzel-operator`, `tzel-wallet`, `tzel-detect`, `sp-client`, `octez_kernel_message`,
     `verified_bridge_fixture_message`, `reprove`, and the Cairo executable JSON files
+  - installs `rollup-config-admin-{runtime,build}.env` and wraps `octez_kernel_message` so
+    config messages stay usable after install
 - `../../scripts/shadownet_operator_preflight.sh`
   - checks binaries, env vars, and local service RPCs, including `tzel-detect` when enabled
 - `../../scripts/shadownet_live_e2e_smoke.sh`
@@ -49,6 +51,7 @@ by the rest of the DAL network. In practice that means:
    - edit `/etc/tzel/shadownet.env`
 5. Initialize local state and node identity.
    - `sudo ./scripts/init_shadownet_operator_box.sh /etc/tzel/shadownet.env`
+   - this also creates `TZEL_OPERATOR_BEARER_TOKEN_FILE` if it does not exist
 6. Import the operator key once.
    - `sudo -u tzel octez-client -d /var/lib/tzel/octez-client import secret key tzelshadownet <SECRET_KEY>`
 7. Copy the service units.
@@ -92,7 +95,6 @@ For delegated watch-only scanning, export watch material from a spending wallet:
   --rollup-node-url http://127.0.0.1:28944 \
   --rollup-address "$TZEL_ROLLUP_ADDRESS" \
   --bridge-ticketer "$TZEL_BRIDGE_TICKETER" \
-  --operator-url http://127.0.0.1:8787 \
   --source-alias "$TZEL_SOURCE_ALIAS"
 ```
 
@@ -116,7 +118,6 @@ the rollup state:
   --rollup-node-url http://127.0.0.1:28944 \
   --rollup-address "$TZEL_ROLLUP_ADDRESS" \
   --bridge-ticketer "$TZEL_BRIDGE_TICKETER" \
-  --operator-url http://127.0.0.1:8787 \
   --source-alias "$TZEL_SOURCE_ALIAS"
 /usr/local/bin/tzel-wallet --wallet /tmp/tzel-check.wallet check
 ```

@@ -16,6 +16,7 @@ required_vars=(
   TZEL_DAL_NODE_BIN
   TZEL_ROLLUP_NODE_BIN
   TZEL_OPERATOR_BIN
+  TZEL_OPERATOR_BEARER_TOKEN_FILE
   TZEL_L1_RPC_URL
   TZEL_DAL_RPC_ADDR
   TZEL_DAL_PUBLIC_ADDR
@@ -59,6 +60,20 @@ check_cmd "octez-client" "$TZEL_OCTEZ_CLIENT_BIN"
 check_cmd "octez-dal-node" "$TZEL_DAL_NODE_BIN"
 check_cmd "octez-smart-rollup-node" "$TZEL_ROLLUP_NODE_BIN"
 check_cmd "tzel-operator" "$TZEL_OPERATOR_BIN"
+
+if [[ ! -f "$TZEL_OPERATOR_BEARER_TOKEN_FILE" ]]; then
+  echo "missing operator bearer token file: $TZEL_OPERATOR_BEARER_TOKEN_FILE" >&2
+  exit 1
+fi
+if [[ ! -r "$TZEL_OPERATOR_BEARER_TOKEN_FILE" ]]; then
+  echo "operator bearer token file is not readable: $TZEL_OPERATOR_BEARER_TOKEN_FILE" >&2
+  exit 1
+fi
+if [[ -z "$(tr -d '[:space:]' < "$TZEL_OPERATOR_BEARER_TOKEN_FILE")" ]]; then
+  echo "operator bearer token file is empty: $TZEL_OPERATOR_BEARER_TOKEN_FILE" >&2
+  exit 1
+fi
+echo "ok: operator bearer token -> $TZEL_OPERATOR_BEARER_TOKEN_FILE"
 
 if ! "$TZEL_OCTEZ_CLIENT_BIN" -d "$TZEL_OCTEZ_CLIENT_DIR" show address "$TZEL_SOURCE_ALIAS" -S >/dev/null 2>&1; then
   echo "missing operator alias in octez-client dir: $TZEL_SOURCE_ALIAS ($TZEL_OCTEZ_CLIENT_DIR)" >&2

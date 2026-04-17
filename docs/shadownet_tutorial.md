@@ -47,6 +47,7 @@ The wallet commands below assume:
 - `/usr/local/bin/octez_kernel_message`
 - `/usr/local/bin/verified_bridge_fixture_message`
 - Cairo executables in `/opt/tzel/cairo/target/dev`
+- rollup config admin env files in `/usr/local/etc/tzel/rollup-config-admin-{runtime,build}.env`
 
 ## 2. Bring Up The Public Operator Box
 
@@ -64,6 +65,7 @@ Edit `/etc/tzel/shadownet.env`:
 - set `TZEL_BRIDGE_TICKETER=KT1...`
 - set `TZEL_DAL_PUBLIC_ADDR=<PUBLIC_IP_OR_DNS>:11732`
 - make sure `TZEL_SOURCE_ALIAS` matches the account you will fund and use
+- set `TZEL_OPERATOR_BEARER_TOKEN_FILE=/etc/tzel/operator-bearer-token`
 
 Initialize state:
 
@@ -172,6 +174,12 @@ Then use:
 - `http://127.0.0.1:8787` for `operator_url`
 - `http://127.0.0.1:28944` for `rollup_node_url`
 
+Load the operator bearer token before creating wallet profiles:
+
+```bash
+export OPERATOR_BEARER_TOKEN="$(cat /etc/tzel/operator-bearer-token)"
+```
+
 ## 5. Create Alice And Bob Wallets
 
 Use a dedicated working directory:
@@ -198,6 +206,7 @@ Create Shadownet profiles:
   --rollup-address "$ROLLUP_ADDRESS" \
   --bridge-ticketer "$BRIDGE_TICKETER" \
   --operator-url http://127.0.0.1:8787 \
+  --operator-bearer-token "$OPERATOR_BEARER_TOKEN" \
   --source-alias "$SOURCE_ALIAS" \
   --public-account alice
 
@@ -208,6 +217,7 @@ Create Shadownet profiles:
   --rollup-address "$ROLLUP_ADDRESS" \
   --bridge-ticketer "$BRIDGE_TICKETER" \
   --operator-url http://127.0.0.1:8787 \
+  --operator-bearer-token "$OPERATOR_BEARER_TOKEN" \
   --source-alias "$SOURCE_ALIAS" \
   --public-account bob
 ```

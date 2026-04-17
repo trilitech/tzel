@@ -55,6 +55,15 @@ jobs:
           cargo test -p tzel-ledger-app --bin sp-ledger
           cargo test -p tzel-demo
 
+      - name: Check deployment script syntax
+        run: |
+          bash -n scripts/prepare_rollup_config_admin.sh
+          bash -n scripts/build_rollup_kernel_release.sh
+          bash -n scripts/install_tzel_binaries.sh
+          bash -n scripts/init_shadownet_operator_box.sh
+          bash -n scripts/shadownet_operator_preflight.sh
+          bash -n scripts/shadownet_live_e2e_smoke.sh
+
       - name: Run Cairo unit tests
         working-directory: cairo
         run: scarb test

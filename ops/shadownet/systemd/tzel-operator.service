@@ -11,6 +11,7 @@ ExecStart=${TZEL_OPERATOR_BIN} \
   --listen=${TZEL_OPERATOR_LISTEN} \
   --source-alias=${TZEL_SOURCE_ALIAS} \
   --state-dir=${TZEL_OPERATOR_STATE_DIR} \
+  --bearer-token-file=${TZEL_OPERATOR_BEARER_TOKEN_FILE} \
   --octez-client-bin=${TZEL_OCTEZ_CLIENT_BIN} \
   --octez-client-dir=${TZEL_OCTEZ_CLIENT_DIR} \
   --octez-node-endpoint=${TZEL_L1_RPC_URL} \

@@ -31,7 +31,7 @@ use tezos_smart_rollup_encoding::{
 use tzel_core::{
     apply_deposit, apply_shield, apply_transfer, apply_unshield, apply_withdraw,
     canonical_wire::{decode_published_note, encode_published_note},
-    auth_leaf_hash, default_auth_domain, derive_auth_pub_seed, hash, hash_merkle,
+    default_auth_domain, hash, hash_merkle,
     kernel_wire::{
         decode_kernel_inbox_message, decode_kernel_result, decode_kernel_verifier_config,
         encode_kernel_result, encode_kernel_verifier_config, kernel_bridge_config_sighash,
@@ -44,6 +44,8 @@ use tzel_core::{
     verify_wots_signature_against_leaf, EncryptedNote, Ledger, LedgerState, WithdrawalRecord,
     DEPTH, F, ZERO,
 };
+#[cfg(any(test, debug_assertions))]
+use tzel_core::{auth_leaf_hash, derive_auth_pub_seed};
 #[cfg(feature = "proof-verifier")]
 use tzel_verifier::DirectProofVerifier;
 
