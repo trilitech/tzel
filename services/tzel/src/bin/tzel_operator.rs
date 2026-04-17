@@ -156,7 +156,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|e| format!("read bearer token file: {}", e))?
             .trim()
             .to_string(),
-        (None, None) => return Err("operator requires --bearer-token or --bearer-token-file".into()),
+        (None, None) => {
+            return Err("operator requires --bearer-token or --bearer-token-file".into())
+        }
     };
     if bearer_token.is_empty() {
         return Err("operator bearer token must not be empty".into());
@@ -207,13 +209,22 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-fn require_bearer_auth(headers: &HeaderMap, config: &OperatorConfig) -> Result<(), (StatusCode, String)> {
+fn require_bearer_auth(
+    headers: &HeaderMap,
+    config: &OperatorConfig,
+) -> Result<(), (StatusCode, String)> {
     let Some(raw) = headers.get(axum::http::header::AUTHORIZATION) else {
-        return Err((StatusCode::UNAUTHORIZED, "missing Authorization header".into()));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "missing Authorization header".into(),
+        ));
     };
-    let auth = raw
-        .to_str()
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid Authorization header".into()))?;
+    let auth = raw.to_str().map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "invalid Authorization header".into(),
+        )
+    })?;
     let Some(token) = auth.strip_prefix("Bearer ") else {
         return Err((StatusCode::UNAUTHORIZED, "expected Bearer token".into()));
     };
@@ -1190,15 +1201,12 @@ mod tests {
     #[tokio::test]
     async fn submit_route_rejects_missing_bearer_auth() {
         let script_dir = make_client_script("#!/bin/sh\necho 'Operation hash is ooShouldNotRun'\n");
-        let state = app_state_with_config(config_with_client(&script_dir.path().join("octez-client")));
+        let state =
+            app_state_with_config(config_with_client(&script_dir.path().join("octez-client")));
 
-        let err = submit_rollup_message(
-            State(state),
-            HeaderMap::new(),
-            Json(sample_submit_req()),
-        )
-        .await
-        .unwrap_err();
+        let err = submit_rollup_message(State(state), HeaderMap::new(), Json(sample_submit_req()))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 
@@ -1220,17 +1228,14 @@ mod tests {
     async fn submit_route_accepts_matching_bearer_auth() {
         let script_dir =
             make_client_script("#!/bin/sh\necho 'Operation hash is ooRouteAuthHash123456789AB'\n");
-        let state = app_state_with_config(config_with_client(&script_dir.path().join("octez-client")));
+        let state =
+            app_state_with_config(config_with_client(&script_dir.path().join("octez-client")));
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Bearer test-token".parse().unwrap());
 
-        let resp = submit_rollup_message(
-            State(state),
-            headers,
-            Json(sample_submit_req()),
-        )
-        .await
-        .expect("matching token should pass route auth");
+        let resp = submit_rollup_message(State(state), headers, Json(sample_submit_req()))
+            .await
+            .expect("matching token should pass route auth");
         assert_eq!(
             resp.0.submission.status,
             RollupSubmissionStatus::SubmittedToL1

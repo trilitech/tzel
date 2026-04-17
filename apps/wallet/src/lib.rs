@@ -22,10 +22,6 @@ use tzel_verifier::{encode_verify_meta, ProofBundle as VerifyProofBundle};
 
 const XMSS_BDS_K: usize = 2;
 
-fn is_zero_u32(v: &u32) -> bool {
-    *v == 0
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 struct FeltSlot {
     present: bool,
@@ -446,53 +442,10 @@ struct WalletAddressState {
     auth_pub_seed: F,
     #[serde(with = "hex_f")]
     nk_tag: F,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    bds: Option<XmssBdsState>,
-    /// Legacy migration-only field from the old wallet format.
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    next_auth_index: u32,
-    /// Legacy migration-only field from the old wallet format.
-    #[serde(default, with = "hex_f_vec", skip_serializing_if = "Vec::is_empty")]
-    next_auth_path: Vec<F>,
+    bds: XmssBdsState,
 }
 
 impl WalletAddressState {
-    fn ensure_bds(&mut self, ask_j: &F) -> Result<(), String> {
-        if self.bds.is_some() {
-            return Ok(());
-        }
-        self.ensure_bds_with(ask_j, |ask_j, pub_seed, next_auth_index| {
-            XmssBdsState::from_index(ask_j, pub_seed, next_auth_index)
-        })
-    }
-
-    fn ensure_bds_with<R>(&mut self, ask_j: &F, rebuild: R) -> Result<(), String>
-    where
-        R: FnOnce(&F, &F, u32) -> Result<(XmssBdsState, F), String>,
-    {
-        if self.bds.is_some() {
-            return Ok(());
-        }
-        let (state, root) = rebuild(ask_j, &self.auth_pub_seed, self.next_auth_index)?;
-        if root != self.auth_root {
-            return Err(format!(
-                "rebuilt XMSS root mismatch for address {}",
-                self.index
-            ));
-        }
-        if !self.next_auth_path.is_empty() && state.current_path() != self.next_auth_path.as_slice()
-        {
-            return Err(format!(
-                "rebuilt XMSS path mismatch for address {} at index {}",
-                self.index, self.next_auth_index
-            ));
-        }
-        self.bds = Some(state);
-        self.next_auth_index = 0;
-        self.next_auth_path.clear();
-        Ok(())
-    }
-
     fn payment_address(&self, ek_v: &Ek, ek_d: &Ek) -> PaymentAddress {
         PaymentAddress {
             d_j: self.d_j,
@@ -509,12 +462,6 @@ impl WalletAddressState {
 struct WalletFile {
     #[serde(with = "hex_f")]
     master_sk: F,
-    /// Legacy global KEM seeds — ignored when per-address derivation is available.
-    /// Kept for backwards compatibility during wallet migration.
-    #[serde(default, with = "hex_bytes")]
-    kem_seed_v: Vec<u8>,
-    #[serde(default, with = "hex_bytes")]
-    kem_seed_d: Vec<u8>,
     #[serde(default)]
     addresses: Vec<WalletAddressState>,
     addr_counter: u32,
@@ -655,12 +602,12 @@ impl WalletFile {
     fn derive_address_state(
         &self,
         j: u32,
-        next_auth_index: u32,
+        next_wots_index: u32,
     ) -> Result<WalletAddressState, String> {
         #[cfg(test)]
         panic!(
-            "unexpected XMSS address derivation for j={} next_auth_index={} — default tests must use fixed prederived wallet/address fixtures",
-            j, next_auth_index
+            "unexpected XMSS address derivation for j={} next_wots_index={} — default tests must use fixed prederived wallet/address fixtures",
+            j, next_wots_index
         );
 
         #[cfg(not(test))]
@@ -672,7 +619,7 @@ impl WalletFile {
         #[cfg(not(test))]
         let auth_pub_seed = derive_auth_pub_seed(&ask_j);
         #[cfg(not(test))]
-        let (bds, auth_root) = XmssBdsState::from_index(&ask_j, &auth_pub_seed, next_auth_index)?;
+        let (bds, auth_root) = XmssBdsState::from_index(&ask_j, &auth_pub_seed, next_wots_index)?;
         #[cfg(not(test))]
         let nk_spend = derive_nk_spend(&acc.nk, &d_j);
         #[cfg(not(test))]
@@ -685,37 +632,20 @@ impl WalletFile {
             auth_root,
             auth_pub_seed,
             nk_tag,
-            bds: Some(bds),
-            next_auth_index: 0,
-            next_auth_path: Vec::new(),
+            bds,
         })
     }
 
     fn materialize_addresses(&mut self) -> Result<(), String> {
-        if self.addresses.len() == self.addr_counter as usize {
-            let ask_base = self.account().ask_base;
-            for addr in &mut self.addresses {
-                let ask_j = derive_ask(&ask_base, addr.index);
-                addr.ensure_bds(&ask_j)?;
-                if let Some(bds) = &addr.bds {
-                    self.wots_key_indices.insert(addr.index, bds.next_index);
-                }
-            }
-            return Ok(());
-        }
         let existing = self.addresses.len() as u32;
         for j in existing..self.addr_counter {
-            let next_auth_index = *self.wots_key_indices.get(&j).unwrap_or(&0);
+            let next_wots_index = *self.wots_key_indices.get(&j).unwrap_or(&0);
             self.addresses
-                .push(self.derive_address_state(j, next_auth_index)?);
+                .push(self.derive_address_state(j, next_wots_index)?);
         }
-        let ask_base = self.account().ask_base;
-        for addr in &mut self.addresses {
-            let ask_j = derive_ask(&ask_base, addr.index);
-            addr.ensure_bds(&ask_j)?;
-            if let Some(bds) = &addr.bds {
-                self.wots_key_indices.insert(addr.index, bds.next_index);
-            }
+        for addr in &self.addresses {
+            self.wots_key_indices
+                .insert(addr.index, addr.bds.next_index);
         }
         Ok(())
     }
@@ -725,16 +655,6 @@ impl WalletFile {
         self.reserve_next_auth(addr_index)
             .expect("XMSS keys should be available for test wallet")
             .0
-    }
-
-    /// Legacy global KEM keys used by pre-migration wallets.
-    /// Returns None when the wallet was created after the per-address migration.
-    fn legacy_kem_keys(&self) -> Option<(Ek, Dk, Ek, Dk)> {
-        let seed_v: [u8; 64] = self.kem_seed_v.as_slice().try_into().ok()?;
-        let seed_d: [u8; 64] = self.kem_seed_d.as_slice().try_into().ok()?;
-        let (ek_v, dk_v) = kem_keygen_from_seed(&seed_v);
-        let (ek_d, dk_d) = kem_keygen_from_seed(&seed_d);
-        Some((ek_v, dk_v, ek_d, dk_d))
     }
 
     /// Per-address KEM keys derived from incoming_seed + address index.
@@ -774,30 +694,12 @@ impl WalletFile {
         })
     }
 
-    /// Recover a note from the notes feed using either:
-    /// 1. Legacy global KEM keys (for pre-migration wallets), or
-    /// 2. Current per-address KEM keys.
+    /// Recover a note from the notes feed using the current per-address KEM keys.
     fn try_recover_note(&self, nm: &NoteMemo) -> Option<Note> {
         let acc = self.account();
 
-        // Legacy compatibility: old wallets used one global ML-KEM keypair
-        // for all addresses. Keep scanning those notes until users migrate.
-        if let Some((_, dk_v_legacy, _, dk_d_legacy)) = self.legacy_kem_keys() {
-            if detect(&nm.enc, &dk_d_legacy) {
-                if let Some((v, rseed, _memo)) = decrypt_memo(&nm.enc, &dk_v_legacy) {
-                    for addr in &self.addresses {
-                        if let Some(note) =
-                            self.recover_note_for_address(&acc, addr, v, rseed, nm.cm, nm.index)
-                        {
-                            return Some(note);
-                        }
-                    }
-                }
-            }
-        }
-
         for addr in &self.addresses {
-            let (_, dk_v_j, _, dk_d_j) = derive_kem_keys(&acc.incoming_seed, addr.index);
+            let (_, dk_v_j, _, dk_d_j) = self.kem_keys(addr.index);
             if !detect(&nm.enc, &dk_d_j) {
                 continue;
             }
@@ -837,11 +739,7 @@ impl WalletFile {
             .get_mut(addr_index as usize)
             .ok_or_else(|| format!("missing address record {}", addr_index))?;
         let ask_j = derive_ask(&ask_base, addr_index);
-        addr.ensure_bds(&ask_j)?;
-        let bds = addr
-            .bds
-            .as_mut()
-            .ok_or_else(|| format!("missing XMSS traversal state for address {}", addr_index))?;
+        let bds = &mut addr.bds;
         let key_idx = bds.next_index;
         if (key_idx as usize) >= AUTH_TREE_SIZE {
             return Err(format!(
@@ -902,11 +800,7 @@ impl WalletFile {
     fn wallet_xmss_floor(&self) -> WalletXmssFloor {
         let mut wots_key_indices = self.wots_key_indices.clone();
         for addr in &self.addresses {
-            let next_index = addr
-                .bds
-                .as_ref()
-                .map(|bds| bds.next_index)
-                .unwrap_or(addr.next_auth_index);
+            let next_index = addr.bds.next_index;
             wots_key_indices
                 .entry(addr.index)
                 .and_modify(|current| *current = (*current).max(next_index))
@@ -1282,12 +1176,7 @@ fn current_wallet_wots_floor(wallet: &WalletFile, addr_index: u32) -> u32 {
                 .addresses
                 .iter()
                 .find(|addr| addr.index == addr_index)
-                .map(|addr| {
-                    addr.bds
-                        .as_ref()
-                        .map(|bds| bds.next_index)
-                        .unwrap_or(addr.next_auth_index)
-                })
+                .map(|addr| addr.bds.next_index)
         })
         .unwrap_or(0)
 }
@@ -1343,7 +1232,7 @@ fn enforce_wallet_xmss_floor(path: &str, wallet: &WalletFile) -> Result<(), Stri
         let current_next = current_wallet_wots_floor(wallet, *addr_index);
         if current_next < *required_next {
             return Err(format!(
-                "wallet appears to be restored from a stale backup: address {} next_auth_index {} is behind durable XMSS floor {}",
+                "wallet appears to be restored from a stale backup: address {} next_wots_index {} is behind durable XMSS floor {}",
                 addr_index, current_next, required_next
             ));
         }
@@ -1594,12 +1483,12 @@ fn validate_network_profile(profile: &WalletNetworkProfile) -> Result<(), String
         .map(|token| !token.trim().is_empty())
         .unwrap_or(false);
     match (has_operator_url, has_operator_token) {
-        (true, false) => Err(
-            "operator_url requires operator_bearer_token; pass both or neither".into(),
-        ),
-        (false, true) => Err(
-            "operator_bearer_token requires operator_url; pass both or neither".into(),
-        ),
+        (true, false) => {
+            Err("operator_url requires operator_bearer_token; pass both or neither".into())
+        }
+        (false, true) => {
+            Err("operator_bearer_token requires operator_url; pass both or neither".into())
+        }
         _ => Ok(()),
     }
 }
@@ -2998,8 +2887,6 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
 
     let w = WalletFile {
         master_sk,
-        kem_seed_v: vec![], // legacy, unused — keys derived per-address from incoming_seed
-        kem_seed_d: vec![],
         addresses: vec![],
         addr_counter: 0,
         notes: vec![],
@@ -3331,12 +3218,12 @@ mod tests {
         }
     }
 
-    fn rebuild_address_state(master_sk: &F, j: u32, next_auth_index: u32) -> WalletAddressState {
+    fn rebuild_address_state(master_sk: &F, j: u32, next_wots_index: u32) -> WalletAddressState {
         let acc = derive_account(master_sk);
         let d_j = derive_address(&acc.incoming_seed, j);
         let ask_j = derive_ask(&acc.ask_base, j);
         let auth_pub_seed = derive_auth_pub_seed(&ask_j);
-        let (bds, auth_root) = XmssBdsState::from_index(&ask_j, &auth_pub_seed, next_auth_index)
+        let (bds, auth_root) = XmssBdsState::from_index(&ask_j, &auth_pub_seed, next_wots_index)
             .expect("fixture XMSS rebuild should succeed");
         let nk_spend = derive_nk_spend(&acc.nk, &d_j);
         let nk_tag = derive_nk_tag(&nk_spend);
@@ -3347,9 +3234,7 @@ mod tests {
             auth_root,
             auth_pub_seed,
             nk_tag,
-            bds: Some(bds),
-            next_auth_index: 0,
-            next_auth_path: Vec::new(),
+            bds,
         }
     }
 
@@ -3401,19 +3286,11 @@ mod tests {
         xmss_tree_node_hash(pub_seed, height - 1, start_idx >> height, &left, &right)
     }
 
-    pub(super) fn test_wallet(
-        addr_counter: u32,
-        legacy: Option<([u8; 64], [u8; 64])>,
-    ) -> WalletFile {
+    pub(super) fn test_wallet(addr_counter: u32) -> WalletFile {
         let base = base_test_wallet();
-        let (kem_seed_v, kem_seed_d) = legacy
-            .map(|(v, d)| (v.to_vec(), d.to_vec()))
-            .unwrap_or_else(|| (vec![], vec![]));
         let cached = std::cmp::min(addr_counter as usize, base.addresses.len());
         let mut wallet = WalletFile {
             master_sk: base.master_sk,
-            kem_seed_v,
-            kem_seed_d,
             addresses: base.addresses[..cached].to_vec(),
             addr_counter,
             notes: vec![],
@@ -3430,7 +3307,7 @@ mod tests {
     }
 
     fn wallet_with_single_note(note_value: u64) -> (WalletFile, F) {
-        let mut w = test_wallet(1, None);
+        let mut w = test_wallet(1);
         let addr = w.addresses[0].clone();
         let acc = w.account();
         let nk_sp = derive_nk_spend(&acc.nk, &addr.d_j);
@@ -3505,7 +3382,7 @@ mod tests {
         ) {
             let total = values.iter().copied().sum::<u64>();
             let amount = 1 + (total / 2);
-            let mut w = test_wallet(0, None);
+            let mut w = test_wallet(0);
             w.notes = values.iter().enumerate().map(|(i, v)| Note {
                 nk_spend: ZERO,
                 nk_tag: ZERO,
@@ -3533,24 +3410,16 @@ mod tests {
 
     #[test]
     fn test_xmss_bds_advances_fixture_state_without_rebuild() {
-        let mut w = test_wallet(1, None);
+        let mut w = test_wallet(1);
         let initial_root = w.addresses[0].auth_root;
-        let initial_path = w.addresses[0]
-            .bds
-            .as_ref()
-            .expect("fixture should include BDS state")
-            .current_path()
-            .to_vec();
+        let initial_path = w.addresses[0].bds.current_path().to_vec();
         assert_eq!(initial_path.len(), AUTH_DEPTH);
 
         let first_idx = w.next_wots_key(0);
         assert_eq!(first_idx, 0);
         assert_eq!(w.wots_key_indices.get(&0), Some(&1));
         assert_eq!(w.addresses[0].auth_root, initial_root);
-        let after_first = w.addresses[0]
-            .bds
-            .as_ref()
-            .expect("BDS should remain populated after first advance");
+        let after_first = &w.addresses[0].bds;
         assert_eq!(after_first.next_index, 1);
         assert_eq!(after_first.current_path().len(), AUTH_DEPTH);
         assert_ne!(after_first.current_path(), initial_path.as_slice());
@@ -3560,10 +3429,7 @@ mod tests {
         assert_eq!(second_idx, 1);
         assert_eq!(w.wots_key_indices.get(&0), Some(&2));
         assert_eq!(w.addresses[0].auth_root, initial_root);
-        let after_second = w.addresses[0]
-            .bds
-            .as_ref()
-            .expect("BDS should remain populated after second advance");
+        let after_second = &w.addresses[0].bds;
         assert_eq!(after_second.next_index, 2);
         assert_eq!(after_second.current_path().len(), AUTH_DEPTH);
         assert_ne!(after_second.current_path(), path_after_first.as_slice());
@@ -3597,7 +3463,7 @@ mod tests {
 
     #[test]
     fn test_export_detect_uses_detect_root_not_incoming_seed() {
-        let w = test_wallet(0, None);
+        let w = test_wallet(0);
         let acc = w.account();
         let detect_root = derive_detect_root(&acc.incoming_seed);
         assert_ne!(
@@ -3608,7 +3474,7 @@ mod tests {
 
     #[test]
     fn test_view_export_includes_address_metadata() {
-        let w = test_wallet(2, None);
+        let w = test_wallet(2);
         let material = WatchKeyMaterial::from_view_wallet(&w);
         let WatchKeyMaterial::View {
             incoming_seed,
@@ -3631,7 +3497,7 @@ mod tests {
 
     #[test]
     fn test_detect_material_matches_wallet_note() {
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         let material = WatchKeyMaterial::from_detect_wallet(&w);
         let WatchKeyMaterial::Detect {
             detect_root,
@@ -3651,7 +3517,7 @@ mod tests {
 
     #[test]
     fn test_view_material_recovers_and_validates_note() {
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         let material = WatchKeyMaterial::from_view_wallet(&w);
         let WatchKeyMaterial::View {
             incoming_seed,
@@ -3674,7 +3540,7 @@ mod tests {
 
     #[test]
     fn test_view_material_rejects_wrong_commitment() {
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         let material = WatchKeyMaterial::from_view_wallet(&w);
         let WatchKeyMaterial::View {
             incoming_seed,
@@ -3698,7 +3564,7 @@ mod tests {
             mut rseed in any::<[u8; 32]>(),
         ) {
             rseed[31] &= 0x07;
-            let w = test_wallet(1, None);
+            let w = test_wallet(1);
             let material = WatchKeyMaterial::from_view_wallet(&w);
             let WatchKeyMaterial::View {
                 incoming_seed,
@@ -3768,7 +3634,7 @@ mod tests {
 
     #[test]
     fn test_apply_watch_feed_detect_deduplicates_and_advances_cursor() {
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         let mut state = WatchWalletFile::from_material(WatchKeyMaterial::from_detect_wallet(&w));
         let note = note_memo_for_wallet_address(&w, 0, 12, felt_tag(b"watch-detect-feed"), None);
         let feed = NotesFeedResp {
@@ -3790,7 +3656,7 @@ mod tests {
 
     #[test]
     fn test_apply_watch_feed_view_tracks_incoming_total() {
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         let mut state = WatchWalletFile::from_material(WatchKeyMaterial::from_view_wallet(&w));
         let note_1 = note_memo_for_wallet_address(&w, 0, 12, felt_tag(b"watch-view-1"), None);
         let note_2 =
@@ -3816,7 +3682,7 @@ mod tests {
 
     #[test]
     fn test_apply_watch_feed_view_is_idempotent() {
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         let mut state = WatchWalletFile::from_material(WatchKeyMaterial::from_view_wallet(&w));
         let note =
             note_memo_for_wallet_address(&w, 0, 27, felt_tag(b"watch-view-repeat"), Some(b"dup"));
@@ -3848,7 +3714,7 @@ mod tests {
         let watch_path_str = watch_path.to_str().unwrap();
         let material_path_str = material_path.to_str().unwrap();
 
-        let w = test_wallet(2, None);
+        let w = test_wallet(2);
         save_wallet(wallet_path_str, &w).expect("save wallet");
         cmd_export_view(wallet_path_str, Some(material_path_str)).expect("export view");
         cmd_watch_init(watch_path_str, material_path_str, false).expect("init watch wallet");
@@ -3882,7 +3748,7 @@ mod tests {
         let watch_path_str = watch_path.to_str().unwrap();
         let material_path_str = material_path.to_str().unwrap();
 
-        let w = test_wallet(3, None);
+        let w = test_wallet(3);
         save_wallet(wallet_path_str, &w).expect("save wallet");
         cmd_export_detect(wallet_path_str, Some(material_path_str)).expect("export detect");
         cmd_watch_init(watch_path_str, material_path_str, false).expect("init watch wallet");
@@ -3918,7 +3784,7 @@ mod tests {
         let view_path_str = view_path.to_str().unwrap();
         let detect_path_str = detect_path.to_str().unwrap();
 
-        let w = test_wallet(2, None);
+        let w = test_wallet(2);
         save_wallet(wallet_path_str, &w).expect("save wallet");
         cmd_export_view(wallet_path_str, Some(view_path_str)).expect("export view");
         cmd_export_detect(wallet_path_str, Some(detect_path_str)).expect("export detect");
@@ -3945,7 +3811,7 @@ mod tests {
         let watch_path_str = watch_path.to_str().unwrap();
         let material_path_str = material_path.to_str().unwrap();
 
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         let note =
             note_memo_for_wallet_address(&w, 0, 91, felt_tag(b"watch-service-view"), Some(b"hi"));
         let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
@@ -4010,7 +3876,7 @@ mod tests {
         let watch_path_str = watch_path.to_str().unwrap();
         let material_path_str = material_path.to_str().unwrap();
 
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         let note = note_memo_for_wallet_address(&w, 0, 73, felt_tag(b"watch-service-detect"), None);
         let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
             .expect("published note should encode");
@@ -4069,7 +3935,7 @@ mod tests {
         let watch_path_str = watch_path.to_str().unwrap();
         let material_path_str = material_path.to_str().unwrap();
 
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         save_wallet(wallet_path_str, &w).expect("save wallet");
         cmd_export_view(wallet_path_str, Some(material_path_str)).expect("export view");
         cmd_watch_init(watch_path_str, material_path_str, false).expect("init watch wallet");
@@ -4090,48 +3956,15 @@ mod tests {
         let wallet_path = dir.path().join("wallet.json");
         let wallet_path_str = wallet_path.to_str().unwrap();
 
-        save_wallet(wallet_path_str, &test_wallet(1, None)).expect("save private wallet");
+        save_wallet(wallet_path_str, &test_wallet(1)).expect("save private wallet");
         let err = validate_detection_service_wallet(wallet_path_str)
             .expect_err("private spending wallet must not validate as watch wallet");
         assert!(err.contains("parse watch wallet"));
     }
 
     #[test]
-    fn test_legacy_kem_keys_absent_for_migrated_wallet() {
-        let w = test_wallet(0, None);
-        assert!(w.legacy_kem_keys().is_none());
-    }
-
-    #[test]
-    fn test_legacy_kem_keys_are_recovered_from_seed_material() {
-        let legacy_v = [0x33; 64];
-        let legacy_d = [0x44; 64];
-        let w = test_wallet(0, Some((legacy_v, legacy_d)));
-        let (ek_v1, dk_v1, ek_d1, dk_d1) = w.legacy_kem_keys().expect("legacy keys");
-        let (ek_v2, dk_v2) = kem_keygen_from_seed(&legacy_v);
-        let (ek_d2, dk_d2) = kem_keygen_from_seed(&legacy_d);
-
-        assert_eq!(ek_v1.to_bytes(), ek_v2.to_bytes());
-        assert_eq!(dk_v1.to_bytes(), dk_v2.to_bytes());
-        assert_eq!(ek_d1.to_bytes(), ek_d2.to_bytes());
-        assert_eq!(dk_d1.to_bytes(), dk_d2.to_bytes());
-    }
-
-    #[test]
-    fn test_legacy_kem_keys_reject_incomplete_seed_material() {
-        let mut w = test_wallet(0, None);
-        w.kem_seed_v = vec![0x11; 63];
-        w.kem_seed_d = vec![0x22; 64];
-
-        assert!(
-            w.legacy_kem_keys().is_none(),
-            "legacy KEM recovery must reject malformed seed lengths"
-        );
-    }
-
-    #[test]
     fn test_per_address_kem_keys_are_deterministic_and_distinct() {
-        let w = test_wallet(0, None);
+        let w = test_wallet(0);
         let (ek_v0_a, dk_v0_a, ek_d0_a, dk_d0_a) = w.kem_keys(0);
         let (ek_v0_b, dk_v0_b, ek_d0_b, dk_d0_b) = w.kem_keys(0);
         let (ek_v1, dk_v1, ek_d1, dk_d1) = w.kem_keys(1);
@@ -4148,7 +3981,7 @@ mod tests {
 
     #[test]
     fn test_try_recover_note_new_per_address_wallet() {
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         let acc = w.account();
         let addr = &w.addresses[0];
         let nk_sp = derive_nk_spend(&acc.nk, &addr.d_j);
@@ -4171,49 +4004,8 @@ mod tests {
     }
 
     #[test]
-    fn test_try_recover_note_legacy_wallet() {
-        let legacy_v = [0x11; 64];
-        let legacy_d = [0x22; 64];
-        let w = test_wallet(1, Some((legacy_v, legacy_d)));
-        let acc = w.account();
-        let addr = &w.addresses[0];
-        let nk_sp = derive_nk_spend(&acc.nk, &addr.d_j);
-        let nk_tg = derive_nk_tag(&nk_sp);
-        let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tg);
-        let rseed = random_felt();
-        let rcm = derive_rcm(&rseed);
-        let cm = commit(&addr.d_j, 91, &rcm, &otag);
-        let (ek_v, _dk_v, ek_d, _dk_d) = w.legacy_kem_keys().expect("legacy keys");
-        let enc = encrypt_note(91, &rseed, Some(b"legacy"), &ek_v, &ek_d);
-        let nm = NoteMemo { index: 2, cm, enc };
-
-        let note = w.try_recover_note(&nm).expect("legacy note should recover");
-        assert_eq!(note.index, 2);
-        assert_eq!(note.addr_index, 0);
-        assert_eq!(note.v, 91);
-        assert_eq!(note.cm, cm);
-    }
-
-    #[test]
-    fn test_try_recover_note_migrated_wallet_accepts_per_address_notes_even_with_legacy_seeds() {
-        let legacy_v = [0x21; 64];
-        let legacy_d = [0x43; 64];
-        let w = test_wallet(1, Some((legacy_v, legacy_d)));
-        let rseed = felt_tag(b"wallet-note-per-address-with-legacy");
-        let nm = note_memo_for_wallet_address(&w, 0, 41, rseed, None);
-
-        let note = w
-            .try_recover_note(&nm)
-            .expect("migrated wallet should still recover per-address notes");
-
-        assert_eq!(note.addr_index, 0);
-        assert_eq!(note.v, 41);
-        assert_eq!(note.cm, nm.cm);
-    }
-
-    #[test]
     fn test_try_recover_note_rejects_phantom_note_with_wrong_commitment() {
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         let mut rseed = ZERO;
         rseed[0] = 0x55;
         let mut nm = note_memo_for_wallet_address(&w, 0, 77, rseed, Some(b"phantom"));
@@ -4226,7 +4018,7 @@ mod tests {
 
     #[test]
     fn test_try_recover_note_rejects_wrong_owner_metadata_even_with_valid_decryption() {
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
         let d_j = w.addresses[0].d_j;
         let (ek_v, _, ek_d, _) = w.kem_keys(0);
         let mut other_master_sk = ZERO;
@@ -4259,7 +4051,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wallet_path = dir.path().join("wallet.json");
         let wallet_path_str = wallet_path.to_str().unwrap();
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
 
         save_wallet(wallet_path_str, &w).expect("wallet should save");
         let loaded = load_wallet(wallet_path_str).expect("wallet should load");
@@ -4274,7 +4066,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wallet_path = dir.path().join("wallet.json");
         let wallet_path_str = wallet_path.to_str().unwrap();
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
 
         save_wallet(wallet_path_str, &w).expect("wallet should save");
 
@@ -4287,7 +4079,7 @@ mod tests {
         assert_eq!(floor.addr_counter, w.addr_counter);
         assert_eq!(
             floor.wots_key_indices.get(&0),
-            Some(&w.addresses[0].bds.as_ref().unwrap().next_index)
+            Some(&w.addresses[0].bds.next_index)
         );
     }
 
@@ -4298,7 +4090,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let wallet_path = dir.path().join("wallet.json");
-        let w = test_wallet(1, None);
+        let w = test_wallet(1);
 
         save_wallet(wallet_path.to_str().unwrap(), &w).expect("wallet should save");
 
@@ -4320,11 +4112,7 @@ mod tests {
         let (tmp_path, _file) =
             create_private_temp_file(&wallet_path, "wallet").expect("create private temp file");
 
-        let mode = std::fs::metadata(&tmp_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let mode = std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
 
@@ -4359,7 +4147,7 @@ mod tests {
         let wallet_path_str = wallet_path.to_str().unwrap();
         let backup_path = dir.path().join("wallet-backup.json");
 
-        let original = test_wallet(1, None);
+        let original = test_wallet(1);
         save_wallet(wallet_path_str, &original).expect("save original wallet");
         std::fs::copy(&wallet_path, &backup_path).expect("copy backup");
 
@@ -4452,7 +4240,7 @@ mod tests {
 
     #[test]
     fn test_next_address_derivation_is_isolated_per_index() {
-        let w = test_wallet(3, None);
+        let w = test_wallet(3);
         let state0 = w.addresses[0].clone();
         let (ek_v0, _, ek_d0, _) = w.kem_keys(state0.index);
         let state1 = w.addresses[1].clone();
@@ -4471,8 +4259,6 @@ mod tests {
         let base = base_test_wallet();
         let mut wallet = WalletFile {
             master_sk: base.master_sk,
-            kem_seed_v: vec![],
-            kem_seed_d: vec![],
             addresses: base.addresses[..2].to_vec(),
             addr_counter: 0,
             notes: vec![],
@@ -4497,8 +4283,6 @@ mod tests {
         let base = base_test_wallet();
         let mut wallet = WalletFile {
             master_sk: base.master_sk,
-            kem_seed_v: vec![],
-            kem_seed_d: vec![],
             addresses: base.addresses[..2].to_vec(),
             addr_counter: 2,
             notes: vec![],
@@ -4516,7 +4300,7 @@ mod tests {
 
     #[test]
     fn test_materialize_addresses_refreshes_wots_index_after_fixture_state_advance() {
-        let mut wallet = test_wallet(1, None);
+        let mut wallet = test_wallet(1);
         assert_eq!(wallet.next_wots_key(0), 0);
         wallet.wots_key_indices.clear();
 
@@ -4525,133 +4309,6 @@ mod tests {
             .expect("fixture materialization should refresh cached WOTS index");
 
         assert_eq!(wallet.wots_key_indices.get(&0), Some(&1));
-    }
-
-    #[test]
-    fn test_ensure_bds_rebuild_clears_legacy_fields_small_depth() {
-        let acc = derive_account(&felt_tag(b"wallet-small-bds"));
-        let d_j = derive_address(&acc.incoming_seed, 0);
-        let ask_j = derive_ask(&acc.ask_base, 0);
-        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
-        let next_auth_index = 5;
-        let (rebuilt_state, rebuilt_root) =
-            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, next_auth_index, 6, 2)
-                .expect("small-depth BDS state should rebuild");
-
-        let mut addr = WalletAddressState {
-            index: 0,
-            d_j,
-            auth_root: rebuilt_root,
-            auth_pub_seed,
-            nk_tag: derive_nk_tag(&derive_nk_spend(&acc.nk, &d_j)),
-            bds: None,
-            next_auth_index,
-            next_auth_path: rebuilt_state.current_path().to_vec(),
-        };
-
-        addr.ensure_bds_with(&ask_j, |_, _, idx| {
-            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, idx, 6, 2)
-        })
-        .expect("legacy small-depth address state should rebuild");
-
-        let restored = addr.bds.as_ref().expect("BDS state should be restored");
-        assert_eq!(restored.next_index, rebuilt_state.next_index);
-        assert_eq!(restored.current_path(), rebuilt_state.current_path());
-        assert_eq!(addr.next_auth_index, 0);
-        assert!(addr.next_auth_path.is_empty());
-    }
-
-    #[test]
-    fn test_ensure_bds_with_rejects_root_mismatch() {
-        let acc = derive_account(&felt_tag(b"wallet-small-root-mismatch"));
-        let d_j = derive_address(&acc.incoming_seed, 0);
-        let ask_j = derive_ask(&acc.ask_base, 0);
-        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
-        let next_auth_index = 3;
-        let (rebuilt_state, rebuilt_root) =
-            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, next_auth_index, 6, 2)
-                .expect("small-depth BDS state should rebuild");
-        let mut wrong_root = rebuilt_root;
-        wrong_root[0] ^= 0x01;
-
-        let mut addr = WalletAddressState {
-            index: 0,
-            d_j,
-            auth_root: wrong_root,
-            auth_pub_seed,
-            nk_tag: derive_nk_tag(&derive_nk_spend(&acc.nk, &d_j)),
-            bds: None,
-            next_auth_index,
-            next_auth_path: rebuilt_state.current_path().to_vec(),
-        };
-
-        let err = addr
-            .ensure_bds_with(&ask_j, |_, _, idx| {
-                XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, idx, 6, 2)
-            })
-            .expect_err("root mismatch should be rejected");
-        assert!(err.contains("rebuilt XMSS root mismatch"));
-        assert!(addr.bds.is_none());
-        assert_eq!(addr.next_auth_index, next_auth_index);
-        assert_eq!(addr.next_auth_path, rebuilt_state.current_path().to_vec());
-    }
-
-    #[test]
-    fn test_ensure_bds_with_rejects_path_mismatch() {
-        let acc = derive_account(&felt_tag(b"wallet-small-path-mismatch"));
-        let d_j = derive_address(&acc.incoming_seed, 0);
-        let ask_j = derive_ask(&acc.ask_base, 0);
-        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
-        let next_auth_index = 4;
-        let (rebuilt_state, rebuilt_root) =
-            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, next_auth_index, 6, 2)
-                .expect("small-depth BDS state should rebuild");
-        let mut wrong_path = rebuilt_state.current_path().to_vec();
-        wrong_path[0][0] ^= 0x01;
-
-        let mut addr = WalletAddressState {
-            index: 0,
-            d_j,
-            auth_root: rebuilt_root,
-            auth_pub_seed,
-            nk_tag: derive_nk_tag(&derive_nk_spend(&acc.nk, &d_j)),
-            bds: None,
-            next_auth_index,
-            next_auth_path: wrong_path,
-        };
-
-        let err = addr
-            .ensure_bds_with(&ask_j, |_, _, idx| {
-                XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, idx, 6, 2)
-            })
-            .expect_err("path mismatch should be rejected");
-        assert!(err.contains("rebuilt XMSS path mismatch"));
-        assert!(addr.bds.is_none());
-        assert_eq!(addr.next_auth_index, next_auth_index);
-    }
-
-    #[test]
-    fn test_ensure_bds_with_short_circuits_when_state_is_already_present() {
-        let ask_j = felt_tag(b"wallet-ensure-bds-ignored");
-        let mut addr = test_wallet(1, None).addresses[0].clone();
-        let original = addr
-            .bds
-            .clone()
-            .expect("fixture address should include BDS");
-        let stale_path = vec![felt_tag(b"stale-legacy-path")];
-        addr.next_auth_index = 99;
-        addr.next_auth_path = stale_path.clone();
-
-        addr.ensure_bds_with(&ask_j, |_, _, _| -> Result<(XmssBdsState, F), String> {
-            panic!("ensure_bds_with should not rebuild when BDS state is already populated");
-        })
-        .expect("existing BDS state should short-circuit");
-
-        let restored = addr.bds.as_ref().expect("BDS state should remain present");
-        assert_eq!(restored.next_index, original.next_index);
-        assert_eq!(restored.current_path(), original.current_path());
-        assert_eq!(addr.next_auth_index, 99);
-        assert_eq!(addr.next_auth_path, stale_path);
     }
 
     fn recompute_xmss_root_from_path(leaf: F, key_idx: u32, pub_seed: &F, siblings: &[F]) -> F {
@@ -4783,7 +4440,7 @@ mod tests {
 
     #[test]
     fn test_reserve_next_auth_returns_path_bound_to_auth_root() {
-        let mut w = test_wallet(1, None);
+        let mut w = test_wallet(1);
         let acc = w.account();
         let ask_j = derive_ask(&acc.ask_base, 0);
         let msg_hash = felt_tag(b"wallet-reserve-auth");
@@ -4802,7 +4459,7 @@ mod tests {
 
     #[test]
     fn test_reserve_next_auth_rejects_missing_address() {
-        let mut w = test_wallet(0, None);
+        let mut w = test_wallet(0);
         let err = w
             .reserve_next_auth(0)
             .expect_err("missing address record should error");
@@ -4811,14 +4468,14 @@ mod tests {
 
     #[test]
     fn test_reserve_next_auth_rejects_exhausted_tree() {
-        let mut w = test_wallet(1, None);
-        w.addresses[0].bds = Some(XmssBdsState {
+        let mut w = test_wallet(1);
+        w.addresses[0].bds = XmssBdsState {
             next_index: AUTH_TREE_SIZE as u32,
             auth_path: vec![],
             keep: vec![],
             treehash: vec![],
             retain: vec![],
-        });
+        };
 
         let err = w
             .reserve_next_auth(0)
@@ -4828,7 +4485,7 @@ mod tests {
 
     #[test]
     fn test_next_wots_key_is_monotonic() {
-        let mut w = test_wallet(1, None);
+        let mut w = test_wallet(1);
         assert_eq!(w.next_wots_key(0), 0);
         assert_eq!(w.next_wots_key(0), 1);
         assert_eq!(w.next_wots_key(0), 2);
@@ -4836,7 +4493,7 @@ mod tests {
 
     #[test]
     fn test_select_notes_rejects_insufficient_funds() {
-        let mut w = test_wallet(0, None);
+        let mut w = test_wallet(0);
         w.notes = vec![
             Note {
                 nk_spend: ZERO,
@@ -4868,7 +4525,7 @@ mod tests {
 
     #[test]
     fn test_select_notes_prefers_single_large_note_when_sufficient() {
-        let mut w = test_wallet(0, None);
+        let mut w = test_wallet(0);
         w.notes = vec![
             Note {
                 nk_spend: ZERO,
@@ -4900,7 +4557,7 @@ mod tests {
 
     #[test]
     fn test_select_notes_skips_pending_spends() {
-        let mut w = test_wallet(1, None);
+        let mut w = test_wallet(1);
         let note_0 = wallet_note_for_address(&w, 0, 40, felt_tag(b"pending-note-0"), 0);
         let note_1 = wallet_note_for_address(&w, 0, 25, felt_tag(b"pending-note-1"), 1);
         let pending_nf = note_nullifier(&note_0);
@@ -4926,7 +4583,7 @@ mod tests {
 
     #[test]
     fn test_apply_scan_feed_deduplicates_new_notes_and_prunes_spent_ones() {
-        let mut w = test_wallet(1, None);
+        let mut w = test_wallet(1);
         let existing = wallet_note_for_address(&w, 0, 40, felt_tag(b"wallet-scan-existing"), 5);
         let spent_nf = nullifier(&existing.nk_spend, &existing.cm, existing.index as u64);
         w.notes.push(existing.clone());
@@ -4982,7 +4639,7 @@ mod tests {
 
     #[test]
     fn test_apply_scan_feed_clears_confirmed_pending_spends() {
-        let mut w = test_wallet(1, None);
+        let mut w = test_wallet(1);
         let existing = wallet_note_for_address(&w, 0, 40, felt_tag(b"wallet-scan-pending"), 5);
         let spent_nf = note_nullifier(&existing);
         w.notes.push(existing);
@@ -5003,7 +4660,7 @@ mod tests {
 
     #[test]
     fn test_apply_scan_feed_drops_newly_recovered_note_if_already_nullified() {
-        let mut w = test_wallet(1, None);
+        let mut w = test_wallet(1);
         let new_rseed = felt_tag(b"wallet-scan-new-spent");
         let new_nm = note_memo_for_wallet_address(&w, 0, 19, new_rseed, None);
         let recovered = w
@@ -5034,9 +4691,9 @@ mod tests {
 
     #[test]
     fn test_next_wots_key_exhausts_at_last_leaf() {
-        let mut w = test_wallet(1, None);
+        let mut w = test_wallet(1);
         let last_idx = (AUTH_TREE_SIZE - 1) as u32;
-        w.addresses[0].bds = Some(XmssBdsState {
+        w.addresses[0].bds = XmssBdsState {
             next_index: last_idx,
             auth_path: vec![ZERO; AUTH_DEPTH],
             keep: vec![FeltSlot::none(); AUTH_DEPTH],
@@ -5044,9 +4701,7 @@ mod tests {
                 .map(TreeHashState::new)
                 .collect(),
             retain: vec![RetainLevel::default(); AUTH_DEPTH],
-        });
-        w.addresses[0].next_auth_index = 0;
-        w.addresses[0].next_auth_path.clear();
+        };
         w.wots_key_indices.insert(0, last_idx);
         assert_eq!(w.next_wots_key(0), last_idx);
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -5063,7 +4718,7 @@ mod tests {
         let recipient_path = dir.path().join("recipient.json");
         let recipient_path_str = recipient_path.to_str().unwrap();
 
-        let mut w = test_wallet(2, None);
+        let mut w = test_wallet(2);
         w.addr_counter = 1;
         w.notes = vec![
             wallet_note_for_address(&w, 0, 40, felt_tag(b"wallet-transfer-note-0"), 7),
@@ -5161,7 +4816,7 @@ mod tests {
         let wallet_path = dir.path().join("wallet.json");
         let wallet_path_str = wallet_path.to_str().unwrap();
 
-        let mut w = test_wallet(2, None);
+        let mut w = test_wallet(2);
         w.addr_counter = 1;
         w.notes = vec![
             wallet_note_for_address(&w, 0, 35, felt_tag(b"wallet-unshield-note-0"), 5),
@@ -5238,7 +4893,7 @@ mod tests {
 
         let (mut w, cm) = wallet_with_single_note(50);
         w.addr_counter = 2;
-        w.addresses = test_wallet(2, None).addresses;
+        w.addresses = test_wallet(2).addresses;
         save_wallet(wallet_path_str, &w).expect("wallet should save");
         let mut loaded = load_wallet(wallet_path_str).expect("wallet should reload");
         let _key_idx = loaded.next_wots_key(0);
@@ -5279,7 +4934,7 @@ mod tests {
 
         let (mut w, cm) = wallet_with_single_note(50);
         w.addr_counter = 2;
-        w.addresses = test_wallet(2, None).addresses;
+        w.addresses = test_wallet(2).addresses;
         save_wallet(wallet_path_str, &w).expect("wallet should save");
         let mut loaded = load_wallet(wallet_path_str).expect("wallet should reload");
         let _key_idx = loaded.next_wots_key(0);
@@ -6849,8 +6504,11 @@ mod network_profile_tests {
             "octez_client_bin": "octez-client",
             "burn_cap": "1"
         });
-        std::fs::write(&profile_path, serde_json::to_string_pretty(&bad_profile).unwrap())
-            .expect("write bad profile");
+        std::fs::write(
+            &profile_path,
+            serde_json::to_string_pretty(&bad_profile).unwrap(),
+        )
+        .expect("write bad profile");
 
         let err = load_required_network_profile(wallet_path_str).unwrap_err();
         assert!(err.contains("operator_url requires operator_bearer_token"));
@@ -6925,7 +6583,7 @@ mod network_profile_tests {
 
     #[test]
     fn rollup_rpc_load_notes_since_reads_chunked_note_payloads() {
-        let wallet = super::tests::test_wallet(1, None);
+        let wallet = super::tests::test_wallet(1);
         let mut rseed = ZERO;
         rseed[0] = 0x55;
         let note_memo =

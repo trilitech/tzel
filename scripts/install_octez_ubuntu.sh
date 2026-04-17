@@ -12,7 +12,7 @@ OCTEZ_LIST="/etc/apt/sources.list.d/octez.list"
 
 echo "Installing Octez packages from the official Ubuntu noble repository."
 echo "Host distro: $(. /etc/os-release && printf '%s %s' "${NAME}" "${VERSION_ID}")"
-echo "Note: this is a pragmatic compatibility path for Ubuntu 25.10, not the officially matched distro."
+echo "Note: this is a pragmatic install path for Ubuntu 25.10, not the officially matched distro."
 
 apt-get update
 apt-get install -y gpg curl

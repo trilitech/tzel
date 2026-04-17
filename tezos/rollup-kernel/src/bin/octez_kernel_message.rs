@@ -75,9 +75,16 @@ fn main() {
             }
             let ask = config_admin_ask();
             let pub_seed = derive_auth_pub_seed(&ask);
-            let verifier_leaf = auth_leaf_hash(&ask, tzel_core::kernel_wire::KERNEL_VERIFIER_CONFIG_KEY_INDEX);
-            let bridge_leaf = auth_leaf_hash(&ask, tzel_core::kernel_wire::KERNEL_BRIDGE_CONFIG_KEY_INDEX);
-            println!("TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX={}", hex_encode(pub_seed));
+            let verifier_leaf = auth_leaf_hash(
+                &ask,
+                tzel_core::kernel_wire::KERNEL_VERIFIER_CONFIG_KEY_INDEX,
+            );
+            let bridge_leaf =
+                auth_leaf_hash(&ask, tzel_core::kernel_wire::KERNEL_BRIDGE_CONFIG_KEY_INDEX);
+            println!(
+                "TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX={}",
+                hex_encode(pub_seed)
+            );
             println!(
                 "TZEL_ROLLUP_VERIFIER_CONFIG_ADMIN_LEAF_HEX={}",
                 hex_encode(verifier_leaf)

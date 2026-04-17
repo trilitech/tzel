@@ -29,7 +29,7 @@ Options:
                             (default: <prefix>/etc/tzel)
   --build-only             Build artifacts but do not install them
   --skip-build              Reuse existing build artifacts instead of rebuilding them
-  --no-sp-client            Do not install the legacy sp-client binary
+  --no-sp-client            Do not install the developer sp-client binary
   --help                    Show this help
 EOF
 }

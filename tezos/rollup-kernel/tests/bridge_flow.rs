@@ -21,8 +21,8 @@ use tezos_smart_rollup_encoding::{
     smart_rollup::SmartRollupAddress,
 };
 use tzel_core::kernel_wire::{
-    encode_kernel_inbox_message, sign_kernel_bridge_config, KernelBridgeConfig,
-    KernelInboxMessage, KernelResult, KernelWithdrawReq,
+    encode_kernel_inbox_message, sign_kernel_bridge_config, KernelBridgeConfig, KernelInboxMessage,
+    KernelResult, KernelWithdrawReq,
 };
 #[cfg(feature = "proof-verifier")]
 use tzel_core::kernel_wire::{

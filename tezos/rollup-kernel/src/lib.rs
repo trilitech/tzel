@@ -36,8 +36,8 @@ use tzel_core::{
         decode_kernel_inbox_message, decode_kernel_result, decode_kernel_verifier_config,
         encode_kernel_result, encode_kernel_verifier_config, kernel_bridge_config_sighash,
         kernel_shield_req_to_host, kernel_transfer_req_to_host, kernel_unshield_req_to_host,
-        kernel_verifier_config_sighash, kernel_withdraw_req_to_host, KernelDalPayloadKind,
-        KernelDalPayloadPointer, KernelBridgeConfig, KernelInboxMessage, KernelResult,
+        kernel_verifier_config_sighash, kernel_withdraw_req_to_host, KernelBridgeConfig,
+        KernelDalPayloadKind, KernelDalPayloadPointer, KernelInboxMessage, KernelResult,
         KernelSignedBridgeConfig, KernelSignedVerifierConfig, KernelVerifierConfig,
         KERNEL_BRIDGE_CONFIG_KEY_INDEX, KERNEL_VERIFIER_CONFIG_KEY_INDEX,
     },
@@ -1044,8 +1044,8 @@ fn load_verifier<H: Host>(host: &H) -> Result<DirectProofVerifier, String> {
 }
 
 fn parse_compiled_felt_hex(hex_value: &str, label: &str) -> Result<F, String> {
-    let bytes =
-        hex::decode(hex_value).map_err(|e| format!("invalid {} hex in kernel build: {}", label, e))?;
+    let bytes = hex::decode(hex_value)
+        .map_err(|e| format!("invalid {} hex in kernel build: {}", label, e))?;
     if bytes.len() != 32 {
         return Err(format!(
             "invalid {} length in kernel build: got {} bytes, expected 32",
@@ -1218,7 +1218,9 @@ fn configure_verifier<H: Host>(
     if !ledger.is_pristine()? {
         if let Some(existing) = read_verifier_config(ledger.host)? {
             if existing != *config {
-                return Err("cannot change verifier configuration after ledger state exists".into());
+                return Err(
+                    "cannot change verifier configuration after ledger state exists".into(),
+                );
             }
         } else {
             return Err("cannot configure verifier after ledger state exists".into());
@@ -2341,8 +2343,7 @@ mod tests {
             auth_domain: new_domain,
             verified_program_hashes: sample_program_hashes(),
         };
-        let message =
-            encode_kernel_inbox_message(&signed_verifier_message(reconfigured)).unwrap();
+        let message = encode_kernel_inbox_message(&signed_verifier_message(reconfigured)).unwrap();
         host.inputs.push_back(InputMessage {
             level: 7,
             id: 2,
@@ -2440,12 +2441,10 @@ mod tests {
         host.inputs.push_back(InputMessage {
             level: 8,
             id: 3,
-            payload: encode_kernel_inbox_message(&signed_verifier_message(
-                KernelVerifierConfig {
-                    auth_domain: original.auth_domain,
-                    verified_program_hashes: changed_hashes,
-                },
-            ))
+            payload: encode_kernel_inbox_message(&signed_verifier_message(KernelVerifierConfig {
+                auth_domain: original.auth_domain,
+                verified_program_hashes: changed_hashes,
+            }))
             .unwrap(),
         });
 
@@ -2482,7 +2481,9 @@ mod tests {
 
         run_with_host(&mut host);
 
-        assert!(host.read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES).is_none());
+        assert!(host
+            .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+            .is_none());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("configuration signature verification failed"))
@@ -2553,7 +2554,7 @@ mod tests {
                 level: 8,
                 id: 1,
                 payload: encode_kernel_inbox_message(&signed_verifier_message(config.clone()))
-                .unwrap(),
+                    .unwrap(),
             },
             InputMessage {
                 level: 9,
