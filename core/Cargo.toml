@@ -8,6 +8,7 @@ name = "tzel_core"
 path = "src/lib.rs"
 
 [dependencies]
+bech32 = "0.11"
 blake2s_simd = "1.0"
 hex = "0.4"
 chacha20poly1305 = "0.10"

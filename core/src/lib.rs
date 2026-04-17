@@ -627,28 +627,6 @@ pub fn recover_wots_pk(msg_hash: &F, pub_seed: &F, key_idx: u32, sig: &[F]) -> V
         .collect()
 }
 
-pub fn verify_wots_signature_against_leaf(
-    msg_hash: &F,
-    pub_seed: &F,
-    key_idx: u32,
-    sig: &[F],
-    expected_leaf: &F,
-) -> Result<(), String> {
-    if sig.len() != WOTS_CHAINS {
-        return Err(format!(
-            "bad WOTS signature length: got {}, expected {}",
-            sig.len(),
-            WOTS_CHAINS
-        ));
-    }
-    let recovered_pk = recover_wots_pk(msg_hash, pub_seed, key_idx, sig);
-    let recovered_leaf = wots_pk_to_leaf(pub_seed, key_idx, &recovered_pk);
-    if &recovered_leaf != expected_leaf {
-        return Err("configuration signature verification failed".into());
-    }
-    Ok(())
-}
-
 pub fn xmss_subtree_root(ask_j: &F, pub_seed: &F, start: u32, height: usize) -> F {
     if height == AUTH_DEPTH && start == 0 {
         assert_full_xmss_rebuild_allowed("xmss_subtree_root");
@@ -1298,7 +1276,7 @@ pub struct DepositReq {
 pub type FundReq = DepositReq;
 
 /// Payment address — everything a sender needs to create a note for the recipient.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaymentAddress {
     #[serde(with = "hex_f")]
     pub d_j: F,
@@ -1312,6 +1290,56 @@ pub struct PaymentAddress {
     pub ek_v: Vec<u8>,
     #[serde(with = "hex_bytes")]
     pub ek_d: Vec<u8>,
+}
+
+impl PaymentAddress {
+    pub fn to_bech32m(&self) -> String {
+        let mut payload = Vec::with_capacity(4 * 32 + self.ek_v.len() + self.ek_d.len());
+        payload.extend_from_slice(&self.d_j);
+        payload.extend_from_slice(&self.auth_root);
+        payload.extend_from_slice(&self.auth_pub_seed);
+        payload.extend_from_slice(&self.nk_tag);
+        payload.extend_from_slice(&self.ek_v);
+        payload.extend_from_slice(&self.ek_d);
+        let hrp = bech32::Hrp::parse("tzel").expect("valid hrp");
+        bech32::encode::<bech32::NoChecksum>(hrp, &payload).expect("bech32 encode")
+    }
+
+    pub fn from_bech32m(s: &str) -> Result<Self, String> {
+        use bech32::primitives::decode::CheckedHrpstring;
+        let checked = CheckedHrpstring::new::<bech32::NoChecksum>(s)
+            .map_err(|e| e.to_string())?;
+        let hrp = checked.hrp();
+        if hrp != bech32::Hrp::parse("tzel").expect("valid hrp") {
+            return Err(format!("unexpected hrp: {}", hrp));
+        }
+        let payload: Vec<u8> = checked.byte_iter().collect();
+        let min_len = 4 * 32;
+        if payload.len() < min_len {
+            return Err(format!("payload too short: {} bytes", payload.len()));
+        }
+        let mut off = 0;
+        let read_f = |buf: &[u8], o: &mut usize| -> Result<F, String> {
+            if buf.len() < *o + 32 {
+                return Err("payload truncated".into());
+            }
+            let mut f = [0u8; 32];
+            f.copy_from_slice(&buf[*o..*o + 32]);
+            *o += 32;
+            Ok(f)
+        };
+        let d_j = read_f(&payload, &mut off)?;
+        let auth_root = read_f(&payload, &mut off)?;
+        let auth_pub_seed = read_f(&payload, &mut off)?;
+        let nk_tag = read_f(&payload, &mut off)?;
+        let ek_len = (payload.len() - off) / 2;
+        if ek_len * 2 + off != payload.len() {
+            return Err("payload length is not symmetric for ek_v/ek_d".into());
+        }
+        let ek_v = payload[off..off + ek_len].to_vec();
+        let ek_d = payload[off + ek_len..].to_vec();
+        Ok(PaymentAddress { d_j, auth_root, auth_pub_seed, nk_tag, ek_v, ek_d })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2932,5 +2960,23 @@ mod tests {
         assert!(ledger.valid_roots.contains(&u(103)));
         assert_eq!(ledger.root_history.len(), 3);
         assert_eq!(ledger.valid_roots.len(), 3);
+    }
+
+    #[test]
+    fn test_payment_address_bech32m_roundtrip() {
+        let seed = [0xab_u8; 32];
+        let (ek_v, _dk_v, ek_d, _dk_d) = derive_kem_keys(&seed, 0);
+        let addr = PaymentAddress {
+            d_j: [0x01; 32],
+            auth_root: [0x02; 32],
+            auth_pub_seed: [0x03; 32],
+            nk_tag: [0x04; 32],
+            ek_v: ek_v.to_bytes().to_vec(),
+            ek_d: ek_d.to_bytes().to_vec(),
+        };
+        let encoded = addr.to_bech32m();
+        assert!(encoded.starts_with("tzel1"));
+        let decoded = PaymentAddress::from_bech32m(&encoded).unwrap();
+        assert_eq!(addr, decoded);
     }
 }

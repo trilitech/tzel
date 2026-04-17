@@ -494,6 +494,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bech32"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
+
+[[package]]
 name = "bigdecimal"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1440,7 +1446,7 @@ version = "0.1.0"
 source = "git+https://github.com/starkware-libs/stwo-circuits?rev=2591775#2591775ae8fd7634eda7b77c471f87c163f65eb1"
 dependencies = [
  "blake2",
- "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
  "indexmap",
  "itertools 0.12.1",
  "num-traits",
@@ -1453,7 +1459,7 @@ version = "0.1.0"
 source = "git+https://github.com/starkware-libs/stwo-circuits?rev=2591775#2591775ae8fd7634eda7b77c471f87c163f65eb1"
 dependencies = [
  "circuits",
- "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
  "indexmap",
  "itertools 0.12.1",
  "num-traits",
@@ -2316,7 +2322,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.1.5",
- "serde",
 ]
 
 [[package]]
@@ -4595,7 +4600,7 @@ dependencies = [
  "dashmap",
  "educe 0.5.11",
  "fnv",
- "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
  "hex",
  "indexmap",
  "itertools 0.12.1",
@@ -4654,7 +4659,7 @@ name = "stwo-constraint-framework"
 version = "2.1.0"
 source = "git+https://github.com/starkware-libs/stwo?rev=aeceb74c#aeceb74c58184d7886ebd7f34a7453fee714ca40"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
  "itertools 0.12.1",
  "num-traits",
  "rand 0.8.5",
@@ -5226,6 +5231,7 @@ dependencies = [
 name = "tzel-core"
 version = "0.1.0"
 dependencies = [
+ "bech32",
  "blake2s_simd",
  "chacha20poly1305",
  "hex",

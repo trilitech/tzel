@@ -22,6 +22,10 @@ use tzel_verifier::{encode_verify_meta, ProofBundle as VerifyProofBundle};
 
 const XMSS_BDS_K: usize = 2;
 
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct FeltSlot {
     present: bool,
@@ -442,10 +446,53 @@ struct WalletAddressState {
     auth_pub_seed: F,
     #[serde(with = "hex_f")]
     nk_tag: F,
-    bds: XmssBdsState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bds: Option<XmssBdsState>,
+    /// Legacy migration-only field from the old wallet format.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    next_auth_index: u32,
+    /// Legacy migration-only field from the old wallet format.
+    #[serde(default, with = "hex_f_vec", skip_serializing_if = "Vec::is_empty")]
+    next_auth_path: Vec<F>,
 }
 
 impl WalletAddressState {
+    fn ensure_bds(&mut self, ask_j: &F) -> Result<(), String> {
+        if self.bds.is_some() {
+            return Ok(());
+        }
+        self.ensure_bds_with(ask_j, |ask_j, pub_seed, next_auth_index| {
+            XmssBdsState::from_index(ask_j, pub_seed, next_auth_index)
+        })
+    }
+
+    fn ensure_bds_with<R>(&mut self, ask_j: &F, rebuild: R) -> Result<(), String>
+    where
+        R: FnOnce(&F, &F, u32) -> Result<(XmssBdsState, F), String>,
+    {
+        if self.bds.is_some() {
+            return Ok(());
+        }
+        let (state, root) = rebuild(ask_j, &self.auth_pub_seed, self.next_auth_index)?;
+        if root != self.auth_root {
+            return Err(format!(
+                "rebuilt XMSS root mismatch for address {}",
+                self.index
+            ));
+        }
+        if !self.next_auth_path.is_empty() && state.current_path() != self.next_auth_path.as_slice()
+        {
+            return Err(format!(
+                "rebuilt XMSS path mismatch for address {} at index {}",
+                self.index, self.next_auth_index
+            ));
+        }
+        self.bds = Some(state);
+        self.next_auth_index = 0;
+        self.next_auth_path.clear();
+        Ok(())
+    }
+
     fn payment_address(&self, ek_v: &Ek, ek_d: &Ek) -> PaymentAddress {
         PaymentAddress {
             d_j: self.d_j,
@@ -462,6 +509,12 @@ impl WalletAddressState {
 struct WalletFile {
     #[serde(with = "hex_f")]
     master_sk: F,
+    /// Legacy global KEM seeds — ignored when per-address derivation is available.
+    /// Kept for backwards compatibility during wallet migration.
+    #[serde(default, with = "hex_bytes")]
+    kem_seed_v: Vec<u8>,
+    #[serde(default, with = "hex_bytes")]
+    kem_seed_d: Vec<u8>,
     #[serde(default)]
     addresses: Vec<WalletAddressState>,
     addr_counter: u32,
@@ -602,12 +655,12 @@ impl WalletFile {
     fn derive_address_state(
         &self,
         j: u32,
-        next_wots_index: u32,
+        next_auth_index: u32,
     ) -> Result<WalletAddressState, String> {
         #[cfg(test)]
         panic!(
-            "unexpected XMSS address derivation for j={} next_wots_index={} — default tests must use fixed prederived wallet/address fixtures",
-            j, next_wots_index
+            "unexpected XMSS address derivation for j={} next_auth_index={} — default tests must use fixed prederived wallet/address fixtures",
+            j, next_auth_index
         );
 
         #[cfg(not(test))]
@@ -619,7 +672,7 @@ impl WalletFile {
         #[cfg(not(test))]
         let auth_pub_seed = derive_auth_pub_seed(&ask_j);
         #[cfg(not(test))]
-        let (bds, auth_root) = XmssBdsState::from_index(&ask_j, &auth_pub_seed, next_wots_index)?;
+        let (bds, auth_root) = XmssBdsState::from_index(&ask_j, &auth_pub_seed, next_auth_index)?;
         #[cfg(not(test))]
         let nk_spend = derive_nk_spend(&acc.nk, &d_j);
         #[cfg(not(test))]
@@ -632,20 +685,37 @@ impl WalletFile {
             auth_root,
             auth_pub_seed,
             nk_tag,
-            bds,
+            bds: Some(bds),
+            next_auth_index: 0,
+            next_auth_path: Vec::new(),
         })
     }
 
     fn materialize_addresses(&mut self) -> Result<(), String> {
+        if self.addresses.len() == self.addr_counter as usize {
+            let ask_base = self.account().ask_base;
+            for addr in &mut self.addresses {
+                let ask_j = derive_ask(&ask_base, addr.index);
+                addr.ensure_bds(&ask_j)?;
+                if let Some(bds) = &addr.bds {
+                    self.wots_key_indices.insert(addr.index, bds.next_index);
+                }
+            }
+            return Ok(());
+        }
         let existing = self.addresses.len() as u32;
         for j in existing..self.addr_counter {
-            let next_wots_index = *self.wots_key_indices.get(&j).unwrap_or(&0);
+            let next_auth_index = *self.wots_key_indices.get(&j).unwrap_or(&0);
             self.addresses
-                .push(self.derive_address_state(j, next_wots_index)?);
+                .push(self.derive_address_state(j, next_auth_index)?);
         }
-        for addr in &self.addresses {
-            self.wots_key_indices
-                .insert(addr.index, addr.bds.next_index);
+        let ask_base = self.account().ask_base;
+        for addr in &mut self.addresses {
+            let ask_j = derive_ask(&ask_base, addr.index);
+            addr.ensure_bds(&ask_j)?;
+            if let Some(bds) = &addr.bds {
+                self.wots_key_indices.insert(addr.index, bds.next_index);
+            }
         }
         Ok(())
     }
@@ -655,6 +725,16 @@ impl WalletFile {
         self.reserve_next_auth(addr_index)
             .expect("XMSS keys should be available for test wallet")
             .0
+    }
+
+    /// Legacy global KEM keys used by pre-migration wallets.
+    /// Returns None when the wallet was created after the per-address migration.
+    fn legacy_kem_keys(&self) -> Option<(Ek, Dk, Ek, Dk)> {
+        let seed_v: [u8; 64] = self.kem_seed_v.as_slice().try_into().ok()?;
+        let seed_d: [u8; 64] = self.kem_seed_d.as_slice().try_into().ok()?;
+        let (ek_v, dk_v) = kem_keygen_from_seed(&seed_v);
+        let (ek_d, dk_d) = kem_keygen_from_seed(&seed_d);
+        Some((ek_v, dk_v, ek_d, dk_d))
     }
 
     /// Per-address KEM keys derived from incoming_seed + address index.
@@ -694,12 +774,30 @@ impl WalletFile {
         })
     }
 
-    /// Recover a note from the notes feed using the current per-address KEM keys.
+    /// Recover a note from the notes feed using either:
+    /// 1. Legacy global KEM keys (for pre-migration wallets), or
+    /// 2. Current per-address KEM keys.
     fn try_recover_note(&self, nm: &NoteMemo) -> Option<Note> {
         let acc = self.account();
 
+        // Legacy compatibility: old wallets used one global ML-KEM keypair
+        // for all addresses. Keep scanning those notes until users migrate.
+        if let Some((_, dk_v_legacy, _, dk_d_legacy)) = self.legacy_kem_keys() {
+            if detect(&nm.enc, &dk_d_legacy) {
+                if let Some((v, rseed, _memo)) = decrypt_memo(&nm.enc, &dk_v_legacy) {
+                    for addr in &self.addresses {
+                        if let Some(note) =
+                            self.recover_note_for_address(&acc, addr, v, rseed, nm.cm, nm.index)
+                        {
+                            return Some(note);
+                        }
+                    }
+                }
+            }
+        }
+
         for addr in &self.addresses {
-            let (_, dk_v_j, _, dk_d_j) = self.kem_keys(addr.index);
+            let (_, dk_v_j, _, dk_d_j) = derive_kem_keys(&acc.incoming_seed, addr.index);
             if !detect(&nm.enc, &dk_d_j) {
                 continue;
             }
@@ -739,7 +837,11 @@ impl WalletFile {
             .get_mut(addr_index as usize)
             .ok_or_else(|| format!("missing address record {}", addr_index))?;
         let ask_j = derive_ask(&ask_base, addr_index);
-        let bds = &mut addr.bds;
+        addr.ensure_bds(&ask_j)?;
+        let bds = addr
+            .bds
+            .as_mut()
+            .ok_or_else(|| format!("missing XMSS traversal state for address {}", addr_index))?;
         let key_idx = bds.next_index;
         if (key_idx as usize) >= AUTH_TREE_SIZE {
             return Err(format!(
@@ -800,7 +902,11 @@ impl WalletFile {
     fn wallet_xmss_floor(&self) -> WalletXmssFloor {
         let mut wots_key_indices = self.wots_key_indices.clone();
         for addr in &self.addresses {
-            let next_index = addr.bds.next_index;
+            let next_index = addr
+                .bds
+                .as_ref()
+                .map(|bds| bds.next_index)
+                .unwrap_or(addr.next_auth_index);
             wots_key_indices
                 .entry(addr.index)
                 .and_modify(|current| *current = (*current).max(next_index))
@@ -1116,7 +1222,9 @@ fn save_private_json<T: Serialize>(path: &str, value: &T, label: &str) -> Result
     let data =
         serde_json::to_string_pretty(value).map_err(|e| format!("serialize {}: {}", label, e))?;
     let output_path = std::path::Path::new(path);
-    let (tmp, mut file) = create_private_temp_file(output_path, label)?;
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path));
+    let mut file =
+        std::fs::File::create(&tmp).map_err(|e| format!("create {} tmp: {}", label, e))?;
     file.write_all(data.as_bytes())
         .map_err(|e| format!("write {} tmp: {}", label, e))?;
     file.sync_all()
@@ -1132,7 +1240,8 @@ fn save_wallet(path: &str, w: &WalletFile) -> Result<(), String> {
     // Durable write: fsync temp file, rename atomically, then fsync the parent
     // directory so one-time WOTS state survives crashes before submit returns.
     let wallet_path = std::path::Path::new(path);
-    let (tmp, mut file) = create_private_temp_file(wallet_path, "wallet")?;
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path));
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {}", e))?;
     file.write_all(data.as_bytes())
         .map_err(|e| format!("write tmp: {}", e))?;
     file.sync_all().map_err(|e| format!("fsync tmp: {}", e))?;
@@ -1155,7 +1264,8 @@ fn save_wallet_xmss_floor(path: &str, floor: &WalletXmssFloor) -> Result<(), Str
     let data =
         serde_json::to_string_pretty(floor).map_err(|e| format!("serialize floor: {}", e))?;
     let floor_path = wallet_xmss_floor_path(path);
-    let (tmp, mut file) = create_private_temp_file(&floor_path, "wallet xmss floor")?;
+    let tmp = PathBuf::from(format!("{}.tmp", floor_path.display()));
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create floor tmp: {}", e))?;
     file.write_all(data.as_bytes())
         .map_err(|e| format!("write floor tmp: {}", e))?;
     file.sync_all()
@@ -1176,40 +1286,14 @@ fn current_wallet_wots_floor(wallet: &WalletFile, addr_index: u32) -> u32 {
                 .addresses
                 .iter()
                 .find(|addr| addr.index == addr_index)
-                .map(|addr| addr.bds.next_index)
+                .map(|addr| {
+                    addr.bds
+                        .as_ref()
+                        .map(|bds| bds.next_index)
+                        .unwrap_or(addr.next_auth_index)
+                })
         })
         .unwrap_or(0)
-}
-
-fn create_private_temp_file(
-    output_path: &std::path::Path,
-    label: &str,
-) -> Result<(PathBuf, std::fs::File), String> {
-    let parent = output_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let base_name = output_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("wallet");
-    for attempt in 0..16u32 {
-        let tmp = parent.join(format!(
-            ".{}.tmp.{}.{}.{}",
-            base_name,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| format!("system clock error: {}", e))?
-                .as_nanos(),
-            attempt
-        ));
-        match create_private_file(&tmp) {
-            Ok(file) => return Ok((tmp, file)),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(format!("create {} tmp: {}", label, err)),
-        }
-    }
-    Err(format!("create {} tmp: too many collisions", label))
 }
 
 fn enforce_wallet_xmss_floor(path: &str, wallet: &WalletFile) -> Result<(), String> {
@@ -1232,31 +1316,12 @@ fn enforce_wallet_xmss_floor(path: &str, wallet: &WalletFile) -> Result<(), Stri
         let current_next = current_wallet_wots_floor(wallet, *addr_index);
         if current_next < *required_next {
             return Err(format!(
-                "wallet appears to be restored from a stale backup: address {} next_wots_index {} is behind durable XMSS floor {}",
+                "wallet appears to be restored from a stale backup: address {} next_auth_index {} is behind durable XMSS floor {}",
                 addr_index, current_next, required_next
             ));
         }
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn create_private_file(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn create_private_file(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
 }
 
 #[cfg(unix)]
@@ -1333,46 +1398,10 @@ fn post_json<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
         .map_err(|e| format!("parse response: {}", e))
 }
 
-fn post_json_with_bearer<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
-    url: &str,
-    body: &Req,
-    bearer_token: Option<&str>,
-) -> Result<Resp, String> {
-    let mut req = ureq::post(url);
-    if let Some(token) = bearer_token {
-        req = req.header("Authorization", &format!("Bearer {}", token));
-    }
-    let resp = req
-        .send_json(serde_json::to_value(body).unwrap())
-        .map_err(|e| format!("HTTP error: {}", e))?;
-    let status = resp.status();
-    if status != 200 {
-        let body = resp.into_body().read_to_string().unwrap_or_default();
-        return Err(format!("HTTP {}: {}", status, body));
-    }
-    resp.into_body()
-        .read_json()
-        .map_err(|e| format!("parse response: {}", e))
-}
-
 fn get_json<Resp: for<'de> Deserialize<'de>>(url: &str) -> Result<Resp, String> {
     let resp = ureq::get(url)
         .call()
         .map_err(|e| format!("HTTP error: {}", e))?;
-    resp.into_body()
-        .read_json()
-        .map_err(|e| format!("parse response: {}", e))
-}
-
-fn get_json_with_bearer<Resp: for<'de> Deserialize<'de>>(
-    url: &str,
-    bearer_token: Option<&str>,
-) -> Result<Resp, String> {
-    let mut req = ureq::get(url);
-    if let Some(token) = bearer_token {
-        req = req.header("Authorization", &format!("Bearer {}", token));
-    }
-    let resp = req.call().map_err(|e| format!("HTTP error: {}", e))?;
     resp.into_body()
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
@@ -1411,8 +1440,6 @@ struct WalletNetworkProfile {
     bridge_ticketer: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operator_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    operator_bearer_token: Option<String>,
     source_alias: String,
     public_account: String,
     #[serde(default = "default_octez_client_bin")]
@@ -1444,7 +1471,6 @@ fn shadownet_profile(
     rollup_address: String,
     bridge_ticketer: String,
     operator_url: Option<String>,
-    operator_bearer_token: Option<String>,
     source_alias: String,
     public_account: Option<String>,
     octez_client_dir: Option<String>,
@@ -1459,7 +1485,6 @@ fn shadownet_profile(
         rollup_address,
         bridge_ticketer,
         operator_url,
-        operator_bearer_token,
         public_account: public_account.unwrap_or_else(|| source_alias.clone()),
         source_alias,
         octez_client_bin: octez_client_bin.unwrap_or_else(default_octez_client_bin),
@@ -1475,41 +1500,11 @@ fn load_network_profile(path: &Path) -> Result<WalletNetworkProfile, String> {
     serde_json::from_str(&data).map_err(|e| format!("parse network profile: {}", e))
 }
 
-fn validate_network_profile(profile: &WalletNetworkProfile) -> Result<(), String> {
-    let has_operator_url = profile.operator_url.is_some();
-    let has_operator_token = profile
-        .operator_bearer_token
-        .as_ref()
-        .map(|token| !token.trim().is_empty())
-        .unwrap_or(false);
-    match (has_operator_url, has_operator_token) {
-        (true, false) => {
-            Err("operator_url requires operator_bearer_token; pass both or neither".into())
-        }
-        (false, true) => {
-            Err("operator_bearer_token requires operator_url; pass both or neither".into())
-        }
-        _ => Ok(()),
-    }
-}
-
-fn redacted_network_profile(profile: &WalletNetworkProfile) -> WalletNetworkProfile {
-    let mut redacted = profile.clone();
-    if redacted.operator_bearer_token.is_some() {
-        redacted.operator_bearer_token = Some("<redacted>".into());
-    }
-    redacted
-}
-
-fn display_network_profile_json(profile: &WalletNetworkProfile) -> String {
-    serde_json::to_string_pretty(&redacted_network_profile(profile)).unwrap()
-}
-
 fn save_network_profile(path: &Path, profile: &WalletNetworkProfile) -> Result<(), String> {
-    validate_network_profile(profile)?;
     let data =
         serde_json::to_string_pretty(profile).map_err(|e| format!("serialize profile: {}", e))?;
-    let (tmp, mut file) = create_private_temp_file(path, "network profile")?;
+    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create profile tmp: {}", e))?;
     file.write_all(data.as_bytes())
         .map_err(|e| format!("write profile tmp: {}", e))?;
     file.sync_all()
@@ -1533,7 +1528,6 @@ fn load_required_network_profile(wallet_path: &str) -> Result<WalletNetworkProfi
             profile.network
         ));
     }
-    validate_network_profile(&profile)?;
     Ok(profile)
 }
 
@@ -1827,7 +1821,6 @@ impl<'a> RollupRpc<'a> {
         if let Some(operator_url) = &self.profile.operator_url {
             return submit_kernel_message_via_operator(
                 operator_url,
-                self.profile.operator_bearer_token.as_deref(),
                 &self.profile.rollup_address,
                 kernel_message_kind(message),
                 payload,
@@ -1969,20 +1962,18 @@ fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
 
 fn submit_kernel_message_via_operator(
     operator_url: &str,
-    operator_bearer_token: Option<&str>,
     rollup_address: &str,
     kind: RollupSubmissionKind,
     payload: Vec<u8>,
 ) -> Result<RollupSubmissionReceipt, String> {
     let base = operator_url.trim_end_matches('/');
-    let resp: SubmitRollupMessageResp = post_json_with_bearer(
+    let resp: SubmitRollupMessageResp = post_json(
         &format!("{}/v1/rollup/submissions", base),
         &SubmitRollupMessageReq {
             kind,
             rollup_address: rollup_address.to_string(),
             payload,
         },
-        operator_bearer_token,
     )?;
     let submission = resp.submission;
     Ok(RollupSubmissionReceipt {
@@ -2000,14 +1991,10 @@ fn submit_kernel_message_via_operator(
 
 fn load_operator_submission(
     operator_url: &str,
-    operator_bearer_token: Option<&str>,
     submission_id: &str,
 ) -> Result<SubmitRollupMessageResp, String> {
     let base = operator_url.trim_end_matches('/');
-    get_json_with_bearer(
-        &format!("{}/v1/rollup/submissions/{}", base, submission_id),
-        operator_bearer_token,
-    )
+    get_json(&format!("{}/v1/rollup/submissions/{}", base, submission_id))
 }
 
 fn format_rollup_submission(submission: &RollupSubmission) -> String {
@@ -2289,6 +2276,8 @@ struct ProveConfig {
     skip_proof: bool,
     reprove_bin: String,
     executables_dir: String,
+    /// If set, delegate proof generation to this HTTP service (POST /prove).
+    proving_service_url: Option<String>,
 }
 
 impl ProveConfig {
@@ -2299,6 +2288,8 @@ impl ProveConfig {
                 "WARNING: Transaction has NO cryptographic guarantee. DO NOT use in production."
             );
             Ok(Proof::TrustMeBro)
+        } else if let Some(url) = &self.proving_service_url {
+            generate_proof_http(url, circuit, args)
         } else {
             generate_proof(&self.reprove_bin, &self.executables_dir, circuit, args)
         }
@@ -2319,6 +2310,7 @@ fn run(cli: Cli) -> Result<(), String> {
         skip_proof: cli.trust_me_bro,
         reprove_bin: cli.reprove_bin,
         executables_dir: cli.executables_dir,
+        proving_service_url: None,
     };
     match cli.cmd {
         Cmd::Keygen => cmd_keygen(&cli.wallet),
@@ -2504,10 +2496,8 @@ enum UserProfileCmd {
         rollup_address: String,
         #[arg(long)]
         bridge_ticketer: String,
-        #[arg(long, requires = "operator_bearer_token")]
+        #[arg(long)]
         operator_url: Option<String>,
-        #[arg(long, requires = "operator_url")]
-        operator_bearer_token: Option<String>,
         #[arg(long)]
         source_alias: String,
         #[arg(long)]
@@ -2658,6 +2648,7 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         skip_proof: false,
         reprove_bin: cli.reprove_bin,
         executables_dir: cli.executables_dir,
+        proving_service_url: None,
     };
 
     match cli.cmd {
@@ -2734,7 +2725,6 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
             rollup_address,
             bridge_ticketer,
             operator_url,
-            operator_bearer_token,
             source_alias,
             public_account,
             octez_client_dir,
@@ -2755,7 +2745,6 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
                 rollup_address,
                 bridge_ticketer,
                 operator_url,
-                operator_bearer_token,
                 source_alias,
                 public_account,
                 octez_client_dir,
@@ -2766,12 +2755,12 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
             );
             save_network_profile(&path, &profile)?;
             println!("Saved {} profile to {}", profile.network, path.display());
-            println!("{}", display_network_profile_json(&profile));
+            println!("{}", serde_json::to_string_pretty(&profile).unwrap());
             Ok(())
         }
         UserProfileCmd::Show => {
             let profile = load_network_profile(&path)?;
-            println!("{}", display_network_profile_json(&profile));
+            println!("{}", serde_json::to_string_pretty(&profile).unwrap());
             Ok(())
         }
     }
@@ -2864,6 +2853,28 @@ fn generate_proof(
     })
 }
 
+fn generate_proof_http(url: &str, circuit: &str, args: &[String]) -> Result<Proof, String> {
+    eprintln!("Generating proof via proving-service for {}...", circuit);
+    let bundle: VerifyProofBundle = post_json(
+        &format!("{}/prove", url),
+        &serde_json::json!({ "circuit": circuit, "args": args }),
+    )
+    .map_err(|e| format!("proving-service: {}", e))?;
+    eprintln!(
+        "Proof received: {} KB, {} outputs",
+        bundle.proof_bytes.len() / 1024,
+        bundle.output_preimage.len()
+    );
+    Ok(Proof::Stark {
+        proof_bytes: bundle.proof_bytes,
+        output_preimage: bundle.output_preimage,
+        verify_meta: bundle
+            .verify_meta
+            .map(|meta| encode_verify_meta(&meta))
+            .transpose()?,
+    })
+}
+
 fn persist_wallet_and_make_proof(
     path: &str,
     w: &WalletFile,
@@ -2887,6 +2898,8 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
 
     let w = WalletFile {
         master_sk,
+        kem_seed_v: vec![], // legacy, unused — keys derived per-address from incoming_seed
+        kem_seed_d: vec![],
         addresses: vec![],
         addr_counter: 0,
         notes: vec![],
@@ -3208,7 +3221,6 @@ mod tests {
             bridge_ticketer: "KT1Jg4fj5wwnKHuW8aa9uDX6dRYBdjXhm2sJ".into(),
             public_account: "alice".into(),
             operator_url: None,
-            operator_bearer_token: None,
             source_alias: "alice".into(),
             octez_client_bin: "octez-client".into(),
             octez_client_dir: None,
@@ -3218,12 +3230,12 @@ mod tests {
         }
     }
 
-    fn rebuild_address_state(master_sk: &F, j: u32, next_wots_index: u32) -> WalletAddressState {
+    fn rebuild_address_state(master_sk: &F, j: u32, next_auth_index: u32) -> WalletAddressState {
         let acc = derive_account(master_sk);
         let d_j = derive_address(&acc.incoming_seed, j);
         let ask_j = derive_ask(&acc.ask_base, j);
         let auth_pub_seed = derive_auth_pub_seed(&ask_j);
-        let (bds, auth_root) = XmssBdsState::from_index(&ask_j, &auth_pub_seed, next_wots_index)
+        let (bds, auth_root) = XmssBdsState::from_index(&ask_j, &auth_pub_seed, next_auth_index)
             .expect("fixture XMSS rebuild should succeed");
         let nk_spend = derive_nk_spend(&acc.nk, &d_j);
         let nk_tag = derive_nk_tag(&nk_spend);
@@ -3234,7 +3246,9 @@ mod tests {
             auth_root,
             auth_pub_seed,
             nk_tag,
-            bds,
+            bds: Some(bds),
+            next_auth_index: 0,
+            next_auth_path: Vec::new(),
         }
     }
 
@@ -3286,11 +3300,19 @@ mod tests {
         xmss_tree_node_hash(pub_seed, height - 1, start_idx >> height, &left, &right)
     }
 
-    pub(super) fn test_wallet(addr_counter: u32) -> WalletFile {
+    pub(super) fn test_wallet(
+        addr_counter: u32,
+        legacy: Option<([u8; 64], [u8; 64])>,
+    ) -> WalletFile {
         let base = base_test_wallet();
+        let (kem_seed_v, kem_seed_d) = legacy
+            .map(|(v, d)| (v.to_vec(), d.to_vec()))
+            .unwrap_or_else(|| (vec![], vec![]));
         let cached = std::cmp::min(addr_counter as usize, base.addresses.len());
         let mut wallet = WalletFile {
             master_sk: base.master_sk,
+            kem_seed_v,
+            kem_seed_d,
             addresses: base.addresses[..cached].to_vec(),
             addr_counter,
             notes: vec![],
@@ -3307,7 +3329,7 @@ mod tests {
     }
 
     fn wallet_with_single_note(note_value: u64) -> (WalletFile, F) {
-        let mut w = test_wallet(1);
+        let mut w = test_wallet(1, None);
         let addr = w.addresses[0].clone();
         let acc = w.account();
         let nk_sp = derive_nk_spend(&acc.nk, &addr.d_j);
@@ -3382,7 +3404,7 @@ mod tests {
         ) {
             let total = values.iter().copied().sum::<u64>();
             let amount = 1 + (total / 2);
-            let mut w = test_wallet(0);
+            let mut w = test_wallet(0, None);
             w.notes = values.iter().enumerate().map(|(i, v)| Note {
                 nk_spend: ZERO,
                 nk_tag: ZERO,
@@ -3410,16 +3432,24 @@ mod tests {
 
     #[test]
     fn test_xmss_bds_advances_fixture_state_without_rebuild() {
-        let mut w = test_wallet(1);
+        let mut w = test_wallet(1, None);
         let initial_root = w.addresses[0].auth_root;
-        let initial_path = w.addresses[0].bds.current_path().to_vec();
+        let initial_path = w.addresses[0]
+            .bds
+            .as_ref()
+            .expect("fixture should include BDS state")
+            .current_path()
+            .to_vec();
         assert_eq!(initial_path.len(), AUTH_DEPTH);
 
         let first_idx = w.next_wots_key(0);
         assert_eq!(first_idx, 0);
         assert_eq!(w.wots_key_indices.get(&0), Some(&1));
         assert_eq!(w.addresses[0].auth_root, initial_root);
-        let after_first = &w.addresses[0].bds;
+        let after_first = w.addresses[0]
+            .bds
+            .as_ref()
+            .expect("BDS should remain populated after first advance");
         assert_eq!(after_first.next_index, 1);
         assert_eq!(after_first.current_path().len(), AUTH_DEPTH);
         assert_ne!(after_first.current_path(), initial_path.as_slice());
@@ -3429,7 +3459,10 @@ mod tests {
         assert_eq!(second_idx, 1);
         assert_eq!(w.wots_key_indices.get(&0), Some(&2));
         assert_eq!(w.addresses[0].auth_root, initial_root);
-        let after_second = &w.addresses[0].bds;
+        let after_second = w.addresses[0]
+            .bds
+            .as_ref()
+            .expect("BDS should remain populated after second advance");
         assert_eq!(after_second.next_index, 2);
         assert_eq!(after_second.current_path().len(), AUTH_DEPTH);
         assert_ne!(after_second.current_path(), path_after_first.as_slice());
@@ -3463,7 +3496,7 @@ mod tests {
 
     #[test]
     fn test_export_detect_uses_detect_root_not_incoming_seed() {
-        let w = test_wallet(0);
+        let w = test_wallet(0, None);
         let acc = w.account();
         let detect_root = derive_detect_root(&acc.incoming_seed);
         assert_ne!(
@@ -3474,7 +3507,7 @@ mod tests {
 
     #[test]
     fn test_view_export_includes_address_metadata() {
-        let w = test_wallet(2);
+        let w = test_wallet(2, None);
         let material = WatchKeyMaterial::from_view_wallet(&w);
         let WatchKeyMaterial::View {
             incoming_seed,
@@ -3497,7 +3530,7 @@ mod tests {
 
     #[test]
     fn test_detect_material_matches_wallet_note() {
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         let material = WatchKeyMaterial::from_detect_wallet(&w);
         let WatchKeyMaterial::Detect {
             detect_root,
@@ -3517,7 +3550,7 @@ mod tests {
 
     #[test]
     fn test_view_material_recovers_and_validates_note() {
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         let material = WatchKeyMaterial::from_view_wallet(&w);
         let WatchKeyMaterial::View {
             incoming_seed,
@@ -3540,7 +3573,7 @@ mod tests {
 
     #[test]
     fn test_view_material_rejects_wrong_commitment() {
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         let material = WatchKeyMaterial::from_view_wallet(&w);
         let WatchKeyMaterial::View {
             incoming_seed,
@@ -3564,7 +3597,7 @@ mod tests {
             mut rseed in any::<[u8; 32]>(),
         ) {
             rseed[31] &= 0x07;
-            let w = test_wallet(1);
+            let w = test_wallet(1, None);
             let material = WatchKeyMaterial::from_view_wallet(&w);
             let WatchKeyMaterial::View {
                 incoming_seed,
@@ -3634,7 +3667,7 @@ mod tests {
 
     #[test]
     fn test_apply_watch_feed_detect_deduplicates_and_advances_cursor() {
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         let mut state = WatchWalletFile::from_material(WatchKeyMaterial::from_detect_wallet(&w));
         let note = note_memo_for_wallet_address(&w, 0, 12, felt_tag(b"watch-detect-feed"), None);
         let feed = NotesFeedResp {
@@ -3656,7 +3689,7 @@ mod tests {
 
     #[test]
     fn test_apply_watch_feed_view_tracks_incoming_total() {
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         let mut state = WatchWalletFile::from_material(WatchKeyMaterial::from_view_wallet(&w));
         let note_1 = note_memo_for_wallet_address(&w, 0, 12, felt_tag(b"watch-view-1"), None);
         let note_2 =
@@ -3682,7 +3715,7 @@ mod tests {
 
     #[test]
     fn test_apply_watch_feed_view_is_idempotent() {
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         let mut state = WatchWalletFile::from_material(WatchKeyMaterial::from_view_wallet(&w));
         let note =
             note_memo_for_wallet_address(&w, 0, 27, felt_tag(b"watch-view-repeat"), Some(b"dup"));
@@ -3714,7 +3747,7 @@ mod tests {
         let watch_path_str = watch_path.to_str().unwrap();
         let material_path_str = material_path.to_str().unwrap();
 
-        let w = test_wallet(2);
+        let w = test_wallet(2, None);
         save_wallet(wallet_path_str, &w).expect("save wallet");
         cmd_export_view(wallet_path_str, Some(material_path_str)).expect("export view");
         cmd_watch_init(watch_path_str, material_path_str, false).expect("init watch wallet");
@@ -3748,7 +3781,7 @@ mod tests {
         let watch_path_str = watch_path.to_str().unwrap();
         let material_path_str = material_path.to_str().unwrap();
 
-        let w = test_wallet(3);
+        let w = test_wallet(3, None);
         save_wallet(wallet_path_str, &w).expect("save wallet");
         cmd_export_detect(wallet_path_str, Some(material_path_str)).expect("export detect");
         cmd_watch_init(watch_path_str, material_path_str, false).expect("init watch wallet");
@@ -3784,7 +3817,7 @@ mod tests {
         let view_path_str = view_path.to_str().unwrap();
         let detect_path_str = detect_path.to_str().unwrap();
 
-        let w = test_wallet(2);
+        let w = test_wallet(2, None);
         save_wallet(wallet_path_str, &w).expect("save wallet");
         cmd_export_view(wallet_path_str, Some(view_path_str)).expect("export view");
         cmd_export_detect(wallet_path_str, Some(detect_path_str)).expect("export detect");
@@ -3811,7 +3844,7 @@ mod tests {
         let watch_path_str = watch_path.to_str().unwrap();
         let material_path_str = material_path.to_str().unwrap();
 
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         let note =
             note_memo_for_wallet_address(&w, 0, 91, felt_tag(b"watch-service-view"), Some(b"hi"));
         let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
@@ -3876,7 +3909,7 @@ mod tests {
         let watch_path_str = watch_path.to_str().unwrap();
         let material_path_str = material_path.to_str().unwrap();
 
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         let note = note_memo_for_wallet_address(&w, 0, 73, felt_tag(b"watch-service-detect"), None);
         let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
             .expect("published note should encode");
@@ -3935,7 +3968,7 @@ mod tests {
         let watch_path_str = watch_path.to_str().unwrap();
         let material_path_str = material_path.to_str().unwrap();
 
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         save_wallet(wallet_path_str, &w).expect("save wallet");
         cmd_export_view(wallet_path_str, Some(material_path_str)).expect("export view");
         cmd_watch_init(watch_path_str, material_path_str, false).expect("init watch wallet");
@@ -3956,15 +3989,48 @@ mod tests {
         let wallet_path = dir.path().join("wallet.json");
         let wallet_path_str = wallet_path.to_str().unwrap();
 
-        save_wallet(wallet_path_str, &test_wallet(1)).expect("save private wallet");
+        save_wallet(wallet_path_str, &test_wallet(1, None)).expect("save private wallet");
         let err = validate_detection_service_wallet(wallet_path_str)
             .expect_err("private spending wallet must not validate as watch wallet");
         assert!(err.contains("parse watch wallet"));
     }
 
     #[test]
+    fn test_legacy_kem_keys_absent_for_migrated_wallet() {
+        let w = test_wallet(0, None);
+        assert!(w.legacy_kem_keys().is_none());
+    }
+
+    #[test]
+    fn test_legacy_kem_keys_are_recovered_from_seed_material() {
+        let legacy_v = [0x33; 64];
+        let legacy_d = [0x44; 64];
+        let w = test_wallet(0, Some((legacy_v, legacy_d)));
+        let (ek_v1, dk_v1, ek_d1, dk_d1) = w.legacy_kem_keys().expect("legacy keys");
+        let (ek_v2, dk_v2) = kem_keygen_from_seed(&legacy_v);
+        let (ek_d2, dk_d2) = kem_keygen_from_seed(&legacy_d);
+
+        assert_eq!(ek_v1.to_bytes(), ek_v2.to_bytes());
+        assert_eq!(dk_v1.to_bytes(), dk_v2.to_bytes());
+        assert_eq!(ek_d1.to_bytes(), ek_d2.to_bytes());
+        assert_eq!(dk_d1.to_bytes(), dk_d2.to_bytes());
+    }
+
+    #[test]
+    fn test_legacy_kem_keys_reject_incomplete_seed_material() {
+        let mut w = test_wallet(0, None);
+        w.kem_seed_v = vec![0x11; 63];
+        w.kem_seed_d = vec![0x22; 64];
+
+        assert!(
+            w.legacy_kem_keys().is_none(),
+            "legacy KEM recovery must reject malformed seed lengths"
+        );
+    }
+
+    #[test]
     fn test_per_address_kem_keys_are_deterministic_and_distinct() {
-        let w = test_wallet(0);
+        let w = test_wallet(0, None);
         let (ek_v0_a, dk_v0_a, ek_d0_a, dk_d0_a) = w.kem_keys(0);
         let (ek_v0_b, dk_v0_b, ek_d0_b, dk_d0_b) = w.kem_keys(0);
         let (ek_v1, dk_v1, ek_d1, dk_d1) = w.kem_keys(1);
@@ -3981,7 +4047,7 @@ mod tests {
 
     #[test]
     fn test_try_recover_note_new_per_address_wallet() {
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         let acc = w.account();
         let addr = &w.addresses[0];
         let nk_sp = derive_nk_spend(&acc.nk, &addr.d_j);
@@ -4004,8 +4070,49 @@ mod tests {
     }
 
     #[test]
+    fn test_try_recover_note_legacy_wallet() {
+        let legacy_v = [0x11; 64];
+        let legacy_d = [0x22; 64];
+        let w = test_wallet(1, Some((legacy_v, legacy_d)));
+        let acc = w.account();
+        let addr = &w.addresses[0];
+        let nk_sp = derive_nk_spend(&acc.nk, &addr.d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
+        let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tg);
+        let rseed = random_felt();
+        let rcm = derive_rcm(&rseed);
+        let cm = commit(&addr.d_j, 91, &rcm, &otag);
+        let (ek_v, _dk_v, ek_d, _dk_d) = w.legacy_kem_keys().expect("legacy keys");
+        let enc = encrypt_note(91, &rseed, Some(b"legacy"), &ek_v, &ek_d);
+        let nm = NoteMemo { index: 2, cm, enc };
+
+        let note = w.try_recover_note(&nm).expect("legacy note should recover");
+        assert_eq!(note.index, 2);
+        assert_eq!(note.addr_index, 0);
+        assert_eq!(note.v, 91);
+        assert_eq!(note.cm, cm);
+    }
+
+    #[test]
+    fn test_try_recover_note_migrated_wallet_accepts_per_address_notes_even_with_legacy_seeds() {
+        let legacy_v = [0x21; 64];
+        let legacy_d = [0x43; 64];
+        let w = test_wallet(1, Some((legacy_v, legacy_d)));
+        let rseed = felt_tag(b"wallet-note-per-address-with-legacy");
+        let nm = note_memo_for_wallet_address(&w, 0, 41, rseed, None);
+
+        let note = w
+            .try_recover_note(&nm)
+            .expect("migrated wallet should still recover per-address notes");
+
+        assert_eq!(note.addr_index, 0);
+        assert_eq!(note.v, 41);
+        assert_eq!(note.cm, nm.cm);
+    }
+
+    #[test]
     fn test_try_recover_note_rejects_phantom_note_with_wrong_commitment() {
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         let mut rseed = ZERO;
         rseed[0] = 0x55;
         let mut nm = note_memo_for_wallet_address(&w, 0, 77, rseed, Some(b"phantom"));
@@ -4018,7 +4125,7 @@ mod tests {
 
     #[test]
     fn test_try_recover_note_rejects_wrong_owner_metadata_even_with_valid_decryption() {
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
         let d_j = w.addresses[0].d_j;
         let (ek_v, _, ek_d, _) = w.kem_keys(0);
         let mut other_master_sk = ZERO;
@@ -4051,7 +4158,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wallet_path = dir.path().join("wallet.json");
         let wallet_path_str = wallet_path.to_str().unwrap();
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
 
         save_wallet(wallet_path_str, &w).expect("wallet should save");
         let loaded = load_wallet(wallet_path_str).expect("wallet should load");
@@ -4066,7 +4173,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wallet_path = dir.path().join("wallet.json");
         let wallet_path_str = wallet_path.to_str().unwrap();
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
 
         save_wallet(wallet_path_str, &w).expect("wallet should save");
 
@@ -4079,7 +4186,7 @@ mod tests {
         assert_eq!(floor.addr_counter, w.addr_counter);
         assert_eq!(
             floor.wots_key_indices.get(&0),
-            Some(&w.addresses[0].bds.next_index)
+            Some(&w.addresses[0].bds.as_ref().unwrap().next_index)
         );
     }
 
@@ -4090,7 +4197,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let wallet_path = dir.path().join("wallet.json");
-        let w = test_wallet(1);
+        let w = test_wallet(1, None);
 
         save_wallet(wallet_path.to_str().unwrap(), &w).expect("wallet should save");
 
@@ -4099,20 +4206,6 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_private_temp_files_start_with_private_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let wallet_path = dir.path().join("wallet.json");
-        let (tmp_path, _file) =
-            create_private_temp_file(&wallet_path, "wallet").expect("create private temp file");
-
-        let mode = std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
 
@@ -4147,7 +4240,7 @@ mod tests {
         let wallet_path_str = wallet_path.to_str().unwrap();
         let backup_path = dir.path().join("wallet-backup.json");
 
-        let original = test_wallet(1);
+        let original = test_wallet(1, None);
         save_wallet(wallet_path_str, &original).expect("save original wallet");
         std::fs::copy(&wallet_path, &backup_path).expect("copy backup");
 
@@ -4240,7 +4333,7 @@ mod tests {
 
     #[test]
     fn test_next_address_derivation_is_isolated_per_index() {
-        let w = test_wallet(3);
+        let w = test_wallet(3, None);
         let state0 = w.addresses[0].clone();
         let (ek_v0, _, ek_d0, _) = w.kem_keys(state0.index);
         let state1 = w.addresses[1].clone();
@@ -4259,6 +4352,8 @@ mod tests {
         let base = base_test_wallet();
         let mut wallet = WalletFile {
             master_sk: base.master_sk,
+            kem_seed_v: vec![],
+            kem_seed_d: vec![],
             addresses: base.addresses[..2].to_vec(),
             addr_counter: 0,
             notes: vec![],
@@ -4283,6 +4378,8 @@ mod tests {
         let base = base_test_wallet();
         let mut wallet = WalletFile {
             master_sk: base.master_sk,
+            kem_seed_v: vec![],
+            kem_seed_d: vec![],
             addresses: base.addresses[..2].to_vec(),
             addr_counter: 2,
             notes: vec![],
@@ -4300,7 +4397,7 @@ mod tests {
 
     #[test]
     fn test_materialize_addresses_refreshes_wots_index_after_fixture_state_advance() {
-        let mut wallet = test_wallet(1);
+        let mut wallet = test_wallet(1, None);
         assert_eq!(wallet.next_wots_key(0), 0);
         wallet.wots_key_indices.clear();
 
@@ -4309,6 +4406,133 @@ mod tests {
             .expect("fixture materialization should refresh cached WOTS index");
 
         assert_eq!(wallet.wots_key_indices.get(&0), Some(&1));
+    }
+
+    #[test]
+    fn test_ensure_bds_rebuild_clears_legacy_fields_small_depth() {
+        let acc = derive_account(&felt_tag(b"wallet-small-bds"));
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        let next_auth_index = 5;
+        let (rebuilt_state, rebuilt_root) =
+            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, next_auth_index, 6, 2)
+                .expect("small-depth BDS state should rebuild");
+
+        let mut addr = WalletAddressState {
+            index: 0,
+            d_j,
+            auth_root: rebuilt_root,
+            auth_pub_seed,
+            nk_tag: derive_nk_tag(&derive_nk_spend(&acc.nk, &d_j)),
+            bds: None,
+            next_auth_index,
+            next_auth_path: rebuilt_state.current_path().to_vec(),
+        };
+
+        addr.ensure_bds_with(&ask_j, |_, _, idx| {
+            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, idx, 6, 2)
+        })
+        .expect("legacy small-depth address state should rebuild");
+
+        let restored = addr.bds.as_ref().expect("BDS state should be restored");
+        assert_eq!(restored.next_index, rebuilt_state.next_index);
+        assert_eq!(restored.current_path(), rebuilt_state.current_path());
+        assert_eq!(addr.next_auth_index, 0);
+        assert!(addr.next_auth_path.is_empty());
+    }
+
+    #[test]
+    fn test_ensure_bds_with_rejects_root_mismatch() {
+        let acc = derive_account(&felt_tag(b"wallet-small-root-mismatch"));
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        let next_auth_index = 3;
+        let (rebuilt_state, rebuilt_root) =
+            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, next_auth_index, 6, 2)
+                .expect("small-depth BDS state should rebuild");
+        let mut wrong_root = rebuilt_root;
+        wrong_root[0] ^= 0x01;
+
+        let mut addr = WalletAddressState {
+            index: 0,
+            d_j,
+            auth_root: wrong_root,
+            auth_pub_seed,
+            nk_tag: derive_nk_tag(&derive_nk_spend(&acc.nk, &d_j)),
+            bds: None,
+            next_auth_index,
+            next_auth_path: rebuilt_state.current_path().to_vec(),
+        };
+
+        let err = addr
+            .ensure_bds_with(&ask_j, |_, _, idx| {
+                XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, idx, 6, 2)
+            })
+            .expect_err("root mismatch should be rejected");
+        assert!(err.contains("rebuilt XMSS root mismatch"));
+        assert!(addr.bds.is_none());
+        assert_eq!(addr.next_auth_index, next_auth_index);
+        assert_eq!(addr.next_auth_path, rebuilt_state.current_path().to_vec());
+    }
+
+    #[test]
+    fn test_ensure_bds_with_rejects_path_mismatch() {
+        let acc = derive_account(&felt_tag(b"wallet-small-path-mismatch"));
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        let next_auth_index = 4;
+        let (rebuilt_state, rebuilt_root) =
+            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, next_auth_index, 6, 2)
+                .expect("small-depth BDS state should rebuild");
+        let mut wrong_path = rebuilt_state.current_path().to_vec();
+        wrong_path[0][0] ^= 0x01;
+
+        let mut addr = WalletAddressState {
+            index: 0,
+            d_j,
+            auth_root: rebuilt_root,
+            auth_pub_seed,
+            nk_tag: derive_nk_tag(&derive_nk_spend(&acc.nk, &d_j)),
+            bds: None,
+            next_auth_index,
+            next_auth_path: wrong_path,
+        };
+
+        let err = addr
+            .ensure_bds_with(&ask_j, |_, _, idx| {
+                XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, idx, 6, 2)
+            })
+            .expect_err("path mismatch should be rejected");
+        assert!(err.contains("rebuilt XMSS path mismatch"));
+        assert!(addr.bds.is_none());
+        assert_eq!(addr.next_auth_index, next_auth_index);
+    }
+
+    #[test]
+    fn test_ensure_bds_with_short_circuits_when_state_is_already_present() {
+        let ask_j = felt_tag(b"wallet-ensure-bds-ignored");
+        let mut addr = test_wallet(1, None).addresses[0].clone();
+        let original = addr
+            .bds
+            .clone()
+            .expect("fixture address should include BDS");
+        let stale_path = vec![felt_tag(b"stale-legacy-path")];
+        addr.next_auth_index = 99;
+        addr.next_auth_path = stale_path.clone();
+
+        addr.ensure_bds_with(&ask_j, |_, _, _| -> Result<(XmssBdsState, F), String> {
+            panic!("ensure_bds_with should not rebuild when BDS state is already populated");
+        })
+        .expect("existing BDS state should short-circuit");
+
+        let restored = addr.bds.as_ref().expect("BDS state should remain present");
+        assert_eq!(restored.next_index, original.next_index);
+        assert_eq!(restored.current_path(), original.current_path());
+        assert_eq!(addr.next_auth_index, 99);
+        assert_eq!(addr.next_auth_path, stale_path);
     }
 
     fn recompute_xmss_root_from_path(leaf: F, key_idx: u32, pub_seed: &F, siblings: &[F]) -> F {
@@ -4440,7 +4664,7 @@ mod tests {
 
     #[test]
     fn test_reserve_next_auth_returns_path_bound_to_auth_root() {
-        let mut w = test_wallet(1);
+        let mut w = test_wallet(1, None);
         let acc = w.account();
         let ask_j = derive_ask(&acc.ask_base, 0);
         let msg_hash = felt_tag(b"wallet-reserve-auth");
@@ -4459,7 +4683,7 @@ mod tests {
 
     #[test]
     fn test_reserve_next_auth_rejects_missing_address() {
-        let mut w = test_wallet(0);
+        let mut w = test_wallet(0, None);
         let err = w
             .reserve_next_auth(0)
             .expect_err("missing address record should error");
@@ -4468,14 +4692,14 @@ mod tests {
 
     #[test]
     fn test_reserve_next_auth_rejects_exhausted_tree() {
-        let mut w = test_wallet(1);
-        w.addresses[0].bds = XmssBdsState {
+        let mut w = test_wallet(1, None);
+        w.addresses[0].bds = Some(XmssBdsState {
             next_index: AUTH_TREE_SIZE as u32,
             auth_path: vec![],
             keep: vec![],
             treehash: vec![],
             retain: vec![],
-        };
+        });
 
         let err = w
             .reserve_next_auth(0)
@@ -4485,7 +4709,7 @@ mod tests {
 
     #[test]
     fn test_next_wots_key_is_monotonic() {
-        let mut w = test_wallet(1);
+        let mut w = test_wallet(1, None);
         assert_eq!(w.next_wots_key(0), 0);
         assert_eq!(w.next_wots_key(0), 1);
         assert_eq!(w.next_wots_key(0), 2);
@@ -4493,7 +4717,7 @@ mod tests {
 
     #[test]
     fn test_select_notes_rejects_insufficient_funds() {
-        let mut w = test_wallet(0);
+        let mut w = test_wallet(0, None);
         w.notes = vec![
             Note {
                 nk_spend: ZERO,
@@ -4525,7 +4749,7 @@ mod tests {
 
     #[test]
     fn test_select_notes_prefers_single_large_note_when_sufficient() {
-        let mut w = test_wallet(0);
+        let mut w = test_wallet(0, None);
         w.notes = vec![
             Note {
                 nk_spend: ZERO,
@@ -4557,7 +4781,7 @@ mod tests {
 
     #[test]
     fn test_select_notes_skips_pending_spends() {
-        let mut w = test_wallet(1);
+        let mut w = test_wallet(1, None);
         let note_0 = wallet_note_for_address(&w, 0, 40, felt_tag(b"pending-note-0"), 0);
         let note_1 = wallet_note_for_address(&w, 0, 25, felt_tag(b"pending-note-1"), 1);
         let pending_nf = note_nullifier(&note_0);
@@ -4583,7 +4807,7 @@ mod tests {
 
     #[test]
     fn test_apply_scan_feed_deduplicates_new_notes_and_prunes_spent_ones() {
-        let mut w = test_wallet(1);
+        let mut w = test_wallet(1, None);
         let existing = wallet_note_for_address(&w, 0, 40, felt_tag(b"wallet-scan-existing"), 5);
         let spent_nf = nullifier(&existing.nk_spend, &existing.cm, existing.index as u64);
         w.notes.push(existing.clone());
@@ -4639,7 +4863,7 @@ mod tests {
 
     #[test]
     fn test_apply_scan_feed_clears_confirmed_pending_spends() {
-        let mut w = test_wallet(1);
+        let mut w = test_wallet(1, None);
         let existing = wallet_note_for_address(&w, 0, 40, felt_tag(b"wallet-scan-pending"), 5);
         let spent_nf = note_nullifier(&existing);
         w.notes.push(existing);
@@ -4660,7 +4884,7 @@ mod tests {
 
     #[test]
     fn test_apply_scan_feed_drops_newly_recovered_note_if_already_nullified() {
-        let mut w = test_wallet(1);
+        let mut w = test_wallet(1, None);
         let new_rseed = felt_tag(b"wallet-scan-new-spent");
         let new_nm = note_memo_for_wallet_address(&w, 0, 19, new_rseed, None);
         let recovered = w
@@ -4691,9 +4915,9 @@ mod tests {
 
     #[test]
     fn test_next_wots_key_exhausts_at_last_leaf() {
-        let mut w = test_wallet(1);
+        let mut w = test_wallet(1, None);
         let last_idx = (AUTH_TREE_SIZE - 1) as u32;
-        w.addresses[0].bds = XmssBdsState {
+        w.addresses[0].bds = Some(XmssBdsState {
             next_index: last_idx,
             auth_path: vec![ZERO; AUTH_DEPTH],
             keep: vec![FeltSlot::none(); AUTH_DEPTH],
@@ -4701,7 +4925,9 @@ mod tests {
                 .map(TreeHashState::new)
                 .collect(),
             retain: vec![RetainLevel::default(); AUTH_DEPTH],
-        };
+        });
+        w.addresses[0].next_auth_index = 0;
+        w.addresses[0].next_auth_path.clear();
         w.wots_key_indices.insert(0, last_idx);
         assert_eq!(w.next_wots_key(0), last_idx);
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4718,7 +4944,7 @@ mod tests {
         let recipient_path = dir.path().join("recipient.json");
         let recipient_path_str = recipient_path.to_str().unwrap();
 
-        let mut w = test_wallet(2);
+        let mut w = test_wallet(2, None);
         w.addr_counter = 1;
         w.notes = vec![
             wallet_note_for_address(&w, 0, 40, felt_tag(b"wallet-transfer-note-0"), 7),
@@ -4816,7 +5042,7 @@ mod tests {
         let wallet_path = dir.path().join("wallet.json");
         let wallet_path_str = wallet_path.to_str().unwrap();
 
-        let mut w = test_wallet(2);
+        let mut w = test_wallet(2, None);
         w.addr_counter = 1;
         w.notes = vec![
             wallet_note_for_address(&w, 0, 35, felt_tag(b"wallet-unshield-note-0"), 5),
@@ -4893,7 +5119,7 @@ mod tests {
 
         let (mut w, cm) = wallet_with_single_note(50);
         w.addr_counter = 2;
-        w.addresses = test_wallet(2).addresses;
+        w.addresses = test_wallet(2, None).addresses;
         save_wallet(wallet_path_str, &w).expect("wallet should save");
         let mut loaded = load_wallet(wallet_path_str).expect("wallet should reload");
         let _key_idx = loaded.next_wots_key(0);
@@ -4934,7 +5160,7 @@ mod tests {
 
         let (mut w, cm) = wallet_with_single_note(50);
         w.addr_counter = 2;
-        w.addresses = test_wallet(2).addresses;
+        w.addresses = test_wallet(2, None).addresses;
         save_wallet(wallet_path_str, &w).expect("wallet should save");
         let mut loaded = load_wallet(wallet_path_str).expect("wallet should reload");
         let _key_idx = loaded.next_wots_key(0);
@@ -5177,11 +5403,7 @@ fn cmd_operator_status(profile: &WalletNetworkProfile, submission_id: &str) -> R
         .operator_url
         .as_deref()
         .ok_or_else(|| "this wallet profile has no operator_url configured".to_string())?;
-    let resp = load_operator_submission(
-        operator_url,
-        profile.operator_bearer_token.as_deref(),
-        submission_id,
-    )?;
+    let resp = load_operator_submission(operator_url, submission_id)?;
     println!("{}", format_rollup_submission(&resp.submission));
     Ok(())
 }
@@ -6384,6 +6606,220 @@ fn prepare_unshield_skip_proof(
     })
 }
 
+fn prepare_transfer_with_proof(
+    w: &mut WalletFile,
+    path: &str,
+    ledger: &str,
+    root: F,
+    recipient: &PaymentAddress,
+    amount: u64,
+    memo: Option<&str>,
+    pc: &ProveConfig,
+) -> Result<PreparedTransferSubmit, String> {
+    let selected = w.select_notes(amount)?;
+    let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
+    let change = (sum_in - amount as u128) as u64;
+    let nullifiers: Vec<F> = selected
+        .iter()
+        .map(|&i| { let n = &w.notes[i]; nullifier(&n.nk_spend, &n.cm, n.index as u64) })
+        .collect();
+
+    let rseed_1 = random_felt();
+    let rcm_1 = derive_rcm(&rseed_1);
+    let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
+        recipient.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
+    ).map_err(|_| "invalid ek_v")?;
+    let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
+        recipient.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
+    ).map_err(|_| "invalid ek_d")?;
+    let otag_1 = owner_tag(&recipient.auth_root, &recipient.auth_pub_seed, &recipient.nk_tag);
+    let cm_1 = commit(&recipient.d_j, amount, &rcm_1, &otag_1);
+    let memo_bytes = memo.map(str::as_bytes);
+    let enc_1 = encrypt_note(amount, &rseed_1, memo_bytes, &ek_v_recv, &ek_d_recv);
+
+    let (change_state, _) = w.next_address()?;
+    let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
+    let rseed_2 = random_felt();
+    let rcm_2 = derive_rcm(&rseed_2);
+    let otag_2 = owner_tag(&change_state.auth_root, &change_state.auth_pub_seed, &change_state.nk_tag);
+    let cm_2 = commit(&change_state.d_j, change, &rcm_2, &otag_2);
+    let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v_c, &ek_d_c);
+
+    let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
+    let auth_domain = cfg.auth_domain;
+    let n = selected.len();
+    let mut cm_paths: Vec<Vec<F>> = vec![];
+    let mut auth_paths: Vec<Vec<F>> = vec![];
+    let mut wots_sigs: Vec<Vec<F>> = vec![];
+    let mut auth_pub_seeds: Vec<F> = vec![];
+    let mut wots_key_indices: Vec<u32> = vec![];
+
+    let nfs_for_sh: Vec<F> = selected
+        .iter()
+        .map(|&i| { let n = &w.notes[i]; nullifier(&n.nk_spend, &n.cm, n.index as u64) })
+        .collect();
+    let mh_1 = memo_ct_hash(&enc_1);
+    let mh_2 = memo_ct_hash(&enc_2);
+    let sighash = transfer_sighash(&auth_domain, &root, &nfs_for_sh, &cm_1, &cm_2, &mh_1, &mh_2);
+
+    let selected_notes: Vec<(usize, u32, F)> = selected
+        .iter()
+        .map(|&i| (w.notes[i].index, w.notes[i].addr_index, w.notes[i].auth_root))
+        .collect();
+    for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
+        let path_resp: MerklePathResp = get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
+        ensure_path_matches_root(&path_resp.root, &root, tree_idx)?;
+        cm_paths.push(path_resp.siblings);
+        let ask_j = derive_ask(&w.account().ask_base, addr_idx);
+        let (key_idx, auth_root, auth_pub_seed, apath) = w.reserve_next_auth(addr_idx)?;
+        if auth_root != stored_auth_root {
+            return Err(format!("auth_root mismatch for note at tree index {}", tree_idx));
+        }
+        auth_paths.push(apath);
+        auth_pub_seeds.push(auth_pub_seed);
+        let (sig, _, _) = wots_sign(&ask_j, key_idx, &sighash);
+        wots_sigs.push(sig);
+        wots_key_indices.push(key_idx);
+    }
+
+    let total_fields = 3 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 16;
+    let mut args: Vec<String> = vec![
+        felt_u64_to_hex(total_fields as u64),
+        felt_u64_to_hex(n as u64),
+        felt_to_hex(&auth_domain),
+        felt_to_hex(&root),
+    ];
+    for (idx, &si) in selected.iter().enumerate() {
+        let note = &w.notes[si];
+        let nf = nullifier(&note.nk_spend, &note.cm, note.index as u64);
+        args.extend([
+            felt_to_hex(&nf), felt_to_hex(&note.nk_spend), felt_to_hex(&note.auth_root),
+            felt_to_hex(&auth_pub_seeds[idx]), felt_u64_to_hex(wots_key_indices[idx] as u64),
+            felt_to_hex(&note.d_j), felt_u64_to_hex(note.v),
+            felt_to_hex(&note.rseed), felt_u64_to_hex(note.index as u64),
+        ]);
+    }
+    for path in &cm_paths   { for s in path { args.push(felt_to_hex(s)); } }
+    for path in &auth_paths { for s in path { args.push(felt_to_hex(s)); } }
+    for sig  in &wots_sigs  { for s in sig  { args.push(felt_to_hex(s)); } }
+    args.extend([
+        felt_to_hex(&cm_1), felt_to_hex(&recipient.d_j), felt_u64_to_hex(amount),
+        felt_to_hex(&rseed_1), felt_to_hex(&recipient.auth_root),
+        felt_to_hex(&recipient.auth_pub_seed), felt_to_hex(&recipient.nk_tag),
+        felt_to_hex(&mh_1),
+        felt_to_hex(&cm_2), felt_to_hex(&change_state.d_j), felt_u64_to_hex(change),
+        felt_to_hex(&rseed_2), felt_to_hex(&change_state.auth_root),
+        felt_to_hex(&change_state.auth_pub_seed), felt_to_hex(&change_state.nk_tag),
+        felt_to_hex(&mh_2),
+    ]);
+
+    let proof = persist_wallet_and_make_proof(path, w, pc, "run_transfer", &args)?;
+    Ok(PreparedTransferSubmit { selected, change, req: TransferReq { root, nullifiers, cm_1, cm_2, enc_1, enc_2, proof } })
+}
+
+fn prepare_unshield_with_proof(
+    w: &mut WalletFile,
+    path: &str,
+    ledger: &str,
+    root: F,
+    amount: u64,
+    recipient: &str,
+    pc: &ProveConfig,
+) -> Result<PreparedUnshieldSubmit, String> {
+    let selected = w.select_notes(amount)?;
+    let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
+    let change = (sum_in - amount as u128) as u64;
+    let nullifiers: Vec<F> = selected
+        .iter()
+        .map(|&i| { let n = &w.notes[i]; nullifier(&n.nk_spend, &n.cm, n.index as u64) })
+        .collect();
+
+    let (cm_change, enc_change, change_data) = if change > 0 {
+        let (change_state, _) = w.next_address()?;
+        let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
+        let rseed_c = random_felt();
+        let rcm_c = derive_rcm(&rseed_c);
+        let otag_c = owner_tag(&change_state.auth_root, &change_state.auth_pub_seed, &change_state.nk_tag);
+        let cm = commit(&change_state.d_j, change, &rcm_c, &otag_c);
+        let enc = encrypt_note(change, &rseed_c, None, &ek_v_c, &ek_d_c);
+        let mh = memo_ct_hash(&enc);
+        let cd = ChangeData { d_j: change_state.d_j, rseed: rseed_c, auth_root: change_state.auth_root, auth_pub_seed: change_state.auth_pub_seed, nk_tag: change_state.nk_tag, mh };
+        (cm, Some(enc), Some(cd))
+    } else {
+        (ZERO, None, None)
+    };
+
+    let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
+    let auth_domain = cfg.auth_domain;
+    let n = selected.len();
+    let mut cm_paths: Vec<Vec<F>> = vec![];
+    let mut auth_paths: Vec<Vec<F>> = vec![];
+    let mut wots_sigs: Vec<Vec<F>> = vec![];
+    let mut auth_pub_seeds: Vec<F> = vec![];
+    let mut wots_key_indices: Vec<u32> = vec![];
+
+    let recipient_f = hash(recipient.as_bytes());
+    let mh_change_f = change_data.as_ref().map(|cd| cd.mh).unwrap_or(ZERO);
+    let nfs_for_sh: Vec<F> = selected
+        .iter()
+        .map(|&i| { let n = &w.notes[i]; nullifier(&n.nk_spend, &n.cm, n.index as u64) })
+        .collect();
+    let sighash = unshield_sighash(&auth_domain, &root, &nfs_for_sh, amount, &recipient_f, &cm_change, &mh_change_f);
+
+    let selected_notes: Vec<(usize, u32, F)> = selected
+        .iter()
+        .map(|&i| (w.notes[i].index, w.notes[i].addr_index, w.notes[i].auth_root))
+        .collect();
+    for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
+        let path_resp: MerklePathResp = get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
+        ensure_path_matches_root(&path_resp.root, &root, tree_idx)?;
+        cm_paths.push(path_resp.siblings);
+        let ask_j = derive_ask(&w.account().ask_base, addr_idx);
+        let (key_idx, auth_root, auth_pub_seed, apath) = w.reserve_next_auth(addr_idx)?;
+        if auth_root != stored_auth_root {
+            return Err(format!("auth_root mismatch for note at tree index {}", tree_idx));
+        }
+        auth_paths.push(apath);
+        auth_pub_seeds.push(auth_pub_seed);
+        let (sig, _, _) = wots_sign(&ask_j, key_idx, &sighash);
+        wots_sigs.push(sig);
+        wots_key_indices.push(key_idx);
+    }
+
+    let total = 5 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 8;
+    let mut args: Vec<String> = vec![
+        felt_u64_to_hex(total as u64), felt_u64_to_hex(n as u64),
+        felt_to_hex(&auth_domain), felt_to_hex(&root),
+        felt_u64_to_hex(amount), felt_to_hex(&recipient_f),
+    ];
+    for (idx, &si) in selected.iter().enumerate() {
+        let note = &w.notes[si];
+        let nf = nullifier(&note.nk_spend, &note.cm, note.index as u64);
+        args.extend([
+            felt_to_hex(&nf), felt_to_hex(&note.nk_spend), felt_to_hex(&note.auth_root),
+            felt_to_hex(&auth_pub_seeds[idx]), felt_u64_to_hex(wots_key_indices[idx] as u64),
+            felt_to_hex(&note.d_j), felt_u64_to_hex(note.v),
+            felt_to_hex(&note.rseed), felt_u64_to_hex(note.index as u64),
+        ]);
+    }
+    for path in &cm_paths   { for s in path { args.push(felt_to_hex(s)); } }
+    for path in &auth_paths { for s in path { args.push(felt_to_hex(s)); } }
+    for sig  in &wots_sigs  { for s in sig  { args.push(felt_to_hex(s)); } }
+    args.push(felt_u64_to_hex(if change > 0 { 1 } else { 0 }));
+    if let Some(cd) = &change_data {
+        args.extend([
+            felt_to_hex(&cd.d_j), felt_u64_to_hex(change), felt_to_hex(&cd.rseed),
+            felt_to_hex(&cd.auth_root), felt_to_hex(&cd.auth_pub_seed),
+            felt_to_hex(&cd.nk_tag), felt_to_hex(&cd.mh),
+        ]);
+    } else {
+        args.extend(std::iter::repeat("0x0".to_string()).take(7));
+    }
+
+    let proof = persist_wallet_and_make_proof(path, w, pc, "run_unshield", &args)?;
+    Ok(PreparedUnshieldSubmit { selected, change, req: UnshieldReq { root, nullifiers, v_pub: amount, recipient: recipient.into(), cm_change, enc_change, proof } })
+}
+
 fn finalize_successful_spend(
     path: &str,
     w: &mut WalletFile,
@@ -6422,7 +6858,6 @@ mod network_profile_tests {
             "sr1ExampleRollup".into(),
             "KT1ExampleTicketer".into(),
             Some("https://operator.shadownet.example".into()),
-            Some("operator-secret".into()),
             "alice".into(),
             Some("tz1alicepublicaccount".into()),
             Some("/tmp/octez-client".into()),
@@ -6448,7 +6883,6 @@ mod network_profile_tests {
             "sr1SavedRollup".into(),
             "KT1SavedTicketer".into(),
             None,
-            None,
             "bootstrap1".into(),
             None,
             None,
@@ -6462,110 +6896,6 @@ mod network_profile_tests {
         let loaded = load_required_network_profile(wallet_path_str).expect("saved profile");
         assert_eq!(loaded, saved);
         assert_eq!(loaded.public_account, "bootstrap1");
-    }
-
-    #[test]
-    fn save_network_profile_rejects_operator_url_without_token() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let profile_path = dir.path().join("wallet.network.json");
-        let profile = shadownet_profile(
-            "https://saved-rollup.example".into(),
-            "sr1SavedRollup".into(),
-            "KT1SavedTicketer".into(),
-            Some("https://operator.shadownet.example".into()),
-            None,
-            "bootstrap1".into(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-
-        let err = save_network_profile(&profile_path, &profile).unwrap_err();
-        assert!(err.contains("operator_url requires operator_bearer_token"));
-    }
-
-    #[test]
-    fn load_required_network_profile_rejects_saved_operator_url_without_token() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let wallet_path = dir.path().join("wallet.json");
-        let wallet_path_str = wallet_path.to_str().unwrap();
-        let profile_path = default_network_profile_path(wallet_path_str);
-        let bad_profile = serde_json::json!({
-            "network": "shadownet",
-            "rollup_node_url": "https://saved-rollup.example",
-            "rollup_address": "sr1SavedRollup",
-            "bridge_ticketer": "KT1SavedTicketer",
-            "operator_url": "https://operator.shadownet.example",
-            "source_alias": "bootstrap1",
-            "public_account": "bootstrap1",
-            "octez_client_bin": "octez-client",
-            "burn_cap": "1"
-        });
-        std::fs::write(
-            &profile_path,
-            serde_json::to_string_pretty(&bad_profile).unwrap(),
-        )
-        .expect("write bad profile");
-
-        let err = load_required_network_profile(wallet_path_str).unwrap_err();
-        assert!(err.contains("operator_url requires operator_bearer_token"));
-    }
-
-    #[test]
-    fn display_network_profile_redacts_operator_bearer_token() {
-        let profile = shadownet_profile(
-            "https://saved-rollup.example".into(),
-            "sr1SavedRollup".into(),
-            "KT1SavedTicketer".into(),
-            Some("https://operator.shadownet.example".into()),
-            Some("operator-secret".into()),
-            "bootstrap1".into(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-
-        let displayed = display_network_profile_json(&profile);
-        assert!(displayed.contains("\"operator_bearer_token\": \"<redacted>\""));
-        assert!(!displayed.contains("operator-secret"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn network_profile_is_saved_with_private_file_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let profile_path = dir.path().join("wallet.network.json");
-        let profile = shadownet_profile(
-            "https://saved-rollup.example".into(),
-            "sr1SavedRollup".into(),
-            "KT1SavedTicketer".into(),
-            Some("https://operator.shadownet.example".into()),
-            Some("operator-secret".into()),
-            "bootstrap1".into(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-
-        save_network_profile(&profile_path, &profile).expect("save profile");
-
-        let mode = std::fs::metadata(&profile_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
     }
 
     #[test]
@@ -6583,7 +6913,7 @@ mod network_profile_tests {
 
     #[test]
     fn rollup_rpc_load_notes_since_reads_chunked_note_payloads() {
-        let wallet = super::tests::test_wallet(1);
+        let wallet = super::tests::test_wallet(1, None);
         let mut rseed = ZERO;
         rseed[0] = 0x55;
         let note_memo =
@@ -6706,4 +7036,288 @@ mod network_profile_tests {
         assert_eq!(mutez_to_tez_string(1_500_000), "1.5");
         assert_eq!(mutez_to_tez_string(2_000_000), "2");
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Wallet HTTP server (trust-me-bro mode)
+// ═══════════════════════════════════════════════════════════════════════
+
+pub fn wallet_server_entry() {
+    use axum::{
+        extract::State,
+        http::StatusCode,
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    // Parse args — supports both `--flag value` and `--flag=value` forms.
+    let args: Vec<String> = std::env::args().collect();
+    let mut wallet_path = "wallet.json".to_string();
+    let mut ledger_url = "http://localhost:8080".to_string();
+    let mut port: u16 = 8081;
+    let mut trust_me_bro = false;
+    let mut proving_service: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(v) = arg.strip_prefix("--wallet=") {
+            wallet_path = v.to_string();
+        } else if arg == "--wallet" {
+            i += 1; if i < args.len() { wallet_path = args[i].clone(); }
+        } else if let Some(v) = arg.strip_prefix("--ledger=") {
+            ledger_url = v.to_string();
+        } else if arg == "--ledger" {
+            i += 1; if i < args.len() { ledger_url = args[i].clone(); }
+        } else if let Some(v) = arg.strip_prefix("--port=") {
+            port = v.parse().unwrap_or(8081);
+        } else if arg == "--port" {
+            i += 1; if i < args.len() { port = args[i].parse().unwrap_or(8081); }
+        } else if arg == "--trust-me-bro" {
+            trust_me_bro = true;
+        } else if let Some(v) = arg.strip_prefix("--proving-service=") {
+            proving_service = Some(v.to_string());
+        } else if arg == "--proving-service" {
+            i += 1; if i < args.len() { proving_service = Some(args[i].clone()); }
+        }
+        i += 1;
+    }
+
+    let pc = ProveConfig {
+        skip_proof: trust_me_bro,
+        reprove_bin: String::new(),
+        executables_dir: String::new(),
+        proving_service_url: proving_service,
+    };
+
+    // Create wallet if it does not exist.
+    if !std::path::Path::new(&wallet_path).exists() {
+        cmd_keygen(&wallet_path).expect("failed to create wallet");
+    }
+
+    let wallet = load_wallet(&wallet_path).expect("failed to load wallet");
+
+    type WalletState = Arc<Mutex<(WalletFile, String, String, ProveConfig)>>;
+
+    async fn balance_handler(
+        State(st): State<WalletState>,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+        let guard = st.lock().unwrap();
+        let (ref w, _, _, _) = *guard;
+        let bal = w.available_balance();
+        Ok(Json(serde_json::json!({ "private_balance": bal })))
+    }
+
+    async fn address_handler(
+        State(st): State<WalletState>,
+    ) -> Result<Json<PaymentAddress>, (StatusCode, String)> {
+        let mut guard = st.lock().unwrap();
+        let (ref mut w, ref path, _, _) = *guard;
+        let (_, addr) = w.next_address().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        save_wallet(path, w).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        Ok(Json(addr))
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ShieldBody {
+        sender: String,
+        amount: u64,
+    }
+
+    async fn shield_handler(
+        State(st): State<WalletState>,
+        Json(body): Json<ShieldBody>,
+    ) -> Result<Json<ShieldResp>, (StatusCode, String)> {
+        tokio::task::block_in_place(|| {
+            let mut guard = st.lock().unwrap();
+            let (ref mut w, ref path, ref ledger, ref pc) = *guard;
+
+            let (_state, address) = w
+                .next_address()
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            let (proof, shield_cm, shield_enc) = if pc.skip_proof {
+                (Proof::TrustMeBro, ZERO, None)
+            } else {
+                let rseed = random_felt();
+                let rcm = derive_rcm(&rseed);
+                let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
+                let cm = commit(&address.d_j, body.amount, &rcm, &otag);
+                let sender_f = hash(body.sender.as_bytes());
+                let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
+                    address.ek_v.as_slice().try_into()
+                        .map_err(|_| (StatusCode::BAD_REQUEST, "bad ek_v length".to_string()))?,
+                ).map_err(|_| (StatusCode::BAD_REQUEST, "invalid ek_v".to_string()))?;
+                let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
+                    address.ek_d.as_slice().try_into()
+                        .map_err(|_| (StatusCode::BAD_REQUEST, "bad ek_d length".to_string()))?,
+                ).map_err(|_| (StatusCode::BAD_REQUEST, "invalid ek_d".to_string()))?;
+                let enc = encrypt_note(body.amount, &rseed, None, &ek_v_recv, &ek_d_recv);
+                let memo_ct_hash_f = memo_ct_hash(&enc);
+                let args: Vec<String> = vec![
+                    felt_u64_to_hex(9),
+                    felt_u64_to_hex(body.amount),
+                    felt_to_hex(&cm),
+                    felt_to_hex(&sender_f),
+                    felt_to_hex(&memo_ct_hash_f),
+                    felt_to_hex(&address.auth_root),
+                    felt_to_hex(&address.auth_pub_seed),
+                    felt_to_hex(&address.nk_tag),
+                    felt_to_hex(&address.d_j),
+                    felt_to_hex(&rseed),
+                ];
+                let proof = pc.make_proof("run_shield", &args)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                (proof, cm, Some(enc))
+            };
+
+            let req = ShieldReq {
+                sender: body.sender,
+                v: body.amount,
+                address,
+                memo: None,
+                proof,
+                client_cm: shield_cm,
+                client_enc: shield_enc,
+            };
+
+            let resp: ShieldResp = post_json(&format!("{}/shield", ledger), &req)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+            // Save only after successful POST so a failed shield doesn't
+            // permanently consume an address slot on disk.
+            save_wallet(path, w).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            Ok(Json(resp))
+        })
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TransferBody {
+        to: PaymentAddress,
+        amount: u64,
+    }
+
+    async fn transfer_handler(
+        State(st): State<WalletState>,
+        Json(body): Json<TransferBody>,
+    ) -> Result<Json<TransferResp>, (StatusCode, String)> {
+        tokio::task::block_in_place(|| {
+            let mut guard = st.lock().unwrap();
+            let (ref mut w, ref path, ref ledger, ref pc) = *guard;
+
+            let tree_info: TreeInfoResp = get_json(&format!("{}/tree", ledger))
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            let root = tree_info.root;
+
+            let prepared = if pc.skip_proof {
+                prepare_transfer_skip_proof(w, root, &body.to, body.amount, None)
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e))?
+            } else {
+                prepare_transfer_with_proof(w, path, ledger, root, &body.to, body.amount, None, pc)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            };
+
+            save_wallet(path, w).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            let resp: TransferResp = post_json(&format!("{}/transfer", ledger), &prepared.req)
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+
+            finalize_successful_spend(path, w, &prepared.selected)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            Ok(Json(resp))
+        })
+    }
+
+    #[derive(serde::Deserialize)]
+    struct UnshieldBody {
+        recipient: String,
+        amount: u64,
+    }
+
+    async fn unshield_handler(
+        State(st): State<WalletState>,
+        Json(body): Json<UnshieldBody>,
+    ) -> Result<Json<UnshieldResp>, (StatusCode, String)> {
+        tokio::task::block_in_place(|| {
+            let mut guard = st.lock().unwrap();
+            let (ref mut w, ref path, ref ledger, ref pc) = *guard;
+
+            let tree_info: TreeInfoResp = get_json(&format!("{}/tree", ledger))
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            let root = tree_info.root;
+
+            let prepared = if pc.skip_proof {
+                prepare_unshield_skip_proof(w, root, body.amount, &body.recipient)
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e))?
+            } else {
+                prepare_unshield_with_proof(w, path, ledger, root, body.amount, &body.recipient, pc)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            };
+
+            save_wallet(path, w).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            let resp: UnshieldResp = post_json(&format!("{}/unshield", ledger), &prepared.req)
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+
+            finalize_successful_spend(path, w, &prepared.selected)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            Ok(Json(resp))
+        })
+    }
+
+    async fn scan_handler(
+        State(st): State<WalletState>,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+        tokio::task::block_in_place(|| {
+            let mut guard = st.lock().unwrap();
+            let (ref mut w, ref path, ref ledger, _) = *guard;
+
+            let url = format!("{}/notes?cursor={}", ledger, w.scanned);
+            let feed: NotesFeedResp =
+                get_json(&url).map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            let nf_resp: NullifiersResp =
+                get_json(&format!("{}/nullifiers", ledger))
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+
+            let summary = apply_scan_feed(w, &feed, nf_resp.nullifiers);
+            save_wallet(path, w).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            Ok(Json(serde_json::json!({
+                "found": summary.found,
+                "spent": summary.spent,
+            })))
+        })
+    }
+
+    let mode = if trust_me_bro {
+        "trust-me-bro".to_string()
+    } else if let Some(ref url) = pc.proving_service_url {
+        format!("proving-service={}", url)
+    } else {
+        "trust-me-bro (default)".to_string()
+    };
+
+    let state: WalletState = Arc::new(Mutex::new((wallet, wallet_path, ledger_url, pc)));
+
+    let app = Router::new()
+        .route("/balance", get(balance_handler))
+        .route("/address", get(address_handler))
+        .route("/shield", post(shield_handler))
+        .route("/transfer", post(transfer_handler))
+        .route("/unshield", post(unshield_handler))
+        .route("/scan", post(scan_handler))
+        .with_state(state);
+
+    eprintln!("wallet-server listening on 0.0.0.0:{} [{}]", port, mode);
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
 }

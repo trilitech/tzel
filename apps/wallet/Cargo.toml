@@ -3,9 +3,17 @@ name = "tzel-wallet-app"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "tzel_wallet_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sp-client"
 path = "src/bin/sp-client.rs"
+
+[[bin]]
+name = "wallet-server"
+path = "src/bin/wallet-server.rs"
 
 [[bin]]
 name = "tzel-wallet"
