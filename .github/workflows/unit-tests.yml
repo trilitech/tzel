@@ -45,7 +45,6 @@ jobs:
           cargo +nightly-2025-07-14 test -p tzel-verifier --lib
           cargo test --lib -p tzel-services
           cargo test --test integration -p tzel-services
-          cargo test --test cross_impl_interop -p tzel-services
           cargo test --manifest-path services/tzel/Cargo.toml --bin tzel-operator
           cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --lib
           cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --test bridge_flow
@@ -88,5 +87,11 @@ jobs:
         run: |
           opam install -y dune alcotest cstruct ctypes ctypes-foreign hex mirage-crypto yojson
 
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Run OCaml unit tests
-        run: ./scripts/ocaml_unit_tests.sh
+        run: opam exec -- ./scripts/ocaml_unit_tests.sh
+
+      - name: Run cross-implementation interop test
+        run: opam exec -- cargo test --test cross_impl_interop -p tzel-services
