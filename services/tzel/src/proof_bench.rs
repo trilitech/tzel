@@ -2,7 +2,7 @@ use tzel_core::{
     commit, derive_account, derive_address, derive_ask, derive_auth_pub_seed, derive_nk_tag,
     derive_rcm, felt_tag, hash, hash_two, nullifier, owner_tag, transfer_sighash, u64_to_felt,
     unshield_sighash, wots_pk, wots_pk_to_leaf, wots_sign, xmss_tree_node_hash, Account,
-    CircuitKind, MerkleTree, AUTH_DEPTH, AUTH_TREE_SIZE, DEPTH, F, WOTS_CHAINS,
+    CircuitKind, MerkleTree, AUTH_DEPTH, AUTH_TREE_SIZE, DEPTH, F, MIN_TX_FEE, WOTS_CHAINS,
 };
 
 pub const MAX_BENCH_INPUTS: usize = 7;
@@ -89,30 +89,68 @@ pub fn build_shield_bench_witness() -> BenchWitness {
     let sender = hash(b"bench-sender");
     let (d_j, auth_root, auth_pub_seed, nk_tag, memo_ct_hash_f, rseed) =
         synthetic_output_fields(0xC000);
-    let v_pub = 1_000u64;
+    let (
+        producer_d_j,
+        producer_auth_root,
+        producer_auth_pub_seed,
+        producer_nk_tag,
+        producer_memo_ct_hash_f,
+        producer_rseed,
+    ) = synthetic_output_fields(0xC100);
+    let v_pub = 200_000u64;
+    let fee = MIN_TX_FEE;
+    let producer_fee = 1u64;
     let cm = commit(
         &d_j,
         v_pub,
         &derive_rcm(&rseed),
         &owner_tag(&auth_root, &auth_pub_seed, &nk_tag),
     );
+    let producer_cm = commit(
+        &producer_d_j,
+        producer_fee,
+        &derive_rcm(&producer_rseed),
+        &owner_tag(
+            &producer_auth_root,
+            &producer_auth_pub_seed,
+            &producer_nk_tag,
+        ),
+    );
 
     let args = vec![
-        felt_u64_to_hex(9),
+        felt_u64_to_hex(18),
         felt_u64_to_hex(v_pub),
+        felt_u64_to_hex(fee),
+        felt_u64_to_hex(producer_fee),
         felt_to_hex(&cm),
+        felt_to_hex(&producer_cm),
         felt_to_hex(&sender),
         felt_to_hex(&memo_ct_hash_f),
+        felt_to_hex(&producer_memo_ct_hash_f),
         felt_to_hex(&auth_root),
         felt_to_hex(&auth_pub_seed),
         felt_to_hex(&nk_tag),
         felt_to_hex(&d_j),
         felt_to_hex(&rseed),
+        felt_to_hex(&producer_auth_root),
+        felt_to_hex(&producer_auth_pub_seed),
+        felt_to_hex(&producer_nk_tag),
+        felt_to_hex(&producer_d_j),
+        felt_to_hex(&producer_rseed),
     ];
 
     BenchWitness {
         args,
-        expected_public_outputs: vec![u64_to_felt(v_pub), cm, sender, memo_ct_hash_f],
+        expected_public_outputs: vec![
+            u64_to_felt(v_pub),
+            u64_to_felt(fee),
+            u64_to_felt(producer_fee),
+            cm,
+            producer_cm,
+            sender,
+            memo_ct_hash_f,
+            producer_memo_ct_hash_f,
+        ],
     }
 }
 
@@ -133,7 +171,7 @@ pub fn build_transfer_bench_witness(n_inputs: usize) -> BenchWitness {
     let mut values = Vec::with_capacity(n_inputs);
     let mut rseeds = Vec::with_capacity(n_inputs);
     for i in 0..n_inputs {
-        let value = 11 + i as u64;
+        let value = 200_000 + 10_000 * i as u64;
         let rseed = bench_rseed(b"bench-tr-in", i);
         let cm = commit(&d_j, value, &derive_rcm(&rseed), &otag);
         tree.append(cm);
@@ -154,8 +192,12 @@ pub fn build_transfer_bench_witness(n_inputs: usize) -> BenchWitness {
         synthetic_output_fields(0xD000);
     let (d_j_2, auth_root_2, auth_pub_seed_2, nk_tag_2, mh_2, rseed_2) =
         synthetic_output_fields(0xE000);
-    let v_1 = total_in / 2;
-    let v_2 = total_in - v_1;
+    let (d_j_3, auth_root_3, auth_pub_seed_3, nk_tag_3, mh_3, rseed_3) =
+        synthetic_output_fields(0xF000);
+    let producer_fee = 1u64;
+    let spendable = total_in - MIN_TX_FEE - producer_fee;
+    let v_1 = spendable / 2;
+    let v_2 = spendable - v_1;
     let cm_1 = commit(
         &d_j_1,
         v_1,
@@ -168,9 +210,27 @@ pub fn build_transfer_bench_witness(n_inputs: usize) -> BenchWitness {
         &derive_rcm(&rseed_2),
         &owner_tag(&auth_root_2, &auth_pub_seed_2, &nk_tag_2),
     );
+    let cm_3 = commit(
+        &d_j_3,
+        producer_fee,
+        &derive_rcm(&rseed_3),
+        &owner_tag(&auth_root_3, &auth_pub_seed_3, &nk_tag_3),
+    );
 
     let auth_domain = u64_to_felt(0xF001);
-    let sighash = transfer_sighash(&auth_domain, &root, &nullifiers, &cm_1, &cm_2, &mh_1, &mh_2);
+    let fee = MIN_TX_FEE;
+    let sighash = transfer_sighash(
+        &auth_domain,
+        &root,
+        &nullifiers,
+        fee,
+        &cm_1,
+        &cm_2,
+        &cm_3,
+        &mh_1,
+        &mh_2,
+        &mh_3,
+    );
 
     let mut cm_paths = Vec::with_capacity(n_inputs);
     let mut wots_sigs = Vec::with_capacity(n_inputs);
@@ -183,12 +243,13 @@ pub fn build_transfer_bench_witness(n_inputs: usize) -> BenchWitness {
     }
 
     let total_fields =
-        3 + 9 * n_inputs + n_inputs * DEPTH + n_inputs * AUTH_DEPTH + n_inputs * WOTS_CHAINS + 16;
+        4 + 9 * n_inputs + n_inputs * DEPTH + n_inputs * AUTH_DEPTH + n_inputs * WOTS_CHAINS + 24;
     let mut args = Vec::with_capacity(total_fields + 1);
     args.push(felt_u64_to_hex(total_fields as u64));
     args.push(felt_u64_to_hex(n_inputs as u64));
     args.push(felt_to_hex(&auth_domain));
     args.push(felt_to_hex(&root));
+    args.push(felt_u64_to_hex(fee));
 
     for i in 0..n_inputs {
         args.push(felt_to_hex(&nullifiers[i]));
@@ -235,9 +296,19 @@ pub fn build_transfer_bench_witness(n_inputs: usize) -> BenchWitness {
     args.push(felt_to_hex(&nk_tag_2));
     args.push(felt_to_hex(&mh_2));
 
+    args.push(felt_to_hex(&cm_3));
+    args.push(felt_to_hex(&d_j_3));
+    args.push(felt_u64_to_hex(producer_fee));
+    args.push(felt_to_hex(&rseed_3));
+    args.push(felt_to_hex(&auth_root_3));
+    args.push(felt_to_hex(&auth_pub_seed_3));
+    args.push(felt_to_hex(&nk_tag_3));
+    args.push(felt_to_hex(&mh_3));
+
     let mut expected_public_outputs = vec![auth_domain, root];
     expected_public_outputs.extend(nullifiers.iter().copied());
-    expected_public_outputs.extend([cm_1, cm_2, mh_1, mh_2]);
+    expected_public_outputs.push(u64_to_felt(fee));
+    expected_public_outputs.extend([cm_1, cm_2, cm_3, mh_1, mh_2, mh_3]);
 
     BenchWitness {
         args,
@@ -262,7 +333,7 @@ pub fn build_unshield_bench_witness(n_inputs: usize) -> BenchWitness {
     let mut values = Vec::with_capacity(n_inputs);
     let mut rseeds = Vec::with_capacity(n_inputs);
     for i in 0..n_inputs {
-        let value = 13 + i as u64;
+        let value = 210_000 + 10_000 * i as u64;
         let rseed = bench_rseed(b"bench-un-in", i);
         let cm = commit(&d_j, value, &derive_rcm(&rseed), &otag);
         tree.append(cm);
@@ -280,8 +351,11 @@ pub fn build_unshield_bench_witness(n_inputs: usize) -> BenchWitness {
     let total_in: u64 = values.iter().sum();
 
     let auth_domain = u64_to_felt(0xF101);
-    let v_pub = total_in / 2;
-    let v_change = total_in - v_pub;
+    let fee = MIN_TX_FEE;
+    let producer_fee = 1u64;
+    let spendable = total_in - fee - producer_fee;
+    let v_pub = spendable / 2;
+    let v_change = spendable - v_pub;
     let recipient = hash(b"bench-recipient");
     let (
         d_j_change,
@@ -297,14 +371,25 @@ pub fn build_unshield_bench_witness(n_inputs: usize) -> BenchWitness {
         &derive_rcm(&rseed_change),
         &owner_tag(&auth_root_change, &auth_pub_seed_change, &nk_tag_change),
     );
+    let (d_j_fee, auth_root_fee, auth_pub_seed_fee, nk_tag_fee, mh_fee, rseed_fee) =
+        synthetic_output_fields(0xF300);
+    let cm_fee = commit(
+        &d_j_fee,
+        producer_fee,
+        &derive_rcm(&rseed_fee),
+        &owner_tag(&auth_root_fee, &auth_pub_seed_fee, &nk_tag_fee),
+    );
     let sighash = unshield_sighash(
         &auth_domain,
         &root,
         &nullifiers,
         v_pub,
+        fee,
         &recipient,
         &cm_change,
         &mh_change,
+        &cm_fee,
+        &mh_fee,
     );
 
     let mut cm_paths = Vec::with_capacity(n_inputs);
@@ -318,13 +403,14 @@ pub fn build_unshield_bench_witness(n_inputs: usize) -> BenchWitness {
     }
 
     let total_fields =
-        5 + 9 * n_inputs + n_inputs * DEPTH + n_inputs * AUTH_DEPTH + n_inputs * WOTS_CHAINS + 8;
+        6 + 9 * n_inputs + n_inputs * DEPTH + n_inputs * AUTH_DEPTH + n_inputs * WOTS_CHAINS + 15;
     let mut args = Vec::with_capacity(total_fields + 1);
     args.push(felt_u64_to_hex(total_fields as u64));
     args.push(felt_u64_to_hex(n_inputs as u64));
     args.push(felt_to_hex(&auth_domain));
     args.push(felt_to_hex(&root));
     args.push(felt_u64_to_hex(v_pub));
+    args.push(felt_u64_to_hex(fee));
     args.push(felt_to_hex(&recipient));
 
     for i in 0..n_inputs {
@@ -363,9 +449,25 @@ pub fn build_unshield_bench_witness(n_inputs: usize) -> BenchWitness {
     args.push(felt_to_hex(&nk_tag_change));
     args.push(felt_to_hex(&mh_change));
 
+    args.push(felt_to_hex(&d_j_fee));
+    args.push(felt_u64_to_hex(producer_fee));
+    args.push(felt_to_hex(&rseed_fee));
+    args.push(felt_to_hex(&auth_root_fee));
+    args.push(felt_to_hex(&auth_pub_seed_fee));
+    args.push(felt_to_hex(&nk_tag_fee));
+    args.push(felt_to_hex(&mh_fee));
+
     let mut expected_public_outputs = vec![auth_domain, root];
     expected_public_outputs.extend(nullifiers.iter().copied());
-    expected_public_outputs.extend([u64_to_felt(v_pub), recipient, cm_change, mh_change]);
+    expected_public_outputs.extend([
+        u64_to_felt(v_pub),
+        u64_to_felt(fee),
+        recipient,
+        cm_change,
+        mh_change,
+        cm_fee,
+        mh_fee,
+    ]);
 
     BenchWitness {
         args,

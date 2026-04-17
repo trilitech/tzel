@@ -297,7 +297,7 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
             .unwrap()
             .balances
             .get(fixture.shield.sender.as_str()),
-        Some(&fixture.shield.v)
+        Some(&(fixture.shield.v + fixture.shield.fee + fixture.shield.producer_fee))
     );
 
     apply_fixture_shield(&mut host, fixture, 3);
@@ -306,6 +306,7 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
         KernelResult::Shield(resp) => {
             assert_eq!(resp.index, 0);
             assert_eq!(resp.cm, fixture.shield.client_cm);
+            assert_eq!(resp.producer_index, 1);
         }
         other => panic!("unexpected rollup result: {:?}", other),
     }
@@ -314,12 +315,17 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
         ledger.balances.get(fixture.shield.sender.as_str()),
         Some(&0)
     );
-    assert_eq!(ledger.tree.leaves, vec![fixture.shield.client_cm]);
+    assert_eq!(
+        ledger.tree.leaves,
+        vec![fixture.shield.client_cm, fixture.shield.producer_cm]
+    );
 
     apply_fixture_transfer(&mut host, fixture, 4);
 
     match read_last_result(&host).unwrap() {
-        KernelResult::Transfer(resp) => assert_eq!((resp.index_1, resp.index_2), (1, 2)),
+        KernelResult::Transfer(resp) => {
+            assert_eq!((resp.index_1, resp.index_2, resp.index_3), (2, 3, 4))
+        }
         other => panic!("unexpected rollup result: {:?}", other),
     }
     let ledger = read_ledger(&host).unwrap();
@@ -327,8 +333,10 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
         ledger.tree.leaves,
         vec![
             fixture.shield.client_cm,
+            fixture.shield.producer_cm,
             fixture.transfer.cm_1,
             fixture.transfer.cm_2,
+            fixture.transfer.cm_3,
         ]
     );
     assert_eq!(ledger.nullifiers.len(), 1);
@@ -338,7 +346,10 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
     apply_fixture_unshield(&mut restarted, fixture, 5);
 
     match read_last_result(&restarted).unwrap() {
-        KernelResult::Unshield(resp) => assert_eq!(resp.change_index, None),
+        KernelResult::Unshield(resp) => {
+            assert_eq!(resp.change_index, None);
+            assert_eq!(resp.producer_index, 5);
+        }
         other => panic!("unexpected rollup result: {:?}", other),
     }
     let ledger = read_ledger(&restarted).unwrap();
@@ -516,7 +527,9 @@ fn verified_transfer_consumes_one_note_and_creates_change_and_recipient_notes() 
     apply_fixture_transfer(&mut host, fixture, 4);
 
     match read_last_result(&host).unwrap() {
-        KernelResult::Transfer(resp) => assert_eq!((resp.index_1, resp.index_2), (1, 2)),
+        KernelResult::Transfer(resp) => {
+            assert_eq!((resp.index_1, resp.index_2, resp.index_3), (2, 3, 4))
+        }
         other => panic!("unexpected rollup result: {:?}", other),
     }
 
@@ -525,7 +538,7 @@ fn verified_transfer_consumes_one_note_and_creates_change_and_recipient_notes() 
     assert_eq!(after_transfer.withdrawals, before_transfer.withdrawals);
     assert_eq!(
         after_transfer.tree.leaves.len(),
-        before_transfer.tree.leaves.len() + 2
+        before_transfer.tree.leaves.len() + 3
     );
     assert_eq!(
         after_transfer.nullifiers.len(),
@@ -535,8 +548,10 @@ fn verified_transfer_consumes_one_note_and_creates_change_and_recipient_notes() 
         after_transfer.tree.leaves,
         vec![
             fixture.shield.client_cm,
+            fixture.shield.producer_cm,
             fixture.transfer.cm_1,
             fixture.transfer.cm_2,
+            fixture.transfer.cm_3,
         ]
     );
     assert!(after_transfer
@@ -725,11 +740,15 @@ fn kernel_shield_req_from_fixture(req: &ShieldReq) -> KernelShieldReq {
     KernelShieldReq {
         sender: req.sender.clone(),
         v: req.v,
+        fee: req.fee,
+        producer_fee: req.producer_fee,
         address: req.address.clone(),
         memo: req.memo.clone(),
         proof: kernel_proof_from_fixture(&req.proof),
         client_cm: req.client_cm,
         client_enc: req.client_enc.clone(),
+        producer_cm: req.producer_cm,
+        producer_enc: req.producer_enc.clone(),
     }
 }
 
@@ -738,10 +757,13 @@ fn kernel_transfer_req_from_fixture(req: &TransferReq) -> KernelTransferReq {
     KernelTransferReq {
         root: req.root,
         nullifiers: req.nullifiers.clone(),
+        fee: req.fee,
         cm_1: req.cm_1,
         cm_2: req.cm_2,
+        cm_3: req.cm_3,
         enc_1: req.enc_1.clone(),
         enc_2: req.enc_2.clone(),
+        enc_3: req.enc_3.clone(),
         proof: kernel_proof_from_fixture(&req.proof),
     }
 }
@@ -752,9 +774,12 @@ fn kernel_unshield_req_from_fixture(req: &UnshieldReq) -> KernelUnshieldReq {
         root: req.root,
         nullifiers: req.nullifiers.clone(),
         v_pub: req.v_pub,
+        fee: req.fee,
         recipient: req.recipient.clone(),
         cm_change: req.cm_change,
         enc_change: req.enc_change.clone(),
+        cm_fee: req.cm_fee,
+        enc_fee: req.enc_fee.clone(),
         proof: kernel_proof_from_fixture(&req.proof),
     }
 }
@@ -795,7 +820,7 @@ fn apply_fixture_deposit(host: &mut TestHost, fixture: &VerifiedBridgeFixture, l
         0,
         encode_custom_ticket_deposit_message(
             fixture.shield.sender.as_bytes().to_vec(),
-            fixture.shield.v,
+            fixture.shield.v + fixture.shield.fee + fixture.shield.producer_fee,
             &fixture.bridge_ticketer,
             &fixture.bridge_ticketer,
             0,

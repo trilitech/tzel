@@ -4,6 +4,7 @@
 ///   [0]  N
 ///   [1]  auth_domain
 ///   [2]  root
+///   [3]  fee
 ///   Then per input (N times):
 ///     nf, nk_spend, auth_root, auth_pub_seed, auth_index,
 ///     d_j, v, rseed, cm_path_idx
@@ -11,8 +12,11 @@
 ///   Then per input (N times): AUTH_DEPTH auth siblings
 ///   Then per input (N times): WOTS_CHAINS sig values
 ///   Then output 1: cm_1, d_j_1, v_1, rseed_1, auth_root_1, auth_pub_seed_1, nk_tag_1,
-///   memo_ct_hash_1 Then output 2: cm_2, d_j_2, v_2, rseed_2, auth_root_2, auth_pub_seed_2,
-///   nk_tag_2, memo_ct_hash_2
+///   memo_ct_hash_1
+///   Then output 2: cm_2, d_j_2, v_2, rseed_2, auth_root_2, auth_pub_seed_2, nk_tag_2,
+///   memo_ct_hash_2
+///   Then output 3: cm_3, d_j_3, v_3, rseed_3, auth_root_3, auth_pub_seed_3, nk_tag_3,
+///   memo_ct_hash_3
 
 use tzel::merkle;
 use tzel::{transfer, xmss_common};
@@ -26,6 +30,8 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let auth_domain = *args.at(pos);
     pos += 1;
     let root = *args.at(pos);
+    pos += 1;
+    let fee: u64 = (*args.at(pos)).try_into().unwrap();
     pos += 1;
 
     let mut nf_list: Array<felt252> = array![];
@@ -119,14 +125,33 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let mh_2 = *args.at(pos);
     pos += 1;
 
+    let cm_3 = *args.at(pos);
+    pos += 1;
+    let d_j_3 = *args.at(pos);
+    pos += 1;
+    let v_3: u64 = (*args.at(pos)).try_into().unwrap();
+    pos += 1;
+    let rseed_3 = *args.at(pos);
+    pos += 1;
+    let auth_root_3 = *args.at(pos);
+    pos += 1;
+    let auth_pub_seed_3 = *args.at(pos);
+    pos += 1;
+    let nk_tag_3 = *args.at(pos);
+    pos += 1;
+    let mh_3 = *args.at(pos);
+    pos += 1;
+
     assert(pos == args.len(), 'unexpected trailing args');
 
     transfer::verify(
         auth_domain,
         root,
         nf_list.span(),
+        fee,
         cm_1,
         cm_2,
+        cm_3,
         nk_spend_list.span(),
         auth_root_list.span(),
         auth_pub_seed_list.span(),
@@ -152,5 +177,12 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         auth_pub_seed_2,
         nk_tag_2,
         mh_2,
+        d_j_3,
+        v_3,
+        rseed_3,
+        auth_root_3,
+        auth_pub_seed_3,
+        nk_tag_3,
+        mh_3,
     )
 }

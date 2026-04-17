@@ -1,22 +1,50 @@
 /// Parameterized shield executable — takes witness data as input.
 /// Arguments (flattened felt252 array):
-///   [v_pub, cm_new, sender, memo_ct_hash, auth_root, auth_pub_seed, nk_tag, d_j, rseed]
+///   [v_note, fee, producer_fee, cm_new, cm_producer, sender, memo_ct_hash,
+///    producer_memo_ct_hash, auth_root, auth_pub_seed, nk_tag, d_j, rseed,
+///    producer_auth_root, producer_auth_pub_seed, producer_nk_tag, producer_d_j, producer_rseed]
 
 use tzel::shield;
 
 #[executable]
 fn main(args: Array<felt252>) -> Array<felt252> {
-    assert(args.len() == 9, 'shield: need 9 args');
-    let v_pub: u64 = (*args.at(0)).try_into().unwrap();
-    let cm_new = *args.at(1);
-    let sender = *args.at(2);
-    let memo_ct_hash = *args.at(3);
-    let auth_root = *args.at(4);
-    let auth_pub_seed = *args.at(5);
-    let nk_tag = *args.at(6);
-    let d_j = *args.at(7);
-    let rseed = *args.at(8);
+    assert(args.len() == 18, 'shield: need 18 args');
+    let v_note: u64 = (*args.at(0)).try_into().unwrap();
+    let fee: u64 = (*args.at(1)).try_into().unwrap();
+    let producer_fee: u64 = (*args.at(2)).try_into().unwrap();
+    let cm_new = *args.at(3);
+    let cm_producer = *args.at(4);
+    let sender = *args.at(5);
+    let memo_ct_hash = *args.at(6);
+    let producer_memo_ct_hash = *args.at(7);
+    let auth_root = *args.at(8);
+    let auth_pub_seed = *args.at(9);
+    let nk_tag = *args.at(10);
+    let d_j = *args.at(11);
+    let rseed = *args.at(12);
+    let producer_auth_root = *args.at(13);
+    let producer_auth_pub_seed = *args.at(14);
+    let producer_nk_tag = *args.at(15);
+    let producer_d_j = *args.at(16);
+    let producer_rseed = *args.at(17);
     shield::verify(
-        v_pub, cm_new, sender, memo_ct_hash, auth_root, auth_pub_seed, nk_tag, d_j, rseed,
+        v_note,
+        fee,
+        producer_fee,
+        cm_new,
+        cm_producer,
+        sender,
+        memo_ct_hash,
+        producer_memo_ct_hash,
+        auth_root,
+        auth_pub_seed,
+        nk_tag,
+        d_j,
+        rseed,
+        producer_auth_root,
+        producer_auth_pub_seed,
+        producer_nk_tag,
+        producer_d_j,
+        producer_rseed,
     )
 }

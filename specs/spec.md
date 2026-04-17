@@ -205,9 +205,23 @@ This prevents an attacker from creating two identical commitments (same d_j, v, 
 
 ## Transaction Types
 
+The reference rollup currently enforces a fixed transaction fee:
+
+```
+MIN_TX_FEE = 100000 mutez   // 0.1 tez
+```
+
+Shield, transfer, and unshield transactions MUST publish `fee >= MIN_TX_FEE`.
+That fee is burned: it is deducted from consumed value and is not recreated as a
+public or private output.
+
+Each private transaction also carries a distinct `producer_fee > 0` that is
+paid to the DAL slot producer as an ordinary shielded note output. This is a
+separate resource price from the burned rollup fee above.
+
 ### Shield (public -> private)
 
-**Public outputs:** `[v_pub, cm_new, sender_id, memo_ct_hash]`
+**Public outputs:** `[v_pub, fee, producer_fee, cm_new, cm_producer, sender_id, memo_ct_hash, producer_memo_ct_hash]`
 
 `sender_id` is defined in [Public Account Identifier Encoding](#public-account-identifier-encoding). `auth_root` does NOT appear in the public outputs; it is a private input used only to compute `owner_tag`.
 
@@ -215,18 +229,27 @@ This prevents an attacker from creating two identical commitments (same d_j, v, 
 1. `rcm = H(H(TAG_RCM), rseed)`
 2. `owner_tag = H_owner(auth_root, pub_seed, nk_tag)` where `auth_root`, `pub_seed`, and `nk_tag` are private inputs from the recipient's payment address
 3. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
+4. `producer_rcm = H(H(TAG_RCM), producer_rseed)`
+5. `producer_owner_tag = H_owner(producer_auth_root, producer_pub_seed, producer_nk_tag)` where those values are private inputs from the DAL producer's payment address
+6. `cm_producer = H_commit(producer_d_j, producer_fee, producer_rcm, producer_owner_tag)`
+7. `producer_fee > 0`
 
-`memo_ct_hash` is computed client-side as `H(ct_d || tag || ct_v || nonce || encrypted_data)` — covering ALL on-chain note data — and passed into the circuit as a public input.
+`memo_ct_hash` and `producer_memo_ct_hash` are computed client-side as
+`H(ct_d || tag || ct_v || nonce || encrypted_data)` — covering ALL on-chain
+note data — and passed into the circuit as public inputs.
 
-**Contract / ledger checks:** proof valid, sender binding per [Shield sender binding](#shield-sender-binding), `H(posted_memo_calldata) == memo_ct_hash`.
+**Contract / ledger checks:** proof valid, sender binding per [Shield sender binding](#shield-sender-binding), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= MIN_TX_FEE`.
 
-**State changes:** deduct `v_pub` from sender, append `cm_new` to T.
+**State changes:** deduct `v_pub + fee + producer_fee` from sender, append `cm_new` and `cm_producer` to T.
 
-### Transfer (N->2, where 1 <= N <= 7)
+### Transfer (N->recipient + change + producer fee, where 1 <= N <= 7)
 
-Consumes N private notes and creates exactly 2 new private notes. Handles splits (N=1), standard transfers (N=2), and consolidations (N>2) with a single circuit. N is a runtime parameter, not a program parameter — the program hash is the same for all N.
+Consumes N private notes and creates exactly 3 new private notes: the recipient
+note, the sender's change note, and a producer-fee note for DAL inclusion. N is
+a runtime parameter, not a program parameter — the program hash is the same for
+all N.
 
-**Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2]`
+**Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3, memo_ct_hash_1, memo_ct_hash_2, memo_ct_hash_3]`
 
 XMSS-style WOTS+ signature verification happens inside the STARK. No auth leaves, public keys, or signatures appear in the public outputs.
 
@@ -242,19 +265,21 @@ XMSS-style WOTS+ signature verification happens inside the STARK. No auth leaves
    - `auth_leaf_i = LTree(pub_seed_i, key_idx_i, pk_0, ..., pk_132)` from those recovered chain endpoints
    - Merkle membership of that exact `auth_leaf_i` at position `key_idx_i` against `auth_root_i` using the XMSS tree-node hash (auth key tree)
 2. All nullifiers pairwise distinct
-3. For both outputs:
+3. For all three outputs:
    - `owner_tag_out = H_owner(auth_root_out, pub_seed_out, nk_tag_out)` where `auth_root_out`, `pub_seed_out`, and `nk_tag_out` are private inputs from the recipient's payment address
    - `cm_out = H_commit(d_j_out, v_out, rcm_out, owner_tag_out)`
-4. `sum(v_inputs) = v_1 + v_2` (in u128)
+4. `v_3 > 0`
+5. `sum(v_inputs) = v_1 + v_2 + v_3 + fee` (in u128)
 5. All values are u64 (implicit range check)
 
-**Contract checks:** proof valid. No signature verification needed — the STARK proof proves spend authorization.
+**Contract checks:** proof valid, `fee >= MIN_TX_FEE`. No signature verification needed — the STARK proof proves spend authorization.
 
 ### Unshield (N->withdrawal + optional change, where 1 <= N <= 7)
 
-Consumes N private notes, releases `v_pub` to a public address, and optionally creates one private change note.
+Consumes N private notes, releases `v_pub` to a public address, and creates a
+producer-fee note plus an optional private change note.
 
-**Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, v_pub, recipient_id, cm_change, memo_ct_hash_change]`
+**Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, v_pub, fee, recipient_id, cm_change, memo_ct_hash_change, cm_fee, memo_ct_hash_fee]`
 
 `recipient_id` is defined in [Public Account Identifier Encoding](#public-account-identifier-encoding).
 
@@ -267,9 +292,11 @@ Consumes N private notes, releases `v_pub` to a public address, and optionally c
    - `owner_tag_c = H_owner(auth_root_c, pub_seed_c, nk_tag_c)` where `auth_root_c`, `pub_seed_c`, and `nk_tag_c` are private inputs
    - `cm_change = H_commit(d_j_c, v_change, rcm_c, owner_tag_c)`
 4. If no change: all change witness data constrained to zero (`v_change`, `d_j_change`, `rseed_change`, `auth_root_change`, `pub_seed_change`, `nk_tag_change`, `memo_ct_hash_change` = 0) to eliminate prover malleability
-5. `sum(v_inputs) = v_pub + v_change`
+5. `cm_fee = H_commit(d_j_fee, v_fee, rcm_fee, owner_tag_fee)` for the DAL producer note
+6. `v_fee > 0`
+7. `sum(v_inputs) = v_pub + v_change + v_fee + fee`
 
-**Contract / ledger checks:** proof valid. Verify recipient binding per [Public Account Identifier Encoding](#public-account-identifier-encoding), credit `v_pub` to that recipient account, append `cm_change` to T (if nonzero). No signature verification needed — the STARK proof proves spend authorization.
+**Contract / ledger checks:** proof valid, `fee >= MIN_TX_FEE`. Verify recipient binding per [Public Account Identifier Encoding](#public-account-identifier-encoding), credit `v_pub` to that recipient account, append `cm_change` to T (if nonzero), append `cm_fee` to T. No signature verification needed — the STARK proof proves spend authorization.
 
 ## Contract Consensus Rules
 
@@ -317,10 +344,10 @@ The WOTS+ signature inside the STARK binds to the transaction's public outputs. 
 
 ```
 // Transfer (type_tag = 0x01):
-sighash = fold(0x01, auth_domain, root, nf_0, ..., nf_{N-1}, cm_1, cm_2, mh_1, mh_2)
+sighash = fold(0x01, auth_domain, root, nf_0, ..., nf_{N-1}, fee, cm_1, cm_2, cm_3, mh_1, mh_2, mh_3)
 
 // Unshield (type_tag = 0x02):
-sighash = fold(0x02, auth_domain, root, nf_0, ..., nf_{N-1}, v_pub, recipient_id, cm_change, mh_change)
+sighash = fold(0x02, auth_domain, root, nf_0, ..., nf_{N-1}, v_pub, fee, recipient_id, cm_change, mh_change, cm_fee, mh_fee)
 ```
 
 The fold algorithm is the sequential left fold used by the client and circuit:
@@ -351,7 +378,7 @@ The contract appends commitments to the tree in sequential order (each new commi
 1. User constructs the transaction, computing the WOTS+ signature over the sighash with `sk_i` for each input.
 2. User gives the prover per-input: `(nk_spend_j, auth_root_j, wots_sig_i, auth_tree_path_i, d_j, v, rseed, commitment_tree_path, pos)`, plus output data including `auth_root` and `nk_tag` for output notes.
 3. Prover generates the STARK proof. The WOTS+ signature is verified inside the circuit.
-4. Prover returns proof to user. Public outputs contain only `[auth_domain, root, nullifiers, commitments, memo hashes]` — no auth leaves, public keys, or signatures.
+4. Prover returns proof to user. Public outputs contain only `[auth_domain, root, nullifiers, fee, commitments, memo hashes]` (or `[auth_domain, root, nullifiers, v_pub, fee, recipient_id, cm_change, memo_ct_hash_change, cm_fee, memo_ct_hash_fee]` for unshield) — no auth leaves, public keys, or signatures.
 5. Transaction (proof + note data) submitted on-chain. No separate signatures or public keys needed.
 
 ## Detection (Fuzzy Message Detection)
@@ -420,37 +447,37 @@ encrypted_data  — 1,080 bytes   ChaCha20-Poly1305(v:8 || rseed:32 || memo:1024
 
 ```
 proof             — ~295 KB    circuit proof (ZK, two-level recursive STARK)
-public_outputs    —  128 B     [v_pub, cm_new, sender_id, memo_ct_hash] (4 x 32 bytes)
-note_data         —  3.2 KB    1 output note
-                  ----------
-                  ~298 KB total (no spend signature — sender bound by external verifier check)
-```
-
-### Transfer (N->2)
-
-```
-proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
-public_outputs    — (N+6)*32 B  [auth_domain, root, nf_0..nf_{N-1}, cm_1, cm_2, mh_1, mh_2]
+public_outputs    —  256 B     [v_pub, fee, producer_fee, cm_new, cm_producer, sender_id, memo_ct_hash, producer_memo_ct_hash] (8 x 32 bytes)
 note_data         —  6.4 KB    2 output notes
                   ----------
-                  ~301 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
+                  ~302 KB total (no spend signature — sender bound by external verifier check)
 ```
 
-For a typical N=2 transfer: ~302 KB total.
-
-### Unshield (N->withdrawal + change)
+### Transfer (N->recipient + change + producer fee)
 
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
-public_outputs    — (N+6)*32 B  [auth_domain, root, nf_0..nf_{N-1}, v_pub, recipient_id, cm_change, mh_change]
-note_data         — 0-3.2 KB   0 or 1 change note
+public_outputs    — (N+8)*32 B  [auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3, mh_1, mh_2, mh_3]
+note_data         —  9.6 KB    3 output notes
                   ----------
-                  ~295-299 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
+                  ~305 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
 ```
 
-For a typical N=2 unshield: ~296-299 KB total.
+For a typical N=2 transfer: ~306 KB total.
 
-For transfer and unshield public-output parsing, the verifier infers the input count as `N = total_public_output_felts - 6`. That is, after the leading `auth_domain` and `root`, the final four felts are fixed-format outputs and the remaining middle slice is the nullifier list.
+### Unshield (N->withdrawal + optional change + producer fee)
+
+```
+proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
+public_outputs    — (N+8)*32 B  [auth_domain, root, nf_0..nf_{N-1}, v_pub, fee, recipient_id, cm_change, mh_change, cm_fee, mh_fee]
+note_data         — 3.2-6.4 KB  producer fee note plus optional change note
+                  ----------
+                  ~299-302 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
+```
+
+For a typical N=2 unshield: ~300-303 KB total.
+
+For transfer and unshield public-output parsing, the verifier infers the input count as `N = total_public_output_felts - 8`. That is, after the leading `auth_domain` and `root`, the final six felts are fixed-format outputs and the remaining middle slice is the nullifier list.
 
 ## Domain Separation
 

@@ -95,6 +95,8 @@ For delegated watch-only scanning, export watch material from a spending wallet:
   --rollup-node-url http://127.0.0.1:28944 \
   --rollup-address "$TZEL_ROLLUP_ADDRESS" \
   --bridge-ticketer "$TZEL_BRIDGE_TICKETER" \
+  --dal-fee 1 \
+  --dal-fee-address /var/lib/tzel/watch/producer-address.json \
   --source-alias "$TZEL_SOURCE_ALIAS"
 ```
 
@@ -118,6 +120,8 @@ the rollup state:
   --rollup-node-url http://127.0.0.1:28944 \
   --rollup-address "$TZEL_ROLLUP_ADDRESS" \
   --bridge-ticketer "$TZEL_BRIDGE_TICKETER" \
+  --dal-fee 1 \
+  --dal-fee-address /var/lib/tzel/watch/producer-address.json \
   --source-alias "$TZEL_SOURCE_ALIAS"
 /usr/local/bin/tzel-wallet --wallet /tmp/tzel-check.wallet check
 ```

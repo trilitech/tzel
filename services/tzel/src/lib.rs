@@ -253,6 +253,16 @@ mod tests {
     use tzel_core::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES;
     use tzel_verifier::{encode_verify_meta, VerifyMeta};
 
+    const TEST_FEE: u64 = MIN_TX_FEE;
+
+    fn random_nonzero_felt() -> F {
+        let mut value = random_felt();
+        if value == ZERO {
+            value[0] = 1;
+        }
+        value
+    }
+
     fn random_payment_address() -> PaymentAddress {
         PaymentAddress {
             d_j: random_felt(),
@@ -291,6 +301,27 @@ mod tests {
             },
             nk_sp,
         )
+    }
+
+    fn test_encrypted_note(seed_byte: u8) -> EncryptedNote {
+        let seed_v = [seed_byte; 64];
+        let seed_d = [seed_byte.wrapping_add(1); 64];
+        let (ek_v, _) = kem_keygen_from_seed(&seed_v);
+        let (ek_d, _) = kem_keygen_from_seed(&seed_d);
+        encrypt_note(
+            seed_byte as u64 + 1,
+            &u(10_000 + seed_byte as u64),
+            None,
+            &ek_v,
+            &ek_d,
+        )
+    }
+
+    fn test_output_note(seed_byte: u8) -> (F, EncryptedNote, F) {
+        let enc = test_encrypted_note(seed_byte);
+        let cm = random_nonzero_felt();
+        let mh = memo_ct_hash(&enc);
+        (cm, enc, mh)
     }
 
     /// Check the deterministic address/tag/commitment path without rebuilding a
@@ -391,7 +422,7 @@ mod tests {
     #[test]
     fn test_e2e_local() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 1000);
+        let _ = ledger.fund("alice", 300_010);
 
         // Generate alice's address with auth tree
         let mut master_sk = ZERO;
@@ -421,15 +452,20 @@ mod tests {
             ek_v: ek_v.to_bytes().to_vec(),
             ek_d: ek_d.to_bytes().to_vec(),
         };
+        let (shield_fee_cm, shield_fee_enc, _shield_fee_mh) = test_output_note(0x01);
         let resp = ledger
             .shield(&ShieldReq {
                 sender: "alice".into(),
-                v: 1000,
+                v: 200_000,
+                fee: TEST_FEE,
+                producer_fee: 1,
                 address: addr,
                 memo: None,
                 proof: Proof::TrustMeBro,
                 client_cm: ZERO,
                 client_enc: None,
+                producer_cm: shield_fee_cm,
+                producer_enc: Some(shield_fee_enc),
             })
             .unwrap();
 
@@ -439,7 +475,7 @@ mod tests {
         let (cm, enc) = &ledger.memos[0];
         assert!(detect(enc, &dk_d));
         let (v, rseed, _) = decrypt_memo(enc, &dk_v).unwrap();
-        assert_eq!(v, 1000);
+        assert_eq!(v, 200_000);
         let rcm = derive_rcm(&rseed);
         let otag = owner_tag(&auth_root, &auth_pub_seed, &nk_tg);
         assert_eq!(commit(&d_j, v, &rcm, &otag), *cm);
@@ -453,25 +489,31 @@ mod tests {
             .unshield(&UnshieldReq {
                 root: ledger.tree.root(),
                 nullifiers: vec![nf],
-                v_pub: 1000,
+                v_pub: 100_000,
+                fee: TEST_FEE,
                 recipient: "alice".into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_fee: random_nonzero_felt(),
+                enc_fee: test_encrypted_note(0x02),
                 proof: Proof::TrustMeBro,
             })
             .unwrap();
         assert_eq!(resp.change_index, None);
-        assert_eq!(ledger.balances["alice"], 1000);
+        assert_eq!(ledger.balances["alice"], 100_009);
 
         // Double-spend rejected
         assert!(ledger
             .unshield(&UnshieldReq {
                 root: ledger.tree.root(),
                 nullifiers: vec![nf],
-                v_pub: 1000,
+                v_pub: 100_000,
+                fee: TEST_FEE,
                 recipient: "alice".into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_fee: random_nonzero_felt(),
+                enc_fee: test_encrypted_note(0x03),
                 proof: Proof::TrustMeBro,
             })
             .is_err());
@@ -485,6 +527,10 @@ mod tests {
 
     fn u(v: u64) -> F {
         u64_to_felt(v)
+    }
+
+    fn fee_f() -> F {
+        u(TEST_FEE)
     }
 
     /// Helper: build a fake Stark proof with a given output_preimage.
@@ -505,7 +551,7 @@ mod tests {
     /// Helper: set up a ledger with one shielded note, return (ledger, cm, nf, root, enc).
     fn setup_with_note() -> (Ledger, F, F, F, EncryptedNote) {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 10000);
+        let _ = ledger.fund("alice", 300_010);
 
         let mut master_sk = ZERO;
         master_sk[0] = 0xAA;
@@ -533,15 +579,20 @@ mod tests {
             ek_v: ek_v.to_bytes().to_vec(),
             ek_d: ek_d.to_bytes().to_vec(),
         };
+        let (producer_cm, producer_enc, _producer_mh) = test_output_note(0x04);
         ledger
             .shield(&ShieldReq {
                 sender: "alice".into(),
-                v: 1000,
+                v: 200_000,
+                fee: TEST_FEE,
+                producer_fee: 1,
                 address: addr,
                 memo: None,
                 proof: Proof::TrustMeBro,
                 client_cm: ZERO,
                 client_enc: None,
+                producer_cm,
+                producer_enc: Some(producer_enc),
             })
             .unwrap();
 
@@ -564,18 +615,22 @@ mod tests {
         let real_cm_1 = random_felt();
         let fake_cm_1 = random_felt(); // attacker's commitment (different amount)
         let cm_2 = random_felt();
+        let (cm_3, enc_3, mh_3) = test_output_note(0x10);
 
         // Build output_preimage as if the proof proved (root, nf, real_cm_1, cm_2, mh1, mh2)
         // but submit the request with fake_cm_1
-        let preimage = vec![root, nf, real_cm_1, cm_2, ZERO, ZERO];
+        let preimage = vec![root, nf, fee_f(), real_cm_1, cm_2, cm_3, ZERO, ZERO, mh_3];
 
         let result = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
+            fee: TEST_FEE,
             cm_1: fake_cm_1, // attacker substitutes a DIFFERENT commitment
             cm_2,
+            cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3,
             proof: fake_stark(preimage),
         });
         assert!(
@@ -598,21 +653,25 @@ mod tests {
         let cm_1 = random_felt();
         let cm_2 = random_felt();
         let mh_1 = memo_ct_hash(&enc); // hash of the REAL encrypted note
+        let (cm_3, enc_3, mh_3) = test_output_note(0x11);
 
         // Create a DIFFERENT encrypted note (attacker's garbage)
         let seed_atk: [u8; 64] = [0xBB; 64];
         let (ek_atk, _) = kem_keygen_from_seed(&seed_atk);
         let fake_enc = encrypt_note(999, &random_felt(), None, &ek_atk, &ek_atk);
         // Output_preimage commits to mh_1 (real note's hash)
-        let preimage = vec![root, nf, cm_1, cm_2, mh_1, ZERO];
+        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, mh_1, ZERO, mh_3];
 
         let result = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
+            fee: TEST_FEE,
             cm_1,
             cm_2,
+            cm_3,
             enc_1: fake_enc, // attacker swaps in a DIFFERENT encrypted note
             enc_2: enc.clone(),
+            enc_3,
             proof: fake_stark(preimage),
         });
         assert!(
@@ -633,17 +692,31 @@ mod tests {
         let (mut ledger, _cm, nf, root, _enc) = setup_with_note();
 
         let alice_recipient = hash(b"alice");
+        let (cm_fee, enc_fee, mh_fee) = test_output_note(0x12);
 
         // Proof commits to alice as recipient
-        let preimage = vec![root, nf, u(1000), alice_recipient, ZERO, ZERO];
+        let preimage = vec![
+            root,
+            nf,
+            u(1000),
+            fee_f(),
+            alice_recipient,
+            ZERO,
+            ZERO,
+            cm_fee,
+            mh_fee,
+        ];
 
         let result = ledger.unshield(&UnshieldReq {
             root,
             nullifiers: vec![nf],
             v_pub: 1000,
+            fee: TEST_FEE,
             recipient: "attacker".into(), // attacker redirects to themselves
             cm_change: ZERO,
             enc_change: None,
+            cm_fee,
+            enc_fee,
             proof: fake_stark(preimage),
         });
         assert!(
@@ -661,17 +734,31 @@ mod tests {
     #[test]
     fn test_attack_unshield_inflated_vpub_rejected() {
         let (mut ledger, _cm, nf, root, _enc) = setup_with_note();
+        let (cm_fee, enc_fee, mh_fee) = test_output_note(0x13);
 
         // Proof commits to v_pub=100
-        let preimage = vec![root, nf, u(100), hash(b"alice"), ZERO, ZERO];
+        let preimage = vec![
+            root,
+            nf,
+            u(100),
+            fee_f(),
+            hash(b"alice"),
+            ZERO,
+            ZERO,
+            cm_fee,
+            mh_fee,
+        ];
 
         let result = ledger.unshield(&UnshieldReq {
             root,
             nullifiers: vec![nf],
             v_pub: 1000000, // attacker claims 1000000
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_fee,
+            enc_fee,
             proof: fake_stark(preimage),
         });
         assert!(
@@ -692,15 +779,27 @@ mod tests {
         let _ = ledger.fund("alice", 2000000);
 
         let cm = random_felt();
+        let (producer_cm, producer_enc, producer_mh) = test_output_note(0x14);
 
         // Proof commits to v_pub=1
-        let preimage = vec![u(1), cm, hash(b"alice"), ZERO];
+        let preimage = vec![
+            u(1),
+            fee_f(),
+            u(1),
+            cm,
+            producer_cm,
+            hash(b"alice"),
+            ZERO,
+            producer_mh,
+        ];
 
         let addr = random_payment_address();
 
         let result = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000000, // attacker claims 1000000
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
             proof: fake_stark(preimage),
@@ -712,13 +811,15 @@ mod tests {
                 nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
             }),
+            producer_cm,
+            producer_enc: Some(producer_enc),
         });
         assert!(
             result.is_err(),
             "shield with inflated amount should be rejected"
         );
         assert!(
-            result.unwrap_err().contains("v_pub mismatch"),
+            result.unwrap_err().contains("proof note value mismatch"),
             "should specifically catch amount inflation"
         );
     }
@@ -732,18 +833,22 @@ mod tests {
         let fake_nf = random_felt(); // attacker invents a nullifier
         let cm_1 = random_felt();
         let cm_2 = random_felt();
+        let (cm_3, enc_3, mh_3) = test_output_note(0x51);
         let mh = ZERO;
 
         // Proof commits to the REAL nullifier
-        let preimage = vec![root, nf, cm_1, cm_2, mh, mh];
+        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, mh, mh, mh_3];
 
         let result = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![fake_nf], // attacker substitutes a DIFFERENT nullifier
+            fee: TEST_FEE,
             cm_1,
             cm_2,
+            cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3,
             proof: fake_stark(preimage),
         });
         assert!(
@@ -764,14 +869,19 @@ mod tests {
         let mut ledger = Ledger::new();
         let _ = ledger.fund("alice", 100);
         let addr = random_payment_address();
+        let (producer_cm, producer_enc, _producer_mh) = test_output_note(0x20);
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 200,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
             proof: Proof::TrustMeBro,
             client_cm: ZERO,
             client_enc: None,
+            producer_cm,
+            producer_enc: Some(producer_enc),
         });
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("insufficient"));
@@ -781,13 +891,17 @@ mod tests {
     #[test]
     fn test_transfer_zero_inputs_rejected() {
         let (mut ledger, _, _, root, enc) = setup_with_note();
+        let (cm_3, enc_3, _mh_3) = test_output_note(0x21);
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![], // zero inputs
+            fee: TEST_FEE,
             cm_1: random_felt(),
             cm_2: random_felt(),
+            cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3,
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -799,13 +913,17 @@ mod tests {
     fn test_transfer_invalid_root_rejected() {
         let (mut ledger, _, nf, _, enc) = setup_with_note();
         let fake_root = random_felt(); // not in valid_roots
+        let (cm_3, enc_3, _mh_3) = test_output_note(0x22);
         let r = ledger.transfer(&TransferReq {
             root: fake_root,
             nullifiers: vec![nf],
+            fee: TEST_FEE,
             cm_1: random_felt(),
             cm_2: random_felt(),
+            cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3,
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -816,26 +934,34 @@ mod tests {
     #[test]
     fn test_transfer_double_spend_rejected() {
         let (mut ledger, _, nf, root, enc) = setup_with_note();
+        let (cm_3a, enc_3a, _mh_3a) = test_output_note(0x23);
         // First spend succeeds
         ledger
             .transfer(&TransferReq {
                 root,
                 nullifiers: vec![nf],
+                fee: TEST_FEE,
                 cm_1: random_felt(),
                 cm_2: random_felt(),
+                cm_3: cm_3a,
                 enc_1: enc.clone(),
                 enc_2: enc.clone(),
+                enc_3: enc_3a,
                 proof: Proof::TrustMeBro,
             })
             .unwrap();
+        let (cm_3b, enc_3b, _mh_3b) = test_output_note(0x24);
         // Second spend with same nullifier fails
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
+            fee: TEST_FEE,
             cm_1: random_felt(),
             cm_2: random_felt(),
+            cm_3: cm_3b,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3: enc_3b,
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -846,13 +972,17 @@ mod tests {
     #[test]
     fn test_transfer_duplicate_nullifier_rejected() {
         let (mut ledger, _, nf, root, enc) = setup_with_note();
+        let (cm_3, enc_3, _mh_3) = test_output_note(0x25);
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf, nf], // same nf twice
+            fee: TEST_FEE,
             cm_1: random_felt(),
             cm_2: random_felt(),
+            cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3,
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -863,13 +993,17 @@ mod tests {
     #[test]
     fn test_unshield_invalid_root_rejected() {
         let (mut ledger, _, nf, _, _) = setup_with_note();
+        let (cm_fee, enc_fee, _mh_fee) = test_output_note(0x26);
         let r = ledger.unshield(&UnshieldReq {
             root: random_felt(),
             nullifiers: vec![nf],
             v_pub: 1000,
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_fee,
+            enc_fee,
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -880,24 +1014,32 @@ mod tests {
     #[test]
     fn test_unshield_double_spend_rejected() {
         let (mut ledger, _, nf, root, _) = setup_with_note();
+        let (cm_fee_a, enc_fee_a, _mh_fee_a) = test_output_note(0x27);
         ledger
             .unshield(&UnshieldReq {
                 root,
                 nullifiers: vec![nf],
                 v_pub: 1000,
+                fee: TEST_FEE,
                 recipient: "alice".into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_fee: cm_fee_a,
+                enc_fee: enc_fee_a,
                 proof: Proof::TrustMeBro,
             })
             .unwrap();
+        let (cm_fee_b, enc_fee_b, _mh_fee_b) = test_output_note(0x28);
         let r = ledger.unshield(&UnshieldReq {
             root,
             nullifiers: vec![nf],
             v_pub: 1000,
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_fee: cm_fee_b,
+            enc_fee: enc_fee_b,
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -908,13 +1050,17 @@ mod tests {
     #[test]
     fn test_unshield_duplicate_nullifier_rejected() {
         let (mut ledger, _, nf, root, _) = setup_with_note();
+        let (cm_fee, enc_fee, _mh_fee) = test_output_note(0x29);
         let r = ledger.unshield(&UnshieldReq {
             root,
             nullifiers: vec![nf, nf],
             v_pub: 1000,
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_fee,
+            enc_fee,
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -927,17 +1073,29 @@ mod tests {
     #[test]
     fn test_attack_shield_cm_mismatch_rejected() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 10000);
+        let _ = ledger.fund("alice", 200_000);
 
         let real_cm = random_felt();
         let fake_cm = random_felt();
+        let (producer_cm, producer_enc, producer_mh) = test_output_note(0x2A);
 
-        let preimage = vec![u(1000), real_cm, ZERO, ZERO];
+        let preimage = vec![
+            u(1000),
+            fee_f(),
+            u(1),
+            real_cm,
+            producer_cm,
+            hash(b"alice"),
+            ZERO,
+            producer_mh,
+        ];
 
         let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
             proof: fake_stark(preimage),
@@ -949,6 +1107,8 @@ mod tests {
                 nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
             }),
+            producer_cm,
+            producer_enc: Some(producer_enc),
         });
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("cm mismatch"));
@@ -962,18 +1122,22 @@ mod tests {
         let fake_root = random_felt();
         let cm_1 = random_felt();
         let cm_2 = random_felt();
+        let (cm_3, enc_3, mh_3) = test_output_note(0x30);
         let mh = memo_ct_hash(&enc);
 
         // Proof commits to fake_root
-        let preimage = vec![fake_root, nf, cm_1, cm_2, mh, mh];
+        let preimage = vec![fake_root, nf, fee_f(), cm_1, cm_2, cm_3, mh, mh, mh_3];
 
         let r = ledger.transfer(&TransferReq {
             root, // request uses the REAL root
             nullifiers: vec![nf],
+            fee: TEST_FEE,
             cm_1,
             cm_2,
+            cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3,
             proof: fake_stark(preimage),
         });
         assert!(r.is_err());
@@ -986,21 +1150,36 @@ mod tests {
         let bad_domain = random_felt();
         let cm_1 = random_felt();
         let cm_2 = random_felt();
+        let (cm_3, enc_3, mh_3) = test_output_note(0x31);
         let mh = memo_ct_hash(&enc);
 
         let proof = Proof::Stark {
             proof_bytes: vec![0xDE; 128],
-            output_preimage: vec![bad_domain, root, nf, cm_1, cm_2, mh, mh],
+            output_preimage: vec![
+                bad_domain,
+                root,
+                nf,
+                fee_f(),
+                cm_1,
+                cm_2,
+                cm_3,
+                mh,
+                mh,
+                mh_3,
+            ],
             verify_meta: None,
         };
 
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
+            fee: TEST_FEE,
             cm_1,
             cm_2,
+            cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3,
             proof,
         });
         assert!(r.is_err());
@@ -1015,17 +1194,21 @@ mod tests {
         let cm_1 = random_felt();
         let real_cm_2 = random_felt();
         let fake_cm_2 = random_felt();
+        let (cm_3, enc_3, mh_3) = test_output_note(0x32);
         let mh = memo_ct_hash(&enc);
 
-        let preimage = vec![root, nf, cm_1, real_cm_2, mh, mh];
+        let preimage = vec![root, nf, fee_f(), cm_1, real_cm_2, cm_3, mh, mh, mh_3];
 
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
+            fee: TEST_FEE,
             cm_1,
             cm_2: fake_cm_2, // attacker substitutes cm_2
+            cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3,
             proof: fake_stark(preimage),
         });
         assert!(r.is_err());
@@ -1039,16 +1222,30 @@ mod tests {
 
         let fake_root = random_felt();
         let recipient = hash(b"alice");
+        let (cm_fee, enc_fee, mh_fee) = test_output_note(0x33);
 
-        let preimage = vec![fake_root, nf, u(1000), recipient, ZERO, ZERO];
+        let preimage = vec![
+            fake_root,
+            nf,
+            u(1000),
+            fee_f(),
+            recipient,
+            ZERO,
+            ZERO,
+            cm_fee,
+            mh_fee,
+        ];
 
         let r = ledger.unshield(&UnshieldReq {
             root, // request uses the REAL root
             nullifiers: vec![nf],
             v_pub: 1000,
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_fee,
+            enc_fee,
             proof: fake_stark(preimage),
         });
         assert!(r.is_err());
@@ -1064,16 +1261,30 @@ mod tests {
         let real_cm_change = random_felt();
         let fake_cm_change = random_felt(); // attacker's commitment
         let recipient = hash(b"alice");
+        let (cm_fee, enc_fee, mh_fee) = test_output_note(0x34);
 
-        let preimage = vec![root, nf, u(500), recipient, real_cm_change, ZERO];
+        let preimage = vec![
+            root,
+            nf,
+            u(500),
+            fee_f(),
+            recipient,
+            real_cm_change,
+            ZERO,
+            cm_fee,
+            mh_fee,
+        ];
 
         let result = ledger.unshield(&UnshieldReq {
             root,
             nullifiers: vec![nf],
             v_pub: 500,
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: fake_cm_change, // attacker substitutes a DIFFERENT change commitment
             enc_change: None,
+            cm_fee,
+            enc_fee,
             proof: fake_stark(preimage),
         });
         assert!(
@@ -1187,17 +1398,22 @@ mod tests {
     #[test]
     fn test_regression_shield_stark_requires_client_cm() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 10000);
+        let _ = ledger.fund("alice", 200_000);
 
         let addr = random_payment_address();
+        let (producer_cm, producer_enc, _producer_mh) = test_output_note(0x35);
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
             proof: fake_stark(vec![ZERO; 8]),
             client_cm: ZERO, // BUG: no client cm with Stark proof
             client_enc: None,
+            producer_cm,
+            producer_enc: Some(producer_enc),
         });
         assert!(
             r.is_err(),
@@ -1212,8 +1428,8 @@ mod tests {
     #[test]
     fn test_regression_shield_sender_validated() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 10000);
-        let _ = ledger.fund("attacker", 10000);
+        let _ = ledger.fund("alice", 200_000);
+        let _ = ledger.fund("attacker", 200_000);
 
         let cm = random_felt();
         let alice_sender = hash(b"alice");
@@ -1225,19 +1441,33 @@ mod tests {
             encrypted_data: vec![0; 1080],
         };
         let mh = memo_ct_hash(&enc);
+        let (producer_cm, producer_enc, producer_mh) = test_output_note(0x36);
 
         // Proof commits to sender=alice
-        let preimage = vec![u(1000), cm, alice_sender, mh];
+        let preimage = vec![
+            u(1000),
+            fee_f(),
+            u(1),
+            cm,
+            producer_cm,
+            alice_sender,
+            mh,
+            producer_mh,
+        ];
 
         let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "attacker".into(), // attacker front-runs with different sender
             v: 1000,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
             proof: fake_stark(preimage),
             client_cm: cm,
             client_enc: Some(enc),
+            producer_cm,
+            producer_enc: Some(producer_enc),
         });
         assert!(
             r.is_err(),
@@ -1251,7 +1481,7 @@ mod tests {
     #[test]
     fn test_regression_shield_memo_hash_validated() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 10000);
+        let _ = ledger.fund("alice", 200_000);
 
         let cm = random_felt();
         let sender_dec = hash(b"alice");
@@ -1261,22 +1491,36 @@ mod tests {
         let (ek, _) = kem_keygen_from_seed(&seed);
         let real_enc = encrypt_note(1000, &random_felt(), None, &ek, &ek);
         let real_mh = memo_ct_hash(&real_enc);
+        let (producer_cm, producer_enc, producer_mh) = test_output_note(0x37);
 
         // Fake encrypted note with different content
         let fake_enc = encrypt_note(999, &random_felt(), Some(b"evil"), &ek, &ek);
 
         // Proof commits to the REAL memo hash
-        let preimage = vec![u(1000), cm, sender_dec, real_mh];
+        let preimage = vec![
+            u(1000),
+            fee_f(),
+            u(1),
+            cm,
+            producer_cm,
+            sender_dec,
+            real_mh,
+            producer_mh,
+        ];
 
         let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
             proof: fake_stark(preimage),
             client_cm: cm,
             client_enc: Some(fake_enc), // attacker swaps the encrypted note
+            producer_cm,
+            producer_enc: Some(producer_enc),
         });
         assert!(r.is_err(), "shield with swapped memo should be rejected");
         assert!(r.unwrap_err().contains("memo_ct_hash mismatch"));
@@ -1290,16 +1534,30 @@ mod tests {
         let (mut ledger, _, nf, root, _) = setup_with_note();
 
         let recipient = hash(b"alice");
+        let (cm_fee, enc_fee, _mh_fee) = test_output_note(0x38);
         // Proof has nonzero mh_change but no enc_change
-        let preimage = vec![root, nf, u(1000), recipient, ZERO, u(12345)];
+        let preimage = vec![
+            root,
+            nf,
+            u(1000),
+            fee_f(),
+            recipient,
+            ZERO,
+            u(12345),
+            cm_fee,
+            ZERO,
+        ];
 
         let r = ledger.unshield(&UnshieldReq {
             root,
             nullifiers: vec![nf],
             v_pub: 1000,
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_fee,
+            enc_fee,
             proof: fake_stark(preimage),
         });
         assert!(
@@ -1315,21 +1573,35 @@ mod tests {
     #[test]
     fn test_regression_shield_stark_requires_client_enc() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 10000);
+        let _ = ledger.fund("alice", 200_000);
 
         let cm = random_felt();
         let sender_dec = hash(b"alice");
-        let preimage = vec![u(1000), cm, sender_dec, ZERO];
+        let (producer_cm, producer_enc, producer_mh) = test_output_note(0x39);
+        let preimage = vec![
+            u(1000),
+            fee_f(),
+            u(1),
+            cm,
+            producer_cm,
+            sender_dec,
+            ZERO,
+            producer_mh,
+        ];
 
         let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
             proof: fake_stark(preimage),
             client_cm: cm,
             client_enc: None, // BUG: Stark proof without client_enc
+            producer_cm,
+            producer_enc: Some(producer_enc),
         });
         assert!(
             r.is_err(),
@@ -1375,12 +1647,36 @@ mod tests {
         let nf = random_felt();
         let cm_1 = random_felt();
         let cm_2 = random_felt();
+        let cm_3 = random_felt();
         let mh = ZERO;
+        let mh_3 = random_felt();
 
-        let transfer_sh = transfer_sighash(&auth_domain, &root, &[nf], &cm_1, &cm_2, &mh, &mh);
+        let transfer_sh = transfer_sighash(
+            &auth_domain,
+            &root,
+            &[nf],
+            0,
+            &cm_1,
+            &cm_2,
+            &cm_3,
+            &mh,
+            &mh,
+            &mh_3,
+        );
 
         // Unshield with same values (treating cm_1 as v_pub felt, cm_2 as recipient, etc.)
-        let unshield_sh = unshield_sighash(&auth_domain, &root, &[nf], 0, &cm_2, &mh, &mh);
+        let unshield_sh = unshield_sighash(
+            &auth_domain,
+            &root,
+            &[nf],
+            0,
+            0,
+            &cm_2,
+            &mh,
+            &cm_3,
+            &mh_3,
+            &mh,
+        );
 
         assert_ne!(
             transfer_sh, unshield_sh,
@@ -1394,12 +1690,36 @@ mod tests {
         let nf = random_felt();
         let cm_1 = random_felt();
         let cm_2 = random_felt();
+        let cm_3 = random_felt();
         let mh = random_felt();
+        let mh_3 = random_felt();
         let auth_domain_a = default_auth_domain();
         let auth_domain_b = random_felt();
 
-        let sh_a = transfer_sighash(&auth_domain_a, &root, &[nf], &cm_1, &cm_2, &mh, &mh);
-        let sh_b = transfer_sighash(&auth_domain_b, &root, &[nf], &cm_1, &cm_2, &mh, &mh);
+        let sh_a = transfer_sighash(
+            &auth_domain_a,
+            &root,
+            &[nf],
+            0,
+            &cm_1,
+            &cm_2,
+            &cm_3,
+            &mh,
+            &mh,
+            &mh_3,
+        );
+        let sh_b = transfer_sighash(
+            &auth_domain_b,
+            &root,
+            &[nf],
+            0,
+            &cm_1,
+            &cm_2,
+            &cm_3,
+            &mh,
+            &mh,
+            &mh_3,
+        );
 
         assert_ne!(
             sh_a, sh_b,
@@ -1499,8 +1819,10 @@ mod tests {
         let req = TransferReq {
             root: random_felt(),
             nullifiers: vec![random_felt(), random_felt()],
+            fee: TEST_FEE,
             cm_1: random_felt(),
             cm_2: random_felt(),
+            cm_3: random_felt(),
             enc_1: EncryptedNote {
                 ct_d: vec![0; 1088],
                 tag: 42,
@@ -1511,6 +1833,13 @@ mod tests {
             enc_2: EncryptedNote {
                 ct_d: vec![0; 1088],
                 tag: 99,
+                ct_v: vec![0; 1088],
+                nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
+                encrypted_data: vec![0; 1080],
+            },
+            enc_3: EncryptedNote {
+                ct_d: vec![0; 1088],
+                tag: 7,
                 ct_v: vec![0; 1088],
                 nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
@@ -1637,7 +1966,7 @@ mod tests {
     #[test]
     fn test_ledger_shield_rejects_malformed_client_note_lengths() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 1000);
+        let _ = ledger.fund("alice", 200_000);
 
         let mut master_sk = ZERO;
         master_sk[0] = 0x44;
@@ -1676,11 +2005,15 @@ mod tests {
             .shield(&ShieldReq {
                 sender: "alice".into(),
                 v: 100,
+                fee: TEST_FEE,
+                producer_fee: 1,
                 address: addr,
                 memo: None,
                 proof: Proof::TrustMeBro,
                 client_cm,
                 client_enc: Some(bad_enc),
+                producer_cm: random_nonzero_felt(),
+                producer_enc: Some(test_encrypted_note(0x40)),
             })
             .unwrap_err();
         assert!(err.contains("invalid client encrypted note"));
@@ -1696,10 +2029,13 @@ mod tests {
             .transfer(&TransferReq {
                 root,
                 nullifiers: vec![nf],
+                fee: TEST_FEE,
                 cm_1: random_felt(),
                 cm_2: random_felt(),
+                cm_3: random_felt(),
                 enc_1: bad_enc,
                 enc_2: enc,
+                enc_3: test_encrypted_note(0x41),
                 proof: Proof::TrustMeBro,
             })
             .unwrap_err();
@@ -1715,9 +2051,12 @@ mod tests {
                 root,
                 nullifiers: vec![nf],
                 v_pub: 1000,
+                fee: TEST_FEE,
                 recipient: "alice".into(),
                 cm_change: ZERO,
                 enc_change: Some(enc),
+                cm_fee: random_nonzero_felt(),
+                enc_fee: test_encrypted_note(0x42),
                 proof: Proof::TrustMeBro,
             })
             .unwrap_err();
@@ -1731,6 +2070,7 @@ mod tests {
         let (mut ledger, _cm, nf, root, enc) = setup_with_note();
         let cm_1 = random_felt();
         let cm_2 = random_felt();
+        let (cm_3, enc_3, mh_3) = test_output_note(0x43);
         let mh_1 = memo_ct_hash(&enc);
         let real_mh_2 = memo_ct_hash(&enc);
 
@@ -1739,14 +2079,17 @@ mod tests {
         let (ek, _) = kem_keygen_from_seed(&seed);
         let fake_enc_2 = encrypt_note(100, &random_felt(), None, &ek, &ek);
 
-        let preimage = vec![root, nf, cm_1, cm_2, mh_1, real_mh_2];
+        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, mh_1, real_mh_2, mh_3];
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
+            fee: TEST_FEE,
             cm_1,
             cm_2,
+            cm_3,
             enc_1: enc.clone(),
             enc_2: fake_enc_2, // attacker swaps enc_2
+            enc_3,
             proof: fake_stark(preimage),
         });
         assert!(r.is_err());
@@ -1757,13 +2100,17 @@ mod tests {
     #[test]
     fn test_unshield_zero_inputs_rejected() {
         let (mut ledger, _, _, root, _) = setup_with_note();
+        let (cm_fee, enc_fee, _mh_fee) = test_output_note(0x44);
         let r = ledger.unshield(&UnshieldReq {
             root,
             nullifiers: vec![],
             v_pub: 100,
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_fee,
+            enc_fee,
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -1774,13 +2121,17 @@ mod tests {
     #[test]
     fn test_transfer_preimage_too_short_rejected() {
         let (mut ledger, _, nf, root, enc) = setup_with_note();
+        let (cm_3, enc_3, _mh_3) = test_output_note(0x45);
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
+            fee: TEST_FEE,
             cm_1: random_felt(),
             cm_2: random_felt(),
+            cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3,
             proof: fake_stark(vec![u(1), u(2)]), // way too short
         });
         assert!(r.is_err());
@@ -1792,7 +2143,7 @@ mod tests {
     #[test]
     fn test_shield_client_cm_used() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 10000);
+        let _ = ledger.fund("alice", 200_000);
 
         let cm = random_felt();
         let sender_dec = hash(b"alice");
@@ -1800,17 +2151,31 @@ mod tests {
         let (ek, _) = kem_keygen_from_seed(&seed);
         let enc = encrypt_note(500, &random_felt(), None, &ek, &ek);
         let mh = memo_ct_hash(&enc);
+        let (producer_cm, producer_enc, producer_mh) = test_output_note(0x46);
 
-        let preimage = vec![u(500), cm, sender_dec, mh];
+        let preimage = vec![
+            u(500),
+            fee_f(),
+            u(1),
+            cm,
+            producer_cm,
+            sender_dec,
+            mh,
+            producer_mh,
+        ];
         let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 500,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
             proof: fake_stark(preimage),
             client_cm: cm,
             client_enc: Some(enc),
+            producer_cm,
+            producer_enc: Some(producer_enc),
         });
         assert!(
             r.is_ok(),
@@ -1838,34 +2203,102 @@ mod tests {
         let nf = [0x02; 32];
         let cm_1 = [0x03; 32];
         let cm_2 = [0x04; 32];
+        let cm_3 = [0x05; 32];
         let mh_1 = [0x05; 32];
         let mh_2 = [0x06; 32];
+        let mh_3 = [0x07; 32];
 
-        let sh = transfer_sighash(&auth_domain, &root, &[nf], &cm_1, &cm_2, &mh_1, &mh_2);
+        let sh = transfer_sighash(
+            &auth_domain,
+            &root,
+            &[nf],
+            0,
+            &cm_1,
+            &cm_2,
+            &cm_3,
+            &mh_1,
+            &mh_2,
+            &mh_3,
+        );
         assert_ne!(sh, ZERO, "transfer_sighash must not be zero");
         // Pin the value — any mutation that changes the fold will break this
         let pinned = sh;
 
         // Call again with same inputs — must be deterministic
-        let sh2 = transfer_sighash(&auth_domain, &root, &[nf], &cm_1, &cm_2, &mh_1, &mh_2);
+        let sh2 = transfer_sighash(
+            &auth_domain,
+            &root,
+            &[nf],
+            0,
+            &cm_1,
+            &cm_2,
+            &cm_3,
+            &mh_1,
+            &mh_2,
+            &mh_3,
+        );
         assert_eq!(sh, sh2, "sighash must be deterministic");
 
         // Different input → different output
-        let sh3 = transfer_sighash(&auth_domain, &root, &[nf], &cm_2, &cm_1, &mh_1, &mh_2);
+        let sh3 = transfer_sighash(
+            &auth_domain,
+            &root,
+            &[nf],
+            0,
+            &cm_2,
+            &cm_1,
+            &cm_3,
+            &mh_1,
+            &mh_2,
+            &mh_3,
+        );
         assert_ne!(sh, sh3, "swapping cm_1/cm_2 must change sighash");
 
         // Unshield sighash with same root/nf must differ from transfer (type tags)
         let recipient = [0x07; 32];
-        let ush = unshield_sighash(&auth_domain, &root, &[nf], 1000, &recipient, &ZERO, &ZERO);
+        let ush = unshield_sighash(
+            &auth_domain,
+            &root,
+            &[nf],
+            1000,
+            0,
+            &recipient,
+            &ZERO,
+            &ZERO,
+            &cm_3,
+            &mh_3,
+        );
         assert_ne!(ush, ZERO, "unshield_sighash must not be zero");
         assert_ne!(ush, sh, "transfer and unshield sighash must differ");
 
         // Unshield is also deterministic
-        let ush2 = unshield_sighash(&auth_domain, &root, &[nf], 1000, &recipient, &ZERO, &ZERO);
+        let ush2 = unshield_sighash(
+            &auth_domain,
+            &root,
+            &[nf],
+            1000,
+            0,
+            &recipient,
+            &ZERO,
+            &ZERO,
+            &cm_3,
+            &mh_3,
+        );
         assert_eq!(ush, ush2);
 
         // Different v_pub → different output
-        let ush3 = unshield_sighash(&auth_domain, &root, &[nf], 999, &recipient, &ZERO, &ZERO);
+        let ush3 = unshield_sighash(
+            &auth_domain,
+            &root,
+            &[nf],
+            999,
+            0,
+            &recipient,
+            &ZERO,
+            &ZERO,
+            &cm_3,
+            &mh_3,
+        );
         assert_ne!(ush, ush3, "different v_pub must change sighash");
 
         // Pin both values for regression (if the function is replaced with Default, these fail)
@@ -2002,9 +2435,10 @@ mod tests {
     #[test]
     fn test_mutant_shield_exact_balance() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 500);
+        let _ = ledger.fund("alice", 500 + TEST_FEE + 1);
 
         let addr = random_payment_address();
+        let (producer_cm_a, producer_enc_a, _producer_mh_a) = test_output_note(0x47);
 
         // Exact balance: v == bal. Must succeed.
         // (< mutation turns `bal < v` into `bal == v`, which would REJECT this)
@@ -2012,11 +2446,15 @@ mod tests {
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 500,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr.clone(),
             memo: None,
             proof: Proof::TrustMeBro,
             client_cm: ZERO,
             client_enc: None,
+            producer_cm: producer_cm_a,
+            producer_enc: Some(producer_enc_a),
         });
         assert!(
             r.is_ok(),
@@ -2025,14 +2463,19 @@ mod tests {
         );
 
         // Over balance: must fail
+        let (producer_cm_b, producer_enc_b, _producer_mh_b) = test_output_note(0x48);
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
             proof: Proof::TrustMeBro,
             client_cm: ZERO,
             client_enc: None,
+            producer_cm: producer_cm_b,
+            producer_enc: Some(producer_enc_b),
         });
         assert!(r.is_err(), "shield exceeding balance must fail");
     }
@@ -2042,7 +2485,7 @@ mod tests {
     #[test]
     fn test_mutant_shield_preimage_length_boundary() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 10000);
+        let _ = ledger.fund("alice", 200_000);
 
         let cm = random_felt();
         let sender_dec = hash(b"alice");
@@ -2051,34 +2494,53 @@ mod tests {
         let enc = encrypt_note(1000, &random_felt(), None, &ek, &ek);
         let mh = memo_ct_hash(&enc);
 
-        // Preimage with exactly 4 elements (minimum valid — no bootloader header)
-        let preimage_4 = vec![u(1000), cm, sender_dec, mh];
+        // Preimage with exactly 5 elements (minimum valid — no bootloader header)
+        let _preimage_5 = vec![u(1000), fee_f(), cm, sender_dec, mh];
+        let (producer_cm, producer_enc, producer_mh) = test_output_note(0x49);
+        let preimage_8 = vec![
+            u(1000),
+            fee_f(),
+            u(1),
+            cm,
+            producer_cm,
+            sender_dec,
+            mh,
+            producer_mh,
+        ];
         let addr = random_payment_address();
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr.clone(),
             memo: None,
-            proof: fake_stark(preimage_4),
+            proof: fake_stark(preimage_8),
             client_cm: cm,
             client_enc: Some(enc.clone()),
+            producer_cm,
+            producer_enc: Some(producer_enc.clone()),
         });
         assert!(
             r.is_ok(),
-            "preimage of exactly 4 should be accepted: {:?}",
+            "preimage of exactly 5 should be accepted: {:?}",
             r.err()
         );
 
-        // Preimage with 3 elements (too short)
-        let preimage_3 = vec![u(1000), cm, sender_dec];
+        // Preimage with 4 elements (too short)
+        let preimage_7 = vec![u(1000), fee_f(), u(1), cm, producer_cm, sender_dec, mh];
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
-            proof: fake_stark(preimage_3),
+            proof: fake_stark(preimage_7),
             client_cm: cm,
             client_enc: Some(enc),
+            producer_cm,
+            producer_enc: Some(producer_enc),
         });
         assert!(r.is_err(), "preimage of 3 should be rejected");
     }
@@ -2089,19 +2551,24 @@ mod tests {
     #[test]
     fn test_mutant_shield_cm_without_enc_tmb() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 10000);
+        let _ = ledger.fund("alice", 200_000);
         let addr = random_payment_address();
+        let (producer_cm, producer_enc, _producer_mh) = test_output_note(0x4A);
         // TrustMeBro with client_cm set but client_enc=None
         // With &&: client_cm!=ZERO && client_enc.is_some() = true && false = false → server generates cm (OK)
         // With ||: client_cm!=ZERO || client_enc.is_some() = true || false = true → unwrap None → PANIC
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
             proof: Proof::TrustMeBro,
             client_cm: random_felt(), // set but enc is None
             client_enc: None,
+            producer_cm,
+            producer_enc: Some(producer_enc),
         });
         // Should succeed — server generates its own cm/enc
         assert!(
@@ -2115,10 +2582,20 @@ mod tests {
     #[test]
     fn test_mutant_shield_stark_cm_without_enc() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 10000);
+        let _ = ledger.fund("alice", 200_000);
 
         let cm = random_felt();
-        let preimage = vec![u(1000), cm, ZERO, ZERO];
+        let (producer_cm, producer_enc, producer_mh) = test_output_note(0x4B);
+        let preimage = vec![
+            u(1000),
+            fee_f(),
+            u(1),
+            cm,
+            producer_cm,
+            ZERO,
+            ZERO,
+            producer_mh,
+        ];
         let addr = random_payment_address();
 
         // client_cm set but client_enc is None — must be rejected
@@ -2126,11 +2603,15 @@ mod tests {
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
+            fee: TEST_FEE,
+            producer_fee: 1,
             address: addr,
             memo: None,
             proof: fake_stark(preimage),
             client_cm: cm,
             client_enc: None, // THIS is the key — Stark proof requires enc
+            producer_cm,
+            producer_enc: Some(producer_enc),
         });
         assert!(
             r.is_err(),
@@ -2148,13 +2629,17 @@ mod tests {
         // We can't easily create 7 real notes here, so test the boundary:
         // N=8 must be rejected
         let nfs: Vec<F> = (0..8).map(|_| random_felt()).collect();
+        let (cm_3a, enc_3a, _mh_3a) = test_output_note(0x4C);
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: nfs,
+            fee: TEST_FEE,
             cm_1: random_felt(),
             cm_2: random_felt(),
+            cm_3: cm_3a,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3: enc_3a,
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err(), "N=8 transfer must be rejected");
@@ -2162,13 +2647,17 @@ mod tests {
 
         // N=7 should pass the count check (may fail on nullifier/root, that's fine)
         let nfs7: Vec<F> = (0..7).map(|_| random_felt()).collect();
+        let (cm_3b, enc_3b, _mh_3b) = test_output_note(0x4D);
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: nfs7,
+            fee: TEST_FEE,
             cm_1: random_felt(),
             cm_2: random_felt(),
+            cm_3: cm_3b,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3: enc_3b,
             proof: Proof::TrustMeBro,
         });
         // Should NOT fail with "bad nullifier count" — may fail with "nullifier spent" or "invalid root"
@@ -2187,26 +2676,34 @@ mod tests {
         let (mut ledger, _, _, root, _) = setup_with_note();
 
         let nfs8: Vec<F> = (0..8).map(|_| random_felt()).collect();
+        let (cm_fee_a, enc_fee_a, _mh_fee_a) = test_output_note(0x4E);
         let r = ledger.unshield(&UnshieldReq {
             root,
             nullifiers: nfs8,
             v_pub: 100,
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_fee: cm_fee_a,
+            enc_fee: enc_fee_a,
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("bad nullifier count"));
 
         let nfs7: Vec<F> = (0..7).map(|_| random_felt()).collect();
+        let (cm_fee_b, enc_fee_b, _mh_fee_b) = test_output_note(0x4F);
         let r = ledger.unshield(&UnshieldReq {
             root,
             nullifiers: nfs7,
             v_pub: 100,
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_fee: cm_fee_b,
+            enc_fee: enc_fee_b,
             proof: Proof::TrustMeBro,
         });
         if let Err(e) = &r {
@@ -2228,20 +2725,24 @@ mod tests {
         // This ensures positional checks can't pass by coincidence.
         let cm_1 = random_felt();
         let cm_2 = random_felt();
+        let (cm_3, enc_3, mh_3) = test_output_note(0x50);
         let mh_1 = memo_ct_hash(&enc);
         let mh_2 = memo_ct_hash(&enc);
 
-        // N=1: tail layout is [root, nf, cm_1, cm_2, mh_1, mh_2] = 6 elements
-        let preimage = vec![root, nf, cm_1, cm_2, mh_1, mh_2];
+        // N=1: tail layout is [root, nf, fee, cm_1, cm_2, cm_3, mh_1, mh_2, mh_3]
+        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, mh_1, mh_2, mh_3];
 
         // This should succeed — all fields at correct positions
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
+            fee: TEST_FEE,
             cm_1,
             cm_2,
+            cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3: enc_3.clone(),
             proof: fake_stark(preimage.clone()),
         });
         assert!(
@@ -2251,14 +2752,17 @@ mod tests {
         );
 
         // Now test with preimage that has cm_1 and cm_2 SWAPPED in position
-        let bad_preimage = vec![root, nf, cm_2, cm_1, mh_1, mh_2];
+        let bad_preimage = vec![root, nf, fee_f(), cm_2, cm_1, cm_3, mh_1, mh_2, mh_3];
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
+            fee: TEST_FEE,
             cm_1,
             cm_2,
+            cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
+            enc_3,
             proof: fake_stark(bad_preimage),
         });
         assert!(r.is_err(), "swapped cm_1/cm_2 positions must be caught");
@@ -2271,7 +2775,7 @@ mod tests {
     #[test]
     fn test_mutant_transfer_multi_nullifier_preimage() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund("alice", 50000);
+        let _ = ledger.fund("alice", 300_000);
 
         // Create two notes so we have two distinct nullifiers
         let mut master_sk = ZERO;
@@ -2299,28 +2803,38 @@ mod tests {
             ek_v: ek_v.to_bytes().to_vec(),
             ek_d: ek_d.to_bytes().to_vec(),
         };
+        let (producer_cm_a, producer_enc_a, _producer_mh_a) = test_output_note(0x52);
+        let (producer_cm_b, producer_enc_b, _producer_mh_b) = test_output_note(0x53);
 
         // Shield two notes
         ledger
             .shield(&ShieldReq {
                 sender: "alice".into(),
                 v: 1000,
+                fee: TEST_FEE,
+                producer_fee: 1,
                 address: addr.clone(),
                 memo: None,
                 proof: Proof::TrustMeBro,
                 client_cm: ZERO,
                 client_enc: None,
+                producer_cm: producer_cm_a,
+                producer_enc: Some(producer_enc_a),
             })
             .unwrap();
         ledger
             .shield(&ShieldReq {
                 sender: "alice".into(),
                 v: 2000,
+                fee: TEST_FEE,
+                producer_fee: 1,
                 address: addr.clone(),
                 memo: None,
                 proof: Proof::TrustMeBro,
                 client_cm: ZERO,
                 client_enc: None,
+                producer_cm: producer_cm_b,
+                producer_enc: Some(producer_enc_b),
             })
             .unwrap();
 
@@ -2333,6 +2847,7 @@ mod tests {
 
         let out_cm_1 = random_felt();
         let out_cm_2 = random_felt();
+        let out_cm_3 = random_felt();
         // Use two DIFFERENT encrypted notes so mh_1 != mh_2.
         // This is critical: with N=2, cm1_pos=3, so cm1_pos+2=5 and cm1_pos*2=6.
         // If mh_1==mh_2, tail[5]==tail[6] and the * mutant survives.
@@ -2340,27 +2855,43 @@ mod tests {
         let enc_2 = encrypt_note(500, &random_felt(), Some(b"different"), &ek_v, &ek_d);
         let mh_1 = memo_ct_hash(&enc_1);
         let mh_2 = memo_ct_hash(&enc_2);
+        let enc_3 = test_encrypted_note(0x54);
+        let mh_3 = memo_ct_hash(&enc_3);
         assert_ne!(
             mh_1, mh_2,
             "mh_1 and mh_2 must differ to detect positional mutants"
         );
 
-        // N=2: tail = [root, nf_0, nf_1, cm_1, cm_2, mh_1, mh_2] = 7 elements
-        // cm1_pos = 1+2 = 3
-        // cm1_pos+2 = 5, cm1_pos*2 = 6 — these DIFFER, catching the * mutant
+        // N=2: tail = [root, nf_0, nf_1, fee, cm_1, cm_2, cm_3, mh_1, mh_2, mh_3]
+        // cm1_pos = 2+n+1 = 5 in the old mutant discussion, but we still need distinct
+        // positions for the three output commitments and hashes.
         // With i=1: 1+1=2, 1-1=0 — these DIFFER, catching the - mutant
 
         // Build EXACT-length preimage (no bootloader header padding)
         // This means preimage.len() == expected_tail_len, catching < vs <= mutant
-        let preimage = vec![root, nf_0, nf_1, out_cm_1, out_cm_2, mh_1, mh_2];
+        let preimage = vec![
+            root,
+            nf_0,
+            nf_1,
+            fee_f(),
+            out_cm_1,
+            out_cm_2,
+            out_cm_3,
+            mh_1,
+            mh_2,
+            mh_3,
+        ];
 
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf_0, nf_1],
+            fee: TEST_FEE,
             cm_1: out_cm_1,
             cm_2: out_cm_2,
+            cm_3: out_cm_3,
             enc_1: enc_1.clone(),
             enc_2: enc_2.clone(),
+            enc_3: enc_3.clone(),
             proof: fake_stark(preimage),
         });
         assert!(
@@ -2372,41 +2903,65 @@ mod tests {
         // Also verify that swapping nf_0/nf_1 in the preimage is caught
         // (detects 1+i vs 1-i mutant — with N=2 and i=1 they index differently)
         let mut ledger2 = Ledger::new();
-        let _ = ledger2.fund("alice", 50000);
+        let _ = ledger2.fund("alice", 300_000);
+        let (producer_cm_c, producer_enc_c, _producer_mh_c) = test_output_note(0x55);
+        let (producer_cm_d, producer_enc_d, _producer_mh_d) = test_output_note(0x56);
         ledger2
             .shield(&ShieldReq {
                 sender: "alice".into(),
                 v: 1000,
+                fee: TEST_FEE,
+                producer_fee: 1,
                 address: addr.clone(),
                 memo: None,
                 proof: Proof::TrustMeBro,
                 client_cm: ZERO,
                 client_enc: None,
+                producer_cm: producer_cm_c,
+                producer_enc: Some(producer_enc_c),
             })
             .unwrap();
         ledger2
             .shield(&ShieldReq {
                 sender: "alice".into(),
                 v: 2000,
+                fee: TEST_FEE,
+                producer_fee: 1,
                 address: addr.clone(),
                 memo: None,
                 proof: Proof::TrustMeBro,
                 client_cm: ZERO,
                 client_enc: None,
+                producer_cm: producer_cm_d,
+                producer_enc: Some(producer_enc_d),
             })
             .unwrap();
         let root2 = ledger2.tree.root();
         let nf2_0 = nullifier(&nk_sp, &ledger2.tree.leaves[0], 0);
         let nf2_1 = nullifier(&nk_sp, &ledger2.tree.leaves[1], 1);
 
-        let bad_preimage = vec![root2, nf2_1, nf2_0, out_cm_1, out_cm_2, mh_1, mh_2];
+        let bad_preimage = vec![
+            root2,
+            nf2_1,
+            nf2_0,
+            fee_f(),
+            out_cm_1,
+            out_cm_2,
+            out_cm_3,
+            mh_1,
+            mh_2,
+            mh_3,
+        ];
         let r = ledger2.transfer(&TransferReq {
             root: root2,
             nullifiers: vec![nf2_0, nf2_1],
+            fee: TEST_FEE,
             cm_1: out_cm_1,
             cm_2: out_cm_2,
+            cm_3: out_cm_3,
             enc_1: enc_1.clone(),
             enc_2: enc_2.clone(),
+            enc_3,
             proof: fake_stark(bad_preimage),
         });
         assert!(
@@ -2663,14 +3218,18 @@ mod tests {
     fn test_unshield_rejects_public_balance_overflow() {
         let mut ledger = Ledger::new();
         ledger.balances.insert("alice".into(), u64::MAX);
+        let (cm_fee, enc_fee, _mh_fee) = test_output_note(0x57);
 
         let req = UnshieldReq {
             root: ledger.tree.root(),
             nullifiers: vec![random_felt()],
             v_pub: 1,
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_fee,
+            enc_fee,
             proof: Proof::TrustMeBro,
         };
 
@@ -2701,13 +3260,17 @@ mod tests {
             (ekv, dkv, ekd, dkd)
         };
         let enc_change = encrypt_note(1, &random_felt(), None, &ek_v, &ek_d);
+        let (cm_fee, enc_fee, _mh_fee) = test_output_note(0x58);
         let req = UnshieldReq {
             root: ledger.tree.root(),
             nullifiers: vec![random_felt()],
             v_pub: 1,
+            fee: TEST_FEE,
             recipient: "alice".into(),
             cm_change: random_felt(),
             enc_change: Some(enc_change),
+            cm_fee,
+            enc_fee,
             proof: Proof::TrustMeBro,
         };
 

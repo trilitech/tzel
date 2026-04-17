@@ -11,7 +11,7 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 7;
+pub const KERNEL_WIRE_VERSION: u16 = 9;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
@@ -28,9 +28,9 @@ const MAX_ENCODED_PROOF_WIRE_BYTES: usize =
     MAX_PROOF_BYTES + MAX_VERIFY_META_BYTES + (MAX_OUTPUT_PREIMAGE_ITEMS * 64) + 4096;
 const MAX_ENCODED_NULLIFIER_LIST_BYTES: usize = 256 * 1024;
 const MAX_TRANSFER_PAYLOAD_BYTES: usize =
-    (4 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + (2 * MAX_ENCODED_NOTE_WIRE_BYTES) + 65536;
+    (5 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + (3 * MAX_ENCODED_NOTE_WIRE_BYTES) + 65536;
 const MAX_UNSHIELD_PAYLOAD_BYTES: usize =
-    (3 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + MAX_ENCODED_NOTE_WIRE_BYTES + 65536;
+    (4 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + (2 * MAX_ENCODED_NOTE_WIRE_BYTES) + 65536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelVerifierConfig {
@@ -65,22 +65,29 @@ pub struct KernelStarkProof {
 #[derive(Debug, Clone)]
 pub struct KernelShieldReq {
     pub sender: String,
+    pub fee: u64,
     pub v: u64,
+    pub producer_fee: u64,
     pub address: PaymentAddress,
     pub memo: Option<String>,
     pub proof: KernelStarkProof,
     pub client_cm: F,
     pub client_enc: Option<EncryptedNote>,
+    pub producer_cm: F,
+    pub producer_enc: Option<EncryptedNote>,
 }
 
 #[derive(Debug, Clone)]
 pub struct KernelTransferReq {
     pub root: F,
     pub nullifiers: Vec<F>,
+    pub fee: u64,
     pub cm_1: F,
     pub cm_2: F,
+    pub cm_3: F,
     pub enc_1: EncryptedNote,
     pub enc_2: EncryptedNote,
+    pub enc_3: EncryptedNote,
     pub proof: KernelStarkProof,
 }
 
@@ -89,9 +96,12 @@ pub struct KernelUnshieldReq {
     pub root: F,
     pub nullifiers: Vec<F>,
     pub v_pub: u64,
+    pub fee: u64,
     pub recipient: String,
     pub cm_change: F,
     pub enc_change: Option<EncryptedNote>,
+    pub cm_fee: F,
+    pub enc_fee: EncryptedNote,
     pub proof: KernelStarkProof,
 }
 
@@ -216,19 +226,25 @@ struct WireSignedKernelBridgeConfig {
 struct WireKernelShieldReq {
     #[encoding(string = "MAX_ACCOUNT_ID_BYTES")]
     sender: String,
+    fee: WireU64Le,
     v: WireU64Le,
+    producer_fee: WireU64Le,
     address: WirePaymentAddress,
     #[encoding(string = "MAX_MEMO_BYTES")]
     memo: Option<String>,
     proof: WireEncodedProof,
     client_cm: WireFelt,
     client_enc: Option<WireEncryptedNote>,
+    producer_cm: WireFelt,
+    producer_enc: Option<WireEncryptedNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireShieldResp {
     cm: WireFelt,
     index: WireU64Le,
+    producer_cm: WireFelt,
+    producer_index: WireU64Le,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -241,6 +257,7 @@ struct WireKernelTransferReq {
 struct WireTransferResp {
     index_1: WireU64Le,
     index_2: WireU64Le,
+    index_3: WireU64Le,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -293,6 +310,7 @@ struct WireKernelDalPayloadPointer {
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireUnshieldResp {
     change_index: Option<WireU64Le>,
+    producer_index: WireU64Le,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -565,12 +583,16 @@ pub fn kernel_proof_to_host(proof: &KernelStarkProof) -> Proof {
 pub fn kernel_shield_req_to_host(req: &KernelShieldReq) -> ShieldReq {
     ShieldReq {
         sender: req.sender.clone(),
+        fee: req.fee,
         v: req.v,
+        producer_fee: req.producer_fee,
         address: req.address.clone(),
         memo: req.memo.clone(),
         proof: kernel_proof_to_host(&req.proof),
         client_cm: req.client_cm,
         client_enc: req.client_enc.clone(),
+        producer_cm: req.producer_cm,
+        producer_enc: req.producer_enc.clone(),
     }
 }
 
@@ -578,10 +600,13 @@ pub fn kernel_transfer_req_to_host(req: &KernelTransferReq) -> TransferReq {
     TransferReq {
         root: req.root,
         nullifiers: req.nullifiers.clone(),
+        fee: req.fee,
         cm_1: req.cm_1,
         cm_2: req.cm_2,
+        cm_3: req.cm_3,
         enc_1: req.enc_1.clone(),
         enc_2: req.enc_2.clone(),
+        enc_3: req.enc_3.clone(),
         proof: kernel_proof_to_host(&req.proof),
     }
 }
@@ -591,9 +616,12 @@ pub fn kernel_unshield_req_to_host(req: &KernelUnshieldReq) -> UnshieldReq {
         root: req.root,
         nullifiers: req.nullifiers.clone(),
         v_pub: req.v_pub,
+        fee: req.fee,
         recipient: req.recipient.clone(),
         cm_change: req.cm_change,
         enc_change: req.enc_change.clone(),
+        cm_fee: req.cm_fee,
+        enc_fee: req.enc_fee.clone(),
         proof: kernel_proof_to_host(&req.proof),
     }
 }
@@ -943,7 +971,9 @@ fn encoded_felt_list_from_wire(wire: WireEncodedFeltList) -> Result<Vec<F>, Stri
 fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldReq, String> {
     Ok(WireKernelShieldReq {
         sender: req.sender.clone(),
+        fee: u64_to_wire(req.fee),
         v: u64_to_wire(req.v),
+        producer_fee: u64_to_wire(req.producer_fee),
         address: payment_address_to_wire(&req.address),
         memo: req.memo.clone(),
         proof: encoded_proof_to_wire(&req.proof)?,
@@ -953,18 +983,31 @@ fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldRe
             .as_ref()
             .map(encrypted_note_to_wire)
             .transpose()?,
+        producer_cm: felt_to_wire(&req.producer_cm),
+        producer_enc: req
+            .producer_enc
+            .as_ref()
+            .map(encrypted_note_to_wire)
+            .transpose()?,
     })
 }
 
 fn kernel_shield_req_from_wire(wire: WireKernelShieldReq) -> Result<KernelShieldReq, String> {
     Ok(KernelShieldReq {
         sender: wire.sender,
+        fee: wire_to_u64(wire.fee)?,
         v: wire_to_u64(wire.v)?,
+        producer_fee: wire_to_u64(wire.producer_fee)?,
         address: payment_address_from_wire(wire.address)?,
         memo: wire.memo,
         proof: encoded_proof_from_wire(wire.proof)?,
         client_cm: wire_to_felt(wire.client_cm)?,
         client_enc: wire.client_enc.map(encrypted_note_from_wire).transpose()?,
+        producer_cm: wire_to_felt(wire.producer_cm)?,
+        producer_enc: wire
+            .producer_enc
+            .map(encrypted_note_from_wire)
+            .transpose()?,
     })
 }
 
@@ -976,6 +1019,12 @@ fn shield_resp_to_wire(resp: &ShieldResp) -> Result<WireShieldResp, String> {
                 .try_into()
                 .map_err(|_| "shield index does not fit in u64".to_string())?,
         ),
+        producer_cm: felt_to_wire(&resp.producer_cm),
+        producer_index: u64_to_wire(
+            resp.producer_index
+                .try_into()
+                .map_err(|_| "shield producer_index does not fit in u64".to_string())?,
+        ),
     })
 }
 
@@ -985,6 +1034,10 @@ fn shield_resp_from_wire(wire: WireShieldResp) -> Result<ShieldResp, String> {
         index: wire_to_u64(wire.index)?
             .try_into()
             .map_err(|_| "shield index does not fit in usize".to_string())?,
+        producer_cm: wire_to_felt(wire.producer_cm)?,
+        producer_index: wire_to_u64(wire.producer_index)?
+            .try_into()
+            .map_err(|_| "shield producer_index does not fit in usize".to_string())?,
     })
 }
 
@@ -992,22 +1045,28 @@ fn kernel_transfer_req_to_wire(req: &KernelTransferReq) -> Result<WireKernelTran
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.root))?);
     bytes.extend_from_slice(&encode_tze(&encoded_felt_list_to_wire(&req.nullifiers)?)?);
+    bytes.extend_from_slice(&encode_tze(&u64_to_wire(req.fee))?);
     bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.cm_1))?);
     bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.cm_2))?);
+    bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.cm_3))?);
     bytes.extend_from_slice(&encode_tze(&encoded_proof_to_wire(&req.proof)?)?);
     bytes.extend_from_slice(&encode_tze(&encoded_note_to_wire(&req.enc_1)?)?);
     bytes.extend_from_slice(&encode_tze(&encoded_note_to_wire(&req.enc_2)?)?);
+    bytes.extend_from_slice(&encode_tze(&encoded_note_to_wire(&req.enc_3)?)?);
     Ok(WireKernelTransferReq { bytes })
 }
 
 fn kernel_transfer_req_from_wire(wire: WireKernelTransferReq) -> Result<KernelTransferReq, String> {
     let (rest, root) = decode_tze_prefix::<WireFelt>(&wire.bytes)?;
     let (rest, nullifiers) = decode_tze_prefix::<WireEncodedFeltList>(rest)?;
+    let (rest, fee) = decode_tze_prefix::<WireU64Le>(rest)?;
     let (rest, cm_1) = decode_tze_prefix::<WireFelt>(rest)?;
     let (rest, cm_2) = decode_tze_prefix::<WireFelt>(rest)?;
+    let (rest, cm_3) = decode_tze_prefix::<WireFelt>(rest)?;
     let (rest, proof) = decode_tze_prefix::<WireEncodedProof>(rest)?;
     let (rest, enc_1) = decode_tze_prefix::<WireEncodedNote>(rest)?;
     let (rest, enc_2) = decode_tze_prefix::<WireEncodedNote>(rest)?;
+    let (rest, enc_3) = decode_tze_prefix::<WireEncodedNote>(rest)?;
     if !rest.is_empty() {
         return Err(format!(
             "kernel transfer payload left {} trailing bytes",
@@ -1017,11 +1076,14 @@ fn kernel_transfer_req_from_wire(wire: WireKernelTransferReq) -> Result<KernelTr
     Ok(KernelTransferReq {
         root: wire_to_felt(root)?,
         nullifiers: encoded_felt_list_from_wire(nullifiers)?,
+        fee: wire_to_u64(fee)?,
         cm_1: wire_to_felt(cm_1)?,
         cm_2: wire_to_felt(cm_2)?,
+        cm_3: wire_to_felt(cm_3)?,
         proof: encoded_proof_from_wire(proof)?,
         enc_1: encoded_note_from_wire(enc_1)?,
         enc_2: encoded_note_from_wire(enc_2)?,
+        enc_3: encoded_note_from_wire(enc_3)?,
     })
 }
 
@@ -1037,6 +1099,11 @@ fn transfer_resp_to_wire(resp: &TransferResp) -> Result<WireTransferResp, String
                 .try_into()
                 .map_err(|_| "transfer index_2 does not fit in u64".to_string())?,
         ),
+        index_3: u64_to_wire(
+            resp.index_3
+                .try_into()
+                .map_err(|_| "transfer index_3 does not fit in u64".to_string())?,
+        ),
     })
 }
 
@@ -1048,6 +1115,9 @@ fn transfer_resp_from_wire(wire: WireTransferResp) -> Result<TransferResp, Strin
         index_2: wire_to_u64(wire.index_2)?
             .try_into()
             .map_err(|_| "transfer index_2 does not fit in usize".to_string())?,
+        index_3: wire_to_u64(wire.index_3)?
+            .try_into()
+            .map_err(|_| "transfer index_3 does not fit in usize".to_string())?,
     })
 }
 
@@ -1056,6 +1126,7 @@ fn kernel_unshield_req_to_wire(req: &KernelUnshieldReq) -> Result<WireKernelUnsh
     bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.root))?);
     bytes.extend_from_slice(&encode_tze(&encoded_felt_list_to_wire(&req.nullifiers)?)?);
     bytes.extend_from_slice(&encode_tze(&u64_to_wire(req.v_pub))?);
+    bytes.extend_from_slice(&encode_tze(&u64_to_wire(req.fee))?);
     bytes.extend_from_slice(&encode_tze(&WireAccountId {
         value: req.recipient.clone(),
     })?);
@@ -1068,6 +1139,8 @@ fn kernel_unshield_req_to_wire(req: &KernelUnshieldReq) -> Result<WireKernelUnsh
             .map(encoded_note_to_wire)
             .transpose()?,
     })?);
+    bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.cm_fee))?);
+    bytes.extend_from_slice(&encode_tze(&encoded_note_to_wire(&req.enc_fee)?)?);
     Ok(WireKernelUnshieldReq { bytes })
 }
 
@@ -1075,10 +1148,13 @@ fn kernel_unshield_req_from_wire(wire: WireKernelUnshieldReq) -> Result<KernelUn
     let (rest, root) = decode_tze_prefix::<WireFelt>(&wire.bytes)?;
     let (rest, nullifiers) = decode_tze_prefix::<WireEncodedFeltList>(rest)?;
     let (rest, v_pub) = decode_tze_prefix::<WireU64Le>(rest)?;
+    let (rest, fee) = decode_tze_prefix::<WireU64Le>(rest)?;
     let (rest, recipient) = decode_tze_prefix::<WireAccountId>(rest)?;
     let (rest, cm_change) = decode_tze_prefix::<WireFelt>(rest)?;
     let (rest, proof) = decode_tze_prefix::<WireEncodedProof>(rest)?;
     let (rest, enc_change) = decode_tze_prefix::<WireOptionalEncodedNote>(rest)?;
+    let (rest, cm_fee) = decode_tze_prefix::<WireFelt>(rest)?;
+    let (rest, enc_fee) = decode_tze_prefix::<WireEncodedNote>(rest)?;
     if !rest.is_empty() {
         return Err(format!(
             "kernel unshield payload left {} trailing bytes",
@@ -1089,10 +1165,13 @@ fn kernel_unshield_req_from_wire(wire: WireKernelUnshieldReq) -> Result<KernelUn
         root: wire_to_felt(root)?,
         nullifiers: encoded_felt_list_from_wire(nullifiers)?,
         v_pub: wire_to_u64(v_pub)?,
+        fee: wire_to_u64(fee)?,
         recipient: recipient.value,
         cm_change: wire_to_felt(cm_change)?,
         proof: encoded_proof_from_wire(proof)?,
         enc_change: enc_change.note.map(encoded_note_from_wire).transpose()?,
+        cm_fee: wire_to_felt(cm_fee)?,
+        enc_fee: encoded_note_from_wire(enc_fee)?,
     })
 }
 
@@ -1107,6 +1186,11 @@ fn unshield_resp_to_wire(resp: &UnshieldResp) -> Result<WireUnshieldResp, String
                     .map_err(|_| "change index does not fit in u64".to_string())
             })
             .transpose()?,
+        producer_index: u64_to_wire(
+            resp.producer_index
+                .try_into()
+                .map_err(|_| "producer index does not fit in u64".to_string())?,
+        ),
     })
 }
 
@@ -1120,6 +1204,9 @@ fn unshield_resp_from_wire(wire: WireUnshieldResp) -> Result<UnshieldResp, Strin
                     .map_err(|_| "change index does not fit in usize".to_string())
             })
             .transpose()?,
+        producer_index: wire_to_u64(wire.producer_index)?
+            .try_into()
+            .map_err(|_| "producer index does not fit in usize".to_string())?,
     })
 }
 
@@ -1250,25 +1337,36 @@ mod tests {
     fn kernel_inbox_roundtrip_preserves_shield_request() {
         let message = KernelInboxMessage::Shield(KernelShieldReq {
             sender: "alice".into(),
+            fee: 3,
             v: 42,
+            producer_fee: 5,
             address: sample_payment_address(),
             memo: Some("hello".into()),
             proof: sample_kernel_stark_proof(),
             client_cm: ZERO,
             client_enc: None,
+            producer_cm: [9u8; 32],
+            producer_enc: Some(sample_encrypted_note(0x77)),
         });
         let encoded = encode_kernel_inbox_message(&message).unwrap();
         let decoded = decode_kernel_inbox_message(&encoded).unwrap();
         match decoded {
             KernelInboxMessage::Shield(req) => {
                 assert_eq!(req.sender, "alice");
+                assert_eq!(req.fee, 3);
                 assert_eq!(req.v, 42);
+                assert_eq!(req.producer_fee, 5);
                 assert_eq!(req.memo.as_deref(), Some("hello"));
                 assert_eq!(
                     req.proof.proof_bytes,
                     sample_kernel_stark_proof().proof_bytes
                 );
                 assert_eq!(req.address.d_j, sample_payment_address().d_j);
+                assert_eq!(req.producer_cm, [9u8; 32]);
+                assert_eq!(
+                    req.producer_enc.as_ref().map(|enc| &enc.ct_d),
+                    Some(&sample_encrypted_note(0x77).ct_d)
+                );
             }
             other => panic!("unexpected decoded message: {:?}", other),
         }
@@ -1279,10 +1377,13 @@ mod tests {
         let message = KernelInboxMessage::Transfer(KernelTransferReq {
             root: [1u8; 32],
             nullifiers: vec![[2u8; 32], [3u8; 32]],
+            fee: 9,
             cm_1: [4u8; 32],
             cm_2: [5u8; 32],
+            cm_3: [6u8; 32],
             enc_1: sample_encrypted_note(0x11),
             enc_2: sample_encrypted_note(0x22),
+            enc_3: sample_encrypted_note(0x33),
             proof: sample_kernel_stark_proof(),
         });
         let encoded = encode_kernel_inbox_message(&message).unwrap();
@@ -1356,12 +1457,16 @@ mod tests {
         };
         let message = KernelInboxMessage::Shield(KernelShieldReq {
             sender: "alice".to_string(),
+            fee: 1,
             v: 7,
+            producer_fee: 3,
             address: sample_payment_address(),
             memo: None,
             proof,
             client_cm: [0x44; 32],
             client_enc: None,
+            producer_cm: [0x55; 32],
+            producer_enc: Some(sample_encrypted_note(0x56)),
         });
         let encoded = encode_kernel_inbox_message(&message).unwrap();
         let decoded = decode_kernel_inbox_message(&encoded).unwrap();
@@ -1383,12 +1488,16 @@ mod tests {
         };
         let message = KernelInboxMessage::Shield(KernelShieldReq {
             sender: "alice".to_string(),
+            fee: 2,
             v: 7,
+            producer_fee: 4,
             address: sample_payment_address(),
             memo: None,
             proof: proof.clone(),
             client_cm: [0x44; 32],
             client_enc: None,
+            producer_cm: [0x66; 32],
+            producer_enc: Some(sample_encrypted_note(0x67)),
         });
         let encoded = encode_kernel_inbox_message(&message).unwrap();
         let decoded = decode_kernel_inbox_message(&encoded).unwrap();
@@ -1431,10 +1540,13 @@ mod tests {
         let req = KernelTransferReq {
             root: [1u8; 32],
             nullifiers: vec![[2u8; 32], [3u8; 32]],
+            fee: 11,
             cm_1: [4u8; 32],
             cm_2: [5u8; 32],
+            cm_3: [6u8; 32],
             enc_1: sample_encrypted_note(0x11),
             enc_2: sample_encrypted_note(0x22),
+            enc_3: sample_encrypted_note(0x33),
             proof: sample_kernel_stark_proof(),
         };
         let wire = kernel_transfer_req_to_wire(&req).unwrap();
@@ -1443,8 +1555,10 @@ mod tests {
         let host = kernel_transfer_req_from_wire(decoded).unwrap();
         assert_eq!(host.root, req.root);
         assert_eq!(host.nullifiers, req.nullifiers);
+        assert_eq!(host.fee, req.fee);
         assert_eq!(host.cm_1, req.cm_1);
         assert_eq!(host.cm_2, req.cm_2);
+        assert_eq!(host.cm_3, req.cm_3);
         assert_eq!(host.enc_1.ct_d, req.enc_1.ct_d);
         assert_eq!(host.enc_1.tag, req.enc_1.tag);
         assert_eq!(host.enc_1.ct_v, req.enc_1.ct_v);
@@ -1453,6 +1567,10 @@ mod tests {
         assert_eq!(host.enc_2.tag, req.enc_2.tag);
         assert_eq!(host.enc_2.ct_v, req.enc_2.ct_v);
         assert_eq!(host.enc_2.encrypted_data, req.enc_2.encrypted_data);
+        assert_eq!(host.enc_3.ct_d, req.enc_3.ct_d);
+        assert_eq!(host.enc_3.tag, req.enc_3.tag);
+        assert_eq!(host.enc_3.ct_v, req.enc_3.ct_v);
+        assert_eq!(host.enc_3.encrypted_data, req.enc_3.encrypted_data);
         assert_eq!(host.proof.proof_bytes, req.proof.proof_bytes);
     }
 
@@ -1461,10 +1579,13 @@ mod tests {
         let req = KernelTransferReq {
             root: [1u8; 32],
             nullifiers: vec![[2u8; 32], [3u8; 32]],
+            fee: 12,
             cm_1: [4u8; 32],
             cm_2: [5u8; 32],
+            cm_3: [6u8; 32],
             enc_1: sample_encrypted_note(0x11),
             enc_2: sample_encrypted_note(0x22),
+            enc_3: sample_encrypted_note(0x33),
             proof: sample_kernel_stark_proof(),
         };
         let wire = kernel_transfer_req_to_wire(&req).unwrap();
@@ -1473,10 +1594,14 @@ mod tests {
         let (rest, nullifiers) = decode_tze_prefix::<WireEncodedFeltList>(rest).unwrap();
         let decoded_nullifiers = encoded_felt_list_from_wire(nullifiers).unwrap();
         assert_eq!(decoded_nullifiers, req.nullifiers);
+        let (rest, fee) = decode_tze_prefix::<WireU64Le>(rest).unwrap();
+        assert_eq!(wire_to_u64(fee).unwrap(), req.fee);
         let (rest, cm_1) = decode_tze_prefix::<WireFelt>(rest).unwrap();
         assert_eq!(wire_to_felt(cm_1).unwrap(), req.cm_1);
         let (rest, cm_2) = decode_tze_prefix::<WireFelt>(rest).unwrap();
         assert_eq!(wire_to_felt(cm_2).unwrap(), req.cm_2);
+        let (rest, cm_3) = decode_tze_prefix::<WireFelt>(rest).unwrap();
+        assert_eq!(wire_to_felt(cm_3).unwrap(), req.cm_3);
         let (rest, proof) = decode_tze_prefix::<WireEncodedProof>(rest).unwrap();
         let decoded_proof = encoded_proof_from_wire(proof).unwrap();
         assert_eq!(decoded_proof.proof_bytes, req.proof.proof_bytes);
@@ -1486,6 +1611,9 @@ mod tests {
         let (rest, enc_2) = decode_tze_prefix::<WireEncodedNote>(rest).unwrap();
         let decoded_enc_2 = encoded_note_from_wire(enc_2).unwrap();
         assert_eq!(decoded_enc_2.ct_d, req.enc_2.ct_d);
+        let (rest, enc_3) = decode_tze_prefix::<WireEncodedNote>(rest).unwrap();
+        let decoded_enc_3 = encoded_note_from_wire(enc_3).unwrap();
+        assert_eq!(decoded_enc_3.ct_d, req.enc_3.ct_d);
         assert!(rest.is_empty());
     }
 
@@ -1495,9 +1623,12 @@ mod tests {
             root: [1u8; 32],
             nullifiers: vec![[2u8; 32]],
             v_pub: 33,
+            fee: 4,
             recipient: "bob".into(),
             cm_change: [4u8; 32],
             enc_change: Some(sample_encrypted_note(0x33)),
+            cm_fee: [5u8; 32],
+            enc_fee: sample_encrypted_note(0x44),
             proof: sample_kernel_stark_proof(),
         };
         let wire = kernel_unshield_req_to_wire(&req).unwrap();
@@ -1507,14 +1638,20 @@ mod tests {
         assert_eq!(host.root, req.root);
         assert_eq!(host.nullifiers, req.nullifiers);
         assert_eq!(host.v_pub, req.v_pub);
+        assert_eq!(host.fee, req.fee);
         assert_eq!(host.recipient, req.recipient);
         assert_eq!(host.cm_change, req.cm_change);
+        assert_eq!(host.cm_fee, req.cm_fee);
         let host_change = host.enc_change.expect("missing decoded change note");
         let req_change = req.enc_change.expect("missing original change note");
         assert_eq!(host_change.ct_d, req_change.ct_d);
         assert_eq!(host_change.tag, req_change.tag);
         assert_eq!(host_change.ct_v, req_change.ct_v);
         assert_eq!(host_change.encrypted_data, req_change.encrypted_data);
+        assert_eq!(host.enc_fee.ct_d, req.enc_fee.ct_d);
+        assert_eq!(host.enc_fee.tag, req.enc_fee.tag);
+        assert_eq!(host.enc_fee.ct_v, req.enc_fee.ct_v);
+        assert_eq!(host.enc_fee.encrypted_data, req.enc_fee.encrypted_data);
         assert_eq!(host.proof.proof_bytes, req.proof.proof_bytes);
     }
 
@@ -1523,10 +1660,13 @@ mod tests {
         let message = KernelInboxMessage::Transfer(KernelTransferReq {
             root: [1u8; 32],
             nullifiers: vec![[2u8; 32]],
+            fee: 5,
             cm_1: [4u8; 32],
             cm_2: [5u8; 32],
+            cm_3: [6u8; 32],
             enc_1: sample_encrypted_note(0x11),
             enc_2: sample_encrypted_note(0x22),
+            enc_3: sample_encrypted_note(0x33),
             proof: sample_kernel_stark_proof(),
         });
         let encoded = encode_kernel_inbox_message(&message).unwrap();
@@ -1539,10 +1679,13 @@ mod tests {
                 );
                 assert_eq!(req.root, [1u8; 32]);
                 assert_eq!(req.nullifiers, vec![[2u8; 32]]);
+                assert_eq!(req.fee, 5);
                 assert_eq!(req.cm_1, [4u8; 32]);
                 assert_eq!(req.cm_2, [5u8; 32]);
+                assert_eq!(req.cm_3, [6u8; 32]);
                 assert_eq!(req.enc_1.ct_d, sample_encrypted_note(0x11).ct_d);
                 assert_eq!(req.enc_2.ct_v, sample_encrypted_note(0x22).ct_v);
+                assert_eq!(req.enc_3.tag, sample_encrypted_note(0x33).tag);
             }
             other => panic!("unexpected decoded message: {:?}", other),
         }
@@ -1554,9 +1697,12 @@ mod tests {
             root: [1u8; 32],
             nullifiers: vec![[2u8; 32]],
             v_pub: 33,
+            fee: 6,
             recipient: "bob".into(),
             cm_change: [4u8; 32],
             enc_change: Some(sample_encrypted_note(0x33)),
+            cm_fee: [5u8; 32],
+            enc_fee: sample_encrypted_note(0x44),
             proof: sample_kernel_stark_proof(),
         });
         let encoded = encode_kernel_inbox_message(&message).unwrap();
@@ -1570,12 +1716,15 @@ mod tests {
                 assert_eq!(req.root, [1u8; 32]);
                 assert_eq!(req.nullifiers, vec![[2u8; 32]]);
                 assert_eq!(req.v_pub, 33);
+                assert_eq!(req.fee, 6);
                 assert_eq!(req.recipient, "bob");
                 assert_eq!(req.cm_change, [4u8; 32]);
+                assert_eq!(req.cm_fee, [5u8; 32]);
                 assert_eq!(
                     req.enc_change.as_ref().unwrap().encrypted_data,
                     sample_encrypted_note(0x33).encrypted_data
                 );
+                assert_eq!(req.enc_fee.ct_d, sample_encrypted_note(0x44).ct_d);
             }
             other => panic!("unexpected decoded message: {:?}", other),
         }
@@ -1678,20 +1827,28 @@ mod tests {
         fn prop_kernel_shield_roundtrip_preserves_fields(
             sender in small_string(32),
             memo in prop::option::of(small_string(64)),
+            fee in any::<u64>(),
             v in any::<u64>(),
+            producer_fee in 1u64..u64::MAX,
             address in arb_payment_address(),
             proof in arb_kernel_stark_proof(),
             client_cm in arb_felt(),
             client_enc in prop::option::of(arb_encrypted_note()),
+            producer_cm in arb_felt(),
+            producer_enc in arb_encrypted_note(),
         ) {
             let message = KernelInboxMessage::Shield(KernelShieldReq {
                 sender: sender.clone(),
+                fee,
                 v,
+                producer_fee,
                 address: address.clone(),
                 memo: memo.clone(),
                 proof: proof.clone(),
                 client_cm,
                 client_enc: client_enc.clone(),
+                producer_cm,
+                producer_enc: Some(producer_enc.clone()),
             });
 
             let encoded = encode_kernel_inbox_message(&message).unwrap();
@@ -1700,7 +1857,9 @@ mod tests {
                 panic!("decoded wrong kernel message variant");
             };
             prop_assert_eq!(req.sender, sender);
+            prop_assert_eq!(req.fee, fee);
             prop_assert_eq!(req.v, v);
+            prop_assert_eq!(req.producer_fee, producer_fee);
             prop_assert_eq!(req.memo, memo);
             prop_assert_eq!(req.address.d_j, address.d_j);
             prop_assert_eq!(req.address.auth_root, address.auth_root);
@@ -1710,6 +1869,11 @@ mod tests {
             prop_assert_eq!(req.address.ek_d, address.ek_d);
             prop_assert_eq!(req.client_cm, client_cm);
             prop_assert_eq!(req.client_enc.is_some(), client_enc.is_some());
+            prop_assert_eq!(req.producer_cm, producer_cm);
+            prop_assert_eq!(
+                req.producer_enc.as_ref().map(|enc| &enc.ct_d),
+                Some(&producer_enc.ct_d)
+            );
             if let (Some(actual), Some(expected)) = (req.client_enc.as_ref(), client_enc.as_ref()) {
                 prop_assert_eq!(&actual.ct_d, &expected.ct_d);
                 prop_assert_eq!(actual.tag, expected.tag);
@@ -1725,19 +1889,25 @@ mod tests {
         fn prop_kernel_transfer_roundtrip_preserves_fields(
             root in arb_felt(),
             nullifiers in prop::collection::vec(arb_felt(), 0..8),
+            fee in any::<u64>(),
             cm_1 in arb_felt(),
             cm_2 in arb_felt(),
+            cm_3 in arb_felt(),
             enc_1 in arb_encrypted_note(),
             enc_2 in arb_encrypted_note(),
+            enc_3 in arb_encrypted_note(),
             proof in arb_kernel_stark_proof(),
         ) {
             let req = KernelTransferReq {
                 root,
                 nullifiers: nullifiers.clone(),
+                fee,
                 cm_1,
                 cm_2,
+                cm_3,
                 enc_1: enc_1.clone(),
                 enc_2: enc_2.clone(),
+                enc_3: enc_3.clone(),
                 proof: proof.clone(),
             };
 
@@ -1745,8 +1915,10 @@ mod tests {
             let decoded = kernel_transfer_req_from_wire(wire).unwrap();
             prop_assert_eq!(decoded.root, root);
             prop_assert_eq!(decoded.nullifiers, nullifiers);
+            prop_assert_eq!(decoded.fee, fee);
             prop_assert_eq!(decoded.cm_1, cm_1);
             prop_assert_eq!(decoded.cm_2, cm_2);
+            prop_assert_eq!(decoded.cm_3, cm_3);
             prop_assert_eq!(decoded.enc_1.ct_d, enc_1.ct_d);
             prop_assert_eq!(decoded.enc_1.tag, enc_1.tag);
             prop_assert_eq!(decoded.enc_1.ct_v, enc_1.ct_v);
@@ -1755,6 +1927,10 @@ mod tests {
             prop_assert_eq!(decoded.enc_2.tag, enc_2.tag);
             prop_assert_eq!(decoded.enc_2.ct_v, enc_2.ct_v);
             prop_assert_eq!(decoded.enc_2.encrypted_data, enc_2.encrypted_data);
+            prop_assert_eq!(decoded.enc_3.ct_d, enc_3.ct_d);
+            prop_assert_eq!(decoded.enc_3.tag, enc_3.tag);
+            prop_assert_eq!(decoded.enc_3.ct_v, enc_3.ct_v);
+            prop_assert_eq!(decoded.enc_3.encrypted_data, enc_3.encrypted_data);
             prop_assert_eq!(decoded.proof.proof_bytes, proof.proof_bytes);
             prop_assert_eq!(decoded.proof.output_preimage, proof.output_preimage);
             prop_assert_eq!(decoded.proof.verify_meta, proof.verify_meta);
@@ -1765,18 +1941,24 @@ mod tests {
             root in arb_felt(),
             nullifiers in prop::collection::vec(arb_felt(), 0..8),
             v_pub in any::<u64>(),
+            fee in any::<u64>(),
             recipient in small_string(32),
             cm_change in arb_felt(),
             enc_change in prop::option::of(arb_encrypted_note()),
+            cm_fee in arb_felt(),
+            enc_fee in arb_encrypted_note(),
             proof in arb_kernel_stark_proof(),
         ) {
             let req = KernelUnshieldReq {
                 root,
                 nullifiers: nullifiers.clone(),
                 v_pub,
+                fee,
                 recipient: recipient.clone(),
                 cm_change,
                 enc_change: enc_change.clone(),
+                cm_fee,
+                enc_fee: enc_fee.clone(),
                 proof: proof.clone(),
             };
 
@@ -1785,8 +1967,10 @@ mod tests {
             prop_assert_eq!(decoded.root, root);
             prop_assert_eq!(decoded.nullifiers, nullifiers);
             prop_assert_eq!(decoded.v_pub, v_pub);
+            prop_assert_eq!(decoded.fee, fee);
             prop_assert_eq!(decoded.recipient, recipient);
             prop_assert_eq!(decoded.cm_change, cm_change);
+            prop_assert_eq!(decoded.cm_fee, cm_fee);
             prop_assert_eq!(decoded.enc_change.is_some(), enc_change.is_some());
             if let (Some(actual), Some(expected)) = (decoded.enc_change.as_ref(), enc_change.as_ref()) {
                 prop_assert_eq!(&actual.ct_d, &expected.ct_d);
@@ -1794,6 +1978,10 @@ mod tests {
                 prop_assert_eq!(&actual.ct_v, &expected.ct_v);
                 prop_assert_eq!(&actual.encrypted_data, &expected.encrypted_data);
             }
+            prop_assert_eq!(decoded.enc_fee.ct_d, enc_fee.ct_d);
+            prop_assert_eq!(decoded.enc_fee.tag, enc_fee.tag);
+            prop_assert_eq!(decoded.enc_fee.ct_v, enc_fee.ct_v);
+            prop_assert_eq!(decoded.enc_fee.encrypted_data, enc_fee.encrypted_data);
             prop_assert_eq!(decoded.proof.proof_bytes, proof.proof_bytes);
             prop_assert_eq!(decoded.proof.output_preimage, proof.output_preimage);
             prop_assert_eq!(decoded.proof.verify_meta, proof.verify_meta);
@@ -1803,21 +1991,32 @@ mod tests {
         fn prop_kernel_result_roundtrip_preserves_payload(
             shield_cm in arb_felt(),
             shield_index in 0u64..10_000,
+            producer_cm in arb_felt(),
+            producer_index in 0u64..10_000,
             transfer_index_1 in 0u64..10_000,
             transfer_index_2 in 0u64..10_000,
+            transfer_index_3 in 0u64..10_000,
             change_index in prop::option::of(0u64..10_000),
+            producer_note_index in 0u64..10_000,
             message in small_string(64),
         ) {
             let cases = [
                 KernelResult::Configured,
                 KernelResult::Deposit,
-                KernelResult::Shield(ShieldResp { cm: shield_cm, index: shield_index as usize }),
+                KernelResult::Shield(ShieldResp {
+                    cm: shield_cm,
+                    index: shield_index as usize,
+                    producer_cm,
+                    producer_index: producer_index as usize,
+                }),
                 KernelResult::Transfer(TransferResp {
                     index_1: transfer_index_1 as usize,
                     index_2: transfer_index_2 as usize,
+                    index_3: transfer_index_3 as usize,
                 }),
                 KernelResult::Unshield(UnshieldResp {
                     change_index: change_index.map(|x| x as usize),
+                    producer_index: producer_note_index as usize,
                 }),
                 KernelResult::Withdraw(WithdrawResp {
                     withdrawal_index: transfer_index_1 as usize,
@@ -1834,13 +2033,17 @@ mod tests {
                     (KernelResult::Shield(actual), KernelResult::Shield(expected)) => {
                         prop_assert_eq!(actual.cm, expected.cm);
                         prop_assert_eq!(actual.index, expected.index);
+                        prop_assert_eq!(actual.producer_cm, expected.producer_cm);
+                        prop_assert_eq!(actual.producer_index, expected.producer_index);
                     }
                     (KernelResult::Transfer(actual), KernelResult::Transfer(expected)) => {
                         prop_assert_eq!(actual.index_1, expected.index_1);
                         prop_assert_eq!(actual.index_2, expected.index_2);
+                        prop_assert_eq!(actual.index_3, expected.index_3);
                     }
                     (KernelResult::Unshield(actual), KernelResult::Unshield(expected)) => {
                         prop_assert_eq!(actual.change_index, expected.change_index);
+                        prop_assert_eq!(actual.producer_index, expected.producer_index);
                     }
                     (KernelResult::Withdraw(actual), KernelResult::Withdraw(expected)) => {
                         prop_assert_eq!(actual.withdrawal_index, expected.withdrawal_index);
@@ -1910,87 +2113,123 @@ mod tests {
             nullifiers in prop::collection::vec(arb_felt(), 0..8),
             cm_1 in arb_felt(),
             cm_2 in arb_felt(),
+            cm_3 in arb_felt(),
             cm_change in arb_felt(),
+            cm_fee in arb_felt(),
             client_cm in arb_felt(),
+            fee in any::<u64>(),
             value in any::<u64>(),
+            producer_fee in 1u64..u64::MAX,
             address in arb_payment_address(),
             proof in arb_kernel_stark_proof(),
             enc_1 in arb_encrypted_note(),
             enc_2 in arb_encrypted_note(),
+            enc_3 in arb_encrypted_note(),
             enc_change in prop::option::of(arb_encrypted_note()),
+            enc_fee in arb_encrypted_note(),
             client_enc in prop::option::of(arb_encrypted_note()),
+            producer_enc in arb_encrypted_note(),
         ) {
             let shield = KernelShieldReq {
                 sender: sender.clone(),
+                fee,
                 v: value,
+                producer_fee,
                 address: address.clone(),
                 memo: memo.clone(),
                 proof: proof.clone(),
                 client_cm,
                 client_enc: client_enc.clone(),
+                producer_cm: cm_fee,
+                producer_enc: Some(producer_enc.clone()),
             };
             let shield_host = kernel_shield_req_to_host(&shield);
             prop_assert_eq!(shield_host.sender, sender);
+            prop_assert_eq!(shield_host.fee, fee);
             prop_assert_eq!(shield_host.v, value);
+            prop_assert_eq!(shield_host.producer_fee, producer_fee);
             prop_assert_eq!(shield_host.address.d_j, address.d_j);
             prop_assert_eq!(shield_host.memo, memo);
             prop_assert_eq!(shield_host.client_cm, client_cm);
             prop_assert_eq!(shield_host.client_enc.is_some(), client_enc.is_some());
+            prop_assert_eq!(shield_host.producer_cm, cm_fee);
+            prop_assert_eq!(
+                shield_host.producer_enc.as_ref().map(|enc| &enc.ct_d),
+                Some(&producer_enc.ct_d)
+            );
 
             let transfer = KernelTransferReq {
                 root,
                 nullifiers: nullifiers.clone(),
+                fee,
                 cm_1,
                 cm_2,
+                cm_3,
                 enc_1: enc_1.clone(),
                 enc_2: enc_2.clone(),
+                enc_3: enc_3.clone(),
                 proof: proof.clone(),
             };
             let transfer_host = kernel_transfer_req_to_host(&transfer);
             let transfer_nullifiers = transfer_host.nullifiers.clone();
             prop_assert_eq!(transfer_host.root, root);
             prop_assert_eq!(&transfer_nullifiers, &nullifiers);
+            prop_assert_eq!(transfer_host.fee, fee);
             prop_assert_eq!(transfer_host.cm_1, cm_1);
             prop_assert_eq!(transfer_host.cm_2, cm_2);
+            prop_assert_eq!(transfer_host.cm_3, cm_3);
             prop_assert_eq!(transfer_host.enc_1.ct_d, enc_1.ct_d);
             prop_assert_eq!(transfer_host.enc_2.ct_v, enc_2.ct_v);
+            prop_assert_eq!(transfer_host.enc_3.tag, enc_3.tag);
 
             let unshield = KernelUnshieldReq {
                 root,
                 nullifiers: transfer_nullifiers.clone(),
                 v_pub: value,
+                fee,
                 recipient: recipient.clone(),
                 cm_change,
                 enc_change: enc_change.clone(),
+                cm_fee,
+                enc_fee: enc_fee.clone(),
                 proof,
             };
             let unshield_host = kernel_unshield_req_to_host(&unshield);
             prop_assert_eq!(unshield_host.root, root);
             prop_assert_eq!(&unshield_host.nullifiers, &transfer_nullifiers);
             prop_assert_eq!(unshield_host.v_pub, value);
+            prop_assert_eq!(unshield_host.fee, fee);
             prop_assert_eq!(unshield_host.recipient, recipient);
             prop_assert_eq!(unshield_host.cm_change, cm_change);
+            prop_assert_eq!(unshield_host.cm_fee, cm_fee);
             prop_assert_eq!(unshield_host.enc_change.is_some(), enc_change.is_some());
+            prop_assert_eq!(unshield_host.enc_fee.ct_d, enc_fee.ct_d);
         }
 
         #[test]
         fn prop_transfer_payload_rejects_trailing_bytes(
             req_root in arb_felt(),
             nullifiers in prop::collection::vec(arb_felt(), 0..6),
+            fee in any::<u64>(),
             cm_1 in arb_felt(),
             cm_2 in arb_felt(),
+            cm_3 in arb_felt(),
             enc_1 in arb_encrypted_note(),
             enc_2 in arb_encrypted_note(),
+            enc_3 in arb_encrypted_note(),
             proof in arb_kernel_stark_proof(),
             trailing in prop::collection::vec(any::<u8>(), 1..8),
         ) {
             let req = KernelTransferReq {
                 root: req_root,
                 nullifiers,
+                fee,
                 cm_1,
                 cm_2,
+                cm_3,
                 enc_1,
                 enc_2,
+                enc_3,
                 proof,
             };
             let mut wire = kernel_transfer_req_to_wire(&req).unwrap();
@@ -2003,20 +2242,26 @@ mod tests {
         fn prop_transfer_payload_rejects_truncation(
             req_root in arb_felt(),
             nullifiers in prop::collection::vec(arb_felt(), 0..6),
+            fee in any::<u64>(),
             cm_1 in arb_felt(),
             cm_2 in arb_felt(),
+            cm_3 in arb_felt(),
             enc_1 in arb_encrypted_note(),
             enc_2 in arb_encrypted_note(),
+            enc_3 in arb_encrypted_note(),
             proof in arb_kernel_stark_proof(),
             cut in 1usize..8,
         ) {
             let req = KernelTransferReq {
                 root: req_root,
                 nullifiers,
+                fee,
                 cm_1,
                 cm_2,
+                cm_3,
                 enc_1,
                 enc_2,
+                enc_3,
                 proof,
             };
             let mut wire = kernel_transfer_req_to_wire(&req).unwrap();
@@ -2031,9 +2276,12 @@ mod tests {
             req_root in arb_felt(),
             nullifiers in prop::collection::vec(arb_felt(), 0..6),
             v_pub in any::<u64>(),
+            fee in any::<u64>(),
             recipient in small_string(32),
             cm_change in arb_felt(),
             enc_change in prop::option::of(arb_encrypted_note()),
+            cm_fee in arb_felt(),
+            enc_fee in arb_encrypted_note(),
             proof in arb_kernel_stark_proof(),
             trailing in prop::collection::vec(any::<u8>(), 1..8),
         ) {
@@ -2041,9 +2289,12 @@ mod tests {
                 root: req_root,
                 nullifiers,
                 v_pub,
+                fee,
                 recipient,
                 cm_change,
                 enc_change,
+                cm_fee,
+                enc_fee,
                 proof,
             };
             let mut wire = kernel_unshield_req_to_wire(&req).unwrap();
@@ -2057,9 +2308,12 @@ mod tests {
             req_root in arb_felt(),
             nullifiers in prop::collection::vec(arb_felt(), 0..6),
             v_pub in any::<u64>(),
+            fee in any::<u64>(),
             recipient in small_string(32),
             cm_change in arb_felt(),
             enc_change in prop::option::of(arb_encrypted_note()),
+            cm_fee in arb_felt(),
+            enc_fee in arb_encrypted_note(),
             proof in arb_kernel_stark_proof(),
             cut in 1usize..8,
         ) {
@@ -2067,9 +2321,12 @@ mod tests {
                 root: req_root,
                 nullifiers,
                 v_pub,
+                fee,
                 recipient,
                 cm_change,
                 enc_change,
+                cm_fee,
+                enc_fee,
                 proof,
             };
             let mut wire = kernel_unshield_req_to_wire(&req).unwrap();

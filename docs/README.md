@@ -14,7 +14,7 @@ This directory is the entry point for the project documentation.
 ## Tutorials And Guides
 
 - [shadownet_tutorial.md](./shadownet_tutorial.md)
-  - step-by-step Shadownet `deposit -> shield -> send` tutorial
+  - step-by-step Shadownet `deposit -> shield -> send` tutorial with the current burned `100000` mutez rollup fee plus a private DAL-producer fee note
 - [wallet_detection_service.md](./wallet_detection_service.md)
   - watch-only wallet flow and `tzel-detect`
 

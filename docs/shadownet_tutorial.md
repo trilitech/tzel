@@ -3,6 +3,10 @@
 This tutorial covers a Shadownet `deposit -> shield -> send` flow against a
 deployed rollup using the operator box.
 
+The current rollup policy burns `100000` mutez (`0.1 tez`) on every `shield`,
+`send`, and `unshield`, and each of those transactions also pays a separate
+private DAL-producer fee note.
+
 It assumes:
 
 - a public operator machine running `octez-node`, `octez-dal-node`,
@@ -194,6 +198,15 @@ Create wallet files:
 ```bash
 /usr/local/bin/tzel-wallet --wallet alice.wallet init
 /usr/local/bin/tzel-wallet --wallet bob.wallet init
+/usr/local/bin/tzel-wallet --wallet producer.wallet init
+```
+
+Create a shielded address for the DAL slot producer payment:
+
+```bash
+/usr/local/bin/tzel-wallet \
+  --wallet producer.wallet \
+  receive | sed -n '2,$p' > producer-address.json
 ```
 
 Create Shadownet profiles:
@@ -205,6 +218,8 @@ Create Shadownet profiles:
   --rollup-node-url http://127.0.0.1:28944 \
   --rollup-address "$ROLLUP_ADDRESS" \
   --bridge-ticketer "$BRIDGE_TICKETER" \
+  --dal-fee 1 \
+  --dal-fee-address producer-address.json \
   --operator-url http://127.0.0.1:8787 \
   --operator-bearer-token "$OPERATOR_BEARER_TOKEN" \
   --source-alias "$SOURCE_ALIAS" \
@@ -216,6 +231,8 @@ Create Shadownet profiles:
   --rollup-node-url http://127.0.0.1:28944 \
   --rollup-address "$ROLLUP_ADDRESS" \
   --bridge-ticketer "$BRIDGE_TICKETER" \
+  --dal-fee 1 \
+  --dal-fee-address producer-address.json \
   --operator-url http://127.0.0.1:8787 \
   --operator-bearer-token "$OPERATOR_BEARER_TOKEN" \
   --source-alias "$SOURCE_ALIAS" \
@@ -225,6 +242,7 @@ Create Shadownet profiles:
 Notes:
 
 - `public-account` is the rollup-visible transparent account string, not an L1 address
+- `dal_fee_address` is the shielded address that receives the DAL inclusion fee note
 - keep Alice and Bob distinct
 
 ## 6. Fund Alice On L1 And Wait For The Public Rollup Balance
@@ -287,7 +305,7 @@ Keep polling until the operator reports a final state. Then sync Alice:
 
 Acceptance:
 
-- Alice’s public rollup balance drops by the shielded amount
+- Alice’s public rollup balance drops by the shielded amount plus the fixed `100000` mutez burn and the configured DAL-producer fee
 - Alice’s private available balance becomes non-zero
 
 ## 8. Derive Bob’s Receive Address
@@ -344,7 +362,7 @@ Then sync both wallets:
 
 Acceptance:
 
-- Alice has a private balance reduced by the sent amount
+- Alice has a private balance reduced by the sent amount plus the fixed `100000` mutez burn and the configured DAL-producer fee
 - Bob has a private balance equal to the received note
 
 ## 10. Evidence To Keep

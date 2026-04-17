@@ -49,38 +49,55 @@ let derive_test_address keys j =
 
 let () =
   let auth_domain = Tzel.Hash.hash_bytes (Bytes.of_string "tzel-auth-domain-local-dev-v1") in
-  let initial_alice_balance = 100 in
+  let fee = 100_000 in
+  let producer_fee = 1 in
+  let initial_alice_balance = 500_001 in
 
   let alice_keys = Tzel.Keys.derive (fixed_felt 0x11) in
   let bob_keys = Tzel.Keys.derive (fixed_felt 0x55) in
+  let producer_keys = Tzel.Keys.derive (fixed_felt 0x77) in
 
   let alice_addr0 = derive_test_address alice_keys 0 in
   let alice_addr1 = derive_test_address alice_keys 1 in
   let bob_addr0 = derive_test_address bob_keys 0 in
+  let producer_addr0 = derive_test_address producer_keys 0 in
 
   let shield_rseed = fixed_felt 0x21 in
-  let shield_note = Tzel.Note.create alice_addr0 100L shield_rseed in
+  let shield_note = Tzel.Note.create alice_addr0 400_000L shield_rseed in
   let (shield_enc, shield_memo_ct_hash) =
     deterministic_encrypted_note alice_addr0
-      ~v:100L
+      ~v:400_000L
       ~rseed:shield_rseed
       ~memo:(Bytes.of_string "interop-shield")
       ~detect_seed:0x31
       ~view_seed:0x41
   in
+  let shield_producer_rseed = fixed_felt 0x24 in
+  let shield_producer_note = Tzel.Note.create producer_addr0 1L shield_producer_rseed in
+  let (shield_producer_enc, shield_producer_memo_ct_hash) =
+    deterministic_encrypted_note producer_addr0
+      ~v:1L
+      ~rseed:shield_producer_rseed
+      ~memo:(Bytes.of_string "interop-dal-shield")
+      ~detect_seed:0x34
+      ~view_seed:0x44
+  in
 
   let tree = Tzel.Merkle.create_with_leaves ~depth:48 in
   ignore (Tzel.Merkle.append_with_leaves tree shield_note.cm);
+  ignore (Tzel.Merkle.append_with_leaves tree shield_producer_note.cm);
   let root_after_shield = Tzel.Merkle.root_with_leaves tree in
   let shield_nf = Tzel.Note.nullifier alice_addr0.nk_spend shield_note.cm 0 in
 
   let transfer_rseed_1 = fixed_felt 0x22 in
   let transfer_rseed_2 = fixed_felt 0x23 in
-  let transfer_note_1 = Tzel.Note.create alice_addr1 60L transfer_rseed_1 in
-  let transfer_note_2 = Tzel.Note.create bob_addr0 40L transfer_rseed_2 in
+  let transfer_rseed_3 = fixed_felt 0x25 in
+  let transfer_note_1 = Tzel.Note.create alice_addr1 99_999L transfer_rseed_1 in
+  let transfer_note_2 = Tzel.Note.create bob_addr0 200_000L transfer_rseed_2 in
+  let transfer_note_3 = Tzel.Note.create producer_addr0 1L transfer_rseed_3 in
   let (transfer_enc_1, transfer_memo_ct_hash_1) =
     deterministic_encrypted_note alice_addr1
-      ~v:60L
+      ~v:99_999L
       ~rseed:transfer_rseed_1
       ~memo:(Bytes.of_string "interop-change")
       ~detect_seed:0x32
@@ -88,17 +105,36 @@ let () =
   in
   let (transfer_enc_2, transfer_memo_ct_hash_2) =
     deterministic_encrypted_note bob_addr0
-      ~v:40L
+      ~v:200_000L
       ~rseed:transfer_rseed_2
       ~memo:(Bytes.of_string "interop-bob")
       ~detect_seed:0x33
       ~view_seed:0x43
   in
+  let (transfer_enc_3, transfer_memo_ct_hash_3) =
+    deterministic_encrypted_note producer_addr0
+      ~v:1L
+      ~rseed:transfer_rseed_3
+      ~memo:(Bytes.of_string "interop-dal-transfer")
+      ~detect_seed:0x35
+      ~view_seed:0x45
+  in
 
   ignore (Tzel.Merkle.append_with_leaves tree transfer_note_1.cm);
   ignore (Tzel.Merkle.append_with_leaves tree transfer_note_2.cm);
+  ignore (Tzel.Merkle.append_with_leaves tree transfer_note_3.cm);
   let root_after_transfer = Tzel.Merkle.root_with_leaves tree in
-  let bob_nf = Tzel.Note.nullifier bob_addr0.nk_spend transfer_note_2.cm 2 in
+  let bob_nf = Tzel.Note.nullifier bob_addr0.nk_spend transfer_note_2.cm 3 in
+  let unshield_fee_rseed = fixed_felt 0x26 in
+  let unshield_fee_note = Tzel.Note.create producer_addr0 1L unshield_fee_rseed in
+  let (unshield_fee_enc, unshield_fee_memo_ct_hash) =
+    deterministic_encrypted_note producer_addr0
+      ~v:1L
+      ~rseed:unshield_fee_rseed
+      ~memo:(Bytes.of_string "interop-dal-unshield")
+      ~detect_seed:0x36
+      ~view_seed:0x46
+  in
 
   let json =
     `Assoc [
@@ -106,35 +142,48 @@ let () =
       "initial_alice_balance", `Int initial_alice_balance;
       "shield", `Assoc [
         "sender", `String "alice";
-        "v", `Int 100;
+        "v", `Int 400_000;
+        "fee", `Int fee;
+        "producer_fee", `Int producer_fee;
         "address", Tzel.Encoding.payment_address_to_json (payment_address_wire_of_addr alice_addr0);
         "cm", json_felt shield_note.cm;
         "enc", Tzel.Encoding.encrypted_note_to_json shield_enc;
         "memo_ct_hash", json_felt shield_memo_ct_hash;
+        "producer_cm", json_felt shield_producer_note.cm;
+        "producer_enc", Tzel.Encoding.encrypted_note_to_json shield_producer_enc;
+        "producer_memo_ct_hash", json_felt shield_producer_memo_ct_hash;
       ];
       "transfer", `Assoc [
         "root", json_felt root_after_shield;
         "nullifiers", json_felt_list [shield_nf];
+        "fee", `Int fee;
         "cm_1", json_felt transfer_note_1.cm;
         "cm_2", json_felt transfer_note_2.cm;
+        "cm_3", json_felt transfer_note_3.cm;
         "enc_1", Tzel.Encoding.encrypted_note_to_json transfer_enc_1;
         "enc_2", Tzel.Encoding.encrypted_note_to_json transfer_enc_2;
+        "enc_3", Tzel.Encoding.encrypted_note_to_json transfer_enc_3;
         "memo_ct_hash_1", json_felt transfer_memo_ct_hash_1;
         "memo_ct_hash_2", json_felt transfer_memo_ct_hash_2;
+        "memo_ct_hash_3", json_felt transfer_memo_ct_hash_3;
       ];
       "unshield", `Assoc [
         "root", json_felt root_after_transfer;
         "nullifiers", json_felt_list [bob_nf];
-        "v_pub", `Int 40;
+        "v_pub", `Int 99_999;
+        "fee", `Int fee;
         "recipient", `String "bob";
         "cm_change", json_felt Tzel.Felt.zero;
         "enc_change", `Null;
         "memo_ct_hash_change", json_felt Tzel.Felt.zero;
+        "cm_fee", json_felt unshield_fee_note.cm;
+        "enc_fee", Tzel.Encoding.encrypted_note_to_json unshield_fee_enc;
+        "memo_ct_hash_fee", json_felt unshield_fee_memo_ct_hash;
       ];
       "expected", `Assoc [
         "alice_public_balance", `Int 0;
-        "bob_public_balance", `Int 40;
-        "tree_size", `Int 3;
+        "bob_public_balance", `Int 99_999;
+        "tree_size", `Int 6;
         "nullifier_count", `Int 2;
       ];
     ]

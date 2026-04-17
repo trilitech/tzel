@@ -24,6 +24,7 @@ pub const ML_KEM768_CIPHERTEXT_BYTES: usize = 1088;
 pub const NOTE_AEAD_NONCE_BYTES: usize = 12;
 pub const ENCRYPTED_NOTE_BYTES: usize = 8 + 32 + MEMO_SIZE + 16;
 pub const MAX_VALID_ROOTS: usize = 4096;
+pub const MIN_TX_FEE: u64 = 100_000;
 
 /// Generate a random valid felt252 (251-bit value).
 #[cfg(not(target_arch = "wasm32"))]
@@ -250,10 +251,13 @@ pub fn transfer_sighash(
     auth_domain: &F,
     root: &F,
     nullifiers: &[F],
+    fee: u64,
     cm_1: &F,
     cm_2: &F,
+    cm_3: &F,
     mh_1: &F,
     mh_2: &F,
+    mh_3: &F,
 ) -> F {
     // Circuit-type tag 0x01 for transfer
     let mut type_tag = ZERO;
@@ -263,10 +267,13 @@ pub fn transfer_sighash(
     for nf in nullifiers {
         sh = sighash_fold(&sh, nf);
     }
+    sh = sighash_fold(&sh, &u64_to_felt(fee));
     sh = sighash_fold(&sh, cm_1);
     sh = sighash_fold(&sh, cm_2);
+    sh = sighash_fold(&sh, cm_3);
     sh = sighash_fold(&sh, mh_1);
     sh = sighash_fold(&sh, mh_2);
+    sh = sighash_fold(&sh, mh_3);
     sh
 }
 
@@ -276,9 +283,12 @@ pub fn unshield_sighash(
     root: &F,
     nullifiers: &[F],
     v_pub: u64,
+    fee: u64,
     recipient: &F,
     cm_change: &F,
     mh_change: &F,
+    cm_fee: &F,
+    mh_fee: &F,
 ) -> F {
     // Circuit-type tag 0x02 for unshield
     let mut type_tag = ZERO;
@@ -288,12 +298,13 @@ pub fn unshield_sighash(
     for nf in nullifiers {
         sh = sighash_fold(&sh, nf);
     }
-    let mut v_felt = ZERO;
-    v_felt[..8].copy_from_slice(&v_pub.to_le_bytes());
-    sh = sighash_fold(&sh, &v_felt);
+    sh = sighash_fold(&sh, &u64_to_felt(v_pub));
+    sh = sighash_fold(&sh, &u64_to_felt(fee));
     sh = sighash_fold(&sh, recipient);
     sh = sighash_fold(&sh, cm_change);
     sh = sighash_fold(&sh, mh_change);
+    sh = sighash_fold(&sh, cm_fee);
+    sh = sighash_fold(&sh, mh_fee);
     sh
 }
 
@@ -1298,7 +1309,7 @@ pub struct DepositReq {
 pub type FundReq = DepositReq;
 
 /// Payment address — everything a sender needs to create a note for the recipient.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaymentAddress {
     #[serde(with = "hex_f")]
     pub d_j: F,
@@ -1317,7 +1328,9 @@ pub struct PaymentAddress {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShieldReq {
     pub sender: String,
+    pub fee: u64,
     pub v: u64,
+    pub producer_fee: u64,
     pub address: PaymentAddress,
     pub memo: Option<String>,
     pub proof: Proof,
@@ -1327,6 +1340,10 @@ pub struct ShieldReq {
     pub client_cm: F,
     #[serde(default)]
     pub client_enc: Option<EncryptedNote>,
+    #[serde(default, with = "hex_f")]
+    pub producer_cm: F,
+    #[serde(default)]
+    pub producer_enc: Option<EncryptedNote>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1334,6 +1351,9 @@ pub struct ShieldResp {
     #[serde(with = "hex_f")]
     pub cm: F,
     pub index: usize,
+    #[serde(with = "hex_f")]
+    pub producer_cm: F,
+    pub producer_index: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1342,12 +1362,16 @@ pub struct TransferReq {
     pub root: F,
     #[serde(with = "hex_f_vec")]
     pub nullifiers: Vec<F>,
+    pub fee: u64,
     #[serde(with = "hex_f")]
     pub cm_1: F,
     #[serde(with = "hex_f")]
     pub cm_2: F,
+    #[serde(with = "hex_f")]
+    pub cm_3: F,
     pub enc_1: EncryptedNote,
     pub enc_2: EncryptedNote,
+    pub enc_3: EncryptedNote,
     pub proof: Proof,
 }
 
@@ -1355,6 +1379,7 @@ pub struct TransferReq {
 pub struct TransferResp {
     pub index_1: usize,
     pub index_2: usize,
+    pub index_3: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1364,16 +1389,21 @@ pub struct UnshieldReq {
     #[serde(with = "hex_f_vec")]
     pub nullifiers: Vec<F>,
     pub v_pub: u64,
+    pub fee: u64,
     pub recipient: String,
     #[serde(with = "hex_f")]
     pub cm_change: F,
     pub enc_change: Option<EncryptedNote>,
+    #[serde(with = "hex_f")]
+    pub cm_fee: F,
+    pub enc_fee: EncryptedNote,
     pub proof: Proof,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnshieldResp {
     pub change_index: Option<usize>,
+    pub producer_index: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1610,13 +1640,34 @@ pub fn apply_fund<S: LedgerState>(state: &mut S, addr: &str, amount: u64) -> Res
 }
 
 pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<ShieldResp, String> {
+    if req.fee < MIN_TX_FEE {
+        return Err(format!("fee below minimum: {} < {}", req.fee, MIN_TX_FEE));
+    }
+    if req.producer_fee == 0 {
+        return Err("producer fee must be greater than zero".into());
+    }
     let bal = state.balance(&req.sender)?;
-    if bal < req.v {
+    let debit = req
+        .v
+        .checked_add(req.fee)
+        .and_then(|value| value.checked_add(req.producer_fee))
+        .ok_or_else(|| "shield debit overflow".to_string())?;
+    if bal < debit {
         return Err("insufficient balance".into());
     }
     if let Some(ref enc) = req.client_enc {
         enc.validate()
             .map_err(|e| format!("invalid client encrypted note: {}", e))?;
+    }
+    let producer_enc = req
+        .producer_enc
+        .as_ref()
+        .ok_or_else(|| "shield requires producer_enc".to_string())?;
+    producer_enc
+        .validate()
+        .map_err(|e| format!("invalid producer encrypted note: {}", e))?;
+    if req.producer_cm == ZERO {
+        return Err("shield requires producer_cm".into());
     }
 
     match &req.proof {
@@ -1636,25 +1687,38 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
                     "Stark proof requires client_enc (cannot use server-generated note)".into(),
                 );
             }
-            if output_preimage.len() < 4 {
+            if output_preimage.len() < 8 {
                 return Err("shield output_preimage too short".into());
             }
-            let tail_start = output_preimage.len() - 4;
+            let tail_start = output_preimage.len() - 8;
             let tail = &output_preimage[tail_start..];
             if tail[0] != u64_to_felt(req.v) {
-                return Err("proof v_pub mismatch".into());
+                return Err("proof note value mismatch".into());
             }
-            if tail[1] != req.client_cm {
+            if tail[1] != u64_to_felt(req.fee) {
+                return Err("proof fee mismatch".into());
+            }
+            if tail[2] != u64_to_felt(req.producer_fee) {
+                return Err("proof producer_fee mismatch".into());
+            }
+            if tail[3] != req.client_cm {
                 return Err("proof cm mismatch".into());
             }
-            if tail[2] != hash(req.sender.as_bytes()) {
+            if tail[4] != req.producer_cm {
+                return Err("proof producer_cm mismatch".into());
+            }
+            if tail[5] != hash(req.sender.as_bytes()) {
                 return Err("proof sender mismatch".into());
             }
             if let Some(ref enc) = req.client_enc {
                 let mh = memo_ct_hash(enc);
-                if tail[3] != mh {
+                if tail[6] != mh {
                     return Err("proof memo_ct_hash mismatch".into());
                 }
+            }
+            let producer_mh = memo_ct_hash(producer_enc);
+            if tail[7] != producer_mh {
+                return Err("proof producer memo_ct_hash mismatch".into());
             }
         }
     }
@@ -1700,16 +1764,25 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
         }
     };
 
-    state.set_balance(&req.sender, bal - req.v)?;
+    state.set_balance(&req.sender, bal - debit)?;
     let index = state.append_note(cm, enc)?;
+    let producer_index = state.append_note(req.producer_cm, producer_enc.clone())?;
     state.snapshot_root()?;
-    Ok(ShieldResp { cm, index })
+    Ok(ShieldResp {
+        cm,
+        index,
+        producer_cm: req.producer_cm,
+        producer_index,
+    })
 }
 
 pub fn apply_transfer<S: LedgerState>(
     state: &mut S,
     req: &TransferReq,
 ) -> Result<TransferResp, String> {
+    if req.fee < MIN_TX_FEE {
+        return Err(format!("fee below minimum: {} < {}", req.fee, MIN_TX_FEE));
+    }
     let n = req.nullifiers.len();
     if n == 0 || n > 7 {
         return Err("bad nullifier count".into());
@@ -1720,6 +1793,9 @@ pub fn apply_transfer<S: LedgerState>(
     req.enc_2
         .validate()
         .map_err(|e| format!("invalid output note 2: {}", e))?;
+    req.enc_3
+        .validate()
+        .map_err(|e| format!("invalid output note 3: {}", e))?;
     if !state.has_valid_root(&req.root)? {
         return Err("invalid root".into());
     }
@@ -1743,7 +1819,7 @@ pub fn apply_transfer<S: LedgerState>(
             output_preimage,
             verify_meta: _,
         } => {
-            let expected_tail_len = 2 + n + 4;
+            let expected_tail_len = 2 + n + 7;
             if output_preimage.len() < expected_tail_len {
                 return Err(format!(
                     "output_preimage too short: {} < {}",
@@ -1765,37 +1841,56 @@ pub fn apply_transfer<S: LedgerState>(
                     return Err(format!("proof nullifier {} mismatch", i));
                 }
             }
-            let cm1_pos = 2 + n;
+            let fee_pos = 2 + n;
+            if tail[fee_pos] != u64_to_felt(req.fee) {
+                return Err("proof fee mismatch".into());
+            }
+            let cm1_pos = fee_pos + 1;
             if tail[cm1_pos] != req.cm_1 {
                 return Err("proof cm_1 mismatch".into());
             }
             if tail[cm1_pos + 1] != req.cm_2 {
                 return Err("proof cm_2 mismatch".into());
             }
+            if tail[cm1_pos + 2] != req.cm_3 {
+                return Err("proof cm_3 mismatch".into());
+            }
             let mh_1 = memo_ct_hash(&req.enc_1);
             let mh_2 = memo_ct_hash(&req.enc_2);
-            if tail[cm1_pos + 2] != mh_1 {
+            let mh_3 = memo_ct_hash(&req.enc_3);
+            if tail[cm1_pos + 3] != mh_1 {
                 return Err("proof memo_ct_hash_1 mismatch — encrypted note tampered".into());
             }
-            if tail[cm1_pos + 3] != mh_2 {
+            if tail[cm1_pos + 4] != mh_2 {
                 return Err("proof memo_ct_hash_2 mismatch — encrypted note tampered".into());
+            }
+            if tail[cm1_pos + 5] != mh_3 {
+                return Err("proof memo_ct_hash_3 mismatch — encrypted note tampered".into());
             }
         }
     }
 
     let index_1 = state.append_note(req.cm_1, req.enc_1.clone())?;
     let index_2 = state.append_note(req.cm_2, req.enc_2.clone())?;
+    let index_3 = state.append_note(req.cm_3, req.enc_3.clone())?;
     for nf in &req.nullifiers {
         state.insert_nullifier(*nf)?;
     }
     state.snapshot_root()?;
-    Ok(TransferResp { index_1, index_2 })
+    Ok(TransferResp {
+        index_1,
+        index_2,
+        index_3,
+    })
 }
 
 pub fn apply_unshield<S: LedgerState>(
     state: &mut S,
     req: &UnshieldReq,
 ) -> Result<UnshieldResp, String> {
+    if req.fee < MIN_TX_FEE {
+        return Err(format!("fee below minimum: {} < {}", req.fee, MIN_TX_FEE));
+    }
     let n = req.nullifiers.len();
     if n == 0 || n > 7 {
         return Err("bad nullifier count".into());
@@ -1809,6 +1904,12 @@ pub fn apply_unshield<S: LedgerState>(
                 .map_err(|e| format!("invalid change note: {}", e))?;
         }
         _ => {}
+    }
+    req.enc_fee
+        .validate()
+        .map_err(|e| format!("invalid producer fee note: {}", e))?;
+    if req.cm_fee == ZERO {
+        return Err("producer fee note must have non-zero commitment".into());
     }
     if !state.has_valid_root(&req.root)? {
         return Err("invalid root".into());
@@ -1833,7 +1934,7 @@ pub fn apply_unshield<S: LedgerState>(
             output_preimage,
             verify_meta: _,
         } => {
-            let expected_tail_len = 2 + n + 4;
+            let expected_tail_len = 2 + n + 7;
             if output_preimage.len() < expected_tail_len {
                 return Err("output_preimage too short".into());
             }
@@ -1854,19 +1955,29 @@ pub fn apply_unshield<S: LedgerState>(
             if tail[2 + n] != u64_to_felt(req.v_pub) {
                 return Err("proof v_pub mismatch".into());
             }
-            if tail[3 + n] != hash(req.recipient.as_bytes()) {
+            if tail[3 + n] != u64_to_felt(req.fee) {
+                return Err("proof fee mismatch".into());
+            }
+            if tail[4 + n] != hash(req.recipient.as_bytes()) {
                 return Err("proof recipient mismatch".into());
             }
-            if tail[4 + n] != req.cm_change {
+            if tail[5 + n] != req.cm_change {
                 return Err("proof cm_change mismatch".into());
             }
             if let Some(ref enc) = req.enc_change {
                 let mh = memo_ct_hash(enc);
-                if tail[5 + n] != mh {
+                if tail[6 + n] != mh {
                     return Err("proof memo_ct_hash_change mismatch".into());
                 }
-            } else if tail[5 + n] != ZERO {
+            } else if tail[6 + n] != ZERO {
                 return Err("proof memo_ct_hash_change should be 0 when no change".into());
+            }
+            if tail[7 + n] != req.cm_fee {
+                return Err("proof cm_fee mismatch".into());
+            }
+            let fee_mh = memo_ct_hash(&req.enc_fee);
+            if tail[8 + n] != fee_mh {
+                return Err("proof memo_ct_hash_fee mismatch".into());
             }
         }
     }
@@ -1889,9 +2000,13 @@ pub fn apply_unshield<S: LedgerState>(
     for nf in &req.nullifiers {
         state.insert_nullifier(*nf)?;
     }
+    let producer_index = state.append_note(req.cm_fee, req.enc_fee.clone())?;
     state.set_balance(&req.recipient, next_balance)?;
     state.snapshot_root()?;
-    Ok(UnshieldResp { change_index })
+    Ok(UnshieldResp {
+        change_index,
+        producer_index,
+    })
 }
 
 pub fn apply_withdraw<S: LedgerState>(
@@ -2086,17 +2201,37 @@ mod tests {
         amount: u64,
     ) -> (Ledger, PaymentAddress, F, ShieldResp) {
         let (_acc, addr, _dk_v, _dk_d, nk_spend) = sample_address_bundle(seed_byte, 0);
+        let producer_fee = 1;
+        let (producer_enc, producer_cm) = deterministic_note(
+            &addr,
+            producer_fee,
+            u(10_000 + seed_byte as u64),
+            Some(b"dal"),
+        );
         let mut ledger = Ledger::new();
-        ledger.fund(sender, amount * 2).unwrap();
+        ledger
+            .fund(
+                sender,
+                amount
+                    .checked_mul(2)
+                    .and_then(|v| v.checked_add(producer_fee))
+                    .and_then(|v| v.checked_add(MIN_TX_FEE))
+                    .unwrap(),
+            )
+            .unwrap();
         let resp = ledger
             .shield(&ShieldReq {
                 sender: sender.into(),
+                fee: MIN_TX_FEE,
                 v: amount,
+                producer_fee,
                 address: addr.clone(),
                 memo: None,
                 proof: Proof::TrustMeBro,
                 client_cm: ZERO,
                 client_enc: None,
+                producer_cm,
+                producer_enc: Some(producer_enc),
             })
             .unwrap();
         (ledger, addr, nk_spend, resp)
@@ -2528,15 +2663,41 @@ mod tests {
         let nullifiers = vec![u(3), u(4)];
         let cm_1 = u(5);
         let cm_2 = u(6);
+        let cm_3 = u(10);
         let mh_1 = u(7);
         let mh_2 = u(8);
+        let mh_3 = u(11);
         let recipient = u(9);
+        let cm_fee = u(12);
+        let mh_fee = u(13);
+        let fee = 10;
 
-        let transfer =
-            transfer_sighash(&auth_domain, &root, &nullifiers, &cm_1, &cm_2, &mh_1, &mh_2);
+        let transfer = transfer_sighash(
+            &auth_domain,
+            &root,
+            &nullifiers,
+            fee,
+            &cm_1,
+            &cm_2,
+            &cm_3,
+            &mh_1,
+            &mh_2,
+            &mh_3,
+        );
         assert_ne!(
             transfer,
-            transfer_sighash(&u(10), &root, &nullifiers, &cm_1, &cm_2, &mh_1, &mh_2)
+            transfer_sighash(
+                &u(10),
+                &root,
+                &nullifiers,
+                fee,
+                &cm_1,
+                &cm_2,
+                &cm_3,
+                &mh_1,
+                &mh_2,
+                &mh_3
+            )
         );
         assert_ne!(
             transfer,
@@ -2544,10 +2705,13 @@ mod tests {
                 &auth_domain,
                 &u(20),
                 &nullifiers,
+                fee,
                 &cm_1,
                 &cm_2,
+                &cm_3,
                 &mh_1,
-                &mh_2
+                &mh_2,
+                &mh_3
             )
         );
         assert_ne!(
@@ -2556,10 +2720,13 @@ mod tests {
                 &auth_domain,
                 &root,
                 &[u(3), u(40)],
+                fee,
                 &cm_1,
                 &cm_2,
+                &cm_3,
                 &mh_1,
-                &mh_2
+                &mh_2,
+                &mh_3
             )
         );
         assert_ne!(
@@ -2568,10 +2735,13 @@ mod tests {
                 &auth_domain,
                 &root,
                 &[u(4), u(3)],
+                fee,
                 &cm_1,
                 &cm_2,
+                &cm_3,
                 &mh_1,
-                &mh_2
+                &mh_2,
+                &mh_3
             )
         );
         assert_ne!(
@@ -2580,10 +2750,28 @@ mod tests {
                 &auth_domain,
                 &root,
                 &nullifiers,
+                fee + 1,
+                &cm_1,
+                &cm_2,
+                &cm_3,
+                &mh_1,
+                &mh_2,
+                &mh_3
+            )
+        );
+        assert_ne!(
+            transfer,
+            transfer_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                fee,
                 &u(50),
                 &cm_2,
+                &cm_3,
                 &mh_1,
-                &mh_2
+                &mh_2,
+                &mh_3
             )
         );
         assert_ne!(
@@ -2592,10 +2780,13 @@ mod tests {
                 &auth_domain,
                 &root,
                 &nullifiers,
+                fee,
                 &cm_1,
                 &u(60),
+                &cm_3,
                 &mh_1,
-                &mh_2
+                &mh_2,
+                &mh_3
             )
         );
         assert_ne!(
@@ -2604,10 +2795,28 @@ mod tests {
                 &auth_domain,
                 &root,
                 &nullifiers,
+                fee,
                 &cm_1,
                 &cm_2,
+                &u(61),
+                &mh_1,
+                &mh_2,
+                &mh_3
+            )
+        );
+        assert_ne!(
+            transfer,
+            transfer_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                fee,
+                &cm_1,
+                &cm_2,
+                &cm_3,
                 &u(70),
-                &mh_2
+                &mh_2,
+                &mh_3
             )
         );
         assert_ne!(
@@ -2616,10 +2825,28 @@ mod tests {
                 &auth_domain,
                 &root,
                 &nullifiers,
+                fee,
                 &cm_1,
                 &cm_2,
+                &cm_3,
                 &mh_1,
-                &u(80)
+                &u(80),
+                &mh_3
+            )
+        );
+        assert_ne!(
+            transfer,
+            transfer_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                fee,
+                &cm_1,
+                &cm_2,
+                &cm_3,
+                &mh_1,
+                &mh_2,
+                &u(81)
             )
         );
 
@@ -2628,9 +2855,12 @@ mod tests {
             &root,
             &nullifiers,
             12,
+            fee,
             &recipient,
             &cm_1,
+            &cm_fee,
             &mh_1,
+            &mh_fee,
         );
         assert_ne!(
             unshield,
@@ -2639,14 +2869,28 @@ mod tests {
                 &root,
                 &nullifiers,
                 13,
+                fee,
                 &recipient,
                 &cm_1,
-                &mh_1
+                &cm_fee,
+                &mh_1,
+                &mh_fee
             )
         );
         assert_ne!(
             unshield,
-            unshield_sighash(&auth_domain, &root, &nullifiers, 12, &u(10), &cm_1, &mh_1)
+            unshield_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                12,
+                fee,
+                &u(10),
+                &cm_1,
+                &cm_fee,
+                &mh_1,
+                &mh_fee
+            )
         );
         assert_ne!(
             unshield,
@@ -2655,9 +2899,12 @@ mod tests {
                 &u(20),
                 &nullifiers,
                 12,
+                fee,
                 &recipient,
                 &cm_1,
-                &mh_1
+                &cm_fee,
+                &mh_1,
+                &mh_fee
             )
         );
         assert_ne!(
@@ -2667,9 +2914,12 @@ mod tests {
                 &root,
                 &[u(4), u(3)],
                 12,
+                fee,
                 &recipient,
                 &cm_1,
-                &mh_1
+                &cm_fee,
+                &mh_1,
+                &mh_fee
             )
         );
         assert_ne!(
@@ -2679,9 +2929,27 @@ mod tests {
                 &root,
                 &nullifiers,
                 12,
+                fee + 1,
+                &recipient,
+                &cm_1,
+                &cm_fee,
+                &mh_1,
+                &mh_fee
+            )
+        );
+        assert_ne!(
+            unshield,
+            unshield_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                12,
+                fee,
                 &recipient,
                 &u(11),
-                &mh_1
+                &cm_fee,
+                &mh_1,
+                &mh_fee
             )
         );
         assert_ne!(
@@ -2691,9 +2959,42 @@ mod tests {
                 &root,
                 &nullifiers,
                 12,
+                fee,
                 &recipient,
                 &cm_1,
-                &u(12)
+                &u(14),
+                &mh_1,
+                &mh_fee
+            )
+        );
+        assert_ne!(
+            unshield,
+            unshield_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                12,
+                fee,
+                &recipient,
+                &cm_1,
+                &cm_fee,
+                &u(12),
+                &mh_fee
+            )
+        );
+        assert_ne!(
+            unshield,
+            unshield_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                12,
+                fee,
+                &recipient,
+                &cm_1,
+                &cm_fee,
+                &mh_1,
+                &u(15)
             )
         );
     }
@@ -2702,80 +3003,109 @@ mod tests {
     fn test_apply_shield_stark_path_updates_balance_and_tree() {
         let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x71, 0);
         let mut ledger = Ledger::new();
-        ledger.fund("alice", 200).unwrap();
+        let fee = MIN_TX_FEE;
+        let producer_fee = 7;
+        ledger.fund("alice", 125 + producer_fee + fee + 70).unwrap();
 
         let (enc, cm) = deterministic_note(&addr, 125, u(15), Some(b"shield"));
+        let (producer_enc, producer_cm) =
+            deterministic_note(&addr, producer_fee, u(16), Some(b"dal"));
         let memo_hash = memo_ct_hash(&enc);
+        let producer_memo_hash = memo_ct_hash(&producer_enc);
         let root_before = ledger.tree.root();
 
         let resp = apply_shield(
             &mut ledger,
             &ShieldReq {
                 sender: "alice".into(),
+                fee,
                 v: 125,
+                producer_fee,
                 address: addr.clone(),
                 memo: None,
-                proof: fake_stark(vec![u(125), cm, hash(b"alice"), memo_hash]),
+                proof: fake_stark(vec![
+                    u(125),
+                    u(fee),
+                    u(producer_fee),
+                    cm,
+                    producer_cm,
+                    hash(b"alice"),
+                    memo_hash,
+                    producer_memo_hash,
+                ]),
                 client_cm: cm,
                 client_enc: Some(enc.clone()),
+                producer_cm,
+                producer_enc: Some(producer_enc.clone()),
             },
         )
         .unwrap();
 
         assert_eq!(resp.cm, cm);
         assert_eq!(resp.index, 0);
-        assert_eq!(ledger.balance("alice").unwrap(), 75);
-        assert_eq!(ledger.memos.len(), 1);
+        assert_eq!(resp.producer_cm, producer_cm);
+        assert_eq!(resp.producer_index, 1);
+        assert_eq!(ledger.balance("alice").unwrap(), 70);
+        assert_eq!(ledger.memos.len(), 2);
         assert_ne!(ledger.tree.root(), root_before);
         assert!(ledger.valid_roots.contains(&ledger.tree.root()));
     }
 
     #[test]
     fn test_apply_transfer_stark_path_appends_outputs_and_consumes_nullifier() {
-        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x72, "alice", 90);
+        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x72, "alice", 250_000);
         let root = ledger.tree.root();
         let auth_domain = ledger.auth_domain;
         let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
-        let (enc_1, cm_1) = deterministic_note(&addr, 40, u(21), Some(b"out-1"));
-        let (enc_2, cm_2) = deterministic_note(&addr, 50, u(22), Some(b"out-2"));
+        let (enc_1, cm_1) = deterministic_note(&addr, 60_000, u(21), Some(b"out-1"));
+        let (enc_2, cm_2) = deterministic_note(&addr, 70_000, u(22), Some(b"out-2"));
+        let (enc_3, cm_3) = deterministic_note(&addr, 20_000, u(23), Some(b"dal"));
 
         let resp = apply_transfer(
             &mut ledger,
             &TransferReq {
                 root,
                 nullifiers: vec![nf],
+                fee: MIN_TX_FEE,
                 cm_1,
                 cm_2,
+                cm_3,
                 enc_1: enc_1.clone(),
                 enc_2: enc_2.clone(),
+                enc_3: enc_3.clone(),
                 proof: fake_stark(vec![
                     auth_domain,
                     root,
                     nf,
+                    u(MIN_TX_FEE),
                     cm_1,
                     cm_2,
+                    cm_3,
                     memo_ct_hash(&enc_1),
                     memo_ct_hash(&enc_2),
+                    memo_ct_hash(&enc_3),
                 ]),
             },
         )
         .unwrap();
 
-        assert_eq!(resp.index_1, 1);
-        assert_eq!(resp.index_2, 2);
+        assert_eq!(resp.index_1, 2);
+        assert_eq!(resp.index_2, 3);
+        assert_eq!(resp.index_3, 4);
         assert!(ledger.nullifiers.contains(&nf));
-        assert_eq!(ledger.memos.len(), 3);
+        assert_eq!(ledger.memos.len(), 5);
         assert!(ledger.valid_roots.contains(&ledger.tree.root()));
     }
 
     #[test]
     fn test_apply_transfer_rejects_bad_memo_hash_without_mutation() {
-        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x73, "alice", 90);
+        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x73, "alice", 250_000);
         let root = ledger.tree.root();
         let auth_domain = ledger.auth_domain;
         let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
-        let (enc_1, cm_1) = deterministic_note(&addr, 40, u(31), Some(b"out-1"));
-        let (enc_2, cm_2) = deterministic_note(&addr, 50, u(32), Some(b"out-2"));
+        let (enc_1, cm_1) = deterministic_note(&addr, 60_000, u(31), Some(b"out-1"));
+        let (enc_2, cm_2) = deterministic_note(&addr, 70_000, u(32), Some(b"out-2"));
+        let (enc_3, cm_3) = deterministic_note(&addr, 20_000, u(33), Some(b"dal"));
 
         let memos_before = ledger.memos.len();
         let roots_before = ledger.valid_roots.len();
@@ -2787,11 +3117,25 @@ mod tests {
             &TransferReq {
                 root,
                 nullifiers: vec![nf],
+                fee: MIN_TX_FEE,
                 cm_1,
                 cm_2,
+                cm_3,
                 enc_1,
                 enc_2,
-                proof: fake_stark(vec![auth_domain, root, nf, cm_1, cm_2, ZERO, ZERO]),
+                enc_3,
+                proof: fake_stark(vec![
+                    auth_domain,
+                    root,
+                    nf,
+                    u(MIN_TX_FEE),
+                    cm_1,
+                    cm_2,
+                    cm_3,
+                    ZERO,
+                    ZERO,
+                    ZERO,
+                ]),
             },
         )
         .unwrap_err();
@@ -2805,11 +3149,12 @@ mod tests {
 
     #[test]
     fn test_apply_unshield_stark_path_with_change_updates_balance_and_note() {
-        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x74, "alice", 80);
+        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x74, "alice", 180_000);
         let root = ledger.tree.root();
         let auth_domain = ledger.auth_domain;
         let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
         let (enc_change, cm_change) = deterministic_note(&addr, 30, u(41), Some(b"change"));
+        let (enc_fee, cm_fee) = deterministic_note(&addr, 29_970, u(42), Some(b"dal"));
 
         let resp = apply_unshield(
             &mut ledger,
@@ -2817,26 +3162,33 @@ mod tests {
                 root,
                 nullifiers: vec![nf],
                 v_pub: 50,
+                fee: MIN_TX_FEE,
                 recipient: "bob".into(),
                 cm_change,
                 enc_change: Some(enc_change.clone()),
+                cm_fee,
+                enc_fee: enc_fee.clone(),
                 proof: fake_stark(vec![
                     auth_domain,
                     root,
                     nf,
                     u(50),
+                    u(MIN_TX_FEE),
                     hash(b"bob"),
                     cm_change,
                     memo_ct_hash(&enc_change),
+                    cm_fee,
+                    memo_ct_hash(&enc_fee),
                 ]),
             },
         )
         .unwrap();
 
-        assert_eq!(resp.change_index, Some(1));
+        assert_eq!(resp.change_index, Some(2));
+        assert_eq!(resp.producer_index, 3);
         assert_eq!(ledger.balance("bob").unwrap(), 50);
         assert!(ledger.nullifiers.contains(&nf));
-        assert_eq!(ledger.memos.len(), 2);
+        assert_eq!(ledger.memos.len(), 4);
         assert!(ledger.valid_roots.contains(&ledger.tree.root()));
     }
 
@@ -2848,6 +3200,8 @@ mod tests {
         let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
         let leaves_before = ledger.tree.leaves.clone();
         let memos_before = ledger.memos.len();
+        let (_acc, fee_addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x7B, 0);
+        let (enc_fee, cm_fee) = deterministic_note(&fee_addr, 79, u(43), Some(b"dal"));
 
         let err = apply_unshield(
             &mut ledger,
@@ -2855,9 +3209,12 @@ mod tests {
                 root,
                 nullifiers: vec![nf],
                 v_pub: 1,
+                fee: MIN_TX_FEE,
                 recipient: "bob".into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_fee,
+                enc_fee,
                 proof: Proof::TrustMeBro,
             },
         )
@@ -2868,6 +3225,100 @@ mod tests {
         assert!(!ledger.nullifiers.contains(&nf));
         assert_eq!(ledger.tree.leaves, leaves_before);
         assert_eq!(ledger.memos.len(), memos_before);
+    }
+
+    #[test]
+    fn test_apply_shield_rejects_fee_below_minimum() {
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x76, 0);
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", MIN_TX_FEE + 200).unwrap();
+        let (producer_enc, producer_cm) = deterministic_note(&addr, 1, u(61), Some(b"dal"));
+
+        let err = apply_shield(
+            &mut ledger,
+            &ShieldReq {
+                sender: "alice".into(),
+                fee: MIN_TX_FEE - 1,
+                v: 125,
+                producer_fee: 1,
+                address: addr,
+                memo: None,
+                proof: Proof::TrustMeBro,
+                client_cm: ZERO,
+                client_enc: None,
+                producer_cm,
+                producer_enc: Some(producer_enc),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("fee below minimum"));
+        assert_eq!(ledger.balance("alice").unwrap(), MIN_TX_FEE + 200);
+        assert!(ledger.memos.is_empty());
+    }
+
+    #[test]
+    fn test_apply_transfer_rejects_fee_below_minimum() {
+        let (mut ledger, _addr, nk_spend, shield_resp) =
+            shielded_note_setup(0x77, "alice", 150_000);
+        let root = ledger.tree.root();
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x78, 0);
+        let (enc_1, cm_1) = deterministic_note(&addr, 20_000, u(51), Some(b"out-1"));
+        let (enc_2, cm_2) = deterministic_note(&addr, 29_999, u(52), Some(b"out-2"));
+        let (enc_3, cm_3) = deterministic_note(&addr, 1, u(53), Some(b"dal"));
+
+        let err = apply_transfer(
+            &mut ledger,
+            &TransferReq {
+                root,
+                nullifiers: vec![nf],
+                fee: MIN_TX_FEE - 1,
+                cm_1,
+                cm_2,
+                cm_3,
+                enc_1,
+                enc_2,
+                enc_3,
+                proof: Proof::TrustMeBro,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("fee below minimum"));
+        assert!(!ledger.nullifiers.contains(&nf));
+        assert_eq!(ledger.tree.leaves.len(), 2);
+    }
+
+    #[test]
+    fn test_apply_unshield_rejects_fee_below_minimum() {
+        let (mut ledger, _addr, nk_spend, shield_resp) =
+            shielded_note_setup(0x79, "alice", 150_000);
+        let root = ledger.tree.root();
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x7A, 0);
+        let (enc_fee, cm_fee) = deterministic_note(&addr, 1, u(62), Some(b"dal"));
+
+        let err = apply_unshield(
+            &mut ledger,
+            &UnshieldReq {
+                root,
+                nullifiers: vec![nf],
+                v_pub: 50_000,
+                fee: MIN_TX_FEE - 1,
+                recipient: "bob".into(),
+                cm_change: ZERO,
+                enc_change: None,
+                cm_fee,
+                enc_fee,
+                proof: Proof::TrustMeBro,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("fee below minimum"));
+        assert_eq!(ledger.balance("bob").unwrap(), 0);
+        assert!(!ledger.nullifiers.contains(&nf));
     }
 
     #[test]

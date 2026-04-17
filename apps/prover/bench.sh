@@ -41,10 +41,10 @@ fi
 
 echo "Building bench witness generator..."
 (
-  cargo build -p tzel-services --bin gen_proof_bench_args 2>&1 | tail -1
+  cargo build --release -p tzel-services --bin gen_proof_bench_args 2>&1 | tail -1
 )
 
-GEN_ARGS_BIN="target/debug/gen_proof_bench_args"
+GEN_ARGS_BIN="target/release/gen_proof_bench_args"
 
 CASES=(
   "Shield|run_shield.executable.json|shield|"

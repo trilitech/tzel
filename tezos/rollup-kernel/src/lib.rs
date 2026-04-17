@@ -1495,7 +1495,7 @@ mod tests {
             KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig, KernelWithdrawReq,
         },
         owner_tag, PaymentAddress, ProgramHashes, ShieldResp, TransferResp, UnshieldResp,
-        WithdrawResp, ZERO,
+        WithdrawResp, MIN_TX_FEE, ZERO,
     };
 
     #[derive(Default)]
@@ -1762,9 +1762,10 @@ mod tests {
     #[test]
     fn applies_shield_message_with_shared_ledger_logic() {
         let mut host = MockHost::default();
+        let producer_fee = 1;
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 50).unwrap();
+            apply_deposit(&mut state, "alice", 50 + producer_fee + MIN_TX_FEE).unwrap();
         }
 
         let config = KernelVerifierConfig {
@@ -1777,14 +1778,21 @@ mod tests {
         );
 
         let address = sample_payment_address();
+        let producer_rseed = sample_felt(0x31);
+        let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
+        let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
         let shield_req = KernelShieldReq {
             sender: "alice".into(),
+            fee: MIN_TX_FEE,
+            producer_fee,
             v: 50,
             address,
             memo: None,
             proof: sample_kernel_test_proof(),
             client_cm: ZERO,
             client_enc: None,
+            producer_cm,
+            producer_enc: Some(producer_enc),
         };
         let message = encode_kernel_inbox_message(&KernelInboxMessage::Shield(shield_req)).unwrap();
         host.inputs.push_back(InputMessage {
@@ -1797,9 +1805,18 @@ mod tests {
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.balances.get("alice"), Some(&0));
-        assert_eq!(ledger.tree.leaves.len(), 1);
+        assert_eq!(ledger.tree.leaves.len(), 2);
         match read_last_result(&host).unwrap() {
-            KernelResult::Shield(ShieldResp { index, .. }) => assert_eq!(index, 0),
+            KernelResult::Shield(ShieldResp {
+                index,
+                producer_cm: result_producer_cm,
+                producer_index,
+                ..
+            }) => {
+                assert_eq!(index, 0);
+                assert_eq!(result_producer_cm, producer_cm);
+                assert_eq!(producer_index, 1);
+            }
             other => panic!("unexpected rollup result: {:?}", other),
         }
     }
@@ -1807,9 +1824,10 @@ mod tests {
     #[test]
     fn persists_large_shield_note_in_chunked_durable_keys() {
         let mut host = MockHost::default();
+        let producer_fee = 1;
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 50).unwrap();
+            apply_deposit(&mut state, "alice", 50 + producer_fee + MIN_TX_FEE).unwrap();
         }
 
         let config = KernelVerifierConfig {
@@ -1825,17 +1843,24 @@ mod tests {
         let rseed = sample_felt(0x55);
         let enc = sample_encrypted_note(&address, 50, rseed, b"chunked shield note");
         let cm = sample_commitment(&address, 50, rseed);
+        let producer_rseed = sample_felt(0x32);
+        let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
+        let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
         let encoded = encode_published_note(&cm, &enc).unwrap();
         assert!(encoded.len() > MAX_NOTE_CHUNK_BYTES);
 
         let shield_req = KernelShieldReq {
             sender: "alice".into(),
+            fee: MIN_TX_FEE,
+            producer_fee,
             v: 50,
             address,
             memo: Some("chunked shield note".into()),
             proof: sample_kernel_test_proof(),
             client_cm: cm,
             client_enc: Some(enc),
+            producer_cm,
+            producer_enc: Some(producer_enc),
         };
         let message = encode_kernel_inbox_message(&KernelInboxMessage::Shield(shield_req)).unwrap();
         host.inputs.push_back(InputMessage {
@@ -1860,6 +1885,7 @@ mod tests {
                 Some(chunk)
             );
         }
+        assert!(read_persisted_note(&host, 1).is_some());
     }
 
     #[test]
@@ -1875,19 +1901,28 @@ mod tests {
     #[test]
     fn applies_shield_message_from_dal_pointer() {
         let mut host = MockHost::default();
+        let producer_fee = 1;
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 50).unwrap();
+            apply_deposit(&mut state, "alice", 50 + producer_fee + MIN_TX_FEE).unwrap();
         }
 
+        let address = sample_payment_address();
+        let producer_rseed = sample_felt(0x33);
+        let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
+        let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
         let payload = encode_kernel_inbox_message(&KernelInboxMessage::Shield(KernelShieldReq {
             sender: "alice".into(),
+            fee: MIN_TX_FEE,
+            producer_fee,
             v: 50,
-            address: sample_payment_address(),
+            address,
             memo: Some("from dal".into()),
             proof: sample_kernel_test_proof(),
             client_cm: ZERO,
             client_enc: None,
+            producer_cm,
+            producer_enc: Some(producer_enc),
         }))
         .unwrap();
         let pointer = KernelDalPayloadPointer {
@@ -1908,9 +1943,18 @@ mod tests {
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.balances.get("alice"), Some(&0));
-        assert_eq!(ledger.tree.leaves.len(), 1);
+        assert_eq!(ledger.tree.leaves.len(), 2);
         match read_last_result(&host).unwrap() {
-            KernelResult::Shield(ShieldResp { index, .. }) => assert_eq!(index, 0),
+            KernelResult::Shield(ShieldResp {
+                index,
+                producer_cm: result_producer_cm,
+                producer_index,
+                ..
+            }) => {
+                assert_eq!(index, 0);
+                assert_eq!(result_producer_cm, producer_cm);
+                assert_eq!(producer_index, 1);
+            }
             other => panic!("unexpected rollup result: {:?}", other),
         }
     }
@@ -1918,19 +1962,28 @@ mod tests {
     #[test]
     fn rejects_dal_pointer_hash_mismatch_without_mutating_state() {
         let mut host = MockHost::default();
+        let producer_fee = 1;
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 50).unwrap();
+            apply_deposit(&mut state, "alice", 50 + producer_fee + MIN_TX_FEE).unwrap();
         }
 
+        let address = sample_payment_address();
+        let producer_rseed = sample_felt(0x34);
+        let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
+        let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
         let payload = encode_kernel_inbox_message(&KernelInboxMessage::Shield(KernelShieldReq {
             sender: "alice".into(),
+            fee: MIN_TX_FEE,
+            producer_fee,
             v: 50,
-            address: sample_payment_address(),
+            address,
             memo: None,
             proof: sample_kernel_test_proof(),
             client_cm: ZERO,
             client_enc: None,
+            producer_cm,
+            producer_enc: Some(producer_enc),
         }))
         .unwrap();
         let mut bad_hash = hash(&payload);
@@ -1952,7 +2005,10 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("alice"), Some(&50));
+        assert_eq!(
+            ledger.balances.get("alice"),
+            Some(&(50 + producer_fee + MIN_TX_FEE))
+        );
         assert!(ledger.tree.leaves.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
@@ -1965,24 +2021,33 @@ mod tests {
     #[test]
     fn applies_shield_message_from_multi_slot_dal_pointer() {
         let mut host = MockHost::default();
+        let producer_fee = 1;
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 50).unwrap();
+            apply_deposit(&mut state, "alice", 50 + producer_fee + MIN_TX_FEE).unwrap();
         }
 
         let mut proof = sample_kernel_test_proof();
         proof.verify_meta = vec![0xAB; 5_000];
+        let address = sample_payment_address();
+        let producer_rseed = sample_felt(0x35);
+        let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
+        let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
         let payload = encode_kernel_inbox_message(&KernelInboxMessage::Shield(KernelShieldReq {
             sender: "alice".into(),
+            fee: MIN_TX_FEE,
+            producer_fee,
             v: 50,
-            address: sample_payment_address(),
+            address,
             memo: Some("multi-slot".into()),
             proof,
             client_cm: ZERO,
             client_enc: None,
+            producer_cm,
+            producer_enc: Some(producer_enc),
         }))
         .unwrap();
-        let chunk_specs: Vec<(i32, u8)> = (0..64).map(|i| (101 + i, (i % 16) as u8)).collect();
+        let chunk_specs: Vec<(i32, u8)> = (0..96).map(|i| (101 + i, (i % 16) as u8)).collect();
         let pointer = KernelDalPayloadPointer {
             kind: KernelDalPayloadKind::Shield,
             chunks: install_mock_dal_payload_chunks(&mut host, &chunk_specs, 32, 128, &payload),
@@ -1999,9 +2064,18 @@ mod tests {
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.balances.get("alice"), Some(&0));
-        assert_eq!(ledger.tree.leaves.len(), 1);
+        assert_eq!(ledger.tree.leaves.len(), 2);
         match read_last_result(&host).unwrap() {
-            KernelResult::Shield(ShieldResp { index, .. }) => assert_eq!(index, 0),
+            KernelResult::Shield(ShieldResp {
+                index,
+                producer_cm: result_producer_cm,
+                producer_index,
+                ..
+            }) => {
+                assert_eq!(index, 0);
+                assert_eq!(result_producer_cm, producer_cm);
+                assert_eq!(producer_index, 1);
+            }
             other => panic!("unexpected rollup result: {:?}", other),
         }
     }
@@ -2014,18 +2088,23 @@ mod tests {
         let address = sample_payment_address();
         let enc_1 = sample_encrypted_note(&address, 11, [0x11; 32], b"one");
         let enc_2 = sample_encrypted_note(&address, 12, [0x12; 32], b"two");
+        let enc_3 = sample_encrypted_note(&address, 1, [0x13; 32], b"dal");
         let cm_1 = sample_commitment(&address, 11, [0x11; 32]);
         let cm_2 = sample_commitment(&address, 12, [0x12; 32]);
+        let cm_3 = sample_commitment(&address, 1, [0x13; 32]);
         let nf = sample_felt(0x91);
         let root = read_ledger(&host).unwrap().tree.root();
 
         let req = KernelTransferReq {
             root,
             nullifiers: vec![nf],
+            fee: MIN_TX_FEE,
             cm_1,
             cm_2,
+            cm_3,
             enc_1: enc_1.clone(),
             enc_2: enc_2.clone(),
+            enc_3: enc_3.clone(),
             proof: sample_kernel_test_proof(),
         };
         let message = encode_kernel_inbox_message(&KernelInboxMessage::Transfer(req)).unwrap();
@@ -2038,8 +2117,12 @@ mod tests {
         run_with_host(&mut host);
 
         match read_last_result(&host).unwrap() {
-            KernelResult::Transfer(TransferResp { index_1, index_2 }) => {
-                assert_eq!((index_1, index_2), (0, 1))
+            KernelResult::Transfer(TransferResp {
+                index_1,
+                index_2,
+                index_3,
+            }) => {
+                assert_eq!((index_1, index_2, index_3), (0, 1, 2))
             }
             KernelResult::Error { message } => {
                 panic!("transfer failed: {} | debug: {}", message, host.debug)
@@ -2048,10 +2131,11 @@ mod tests {
         }
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.tree.leaves, vec![cm_1, cm_2]);
+        assert_eq!(ledger.tree.leaves, vec![cm_1, cm_2, cm_3]);
         assert!(ledger.nullifiers.contains(&nf));
         assert!(read_persisted_note(&host, 0).is_some());
         assert!(read_persisted_note(&host, 1).is_some());
+        assert!(read_persisted_note(&host, 2).is_some());
         assert!(host.store.contains_key(&nullifier_path(&nf)));
         assert!(host.store.contains_key(&branch_path(0)));
         assert!(host.store.contains_key(&PATH_TREE_ROOT.to_vec()));
@@ -2067,7 +2151,9 @@ mod tests {
 
         let address = sample_payment_address();
         let enc_change = sample_encrypted_note(&address, 7, [0x21; 32], b"change");
+        let enc_fee = sample_encrypted_note(&address, 1, [0x22; 32], b"dal");
         let cm_change = sample_commitment(&address, 7, [0x21; 32]);
+        let cm_fee = sample_commitment(&address, 1, [0x22; 32]);
         let nf = sample_felt(0xA2);
         let root = read_ledger(&host).unwrap().tree.root();
 
@@ -2075,9 +2161,12 @@ mod tests {
             root,
             nullifiers: vec![nf],
             v_pub: 33,
+            fee: MIN_TX_FEE,
             recipient: "bob".into(),
             cm_change,
             enc_change: Some(enc_change.clone()),
+            cm_fee,
+            enc_fee: enc_fee.clone(),
             proof: sample_kernel_test_proof(),
         };
         let message = encode_kernel_inbox_message(&KernelInboxMessage::Unshield(req)).unwrap();
@@ -2090,8 +2179,12 @@ mod tests {
         run_with_host(&mut host);
 
         match read_last_result(&host).unwrap() {
-            KernelResult::Unshield(UnshieldResp { change_index }) => {
-                assert_eq!(change_index, Some(0))
+            KernelResult::Unshield(UnshieldResp {
+                change_index,
+                producer_index,
+            }) => {
+                assert_eq!(change_index, Some(0));
+                assert_eq!(producer_index, 1);
             }
             KernelResult::Error { message } => {
                 panic!("unshield failed: {} | debug: {}", message, host.debug)
@@ -2101,11 +2194,12 @@ mod tests {
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.balances.get("bob"), Some(&33));
-        assert_eq!(ledger.tree.leaves, vec![cm_change]);
+        assert_eq!(ledger.tree.leaves, vec![cm_change, cm_fee]);
         assert!(ledger.nullifiers.contains(&nf));
         assert!(host.store.contains_key(&balance_path("bob")));
         assert!(host.store.contains_key(&nullifier_path(&nf)));
         assert!(read_persisted_note(&host, 0).is_some());
+        assert!(read_persisted_note(&host, 1).is_some());
     }
 
     #[test]
@@ -2494,14 +2588,23 @@ mod tests {
 
     #[test]
     fn rejects_missing_verifier_configuration_for_proof_messages() {
+        let address = sample_payment_address();
+        let producer_fee = 1;
+        let producer_rseed = sample_felt(0x36);
+        let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
+        let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
         let shield_req = KernelShieldReq {
             sender: "alice".into(),
+            fee: MIN_TX_FEE,
+            producer_fee,
             v: 50,
-            address: sample_payment_address(),
+            address,
             memo: None,
             proof: sample_verified_kernel_proof(),
             client_cm: ZERO,
             client_enc: None,
+            producer_cm,
+            producer_enc: Some(producer_enc),
         };
         let message = encode_kernel_inbox_message(&KernelInboxMessage::Shield(shield_req)).unwrap();
         let mut host = MockHost::with_inputs(vec![InputMessage {
@@ -2563,11 +2666,15 @@ mod tests {
                     KernelShieldReq {
                         sender: "alice".into(),
                         v: 50,
+                        fee: MIN_TX_FEE,
+                        producer_fee: 1,
                         address: sample_payment_address(),
                         memo: None,
                         proof: sample_verified_kernel_proof(),
                         client_cm: ZERO,
                         client_enc: None,
+                        producer_cm: ZERO,
+                        producer_enc: None,
                     },
                 ))
                 .unwrap(),

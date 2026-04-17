@@ -1,7 +1,8 @@
 /// Unshield circuit: N→withdrawal + optional change (1 ≤ N ≤ 7).
 ///
 /// # Public outputs
-///   [auth_domain, root, nf_0..nf_{N-1}, v_pub, recipient_id, cm_change, memo_ct_hash_change]
+///   [auth_domain, root, nf_0..nf_{N-1}, v_pub, fee, recipient_id,
+///    cm_change, memo_ct_hash_change, cm_fee, memo_ct_hash_fee]
 ///
 /// # Spend authorization
 ///   XMSS-style WOTS+ w=4 signature verification inside the STARK, bound to the sighash.
@@ -42,6 +43,7 @@ pub fn verify(
     root: felt252,
     nf_list: Span<felt252>,
     v_pub: u64,
+    fee: u64,
     recipient: felt252,
     nk_spend_list: Span<felt252>,
     auth_root_list: Span<felt252>,
@@ -62,6 +64,13 @@ pub fn verify(
     auth_pub_seed_change: felt252,
     nk_tag_change: felt252,
     memo_ct_hash_change: felt252,
+    d_j_fee: felt252,
+    v_fee: u64,
+    rseed_fee: felt252,
+    auth_root_fee: felt252,
+    auth_pub_seed_fee: felt252,
+    nk_tag_fee: felt252,
+    memo_ct_hash_fee: felt252,
 ) -> Array<felt252> {
     let n = nf_list.len();
     assert(n >= 1, 'unshield: need >= 1 input');
@@ -86,6 +95,7 @@ pub fn verify(
         si += 1;
     }
     sighash = hash::sighash_fold(sighash, v_pub.into());
+    sighash = hash::sighash_fold(sighash, fee.into());
     sighash = hash::sighash_fold(sighash, recipient);
     let cm_change_val = change_commitment_or_zero(
         has_change,
@@ -99,6 +109,11 @@ pub fn verify(
     );
     sighash = hash::sighash_fold(sighash, cm_change_val);
     sighash = hash::sighash_fold(sighash, memo_ct_hash_change);
+    let rcm_fee = hash::derive_rcm(rseed_fee);
+    let otag_fee = hash::owner_tag(auth_root_fee, auth_pub_seed_fee, nk_tag_fee);
+    let cm_fee = hash::commit(d_j_fee, v_fee, rcm_fee, otag_fee);
+    sighash = hash::sighash_fold(sighash, cm_fee);
+    sighash = hash::sighash_fold(sighash, memo_ct_hash_fee);
 
     let mut sum_in: u128 = 0;
     let mut i: u32 = 0;
@@ -151,7 +166,8 @@ pub fn verify(
         a += 1;
     }
 
-    let sum_out: u128 = v_pub.into() + v_change.into();
+    assert(v_fee > 0_u64, 'unshield prod fee');
+    let sum_out: u128 = v_pub.into() + v_change.into() + v_fee.into() + fee.into();
     assert(sum_in == sum_out, 'unshield: balance mismatch');
 
     let mut outputs: Array<felt252> = array![auth_domain, root];
@@ -161,9 +177,12 @@ pub fn verify(
         j += 1;
     }
     outputs.append(v_pub.into());
+    outputs.append(fee.into());
     outputs.append(recipient);
     outputs.append(cm_change_val);
     outputs.append(memo_ct_hash_change);
+    outputs.append(cm_fee);
+    outputs.append(memo_ct_hash_fee);
     outputs
 }
 
@@ -180,6 +199,7 @@ mod tests {
         root: felt252,
         nf_list: Array<felt252>,
         v_pub: u64,
+        fee: u64,
         recipient: felt252,
         nk_spend_list: Array<felt252>,
         auth_root_list: Array<felt252>,
@@ -200,6 +220,13 @@ mod tests {
         auth_pub_seed_change: felt252,
         nk_tag_change: felt252,
         memo_ct_hash_change: felt252,
+        d_j_fee: felt252,
+        v_fee: u64,
+        rseed_fee: felt252,
+        auth_root_fee: felt252,
+        auth_pub_seed_fee: felt252,
+        nk_tag_fee: felt252,
+        memo_ct_hash_fee: felt252,
     }
 
     fn copy_and_mutate(values: Span<felt252>, target: u32) -> Array<felt252> {
@@ -286,9 +313,12 @@ mod tests {
         root: felt252,
         nf_list: Span<felt252>,
         v_pub: u64,
+        fee: u64,
         recipient: felt252,
         cm_change: felt252,
         memo_ct_hash_change: felt252,
+        cm_fee: felt252,
+        memo_ct_hash_fee: felt252,
     ) -> felt252 {
         let mut sighash = hash::sighash_fold(0x02, auth_domain);
         sighash = hash::sighash_fold(sighash, root);
@@ -298,9 +328,12 @@ mod tests {
             i += 1;
         }
         sighash = hash::sighash_fold(sighash, v_pub.into());
+        sighash = hash::sighash_fold(sighash, fee.into());
         sighash = hash::sighash_fold(sighash, recipient);
         sighash = hash::sighash_fold(sighash, cm_change);
         sighash = hash::sighash_fold(sighash, memo_ct_hash_change);
+        sighash = hash::sighash_fold(sighash, cm_fee);
+        sighash = hash::sighash_fold(sighash, memo_ct_hash_fee);
         sighash
     }
 
@@ -323,19 +356,33 @@ mod tests {
         root: felt252,
         nf: felt252,
         v_pub: u64,
+        fee: u64,
         recipient: felt252,
         cm_change: felt252,
         memo_ct_hash_change: felt252,
+        cm_fee: felt252,
+        memo_ct_hash_fee: felt252,
         auth_pub_seed: felt252,
         auth_idx: u32,
     ) -> Array<felt252> {
         let sighash = unshield_sighash(
-            auth_domain, root, array![nf].span(), v_pub, recipient, cm_change, memo_ct_hash_change,
+            auth_domain,
+            root,
+            array![nf].span(),
+            v_pub,
+            fee,
+            recipient,
+            cm_change,
+            memo_ct_hash_change,
+            cm_fee,
+            memo_ct_hash_fee,
         );
         sign_unshield_input(sighash, auth_pub_seed, auth_idx, 0x8200)
     }
 
-    fn build_fixture_with_values(v_in: u64, v_pub: u64, v_change: u64) -> UnshieldFixture {
+    fn build_fixture_with_values_and_fee(
+        v_in: u64, v_pub: u64, v_change: u64, v_fee: u64, fee: u64,
+    ) -> UnshieldFixture {
         let auth_domain = 0x8101;
         let nk_spend = 0x8102;
         let auth_pub_seed = 0x8103;
@@ -399,14 +446,27 @@ mod tests {
             memo_ct_hash_change,
         );
 
+        let d_j_fee = 0x8512;
+        let rseed_fee = 0x8513;
+        let auth_root_fee = 0x8514;
+        let auth_pub_seed_fee = 0x8515;
+        let nk_tag_fee = 0x8516;
+        let memo_ct_hash_fee = 0x8517;
+        let cm_fee = note_commitment(
+            d_j_fee, v_fee, rseed_fee, auth_root_fee, auth_pub_seed_fee, nk_tag_fee,
+        );
+
         let wots_sig_flat = sign_unshield_statement(
             auth_domain,
             root,
             nf,
             v_pub,
+            fee,
             recipient,
             cm_change,
             memo_ct_hash_change,
+            cm_fee,
+            memo_ct_hash_fee,
             auth_pub_seed,
             auth_idx,
         );
@@ -416,6 +476,7 @@ mod tests {
             root,
             nf_list: array![nf],
             v_pub,
+            fee,
             recipient,
             nk_spend_list: array![nk_spend],
             auth_root_list: array![auth_root],
@@ -436,11 +497,25 @@ mod tests {
             auth_pub_seed_change,
             nk_tag_change,
             memo_ct_hash_change,
+            d_j_fee,
+            v_fee,
+            rseed_fee,
+            auth_root_fee,
+            auth_pub_seed_fee,
+            nk_tag_fee,
+            memo_ct_hash_fee,
         }
     }
 
+    fn build_fixture_with_values(
+        v_in: u64, v_pub: u64, v_change: u64, v_fee: u64,
+    ) -> UnshieldFixture {
+        let fee = v_in - v_pub - v_change - v_fee;
+        build_fixture_with_values_and_fee(v_in, v_pub, v_change, v_fee, fee)
+    }
+
     fn build_fixture() -> UnshieldFixture {
-        build_fixture_with_values(80_u64, 50_u64, 30_u64)
+        build_fixture_with_values(80_u64, 47_u64, 25_u64, 3_u64)
     }
 
     fn build_two_input_fixture() -> UnshieldFixture {
@@ -529,11 +604,13 @@ mod tests {
         let nf_0 = hash::nullifier(nk_spend_0, cm_0, 0);
         let nf_1 = hash::nullifier(nk_spend_1, cm_1_in, 1);
 
-        let v_pub = 50_u64;
+        let v_pub = 47_u64;
+        let fee = 5_u64;
+        let v_fee = 3_u64;
         let recipient = 0x9701;
         let has_change = true;
         let d_j_change = 0x9702;
-        let v_change = 30_u64;
+        let v_change = 25_u64;
         let rseed_change = 0x9703;
         let auth_root_change = 0x9704;
         let auth_pub_seed_change = 0x9705;
@@ -550,9 +627,28 @@ mod tests {
             memo_ct_hash_change,
         );
 
+        let d_j_fee = 0x9712;
+        let rseed_fee = 0x9713;
+        let auth_root_fee = 0x9714;
+        let auth_pub_seed_fee = 0x9715;
+        let nk_tag_fee = 0x9716;
+        let memo_ct_hash_fee = 0x9717;
+        let cm_fee = note_commitment(
+            d_j_fee, v_fee, rseed_fee, auth_root_fee, auth_pub_seed_fee, nk_tag_fee,
+        );
+
         let nf_list: Array<felt252> = array![nf_0, nf_1];
         let sighash = unshield_sighash(
-            auth_domain, root, nf_list.span(), v_pub, recipient, cm_change, memo_ct_hash_change,
+            auth_domain,
+            root,
+            nf_list.span(),
+            v_pub,
+            fee,
+            recipient,
+            cm_change,
+            memo_ct_hash_change,
+            cm_fee,
+            memo_ct_hash_fee,
         );
 
         let sig_0 = sign_unshield_input(sighash, auth_pub_seed, auth_idx_0, key_base_0);
@@ -598,6 +694,7 @@ mod tests {
             root,
             nf_list,
             v_pub,
+            fee,
             recipient,
             nk_spend_list: array![nk_spend_0, nk_spend_1],
             auth_root_list: array![auth_root, auth_root],
@@ -618,11 +715,18 @@ mod tests {
             auth_pub_seed_change,
             nk_tag_change,
             memo_ct_hash_change,
+            d_j_fee,
+            v_fee,
+            rseed_fee,
+            auth_root_fee,
+            auth_pub_seed_fee,
+            nk_tag_fee,
+            memo_ct_hash_fee,
         }
     }
 
     fn build_duplicate_nf_fixture() -> UnshieldFixture {
-        let base = build_fixture_with_values(80_u64, 90_u64, 70_u64);
+        let base = build_fixture_with_values_and_fee(80_u64, 47_u64, 25_u64, 3_u64, 5_u64);
         let cm_change = change_commitment_or_zero(
             base.has_change,
             base.d_j_change,
@@ -638,9 +742,19 @@ mod tests {
             base.root,
             array![*base.nf_list.at(0), *base.nf_list.at(0)].span(),
             base.v_pub,
+            base.fee,
             base.recipient,
             cm_change,
             base.memo_ct_hash_change,
+            note_commitment(
+                base.d_j_fee,
+                base.v_fee,
+                base.rseed_fee,
+                base.auth_root_fee,
+                base.auth_pub_seed_fee,
+                base.nk_tag_fee,
+            ),
+            base.memo_ct_hash_fee,
         );
         let sig = sign_unshield_input(
             sighash,
@@ -689,6 +803,7 @@ mod tests {
             root: base.root,
             nf_list: array![*base.nf_list.at(0), *base.nf_list.at(0)],
             v_pub: base.v_pub,
+            fee: base.fee,
             recipient: base.recipient,
             nk_spend_list: array![*base.nk_spend_list.at(0), *base.nk_spend_list.at(0)],
             auth_root_list: array![*base.auth_root_list.at(0), *base.auth_root_list.at(0)],
@@ -713,6 +828,13 @@ mod tests {
             auth_pub_seed_change: base.auth_pub_seed_change,
             nk_tag_change: base.nk_tag_change,
             memo_ct_hash_change: base.memo_ct_hash_change,
+            d_j_fee: base.d_j_fee,
+            v_fee: base.v_fee,
+            rseed_fee: base.rseed_fee,
+            auth_root_fee: base.auth_root_fee,
+            auth_pub_seed_fee: base.auth_pub_seed_fee,
+            nk_tag_fee: base.nk_tag_fee,
+            memo_ct_hash_fee: base.memo_ct_hash_fee,
         }
     }
 
@@ -722,6 +844,7 @@ mod tests {
             fixture.root,
             fixture.nf_list.span(),
             fixture.v_pub,
+            fixture.fee,
             fixture.recipient,
             fixture.nk_spend_list.span(),
             fixture.auth_root_list.span(),
@@ -742,6 +865,13 @@ mod tests {
             fixture.auth_pub_seed_change,
             fixture.nk_tag_change,
             fixture.memo_ct_hash_change,
+            fixture.d_j_fee,
+            fixture.v_fee,
+            fixture.rseed_fee,
+            fixture.auth_root_fee,
+            fixture.auth_pub_seed_fee,
+            fixture.nk_tag_fee,
+            fixture.memo_ct_hash_fee,
         )
     }
 
@@ -828,27 +958,39 @@ mod tests {
             fixture.nk_tag_change,
             fixture.memo_ct_hash_change,
         );
-        assert(outputs.len() == 7, 'unshield outputs len');
+        let cm_fee = note_commitment(
+            fixture.d_j_fee,
+            fixture.v_fee,
+            fixture.rseed_fee,
+            fixture.auth_root_fee,
+            fixture.auth_pub_seed_fee,
+            fixture.nk_tag_fee,
+        );
+        assert(outputs.len() == 10, 'unshield outputs len');
         assert(*outputs.at(0) == fixture.auth_domain, 'unshield out domain');
         assert(*outputs.at(1) == fixture.root, 'unshield out root');
         assert(*outputs.at(2) == *fixture.nf_list.at(0), 'unshield out nf');
         assert(*outputs.at(3) == fixture.v_pub.into(), 'unshield out vpub');
-        assert(*outputs.at(4) == fixture.recipient, 'unshield out recipient');
-        assert(*outputs.at(5) == cm_change, 'unshield out change');
-        assert(*outputs.at(6) == fixture.memo_ct_hash_change, 'unshield out memo');
+        assert(*outputs.at(4) == fixture.fee.into(), 'unshield out fee');
+        assert(*outputs.at(5) == fixture.recipient, 'unshield out recipient');
+        assert(*outputs.at(6) == cm_change, 'unshield out change');
+        assert(*outputs.at(7) == fixture.memo_ct_hash_change, 'unshield out memo');
+        assert(*outputs.at(8) == cm_fee, 'unshield out fee cm');
+        assert(*outputs.at(9) == fixture.memo_ct_hash_fee, 'unshield out fee memo');
     }
 
     #[test]
     fn test_unshield_accepts_valid_two_input_statement() {
         let fixture = build_two_input_fixture();
         let outputs = run_verify(@fixture);
-        assert(outputs.len() == 8, 'unshield outputs len two input');
+        assert(outputs.len() == 11, 'unshield outputs len two input');
         assert(*outputs.at(0) == fixture.auth_domain, 'unshield2 out domain');
         assert(*outputs.at(1) == fixture.root, 'unshield2 out root');
         assert(*outputs.at(2) == *fixture.nf_list.at(0), 'unshield2 out nf0');
         assert(*outputs.at(3) == *fixture.nf_list.at(1), 'unshield2 out nf1');
         assert(*outputs.at(4) == fixture.v_pub.into(), 'unshield2 out vpub');
-        assert(*outputs.at(5) == fixture.recipient, 'unshield2 out recipient');
+        assert(*outputs.at(5) == fixture.fee.into(), 'unshield2 out fee');
+        assert(*outputs.at(6) == fixture.recipient, 'unshield2 out recipient');
     }
 
     #[test]
@@ -881,9 +1023,19 @@ mod tests {
                     fixture.root,
                     *fixture.nf_list.at(0),
                     fixture.v_pub,
+                    fixture.fee,
                     fixture.recipient,
                     cm_change,
                     fixture.memo_ct_hash_change,
+                    note_commitment(
+                        fixture.d_j_fee,
+                        fixture.v_fee,
+                        fixture.rseed_fee,
+                        fixture.auth_root_fee,
+                        fixture.auth_pub_seed_fee,
+                        fixture.nk_tag_fee,
+                    ),
+                    fixture.memo_ct_hash_fee,
                     *fixture.auth_pub_seed_list.at(0),
                     (*fixture.auth_index_list.at(0)).try_into().unwrap(),
                 );
@@ -925,7 +1077,7 @@ mod tests {
     #[test]
     #[should_panic(expected: ('unshield: balance mismatch',))]
     fn test_unshield_rejects_balance_mismatch_even_with_consistent_change_commitment() {
-        let fixture = build_fixture_with_values(80_u64, 50_u64, 29_u64);
+        let fixture = build_fixture_with_values_and_fee(80_u64, 47_u64, 24_u64, 3_u64, 5_u64);
         run_verify(@fixture);
     }
 

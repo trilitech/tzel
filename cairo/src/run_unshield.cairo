@@ -5,7 +5,8 @@
 ///   [1]  auth_domain
 ///   [2]  root
 ///   [3]  v_pub
-///   [4]  recipient
+///   [4]  fee
+///   [5]  recipient
 ///   Then per input (N times):
 ///     nf, nk_spend, auth_root, auth_pub_seed, auth_index,
 ///     d_j, v, rseed, cm_path_idx
@@ -13,6 +14,7 @@
 ///   Then per input (N times): AUTH_DEPTH auth siblings
 ///   Then per input (N times): WOTS_CHAINS sig values
 ///   Then change: has_change, d_j, v, rseed, auth_root, auth_pub_seed, nk_tag, memo_ct_hash
+///   Then producer fee note: d_j, v, rseed, auth_root, auth_pub_seed, nk_tag, memo_ct_hash
 
 use tzel::merkle;
 use tzel::{unshield, xmss_common};
@@ -28,6 +30,8 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let root = *args.at(pos);
     pos += 1;
     let v_pub: u64 = (*args.at(pos)).try_into().unwrap();
+    pos += 1;
+    let fee: u64 = (*args.at(pos)).try_into().unwrap();
     pos += 1;
     let recipient = *args.at(pos);
     pos += 1;
@@ -108,6 +112,21 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let mh_change = *args.at(pos);
     pos += 1;
 
+    let d_j_fee = *args.at(pos);
+    pos += 1;
+    let v_fee: u64 = (*args.at(pos)).try_into().unwrap();
+    pos += 1;
+    let rseed_fee = *args.at(pos);
+    pos += 1;
+    let auth_root_fee = *args.at(pos);
+    pos += 1;
+    let auth_pub_seed_fee = *args.at(pos);
+    pos += 1;
+    let nk_tag_fee = *args.at(pos);
+    pos += 1;
+    let mh_fee = *args.at(pos);
+    pos += 1;
+
     assert(pos == args.len(), 'unexpected trailing args');
 
     unshield::verify(
@@ -115,6 +134,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         root,
         nf_list.span(),
         v_pub,
+        fee,
         recipient,
         nk_spend_list.span(),
         auth_root_list.span(),
@@ -135,5 +155,12 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         auth_pub_seed_change,
         nk_tag_change,
         mh_change,
+        d_j_fee,
+        v_fee,
+        rseed_fee,
+        auth_root_fee,
+        auth_pub_seed_fee,
+        nk_tag_fee,
+        mh_fee,
     )
 }

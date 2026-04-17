@@ -326,15 +326,28 @@ fn make_test_address() -> PaymentAddress {
     }
 }
 
+fn write_test_address(path: &std::path::Path) {
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&make_test_address()).unwrap(),
+    )
+    .expect("write test address");
+}
+
 fn generate_shield_proof(
     sender: &str,
     amount: u64,
+    fee: u64,
     address: &PaymentAddress,
-) -> (Proof, F, EncryptedNote) {
+) -> (Proof, F, EncryptedNote, F, EncryptedNote) {
+    let producer_fee = 1;
     let rseed = random_felt();
+    let producer_rseed = random_felt();
     let rcm = derive_rcm(&rseed);
+    let producer_rcm = derive_rcm(&producer_rseed);
     let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
     let cm = commit(&address.d_j, amount, &rcm, &otag);
+    let producer_cm = commit(&address.d_j, producer_fee, &producer_rcm, &otag);
     let sender_f = hash(sender.as_bytes());
 
     let ek_v = ml_kem_768::EncapsulationKey::new(address.ek_v.as_slice().try_into().unwrap())
@@ -342,19 +355,30 @@ fn generate_shield_proof(
     let ek_d = ml_kem_768::EncapsulationKey::new(address.ek_d.as_slice().try_into().unwrap())
         .expect("valid ek_d");
     let enc = encrypt_note(amount, &rseed, None, &ek_v, &ek_d);
+    let producer_enc = encrypt_note(producer_fee, &producer_rseed, Some(b"dal"), &ek_v, &ek_d);
     let memo_ct_hash_f = memo_ct_hash(&enc);
+    let producer_memo_ct_hash_f = memo_ct_hash(&producer_enc);
 
     let args: Vec<String> = vec![
-        felt_u64_to_hex(9),
+        felt_u64_to_hex(18),
         felt_u64_to_hex(amount),
+        felt_u64_to_hex(fee),
+        felt_u64_to_hex(producer_fee),
         felt_to_hex(&cm),
+        felt_to_hex(&producer_cm),
         felt_to_hex(&sender_f),
         felt_to_hex(&memo_ct_hash_f),
+        felt_to_hex(&producer_memo_ct_hash_f),
         felt_to_hex(&address.auth_root),
         felt_to_hex(&address.auth_pub_seed),
         felt_to_hex(&address.nk_tag),
         felt_to_hex(&address.d_j),
         felt_to_hex(&rseed),
+        felt_to_hex(&address.auth_root),
+        felt_to_hex(&address.auth_pub_seed),
+        felt_to_hex(&address.nk_tag),
+        felt_to_hex(&address.d_j),
+        felt_to_hex(&producer_rseed),
     ];
 
     let executable = format!("{}/run_shield.executable.json", executables_dir());
@@ -391,6 +415,8 @@ fn generate_shield_proof(
         },
         cm,
         enc,
+        producer_cm,
+        producer_enc,
     )
 }
 
@@ -446,6 +472,7 @@ fn test_e2e_trust_me_bro() {
     let dir = dir.path();
     let alice = dir.join("alice.json").to_str().unwrap().to_string();
     let alice_addr = dir.join("alice_addr.json").to_str().unwrap().to_string();
+    let producer_addr = dir.join("producer_addr.json").to_str().unwrap().to_string();
     let port = free_port();
     let l = format!("http://localhost:{}", port);
 
@@ -453,13 +480,14 @@ fn test_e2e_trust_me_bro() {
         std::path::Path::new(&alice),
         std::path::Path::new(&alice_addr),
     );
+    write_test_address(std::path::Path::new(&producer_addr));
 
     let mut ledger = start_ledger(port);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // ── Fund alice ──────────────────────────────────────────────
         let (ok, out) = client_tmb(
             &alice,
-            &["fund", "-l", &l, "--addr", "alice", "--amount", "2000"],
+            &["fund", "-l", &l, "--addr", "alice", "--amount", "300002"],
         );
         assert!(ok, "fund: {}", out);
 
@@ -473,24 +501,28 @@ fn test_e2e_trust_me_bro() {
                 "--sender",
                 "alice",
                 "--amount",
-                "2000",
+                "200001",
+                "--dal-fee",
+                "1",
+                "--dal-fee-address",
+                &producer_addr,
                 "--to",
                 &alice_addr,
             ],
         );
-        assert!(ok, "shield 2000: {}", out);
-        assert!(out.contains("Shielded 2000"));
+        assert!(ok, "shield 200001: {}", out);
+        assert!(out.contains("Shielded 200001"));
 
         // ── Alice scan ──────────────────────────────────────────────
         let (ok, out) = client_tmb(&alice, &["scan", "-l", &l]);
         assert!(ok, "alice scan: {}", out);
         assert!(out.contains("1 new notes found"));
-        assert!(out.contains("balance=2000"));
+        assert!(out.contains("balance=200001"));
 
         // ── Alice balance ───────────────────────────────────────────
         let (ok, out) = client_tmb(&alice, &["balance"]);
         assert!(ok, "balance: {}", out);
-        assert!(out.contains("Private balance: 2000"));
+        assert!(out.contains("Private balance: 200001"));
         assert!(out.contains("Notes: 1"));
 
         // ── Exact unshield (no change address generation) ───────────
@@ -501,13 +533,17 @@ fn test_e2e_trust_me_bro() {
                 "-l",
                 &l,
                 "--amount",
-                "2000",
+                "100000",
+                "--dal-fee",
+                "1",
+                "--dal-fee-address",
+                &producer_addr,
                 "--recipient",
                 "alice_pub",
             ],
         );
         assert!(ok, "unshield: {}", out);
-        assert!(out.contains("Unshielded 2000"));
+        assert!(out.contains("Unshielded 100000"));
 
         let (ok, out) = client_tmb(&alice, &["balance"]);
         assert!(ok, "alice balance 2: {}", out);
@@ -524,7 +560,7 @@ fn test_e2e_trust_me_bro() {
         assert_eq!(balances.get("alice").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(
             balances.get("alice_pub").and_then(|v| v.as_u64()),
-            Some(2000)
+            Some(100000)
         );
 
         // ── Tree integrity ──────────────────────────────────────────
@@ -535,7 +571,11 @@ fn test_e2e_trust_me_bro() {
             .read_json()
             .unwrap();
         let size = tree.get("size").unwrap().as_u64().unwrap();
-        assert_eq!(size, 1, "tree should have exactly one leaf, got {}", size);
+        assert_eq!(
+            size, 3,
+            "tree should contain the user note plus two producer-fee notes, got {}",
+            size
+        );
     }));
 
     let _ = ledger.kill();
@@ -565,11 +605,18 @@ fn test_ledger_rejects_tmb_by_default() {
         .to_str()
         .unwrap()
         .to_string();
+    let producer_addr = dir
+        .path()
+        .join("producer_addr.json")
+        .to_str()
+        .unwrap()
+        .to_string();
 
     install_base_wallet_fixture(
         std::path::Path::new(&alice),
         std::path::Path::new(&alice_addr),
     );
+    write_test_address(std::path::Path::new(&producer_addr));
 
     // Start ledger in verified mode (no --trust-me-bro) on a different port
     let port = free_port();
@@ -580,7 +627,7 @@ fn test_ledger_rejects_tmb_by_default() {
         // Fund works (no proof needed)
         let (ok, _) = client_tmb(
             &alice,
-            &["fund", "-l", &l, "--addr", "alice", "--amount", "1000"],
+            &["fund", "-l", &l, "--addr", "alice", "--amount", "300002"],
         );
         assert!(ok, "fund should work without proof");
 
@@ -594,7 +641,11 @@ fn test_ledger_rejects_tmb_by_default() {
                 "--sender",
                 "alice",
                 "--amount",
-                "500",
+                "200001",
+                "--dal-fee",
+                "1",
+                "--dal-fee-address",
+                &producer_addr,
                 "--to",
                 &alice_addr,
             ],
@@ -660,20 +711,25 @@ fn test_shield_proof_roundtrip() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let fund_resp = post_json_allow_status(
             &format!("{}/fund", l),
-            &serde_json::json!({ "addr": "alice", "amount": 5000 }),
+            &serde_json::json!({ "addr": "alice", "amount": 300001 }),
         );
         assert_eq!(fund_resp.status(), 200);
 
         let address = make_test_address();
-        let (proof, cm, enc) = generate_shield_proof("alice", 1000, &address);
+        let (proof, cm, enc, producer_cm, producer_enc) =
+            generate_shield_proof("alice", 200_000, MIN_TX_FEE, &address);
         let req = ShieldReq {
             sender: "alice".into(),
-            v: 1000,
+            v: 200_000,
+            fee: MIN_TX_FEE,
+            producer_fee: 1,
             address,
             memo: None,
             proof,
             client_cm: cm,
             client_enc: Some(enc),
+            producer_cm,
+            producer_enc: Some(producer_enc),
         };
 
         let resp = post_json_allow_status(&format!("{}/shield", l), &req);
@@ -714,6 +770,7 @@ fn test_transfer_proof_roundtrip() {
         .to_str()
         .unwrap()
         .to_string();
+    let producer_addr = dir.join("producer_addr.json").to_str().unwrap().to_string();
     let port = free_port();
     let l = format!("http://localhost:{}", port);
 
@@ -729,10 +786,11 @@ fn test_transfer_proof_roundtrip() {
             serde_json::to_string_pretty(&make_test_address()).unwrap(),
         )
         .unwrap();
+        write_test_address(std::path::Path::new(&producer_addr));
 
         let (ok, out) = client_tmb(
             &alice,
-            &["fund", "-l", &l, "--addr", "alice", "--amount", "1500"],
+            &["fund", "-l", &l, "--addr", "alice", "--amount", "500001"],
         );
         assert!(ok, "fund: {}", out);
 
@@ -745,7 +803,11 @@ fn test_transfer_proof_roundtrip() {
                 "--sender",
                 "alice",
                 "--amount",
-                "1500",
+                "400000",
+                "--dal-fee",
+                "1",
+                "--dal-fee-address",
+                &producer_addr,
                 "--to",
                 &alice_addr,
             ],
@@ -765,15 +827,27 @@ fn test_transfer_proof_roundtrip() {
                 "--to",
                 &recipient_addr,
                 "--amount",
-                "1500",
+                "150000",
+                "--dal-fee",
+                "1",
+                "--dal-fee-address",
+                &producer_addr,
             ],
         );
         assert!(ok, "real transfer failed: {}", out);
-        assert!(out.contains("Transferred 1500"), "transfer output: {}", out);
+        assert!(
+            out.contains("Transferred 150000"),
+            "transfer output: {}",
+            out
+        );
 
         let (ok, out) = client_tmb(&alice, &["balance"]);
         assert!(ok, "alice balance: {}", out);
-        assert!(out.contains("Private balance: 0"), "alice balance: {}", out);
+        assert!(
+            out.contains("Private balance: 149999"),
+            "alice balance: {}",
+            out
+        );
 
         let tree: serde_json::Value = ureq::get(&format!("{}/tree", l))
             .call()
@@ -783,8 +857,8 @@ fn test_transfer_proof_roundtrip() {
             .unwrap();
         let size = tree.get("size").unwrap().as_u64().unwrap();
         assert_eq!(
-            size, 3,
-            "tree should contain the setup note plus recipient and change outputs"
+            size, 5,
+            "tree should contain the setup user+producer notes plus recipient, change, and producer outputs"
         );
     }));
 
@@ -844,6 +918,7 @@ fn test_unshield_proof_roundtrip() {
     let dir = dir.path();
     let alice = dir.join("alice.json").to_str().unwrap().to_string();
     let alice_addr = dir.join("alice_addr.json").to_str().unwrap().to_string();
+    let producer_addr = dir.join("producer_addr.json").to_str().unwrap().to_string();
     let port = free_port();
     let l = format!("http://localhost:{}", port);
 
@@ -854,10 +929,11 @@ fn test_unshield_proof_roundtrip() {
             std::path::Path::new(&alice),
             std::path::Path::new(&alice_addr),
         );
+        write_test_address(std::path::Path::new(&producer_addr));
 
         let (ok, out) = client_tmb(
             &alice,
-            &["fund", "-l", &l, "--addr", "alice", "--amount", "800"],
+            &["fund", "-l", &l, "--addr", "alice", "--amount", "300002"],
         );
         assert!(ok, "fund: {}", out);
 
@@ -870,7 +946,11 @@ fn test_unshield_proof_roundtrip() {
                 "--sender",
                 "alice",
                 "--amount",
-                "800",
+                "200001",
+                "--dal-fee",
+                "1",
+                "--dal-fee-address",
+                &producer_addr,
                 "--to",
                 &alice_addr,
             ],
@@ -888,13 +968,21 @@ fn test_unshield_proof_roundtrip() {
                 "-l",
                 &l,
                 "--amount",
-                "800",
+                "100000",
+                "--dal-fee",
+                "1",
+                "--dal-fee-address",
+                &producer_addr,
                 "--recipient",
                 "bob_pub",
             ],
         );
         assert!(ok, "real unshield failed: {}", out);
-        assert!(out.contains("Unshielded 800"), "unshield output: {}", out);
+        assert!(
+            out.contains("Unshielded 100000"),
+            "unshield output: {}",
+            out
+        );
 
         let resp: serde_json::Value = ureq::get(&format!("{}/balances", l))
             .call()
@@ -903,7 +991,10 @@ fn test_unshield_proof_roundtrip() {
             .read_json()
             .unwrap();
         let balances = resp.get("balances").unwrap();
-        assert_eq!(balances.get("bob_pub").and_then(|v| v.as_u64()), Some(800));
+        assert_eq!(
+            balances.get("bob_pub").and_then(|v| v.as_u64()),
+            Some(100000)
+        );
     }));
 
     let _ = ledger.kill();

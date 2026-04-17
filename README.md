@@ -16,14 +16,16 @@ Privacy on blockchains today relies on elliptic curve cryptography that quantum 
 - **Fuzzy message detection.** ML-KEM-based detection keys let a lightweight indexer flag likely-incoming transactions without being able to read them.
 - **Diversified addresses.** Generate unlimited unlinkable addresses from a single master key.
 - **1 KB encrypted memos.** End-to-end encrypted with ML-KEM-768 + ChaCha20-Poly1305.
-- **Flexible N->2 transfers.** Consolidate up to 16 notes in a single proof. No dummy notes needed.
+- **Flexible N->3 transfers.** Spend up to 7 notes in a single proof and produce recipient, change, and DAL-producer fee notes without dummy notes.
 
 ### How it works
 
 A UTXO-based private transaction system where:
 - **Deposits** (shield) move public tokens into private notes
-- **Transfers** spend 1-16 private notes and create 2 new ones
-- **Withdrawals** (unshield) destroy private notes and release value publicly
+- **Transfers** spend 1-7 private notes and create recipient, change, and DAL-producer fee notes
+- **Withdrawals** (unshield) destroy private notes, release value publicly, and create a DAL-producer fee note plus optional change
+- **Every shield / transfer / unshield burns a fixed 100000 mutez (0.1 tez)** in the current rollup deployment
+- **Every shield / transfer / unshield also creates a separate private DAL-producer fee note**
 - Every spend is proven with a **zero-knowledge STARK** that verifies the **WOTS+ signature inside the circuit** — the proof itself proves spend authorization
 
 ## Quick start
@@ -39,11 +41,13 @@ cd cairo && scarb build && cd ..
 target/release/sp-ledger --port 8080 --reprove-bin apps/prover/target/release/reprove &
 
 # Run the developer/test wallet harness
-target/release/sp-client keygen
-target/release/sp-client fund -l http://localhost:8080 --addr alice --amount 1000
-target/release/sp-client shield -l http://localhost:8080 --sender alice --amount 1000
-target/release/sp-client scan -l http://localhost:8080
-target/release/sp-client balance
+target/release/sp-client -w alice.json keygen
+target/release/sp-client -w producer.json keygen
+target/release/sp-client -w producer.json address | sed -n '2,$p' > producer-address.json
+target/release/sp-client -w alice.json fund -l http://localhost:8080 --addr alice --amount 300002
+target/release/sp-client -w alice.json shield -l http://localhost:8080 --sender alice --amount 200001 --dal-fee 1 --dal-fee-address producer-address.json
+target/release/sp-client -w alice.json scan -l http://localhost:8080
+target/release/sp-client -w alice.json balance
 
 # Run the STARK proofs (requires ~13 GB RAM)
 ./apps/prover/bench.sh

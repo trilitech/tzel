@@ -1,7 +1,8 @@
 /// Transfer circuit: N→2 JoinSplit (1 ≤ N ≤ 7).
 ///
 /// # Public outputs
-///   [auth_domain, root, nf_0..nf_{N-1}, cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2]
+///   [auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3,
+///    memo_ct_hash_1, memo_ct_hash_2, memo_ct_hash_3]
 ///
 /// # Spend authorization
 ///   XMSS-style WOTS+ w=4 signature verification inside the STARK.
@@ -18,8 +19,10 @@ pub fn verify(
     auth_domain: felt252,
     root: felt252,
     nf_list: Span<felt252>,
+    fee: u64,
     cm_1: felt252,
     cm_2: felt252,
+    cm_3: felt252,
     nk_spend_list: Span<felt252>,
     auth_root_list: Span<felt252>,
     auth_pub_seed_list: Span<felt252>,
@@ -45,6 +48,13 @@ pub fn verify(
     auth_pub_seed_2: felt252,
     nk_tag_2: felt252,
     memo_ct_hash_2: felt252,
+    d_j_3: felt252,
+    v_3: u64,
+    rseed_3: felt252,
+    auth_root_3: felt252,
+    auth_pub_seed_3: felt252,
+    nk_tag_3: felt252,
+    memo_ct_hash_3: felt252,
 ) -> Array<felt252> {
     let n = nf_list.len();
     assert(n >= 1, 'transfer: need >= 1 input');
@@ -68,10 +78,13 @@ pub fn verify(
         sighash = hash::sighash_fold(sighash, *nf_list.at(si));
         si += 1;
     }
+    sighash = hash::sighash_fold(sighash, fee.into());
     sighash = hash::sighash_fold(sighash, cm_1);
     sighash = hash::sighash_fold(sighash, cm_2);
+    sighash = hash::sighash_fold(sighash, cm_3);
     sighash = hash::sighash_fold(sighash, memo_ct_hash_1);
     sighash = hash::sighash_fold(sighash, memo_ct_hash_2);
+    sighash = hash::sighash_fold(sighash, memo_ct_hash_3);
 
     let mut sum_in: u128 = 0;
     let mut i: u32 = 0;
@@ -136,7 +149,12 @@ pub fn verify(
     let otag_2 = hash::owner_tag(auth_root_2, auth_pub_seed_2, nk_tag_2);
     assert(hash::commit(d_j_2, v_2, rcm_2, otag_2) == cm_2, 'transfer: bad cm_2');
 
-    let sum_out: u128 = v_1.into() + v_2.into();
+    let rcm_3 = hash::derive_rcm(rseed_3);
+    let otag_3 = hash::owner_tag(auth_root_3, auth_pub_seed_3, nk_tag_3);
+    assert(hash::commit(d_j_3, v_3, rcm_3, otag_3) == cm_3, 'transfer: bad cm_3');
+
+    assert(v_3 > 0_u64, 'transfer prod fee');
+    let sum_out: u128 = v_1.into() + v_2.into() + v_3.into() + fee.into();
     assert(sum_in == sum_out, 'transfer: balance mismatch');
 
     let mut outputs: Array<felt252> = array![auth_domain, root];
@@ -145,10 +163,13 @@ pub fn verify(
         outputs.append(*nf_list.at(j));
         j += 1;
     }
+    outputs.append(fee.into());
     outputs.append(cm_1);
     outputs.append(cm_2);
+    outputs.append(cm_3);
     outputs.append(memo_ct_hash_1);
     outputs.append(memo_ct_hash_2);
+    outputs.append(memo_ct_hash_3);
     outputs
 }
 
@@ -164,6 +185,7 @@ mod tests {
         auth_domain: felt252,
         root: felt252,
         nf_list: Array<felt252>,
+        fee: u64,
         nk_spend_list: Array<felt252>,
         auth_root_list: Array<felt252>,
         auth_pub_seed_list: Array<felt252>,
@@ -191,6 +213,14 @@ mod tests {
         auth_pub_seed_2: felt252,
         nk_tag_2: felt252,
         memo_ct_hash_2: felt252,
+        cm_3: felt252,
+        d_j_3: felt252,
+        v_3: u64,
+        rseed_3: felt252,
+        auth_root_3: felt252,
+        auth_pub_seed_3: felt252,
+        nk_tag_3: felt252,
+        memo_ct_hash_3: felt252,
     }
 
     fn copy_and_mutate(values: Span<felt252>, target: u32) -> Array<felt252> {
@@ -276,10 +306,13 @@ mod tests {
         auth_domain: felt252,
         root: felt252,
         nf_list: Span<felt252>,
+        fee: u64,
         cm_1: felt252,
         cm_2: felt252,
+        cm_3: felt252,
         memo_ct_hash_1: felt252,
         memo_ct_hash_2: felt252,
+        memo_ct_hash_3: felt252,
     ) -> felt252 {
         let mut sighash = hash::sighash_fold(0x01, auth_domain);
         sighash = hash::sighash_fold(sighash, root);
@@ -288,10 +321,13 @@ mod tests {
             sighash = hash::sighash_fold(sighash, *nf_list.at(i));
             i += 1;
         }
+        sighash = hash::sighash_fold(sighash, fee.into());
         sighash = hash::sighash_fold(sighash, cm_1);
         sighash = hash::sighash_fold(sighash, cm_2);
+        sighash = hash::sighash_fold(sighash, cm_3);
         sighash = hash::sighash_fold(sighash, memo_ct_hash_1);
         sighash = hash::sighash_fold(sighash, memo_ct_hash_2);
+        sighash = hash::sighash_fold(sighash, memo_ct_hash_3);
         sighash
     }
 
@@ -313,20 +349,34 @@ mod tests {
         auth_domain: felt252,
         root: felt252,
         nf: felt252,
+        fee: u64,
         cm_1: felt252,
         cm_2: felt252,
+        cm_3: felt252,
         memo_ct_hash_1: felt252,
         memo_ct_hash_2: felt252,
+        memo_ct_hash_3: felt252,
         auth_pub_seed: felt252,
         auth_idx: u32,
     ) -> Array<felt252> {
         let sighash = transfer_sighash(
-            auth_domain, root, array![nf].span(), cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2,
+            auth_domain,
+            root,
+            array![nf].span(),
+            fee,
+            cm_1,
+            cm_2,
+            cm_3,
+            memo_ct_hash_1,
+            memo_ct_hash_2,
+            memo_ct_hash_3,
         );
         sign_transfer_input(sighash, auth_pub_seed, auth_idx, 0x7500)
     }
 
-    fn build_fixture_with_values(v_in: u64, v_1: u64, v_2: u64) -> TransferFixture {
+    fn build_fixture_with_values_and_fee(
+        v_in: u64, v_1: u64, v_2: u64, v_3: u64, fee: u64,
+    ) -> TransferFixture {
         let auth_domain = 0x7001;
         let nk_spend = 0x7101;
         let auth_pub_seed = 0x7201;
@@ -387,14 +437,25 @@ mod tests {
         let memo_ct_hash_2 = 0x7906;
         let cm_2 = output_commitment(d_j_2, v_2, rseed_2, auth_root_2, auth_pub_seed_2, nk_tag_2);
 
+        let d_j_3 = 0x7A01;
+        let rseed_3 = 0x7A02;
+        let auth_root_3 = 0x7A03;
+        let auth_pub_seed_3 = 0x7A04;
+        let nk_tag_3 = 0x7A05;
+        let memo_ct_hash_3 = 0x7A06;
+        let cm_3 = output_commitment(d_j_3, v_3, rseed_3, auth_root_3, auth_pub_seed_3, nk_tag_3);
+
         let wots_sig_flat = sign_transfer_statement(
             auth_domain,
             root,
             nf,
+            fee,
             cm_1,
             cm_2,
+            cm_3,
             memo_ct_hash_1,
             memo_ct_hash_2,
+            memo_ct_hash_3,
             auth_pub_seed,
             auth_idx,
         );
@@ -403,6 +464,7 @@ mod tests {
             auth_domain,
             root,
             nf_list: array![nf],
+            fee,
             nk_spend_list: array![nk_spend],
             auth_root_list: array![auth_root],
             auth_pub_seed_list: array![auth_pub_seed],
@@ -430,11 +492,24 @@ mod tests {
             auth_pub_seed_2,
             nk_tag_2,
             memo_ct_hash_2,
+            cm_3,
+            d_j_3,
+            v_3,
+            rseed_3,
+            auth_root_3,
+            auth_pub_seed_3,
+            nk_tag_3,
+            memo_ct_hash_3,
         }
     }
 
+    fn build_fixture_with_values(v_in: u64, v_1: u64, v_2: u64, v_3: u64) -> TransferFixture {
+        let fee = v_in - v_1 - v_2 - v_3;
+        build_fixture_with_values_and_fee(v_in, v_1, v_2, v_3, fee)
+    }
+
     fn build_fixture() -> TransferFixture {
-        build_fixture_with_values(70_u64, 45_u64, 25_u64)
+        build_fixture_with_values(70_u64, 42_u64, 20_u64, 3_u64)
     }
 
     fn build_two_input_fixture() -> TransferFixture {
@@ -524,6 +599,8 @@ mod tests {
         let nf_1 = hash::nullifier(nk_spend_1, cm_1_in, 1);
 
         let d_j_1 = 0x8E01;
+        let fee = 5_u64;
+        let v_3 = 3_u64;
         let v_1 = 35_u64;
         let rseed_1 = 0x8E02;
         let auth_root_1 = 0x8E03;
@@ -533,7 +610,7 @@ mod tests {
         let cm_1 = output_commitment(d_j_1, v_1, rseed_1, auth_root_1, auth_pub_seed_1, nk_tag_1);
 
         let d_j_2 = 0x8F01;
-        let v_2 = 35_u64;
+        let v_2 = 27_u64;
         let rseed_2 = 0x8F02;
         let auth_root_2 = 0x8F03;
         let auth_pub_seed_2 = 0x8F04;
@@ -541,9 +618,26 @@ mod tests {
         let memo_ct_hash_2 = 0x8F06;
         let cm_2 = output_commitment(d_j_2, v_2, rseed_2, auth_root_2, auth_pub_seed_2, nk_tag_2);
 
+        let d_j_3 = 0x9001;
+        let rseed_3 = 0x9002;
+        let auth_root_3 = 0x9003;
+        let auth_pub_seed_3 = 0x9004;
+        let nk_tag_3 = 0x9005;
+        let memo_ct_hash_3 = 0x9006;
+        let cm_3 = output_commitment(d_j_3, v_3, rseed_3, auth_root_3, auth_pub_seed_3, nk_tag_3);
+
         let nf_list: Array<felt252> = array![nf_0, nf_1];
         let sighash = transfer_sighash(
-            auth_domain, root, nf_list.span(), cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2,
+            auth_domain,
+            root,
+            nf_list.span(),
+            fee,
+            cm_1,
+            cm_2,
+            cm_3,
+            memo_ct_hash_1,
+            memo_ct_hash_2,
+            memo_ct_hash_3,
         );
 
         let sig_0 = sign_transfer_input(sighash, auth_pub_seed, auth_idx_0, key_base_0);
@@ -588,6 +682,7 @@ mod tests {
             auth_domain,
             root,
             nf_list,
+            fee,
             nk_spend_list: array![nk_spend_0, nk_spend_1],
             auth_root_list: array![auth_root, auth_root],
             auth_pub_seed_list: array![auth_pub_seed, auth_pub_seed],
@@ -615,6 +710,14 @@ mod tests {
             auth_pub_seed_2,
             nk_tag_2,
             memo_ct_hash_2,
+            cm_3,
+            d_j_3,
+            v_3,
+            rseed_3,
+            auth_root_3,
+            auth_pub_seed_3,
+            nk_tag_3,
+            memo_ct_hash_3,
         }
     }
 
@@ -895,8 +998,10 @@ mod tests {
             k += 1;
         }
 
+        let fee = 5_u64;
+        let v_3 = 3_u64;
         let v_1 = total_in / 2_u64;
-        let v_2 = total_in - v_1;
+        let v_2 = total_in - v_1 - fee - v_3;
 
         let d_j_1 = 0xA701;
         let rseed_1 = 0xA702;
@@ -914,8 +1019,25 @@ mod tests {
         let memo_ct_hash_2 = 0xA806;
         let cm_2 = output_commitment(d_j_2, v_2, rseed_2, auth_root_2, auth_pub_seed_2, nk_tag_2);
 
+        let d_j_3 = 0xA901;
+        let rseed_3 = 0xA902;
+        let auth_root_3 = 0xA903;
+        let auth_pub_seed_3 = 0xA904;
+        let nk_tag_3 = 0xA905;
+        let memo_ct_hash_3 = 0xA906;
+        let cm_3 = output_commitment(d_j_3, v_3, rseed_3, auth_root_3, auth_pub_seed_3, nk_tag_3);
+
         let sighash = transfer_sighash(
-            auth_domain, root, nf_list.span(), cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2,
+            auth_domain,
+            root,
+            nf_list.span(),
+            fee,
+            cm_1,
+            cm_2,
+            cm_3,
+            memo_ct_hash_1,
+            memo_ct_hash_2,
+            memo_ct_hash_3,
         );
         let mut wots_sig_flat: Array<felt252> = array![];
         let mut m: u32 = 0;
@@ -934,6 +1056,7 @@ mod tests {
             auth_domain,
             root,
             nf_list,
+            fee,
             nk_spend_list,
             auth_root_list,
             auth_pub_seed_list,
@@ -961,19 +1084,30 @@ mod tests {
             auth_pub_seed_2,
             nk_tag_2,
             memo_ct_hash_2,
+            cm_3,
+            d_j_3,
+            v_3,
+            rseed_3,
+            auth_root_3,
+            auth_pub_seed_3,
+            nk_tag_3,
+            memo_ct_hash_3,
         }
     }
 
     fn build_duplicate_nf_fixture() -> TransferFixture {
-        let base = build_fixture_with_values(70_u64, 80_u64, 60_u64);
+        let base = build_fixture_with_values_and_fee(70_u64, 37_u64, 25_u64, 3_u64, 5_u64);
         let sighash = transfer_sighash(
             base.auth_domain,
             base.root,
             array![*base.nf_list.at(0), *base.nf_list.at(0)].span(),
+            base.fee,
             base.cm_1,
             base.cm_2,
+            base.cm_3,
             base.memo_ct_hash_1,
             base.memo_ct_hash_2,
+            base.memo_ct_hash_3,
         );
         let sig = sign_transfer_input(
             sighash,
@@ -1021,6 +1155,7 @@ mod tests {
             auth_domain: base.auth_domain,
             root: base.root,
             nf_list: array![*base.nf_list.at(0), *base.nf_list.at(0)],
+            fee: base.fee,
             nk_spend_list: array![*base.nk_spend_list.at(0), *base.nk_spend_list.at(0)],
             auth_root_list: array![*base.auth_root_list.at(0), *base.auth_root_list.at(0)],
             auth_pub_seed_list: array![
@@ -1052,6 +1187,14 @@ mod tests {
             auth_pub_seed_2: base.auth_pub_seed_2,
             nk_tag_2: base.nk_tag_2,
             memo_ct_hash_2: base.memo_ct_hash_2,
+            cm_3: base.cm_3,
+            d_j_3: base.d_j_3,
+            v_3: base.v_3,
+            rseed_3: base.rseed_3,
+            auth_root_3: base.auth_root_3,
+            auth_pub_seed_3: base.auth_pub_seed_3,
+            nk_tag_3: base.nk_tag_3,
+            memo_ct_hash_3: base.memo_ct_hash_3,
         }
     }
 
@@ -1060,8 +1203,10 @@ mod tests {
             fixture.auth_domain,
             fixture.root,
             fixture.nf_list.span(),
+            fixture.fee,
             fixture.cm_1,
             fixture.cm_2,
+            fixture.cm_3,
             fixture.nk_spend_list.span(),
             fixture.auth_root_list.span(),
             fixture.auth_pub_seed_list.span(),
@@ -1087,6 +1232,13 @@ mod tests {
             fixture.auth_pub_seed_2,
             fixture.nk_tag_2,
             fixture.memo_ct_hash_2,
+            fixture.d_j_3,
+            fixture.v_3,
+            fixture.rseed_3,
+            fixture.auth_root_3,
+            fixture.auth_pub_seed_3,
+            fixture.nk_tag_3,
+            fixture.memo_ct_hash_3,
         )
     }
 
@@ -1094,33 +1246,38 @@ mod tests {
     fn test_transfer_accepts_valid_statement() {
         let fixture = build_fixture();
         let outputs = run_verify(@fixture);
-        assert(outputs.len() == 7, 'transfer outputs len');
+        assert(outputs.len() == 10, 'transfer outputs len');
         assert(*outputs.at(0) == fixture.auth_domain, 'transfer out domain');
         assert(*outputs.at(1) == fixture.root, 'transfer out root');
         assert(*outputs.at(2) == *fixture.nf_list.at(0), 'transfer out nf');
-        assert(*outputs.at(3) == fixture.cm_1, 'transfer out cm1');
-        assert(*outputs.at(4) == fixture.cm_2, 'transfer out cm2');
-        assert(*outputs.at(5) == fixture.memo_ct_hash_1, 'transfer out memo1');
-        assert(*outputs.at(6) == fixture.memo_ct_hash_2, 'transfer out memo2');
+        assert(*outputs.at(3) == fixture.fee.into(), 'transfer out fee');
+        assert(*outputs.at(4) == fixture.cm_1, 'transfer out cm1');
+        assert(*outputs.at(5) == fixture.cm_2, 'transfer out cm2');
+        assert(*outputs.at(6) == fixture.cm_3, 'transfer out cm3');
+        assert(*outputs.at(7) == fixture.memo_ct_hash_1, 'transfer out memo1');
+        assert(*outputs.at(8) == fixture.memo_ct_hash_2, 'transfer out memo2');
+        assert(*outputs.at(9) == fixture.memo_ct_hash_3, 'transfer out memo3');
     }
 
     #[test]
     fn test_transfer_accepts_valid_two_input_statement() {
         let fixture = build_two_input_fixture();
         let outputs = run_verify(@fixture);
-        assert(outputs.len() == 8, 'transfer outputs len two input');
+        assert(outputs.len() == 11, 'transfer outputs len two input');
         assert(*outputs.at(0) == fixture.auth_domain, 'transfer2 out domain');
         assert(*outputs.at(1) == fixture.root, 'transfer2 out root');
         assert(*outputs.at(2) == *fixture.nf_list.at(0), 'transfer2 out nf0');
         assert(*outputs.at(3) == *fixture.nf_list.at(1), 'transfer2 out nf1');
-        assert(*outputs.at(4) == fixture.cm_1, 'transfer2 out cm1');
-        assert(*outputs.at(5) == fixture.cm_2, 'transfer2 out cm2');
+        assert(*outputs.at(4) == fixture.fee.into(), 'transfer2 out fee');
+        assert(*outputs.at(5) == fixture.cm_1, 'transfer2 out cm1');
+        assert(*outputs.at(6) == fixture.cm_2, 'transfer2 out cm2');
+        assert(*outputs.at(7) == fixture.cm_3, 'transfer2 out cm3');
     }
 
     fn assert_transfer_accepts_multi_input_statement(n_inputs: u32) {
         let fixture = build_multi_input_fixture(n_inputs);
         let outputs = run_verify(@fixture);
-        assert(outputs.len() == n_inputs + 6_u32, 'transfer outputs len multi');
+        assert(outputs.len() == n_inputs + 9_u32, 'transfer outputs len multi');
         assert(*outputs.at(0) == fixture.auth_domain, 'transfer multi out domain');
         assert(*outputs.at(1) == fixture.root, 'transfer multi out root');
         assert(*outputs.at(2) == *fixture.nf_list.at(0), 'transfer multi out nf0');
@@ -1128,8 +1285,10 @@ mod tests {
             *outputs.at(1_u32 + n_inputs) == *fixture.nf_list.at(n_inputs - 1_u32),
             'transfer multi out last nf',
         );
-        assert(*outputs.at(2_u32 + n_inputs) == fixture.cm_1, 'transfer multi out cm1');
-        assert(*outputs.at(3_u32 + n_inputs) == fixture.cm_2, 'transfer multi out cm2');
+        assert(*outputs.at(2_u32 + n_inputs) == fixture.fee.into(), 'transfer multi out fee');
+        assert(*outputs.at(3_u32 + n_inputs) == fixture.cm_1, 'transfer multi out cm1');
+        assert(*outputs.at(4_u32 + n_inputs) == fixture.cm_2, 'transfer multi out cm2');
+        assert(*outputs.at(5_u32 + n_inputs) == fixture.cm_3, 'transfer multi out cm3');
     }
 
     #[test]
@@ -1157,10 +1316,13 @@ mod tests {
                     fixture.auth_domain,
                     fixture.root,
                     *fixture.nf_list.at(0),
+                    fixture.fee,
                     fixture.cm_1,
                     fixture.cm_2,
+                    fixture.cm_3,
                     fixture.memo_ct_hash_1,
                     fixture.memo_ct_hash_2,
+                    fixture.memo_ct_hash_3,
                     *fixture.auth_pub_seed_list.at(0),
                     (*fixture.auth_index_list.at(0)).try_into().unwrap(),
                 );
@@ -1210,7 +1372,7 @@ mod tests {
     #[test]
     #[should_panic(expected: ('transfer: balance mismatch',))]
     fn test_transfer_rejects_balance_mismatch_even_with_consistent_output_commitment() {
-        let fixture = build_fixture_with_values(70_u64, 45_u64, 24_u64);
+        let fixture = build_fixture_with_values_and_fee(70_u64, 45_u64, 21_u64, 3_u64, 5_u64);
         run_verify(@fixture);
     }
 

@@ -17,9 +17,9 @@ The kernel consumes Tezos Data Encoding inbox messages and records:
 
 Supported message kinds:
 - `deposit` (bridge-balance credit after an L1 deposit is observed)
-- `shield` (convert credited bridge balance into a shielded note)
-- `transfer` (shielded transfer inside the rollup)
-- `unshield` (consume a shielded note and credit transparent rollup balance)
+- `shield` (convert credited bridge balance into a user note plus a DAL-producer fee note, and burn the protocol fee)
+- `transfer` (shielded transfer inside the rollup, creating recipient, change, and DAL-producer fee notes while burning the protocol fee)
+- `unshield` (consume a shielded note, burn the protocol fee, credit transparent rollup balance, and append the DAL-producer fee note plus optional change)
 - `withdraw` (debit transparent rollup balance and emit an L1 outbox withdrawal payload)
 
 These messages are applied through the shared Rust transition logic in `core/`.

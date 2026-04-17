@@ -1409,6 +1409,8 @@ struct WalletNetworkProfile {
     rollup_node_url: String,
     rollup_address: String,
     bridge_ticketer: String,
+    dal_fee: u64,
+    dal_fee_address: PaymentAddress,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operator_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1443,6 +1445,8 @@ fn shadownet_profile(
     rollup_node_url: String,
     rollup_address: String,
     bridge_ticketer: String,
+    dal_fee: u64,
+    dal_fee_address: PaymentAddress,
     operator_url: Option<String>,
     operator_bearer_token: Option<String>,
     source_alias: String,
@@ -1458,6 +1462,8 @@ fn shadownet_profile(
         rollup_node_url,
         rollup_address,
         bridge_ticketer,
+        dal_fee,
+        dal_fee_address,
         operator_url,
         operator_bearer_token,
         public_account: public_account.unwrap_or_else(|| source_alias.clone()),
@@ -1476,6 +1482,9 @@ fn load_network_profile(path: &Path) -> Result<WalletNetworkProfile, String> {
 }
 
 fn validate_network_profile(profile: &WalletNetworkProfile) -> Result<(), String> {
+    if profile.dal_fee == 0 {
+        return Err("dal_fee must be greater than zero".into());
+    }
     let has_operator_url = profile.operator_url.is_some();
     let has_operator_token = profile
         .operator_bearer_token
@@ -1523,7 +1532,7 @@ fn load_required_network_profile(wallet_path: &str) -> Result<WalletNetworkProfi
     let profile_path = default_network_profile_path(wallet_path);
     let profile = load_network_profile(&profile_path).map_err(|e| {
         format!(
-            "network profile is not configured: {}. Run `tzel-wallet profile init-shadownet --rollup-node-url ... --rollup-address ... --bridge-ticketer ... --source-alias ...`",
+            "network profile is not configured: {}. Run `tzel-wallet profile init-shadownet --rollup-node-url ... --rollup-address ... --bridge-ticketer ... --dal-fee ... --dal-fee-address ... --source-alias ...`",
             e
         )
     })?;
@@ -2105,6 +2114,54 @@ fn mutez_to_tez_string(amount_mutez: u64) -> String {
     out
 }
 
+fn ensure_min_tx_fee(fee: u64) -> Result<(), String> {
+    if fee < MIN_TX_FEE {
+        return Err(format!(
+            "fee below minimum: {} mutez < {} mutez ({} tez)",
+            fee,
+            MIN_TX_FEE,
+            mutez_to_tez_string(MIN_TX_FEE),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_positive_dal_fee(dal_fee: u64) -> Result<(), String> {
+    if dal_fee == 0 {
+        return Err("dal_fee must be greater than zero".into());
+    }
+    Ok(())
+}
+
+struct PreparedOutputNote {
+    cm: F,
+    enc: EncryptedNote,
+    mh: F,
+    rseed: F,
+}
+
+fn build_output_note(
+    address: &PaymentAddress,
+    value: u64,
+    memo: Option<&[u8]>,
+) -> Result<PreparedOutputNote, String> {
+    let rseed = random_felt();
+    let rcm = derive_rcm(&rseed);
+    let ek_v = ml_kem::ml_kem_768::EncapsulationKey::new(
+        address.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
+    )
+    .map_err(|_| "invalid ek_v")?;
+    let ek_d = ml_kem::ml_kem_768::EncapsulationKey::new(
+        address.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
+    )
+    .map_err(|_| "invalid ek_d")?;
+    let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
+    let cm = commit(&address.d_j, value, &rcm, &otag);
+    let enc = encrypt_note(value, &rseed, memo, &ek_v, &ek_d);
+    let mh = memo_ct_hash(&enc);
+    Ok(PreparedOutputNote { cm, enc, mh, rseed })
+}
+
 fn extract_operation_hash(output: &str) -> Option<String> {
     output
         .split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | '(' | ')'))
@@ -2140,12 +2197,16 @@ fn host_stark_proof_to_kernel(proof: &Proof) -> Result<KernelStarkProof, String>
 fn shield_req_to_kernel(req: &ShieldReq) -> Result<KernelShieldReq, String> {
     Ok(KernelShieldReq {
         sender: req.sender.clone(),
+        fee: req.fee,
+        producer_fee: req.producer_fee,
         v: req.v,
         address: req.address.clone(),
         memo: req.memo.clone(),
         proof: host_stark_proof_to_kernel(&req.proof)?,
         client_cm: req.client_cm,
         client_enc: req.client_enc.clone(),
+        producer_cm: req.producer_cm,
+        producer_enc: req.producer_enc.clone(),
     })
 }
 
@@ -2153,10 +2214,13 @@ fn transfer_req_to_kernel(req: &TransferReq) -> Result<KernelTransferReq, String
     Ok(KernelTransferReq {
         root: req.root,
         nullifiers: req.nullifiers.clone(),
+        fee: req.fee,
         cm_1: req.cm_1,
         cm_2: req.cm_2,
+        cm_3: req.cm_3,
         enc_1: req.enc_1.clone(),
         enc_2: req.enc_2.clone(),
+        enc_3: req.enc_3.clone(),
         proof: host_stark_proof_to_kernel(&req.proof)?,
     })
 }
@@ -2166,9 +2230,12 @@ fn unshield_req_to_kernel(req: &UnshieldReq) -> Result<KernelUnshieldReq, String
         root: req.root,
         nullifiers: req.nullifiers.clone(),
         v_pub: req.v_pub,
+        fee: req.fee,
         recipient: req.recipient.clone(),
         cm_change: req.cm_change,
         enc_change: req.enc_change.clone(),
+        cm_fee: req.cm_fee,
+        enc_fee: req.enc_fee.clone(),
         proof: host_stark_proof_to_kernel(&req.proof)?,
     })
 }
@@ -2240,6 +2307,12 @@ enum Cmd {
         sender: String,
         #[arg(long)]
         amount: u64,
+        #[arg(long, default_value_t = MIN_TX_FEE)]
+        fee: u64,
+        #[arg(long)]
+        dal_fee: u64,
+        #[arg(long)]
+        dal_fee_address: String,
         /// Path to recipient address JSON (default: generate new self-address)
         #[arg(long)]
         to: Option<String>,
@@ -2254,6 +2327,12 @@ enum Cmd {
         to: String,
         #[arg(long)]
         amount: u64,
+        #[arg(long, default_value_t = MIN_TX_FEE)]
+        fee: u64,
+        #[arg(long)]
+        dal_fee: u64,
+        #[arg(long)]
+        dal_fee_address: String,
         #[arg(long)]
         memo: Option<String>,
     },
@@ -2263,6 +2342,12 @@ enum Cmd {
         ledger: String,
         #[arg(long)]
         amount: u64,
+        #[arg(long, default_value_t = MIN_TX_FEE)]
+        fee: u64,
+        #[arg(long)]
+        dal_fee: u64,
+        #[arg(long)]
+        dal_fee_address: String,
         #[arg(long)]
         recipient: String,
     },
@@ -2331,20 +2416,59 @@ fn run(cli: Cli) -> Result<(), String> {
             ledger,
             sender,
             amount,
+            fee,
+            dal_fee,
+            dal_fee_address,
             to,
             memo,
-        } => cmd_shield(&cli.wallet, &ledger, &sender, amount, to, memo, &pc),
+        } => cmd_shield(
+            &cli.wallet,
+            &ledger,
+            &sender,
+            amount,
+            fee,
+            dal_fee,
+            &dal_fee_address,
+            to,
+            memo,
+            &pc,
+        ),
         Cmd::Transfer {
             ledger,
             to,
             amount,
+            fee,
+            dal_fee,
+            dal_fee_address,
             memo,
-        } => cmd_transfer(&cli.wallet, &ledger, &to, amount, memo, &pc),
+        } => cmd_transfer(
+            &cli.wallet,
+            &ledger,
+            &to,
+            amount,
+            fee,
+            dal_fee,
+            &dal_fee_address,
+            memo,
+            &pc,
+        ),
         Cmd::Unshield {
             ledger,
             amount,
+            fee,
+            dal_fee,
+            dal_fee_address,
             recipient,
-        } => cmd_unshield(&cli.wallet, &ledger, amount, &recipient, &pc),
+        } => cmd_unshield(
+            &cli.wallet,
+            &ledger,
+            amount,
+            fee,
+            dal_fee,
+            &dal_fee_address,
+            &recipient,
+            &pc,
+        ),
         Cmd::Fund {
             ledger,
             addr,
@@ -2413,6 +2537,8 @@ enum UserCmd {
     Shield {
         #[arg(long)]
         amount: u64,
+        #[arg(long, default_value_t = MIN_TX_FEE)]
+        fee: u64,
         /// Override the public rollup account to shield from.
         #[arg(long)]
         sender: Option<String>,
@@ -2428,6 +2554,8 @@ enum UserCmd {
         to: String,
         #[arg(long)]
         amount: u64,
+        #[arg(long, default_value_t = MIN_TX_FEE)]
+        fee: u64,
         #[arg(long)]
         memo: Option<String>,
     },
@@ -2435,6 +2563,8 @@ enum UserCmd {
     Unshield {
         #[arg(long)]
         amount: u64,
+        #[arg(long, default_value_t = MIN_TX_FEE)]
+        fee: u64,
         /// Override the public rollup account to receive the transparent balance.
         #[arg(long)]
         recipient: Option<String>,
@@ -2504,6 +2634,10 @@ enum UserProfileCmd {
         rollup_address: String,
         #[arg(long)]
         bridge_ticketer: String,
+        #[arg(long)]
+        dal_fee: u64,
+        #[arg(long)]
+        dal_fee_address: String,
         #[arg(long, requires = "operator_bearer_token")]
         operator_url: Option<String>,
         #[arg(long, requires = "operator_url")]
@@ -2690,22 +2824,32 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         }
         UserCmd::Shield {
             amount,
+            fee,
             sender,
             to,
             memo,
         } => {
             let profile = load_required_network_profile(&cli.wallet)?;
             let sender = sender.unwrap_or_else(|| profile.public_account.clone());
-            cmd_shield_rollup(&cli.wallet, &profile, &sender, amount, to, memo, &pc)
+            cmd_shield_rollup(&cli.wallet, &profile, &sender, amount, fee, to, memo, &pc)
         }
-        UserCmd::Send { to, amount, memo } => {
+        UserCmd::Send {
+            to,
+            amount,
+            fee,
+            memo,
+        } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_transfer_rollup(&cli.wallet, &profile, &to, amount, memo, &pc)
+            cmd_transfer_rollup(&cli.wallet, &profile, &to, amount, fee, memo, &pc)
         }
-        UserCmd::Unshield { amount, recipient } => {
+        UserCmd::Unshield {
+            amount,
+            fee,
+            recipient,
+        } => {
             let profile = load_required_network_profile(&cli.wallet)?;
             let recipient = recipient.unwrap_or_else(|| profile.public_account.clone());
-            cmd_unshield_rollup(&cli.wallet, &profile, amount, &recipient, &pc)
+            cmd_unshield_rollup(&cli.wallet, &profile, amount, fee, &recipient, &pc)
         }
         UserCmd::Withdraw {
             amount,
@@ -2733,6 +2877,8 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
             rollup_node_url,
             rollup_address,
             bridge_ticketer,
+            dal_fee,
+            dal_fee_address,
             operator_url,
             operator_bearer_token,
             source_alias,
@@ -2750,10 +2896,13 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
                     path.display()
                 ));
             }
+            let dal_fee_address = load_address(&dal_fee_address)?;
             let profile = shadownet_profile(
                 rollup_node_url,
                 rollup_address,
                 bridge_ticketer,
+                dal_fee,
+                dal_fee_address,
                 operator_url,
                 operator_bearer_token,
                 source_alias,
@@ -3201,11 +3350,14 @@ mod tests {
     }
 
     pub(super) fn rollup_profile_for_url(base_url: &str) -> WalletNetworkProfile {
+        let wallet = test_wallet(1);
         WalletNetworkProfile {
             network: "shadownet".into(),
             rollup_node_url: base_url.into(),
             rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
             bridge_ticketer: "KT1Jg4fj5wwnKHuW8aa9uDX6dRYBdjXhm2sJ".into(),
+            dal_fee: 1,
+            dal_fee_address: payment_address_for_wallet_address(&wallet, 0),
             public_account: "alice".into(),
             operator_url: None,
             operator_bearer_token: None,
@@ -3370,7 +3522,7 @@ mod tests {
         }
     }
 
-    fn payment_address_for_wallet_address(w: &WalletFile, j: u32) -> PaymentAddress {
+    pub(super) fn payment_address_for_wallet_address(w: &WalletFile, j: u32) -> PaymentAddress {
         let (ek_v, _, ek_d, _) = w.kem_keys(j);
         w.addresses[j as usize].payment_address(&ek_v, &ek_d)
     }
@@ -4739,15 +4891,24 @@ mod tests {
             .map(|n| nullifier(&n.nk_spend, &n.cm, n.index as u64))
             .collect();
         let change_addr = w.addresses[1].clone();
+        let producer_address = payment_address_for_wallet_address(&w, 0);
         let (_ek_v0, dk_v0, _ek_d0, dk_d0) = w.kem_keys(0);
         let (_ek_v1, dk_v1, _ek_d1, dk_d1) = w.kem_keys(1);
 
         let ledger_root = felt_tag(b"wallet-transfer-root");
         let recipient = load_address(recipient_path_str).expect("recipient should load");
         let mut loaded = load_wallet(wallet_path_str).expect("wallet should reload");
-        let prepared =
-            prepare_transfer_skip_proof(&mut loaded, ledger_root, &recipient, 50, Some("memo-1"))
-                .expect("skip-proof transfer request should build");
+        let prepared = prepare_transfer_skip_proof(
+            &mut loaded,
+            ledger_root,
+            &recipient,
+            50,
+            0,
+            1,
+            &producer_address,
+            Some("memo-1"),
+        )
+        .expect("skip-proof transfer request should build");
         save_wallet(wallet_path_str, &loaded).expect("wallet should save before submit");
         let req = &prepared.req;
 
@@ -4784,7 +4945,7 @@ mod tests {
         assert!(detect(&req.enc_2, &dk_d1));
         let (change_value, change_rseed, change_memo) =
             decrypt_memo(&req.enc_2, &dk_v1).expect("change note should decrypt");
-        assert_eq!(change_value, 15);
+        assert_eq!(change_value, 14);
         assert_eq!(change_memo[0], 0xF6);
         let change_otag = owner_tag(
             &change_addr.auth_root,
@@ -4799,6 +4960,26 @@ mod tests {
                 &change_otag
             ),
             req.cm_2
+        );
+
+        assert!(detect(&req.enc_3, &dk_d0));
+        let (producer_value, producer_rseed, producer_memo) =
+            decrypt_memo(&req.enc_3, &dk_v0).expect("producer note should decrypt");
+        assert_eq!(producer_value, 1);
+        assert_eq!(&producer_memo[..3], b"dal");
+        let producer_otag = owner_tag(
+            &producer_address.auth_root,
+            &producer_address.auth_pub_seed,
+            &producer_address.nk_tag,
+        );
+        assert_eq!(
+            commit(
+                &producer_address.d_j,
+                producer_value,
+                &derive_rcm(&producer_rseed),
+                &producer_otag
+            ),
+            req.cm_3
         );
 
         finalize_successful_spend(wallet_path_str, &mut loaded, &prepared.selected)
@@ -4830,12 +5011,22 @@ mod tests {
             .map(|n| nullifier(&n.nk_spend, &n.cm, n.index as u64))
             .collect();
         let change_addr = w.addresses[1].clone();
+        let producer_address = payment_address_for_wallet_address(&w, 0);
+        let (_ek_v0, dk_v0, _ek_d0, dk_d0) = w.kem_keys(0);
         let (_ek_v1, dk_v1, _ek_d1, dk_d1) = w.kem_keys(1);
 
         let ledger_root = felt_tag(b"wallet-unshield-root");
         let mut loaded = load_wallet(wallet_path_str).expect("wallet should reload");
-        let prepared = prepare_unshield_skip_proof(&mut loaded, ledger_root, 50, "bob")
-            .expect("skip-proof unshield request should build");
+        let prepared = prepare_unshield_skip_proof(
+            &mut loaded,
+            ledger_root,
+            50,
+            0,
+            1,
+            &producer_address,
+            "bob",
+        )
+        .expect("skip-proof unshield request should build");
         save_wallet(wallet_path_str, &loaded).expect("wallet should save before submit");
         let req = &prepared.req;
 
@@ -4859,7 +5050,7 @@ mod tests {
         assert!(detect(enc_change, &dk_d1));
         let (change_value, change_rseed, change_memo) =
             decrypt_memo(enc_change, &dk_v1).expect("change note should decrypt");
-        assert_eq!(change_value, 15);
+        assert_eq!(change_value, 14);
         assert_eq!(change_memo[0], 0xF6);
         let change_otag = owner_tag(
             &change_addr.auth_root,
@@ -4874,6 +5065,26 @@ mod tests {
                 &change_otag
             ),
             req.cm_change
+        );
+
+        assert!(detect(&req.enc_fee, &dk_d0));
+        let (producer_value, producer_rseed, producer_memo) =
+            decrypt_memo(&req.enc_fee, &dk_v0).expect("producer note should decrypt");
+        assert_eq!(producer_value, 1);
+        assert_eq!(&producer_memo[..3], b"dal");
+        let producer_otag = owner_tag(
+            &producer_address.auth_root,
+            &producer_address.auth_pub_seed,
+            &producer_address.nk_tag,
+        );
+        assert_eq!(
+            commit(
+                &producer_address.d_j,
+                producer_value,
+                &derive_rcm(&producer_rseed),
+                &producer_otag
+            ),
+            req.cm_fee
         );
 
         finalize_successful_spend(wallet_path_str, &mut loaded, &prepared.selected)
@@ -5213,11 +5424,17 @@ fn cmd_shield(
     ledger: &str,
     sender: &str,
     amount: u64,
+    fee: u64,
+    dal_fee: u64,
+    dal_fee_address_path: &str,
     to: Option<String>,
     memo: Option<String>,
     pc: &ProveConfig,
 ) -> Result<(), String> {
+    ensure_min_tx_fee(fee)?;
+    ensure_positive_dal_fee(dal_fee)?;
     let mut w = load_wallet(path)?;
+    let producer_address = load_address(dal_fee_address_path)?;
 
     let (address, generated_self_address) = if let Some(addr_path) = to {
         (load_address(&addr_path)?, false)
@@ -5226,58 +5443,48 @@ fn cmd_shield(
         (addr, true)
     };
 
-    // Build the proof if --prove is set.
-    // Shield witness: [v_pub, cm_new, sender, memo_ct_hash, auth_root, nk_tag, d_j, rseed]
-    // Note: with TrustMeBro, the ledger generates rseed and computes the commitment.
-    // With a real proof, the client must do this and prove it.
-    let (proof, shield_cm, shield_enc) = if !pc.skip_proof {
-        let rseed = random_felt();
-        let rcm = derive_rcm(&rseed);
-        let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
-        let cm = commit(&address.d_j, amount, &rcm, &otag);
-
-        // sender as felt252
+    let client_note = build_output_note(&address, amount, memo.as_deref().map(str::as_bytes))?;
+    let producer_note = build_output_note(&producer_address, dal_fee, Some(b"dal"))?;
+    let proof = if !pc.skip_proof {
         let sender_f = hash(sender.as_bytes());
-
-        // Create encrypted note to compute memo hash
-        let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-            address.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
-        )
-        .map_err(|_| "invalid ek_v")?;
-        let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-            address.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
-        )
-        .map_err(|_| "invalid ek_d")?;
-        let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
-        let enc = encrypt_note(amount, &rseed, memo_bytes, &ek_v_recv, &ek_d_recv);
-        let memo_ct_hash_f = memo_ct_hash(&enc);
-
         let args: Vec<String> = vec![
-            felt_u64_to_hex(9), // Array length prefix
+            felt_u64_to_hex(18),
             felt_u64_to_hex(amount),
-            felt_to_hex(&cm),
+            felt_u64_to_hex(fee),
+            felt_u64_to_hex(dal_fee),
+            felt_to_hex(&client_note.cm),
+            felt_to_hex(&producer_note.cm),
             felt_to_hex(&sender_f),
-            felt_to_hex(&memo_ct_hash_f),
+            felt_to_hex(&client_note.mh),
+            felt_to_hex(&producer_note.mh),
             felt_to_hex(&address.auth_root),
             felt_to_hex(&address.auth_pub_seed),
             felt_to_hex(&address.nk_tag),
             felt_to_hex(&address.d_j),
-            felt_to_hex(&rseed),
+            felt_to_hex(&client_note.rseed),
+            felt_to_hex(&producer_address.auth_root),
+            felt_to_hex(&producer_address.auth_pub_seed),
+            felt_to_hex(&producer_address.nk_tag),
+            felt_to_hex(&producer_address.d_j),
+            felt_to_hex(&producer_note.rseed),
         ];
-        let proof = pc.make_proof("run_shield", &args)?;
-        (proof, cm, Some(enc))
+        pc.make_proof("run_shield", &args)?
     } else {
-        (Proof::TrustMeBro, ZERO, None)
+        Proof::TrustMeBro
     };
 
     let req = ShieldReq {
         sender: sender.into(),
+        fee,
+        producer_fee: dal_fee,
         v: amount,
         address,
         memo,
         proof,
-        client_cm: shield_cm,
-        client_enc: shield_enc,
+        client_cm: client_note.cm,
+        client_enc: Some(client_note.enc),
+        producer_cm: producer_note.cm,
+        producer_enc: Some(producer_note.enc),
     };
     if generated_self_address {
         // Persist generated self-addresses before submission so a crash after a
@@ -5287,8 +5494,10 @@ fn cmd_shield(
     let resp: ShieldResp = post_json(&format!("{}/shield", ledger), &req)?;
     save_wallet(path, &w)?;
     println!(
-        "Shielded {} -> cm={} index={}",
+        "Shielded {} (fee {}, dal fee {}) -> cm={} index={}",
         amount,
+        fee,
+        dal_fee,
         short(&resp.cm),
         resp.index
     );
@@ -5301,34 +5510,52 @@ fn cmd_transfer(
     ledger: &str,
     to_path: &str,
     amount: u64,
+    fee: u64,
+    dal_fee: u64,
+    dal_fee_address_path: &str,
     memo: Option<String>,
     pc: &ProveConfig,
 ) -> Result<(), String> {
+    ensure_min_tx_fee(fee)?;
+    ensure_positive_dal_fee(dal_fee)?;
     let mut w = load_wallet(path)?;
     let recipient = load_address(to_path)?;
+    let producer_address = load_address(dal_fee_address_path)?;
 
     // Get current root
     let tree_info: TreeInfoResp = get_json(&format!("{}/tree", ledger))?;
     let root = tree_info.root;
 
     if pc.skip_proof {
-        let prepared =
-            prepare_transfer_skip_proof(&mut w, root, &recipient, amount, memo.as_deref())?;
+        let prepared = prepare_transfer_skip_proof(
+            &mut w,
+            root,
+            &recipient,
+            amount,
+            fee,
+            dal_fee,
+            &producer_address,
+            memo.as_deref(),
+        )?;
         save_wallet(path, &w)?;
         let resp: TransferResp = post_json(&format!("{}/transfer", ledger), &prepared.req)?;
         finalize_successful_spend(path, &mut w, &prepared.selected)?;
         println!(
-            "Transferred {} to recipient, change={} (idx={},{})",
-            amount, prepared.change, resp.index_1, resp.index_2
+            "Transferred {} to recipient, fee={}, dal fee={}, change={} (idx={},{},{})",
+            amount, fee, dal_fee, prepared.change, resp.index_1, resp.index_2, resp.index_3
         );
         println!("Run 'scan' to pick up change note.");
         return Ok(());
     }
 
     // Select notes
-    let selected = w.select_notes(amount)?;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(dal_fee))
+        .ok_or_else(|| "transfer total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - dal_fee as u128) as u64;
 
     // Compute nullifiers
     let nullifiers: Vec<F> = selected
@@ -5339,46 +5566,14 @@ fn cmd_transfer(
         })
         .collect();
 
-    // Build output 1: recipient
-    let rseed_1 = random_felt();
-    let rcm_1 = derive_rcm(&rseed_1);
-    let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_v
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_v")?,
-    )
-    .map_err(|_| "invalid ek_v")?;
-    let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_d
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_d")?,
-    )
-    .map_err(|_| "invalid ek_d")?;
-    let otag_1 = owner_tag(
-        &recipient.auth_root,
-        &recipient.auth_pub_seed,
-        &recipient.nk_tag,
-    );
-    let cm_1 = commit(&recipient.d_j, amount, &rcm_1, &otag_1);
-    let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
-    let enc_1 = encrypt_note(amount, &rseed_1, memo_bytes, &ek_v_recv, &ek_d_recv);
+    let note_1 = build_output_note(&recipient, amount, memo.as_deref().map(str::as_bytes))?;
 
     // Build output 2: change to self (per-address KEM keys)
     let (change_state, _change_addr) = w.next_address()?;
     let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-    let rseed_2 = random_felt();
-    let rcm_2 = derive_rcm(&rseed_2);
-    let otag_2 = owner_tag(
-        &change_state.auth_root,
-        &change_state.auth_pub_seed,
-        &change_state.nk_tag,
-    );
-    let cm_2 = commit(&change_state.d_j, change, &rcm_2, &otag_2);
-    let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v_c, &ek_d_c);
+    let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+    let note_2 = build_output_note(&change_address, change, None)?;
+    let note_3 = build_output_note(&producer_address, dal_fee, Some(b"dal"))?;
 
     let proof = if !pc.skip_proof {
         let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
@@ -5405,10 +5600,18 @@ fn cmd_transfer(
                 nullifier(&n.nk_spend, &n.cm, n.index as u64)
             })
             .collect();
-        let mh_1 = memo_ct_hash(&enc_1);
-        let mh_2 = memo_ct_hash(&enc_2);
-        let sighash =
-            transfer_sighash(&auth_domain, &root, &nfs_for_sh, &cm_1, &cm_2, &mh_1, &mh_2);
+        let sighash = transfer_sighash(
+            &auth_domain,
+            &root,
+            &nfs_for_sh,
+            fee,
+            &note_1.cm,
+            &note_2.cm,
+            &note_3.cm,
+            &note_1.mh,
+            &note_2.mh,
+            &note_3.mh,
+        );
 
         let mut wots_key_indices: Vec<u32> = vec![];
         let mut auth_pub_seeds: Vec<F> = vec![];
@@ -5443,11 +5646,12 @@ fn cmd_transfer(
             wots_key_indices.push(key_idx);
         }
 
-        let total_fields = 3 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 16;
+        let total_fields = 4 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 24;
         args.push(felt_u64_to_hex(total_fields as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
         args.push(felt_to_hex(&root));
+        args.push(felt_u64_to_hex(fee));
 
         // Per-input scalar fields (8 per input)
         for (idx, &si) in selected.iter().enumerate() {
@@ -5481,24 +5685,34 @@ fn cmd_transfer(
         }
 
         // Output 1
-        args.push(felt_to_hex(&cm_1));
+        args.push(felt_to_hex(&note_1.cm));
         args.push(felt_to_hex(&recipient.d_j));
         args.push(felt_u64_to_hex(amount));
-        args.push(felt_to_hex(&rseed_1));
+        args.push(felt_to_hex(&note_1.rseed));
         args.push(felt_to_hex(&recipient.auth_root));
         args.push(felt_to_hex(&recipient.auth_pub_seed));
         args.push(felt_to_hex(&recipient.nk_tag));
-        args.push(felt_to_hex(&memo_ct_hash(&enc_1)));
+        args.push(felt_to_hex(&note_1.mh));
 
         // Output 2
-        args.push(felt_to_hex(&cm_2));
+        args.push(felt_to_hex(&note_2.cm));
         args.push(felt_to_hex(&change_state.d_j));
         args.push(felt_u64_to_hex(change));
-        args.push(felt_to_hex(&rseed_2));
+        args.push(felt_to_hex(&note_2.rseed));
         args.push(felt_to_hex(&change_state.auth_root));
         args.push(felt_to_hex(&change_state.auth_pub_seed));
         args.push(felt_to_hex(&change_state.nk_tag));
-        args.push(felt_to_hex(&memo_ct_hash(&enc_2)));
+        args.push(felt_to_hex(&note_2.mh));
+
+        // Output 3
+        args.push(felt_to_hex(&note_3.cm));
+        args.push(felt_to_hex(&producer_address.d_j));
+        args.push(felt_u64_to_hex(dal_fee));
+        args.push(felt_to_hex(&note_3.rseed));
+        args.push(felt_to_hex(&producer_address.auth_root));
+        args.push(felt_to_hex(&producer_address.auth_pub_seed));
+        args.push(felt_to_hex(&producer_address.nk_tag));
+        args.push(felt_to_hex(&note_3.mh));
 
         // Persist consumed WOTS+ leaf reservations before handing witness material
         // to the prover. If proving fails, the keys stay burned instead of being
@@ -5515,10 +5729,13 @@ fn cmd_transfer(
     let req = TransferReq {
         root,
         nullifiers,
-        cm_1,
-        cm_2,
-        enc_1,
-        enc_2,
+        fee,
+        cm_1: note_1.cm,
+        cm_2: note_2.cm,
+        cm_3: note_3.cm,
+        enc_1: note_1.enc,
+        enc_2: note_2.enc,
+        enc_3: note_3.enc,
         proof,
     };
     let resp: TransferResp = post_json(&format!("{}/transfer", ledger), &req)?;
@@ -5526,8 +5743,8 @@ fn cmd_transfer(
     finalize_successful_spend(path, &mut w, &selected)?;
 
     println!(
-        "Transferred {} to recipient, change={} (idx={},{})",
-        amount, change, resp.index_1, resp.index_2
+        "Transferred {} to recipient, fee={}, dal fee={}, change={} (idx={},{},{})",
+        amount, fee, dal_fee, change, resp.index_1, resp.index_2, resp.index_3
     );
     println!("Run 'scan' to pick up change note.");
     Ok(())
@@ -5537,22 +5754,42 @@ fn cmd_unshield(
     path: &str,
     ledger: &str,
     amount: u64,
+    fee: u64,
+    dal_fee: u64,
+    dal_fee_address_path: &str,
     recipient: &str,
     pc: &ProveConfig,
 ) -> Result<(), String> {
+    ensure_min_tx_fee(fee)?;
+    ensure_positive_dal_fee(dal_fee)?;
     let mut w = load_wallet(path)?;
+    let producer_address = load_address(dal_fee_address_path)?;
 
     let tree_info: TreeInfoResp = get_json(&format!("{}/tree", ledger))?;
     let root = tree_info.root;
 
     if pc.skip_proof {
-        let prepared = prepare_unshield_skip_proof(&mut w, root, amount, recipient)?;
+        let prepared = prepare_unshield_skip_proof(
+            &mut w,
+            root,
+            amount,
+            fee,
+            dal_fee,
+            &producer_address,
+            recipient,
+        )?;
         save_wallet(path, &w)?;
         let resp: UnshieldResp = post_json(&format!("{}/unshield", ledger), &prepared.req)?;
         finalize_successful_spend(path, &mut w, &prepared.selected)?;
         println!(
-            "Unshielded {} to {}, change={} (change_idx={:?})",
-            amount, recipient, prepared.change, resp.change_index
+            "Unshielded {} to {}, fee={}, dal fee={}, change={} (change_idx={:?}, producer_idx={})",
+            amount,
+            recipient,
+            fee,
+            dal_fee,
+            prepared.change,
+            resp.change_index,
+            resp.producer_index
         );
         if prepared.change > 0 {
             println!("Run 'scan' to pick up change note.");
@@ -5560,9 +5797,13 @@ fn cmd_unshield(
         return Ok(());
     }
 
-    let selected = w.select_notes(amount)?;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(dal_fee))
+        .ok_or_else(|| "unshield total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - dal_fee as u128) as u64;
 
     let nullifiers: Vec<F> = selected
         .iter()
@@ -5575,28 +5816,21 @@ fn cmd_unshield(
     let (cm_change, enc_change, change_data) = if change > 0 {
         let (change_state, _change_addr) = w.next_address()?;
         let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-        let rseed_c = random_felt();
-        let rcm_c = derive_rcm(&rseed_c);
-        let otag_c = owner_tag(
-            &change_state.auth_root,
-            &change_state.auth_pub_seed,
-            &change_state.nk_tag,
-        );
-        let cm = commit(&change_state.d_j, change, &rcm_c, &otag_c);
-        let enc = encrypt_note(change, &rseed_c, None, &ek_v_c, &ek_d_c);
-        let mh = memo_ct_hash(&enc);
+        let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+        let note = build_output_note(&change_address, change, None)?;
         let cd = ChangeData {
             d_j: change_state.d_j,
-            rseed: rseed_c,
+            rseed: note.rseed,
             auth_root: change_state.auth_root,
             auth_pub_seed: change_state.auth_pub_seed,
             nk_tag: change_state.nk_tag,
-            mh,
+            mh: note.mh,
         };
-        (cm, Some(enc), Some(cd))
+        (note.cm, Some(note.enc), Some(cd))
     } else {
         (ZERO, None, None)
     };
+    let producer_note = build_output_note(&producer_address, dal_fee, Some(b"dal"))?;
 
     let proof = if !pc.skip_proof {
         let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
@@ -5626,9 +5860,12 @@ fn cmd_unshield(
             &root,
             &nfs_for_sh,
             amount,
+            fee,
             &recipient_f,
             &cm_change,
             &mh_change_f,
+            &producer_note.cm,
+            &producer_note.mh,
         );
 
         let mut wots_key_indices: Vec<u32> = vec![];
@@ -5662,12 +5899,13 @@ fn cmd_unshield(
             wots_key_indices.push(key_idx);
         }
 
-        let total = 5 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 8;
+        let total = 6 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 15;
         args.push(felt_u64_to_hex(total as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
         args.push(felt_to_hex(&root));
         args.push(felt_u64_to_hex(amount));
+        args.push(felt_u64_to_hex(fee));
         args.push(felt_to_hex(&recipient_f));
 
         for (idx, &si) in selected.iter().enumerate() {
@@ -5715,6 +5953,14 @@ fn cmd_unshield(
             }
         }
 
+        args.push(felt_to_hex(&producer_address.d_j));
+        args.push(felt_u64_to_hex(dal_fee));
+        args.push(felt_to_hex(&producer_note.rseed));
+        args.push(felt_to_hex(&producer_address.auth_root));
+        args.push(felt_to_hex(&producer_address.auth_pub_seed));
+        args.push(felt_to_hex(&producer_address.nk_tag));
+        args.push(felt_to_hex(&producer_note.mh));
+
         // Persist consumed WOTS+ leaf reservations before handing witness material
         // to the prover. If proving fails, the keys stay burned instead of being
         // silently reused on retry.
@@ -5730,9 +5976,12 @@ fn cmd_unshield(
         root,
         nullifiers,
         v_pub: amount,
+        fee,
         recipient: recipient.into(),
         cm_change,
         enc_change,
+        cm_fee: producer_note.cm,
+        enc_fee: producer_note.enc,
         proof,
     };
     let resp: UnshieldResp = post_json(&format!("{}/unshield", ledger), &req)?;
@@ -5740,8 +5989,8 @@ fn cmd_unshield(
     finalize_successful_spend(path, &mut w, &selected)?;
 
     println!(
-        "Unshielded {} to {}, change={} (change_idx={:?})",
-        amount, recipient, change, resp.change_index
+        "Unshielded {} to {}, fee={}, dal fee={}, change={} (change_idx={:?}, producer_idx={})",
+        amount, recipient, fee, dal_fee, change, resp.change_index, resp.producer_index
     );
     if change > 0 {
         println!("Run 'scan' to pick up change note.");
@@ -5754,17 +6003,25 @@ fn cmd_shield_rollup(
     profile: &WalletNetworkProfile,
     sender: &str,
     amount: u64,
+    fee: u64,
     to: Option<String>,
     memo: Option<String>,
     pc: &ProveConfig,
 ) -> Result<(), String> {
+    ensure_min_tx_fee(fee)?;
+    ensure_positive_dal_fee(profile.dal_fee)?;
     let rollup = RollupRpc::new(profile);
     let balances = rollup.load_balances()?;
+    let producer_address = &profile.dal_fee_address;
     let public_balance = balances.get(sender).copied().unwrap_or(0);
-    if public_balance < amount {
+    let total_debit = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(profile.dal_fee))
+        .ok_or_else(|| "shield total spend overflow".to_string())?;
+    if public_balance < total_debit {
         return Err(format!(
             "insufficient public rollup balance for {}: have {}, need {}",
-            sender, public_balance, amount
+            sender, public_balance, total_debit
         ));
     }
 
@@ -5776,43 +6033,43 @@ fn cmd_shield_rollup(
         (addr, true)
     };
 
-    let rseed = random_felt();
-    let rcm = derive_rcm(&rseed);
-    let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
-    let cm = commit(&address.d_j, amount, &rcm, &otag);
+    let client_note = build_output_note(&address, amount, memo.as_deref().map(str::as_bytes))?;
+    let producer_note = build_output_note(producer_address, profile.dal_fee, Some(b"dal"))?;
     let sender_f = hash(sender.as_bytes());
-    let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        address.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
-    )
-    .map_err(|_| "invalid ek_v")?;
-    let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        address.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
-    )
-    .map_err(|_| "invalid ek_d")?;
-    let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
-    let enc = encrypt_note(amount, &rseed, memo_bytes, &ek_v_recv, &ek_d_recv);
-    let memo_ct_hash_f = memo_ct_hash(&enc);
     let args: Vec<String> = vec![
-        felt_u64_to_hex(9),
+        felt_u64_to_hex(18),
         felt_u64_to_hex(amount),
-        felt_to_hex(&cm),
+        felt_u64_to_hex(fee),
+        felt_u64_to_hex(profile.dal_fee),
+        felt_to_hex(&client_note.cm),
+        felt_to_hex(&producer_note.cm),
         felt_to_hex(&sender_f),
-        felt_to_hex(&memo_ct_hash_f),
+        felt_to_hex(&client_note.mh),
+        felt_to_hex(&producer_note.mh),
         felt_to_hex(&address.auth_root),
         felt_to_hex(&address.auth_pub_seed),
         felt_to_hex(&address.nk_tag),
         felt_to_hex(&address.d_j),
-        felt_to_hex(&rseed),
+        felt_to_hex(&client_note.rseed),
+        felt_to_hex(&producer_address.auth_root),
+        felt_to_hex(&producer_address.auth_pub_seed),
+        felt_to_hex(&producer_address.nk_tag),
+        felt_to_hex(&producer_address.d_j),
+        felt_to_hex(&producer_note.rseed),
     ];
     let proof = pc.make_proof("run_shield", &args)?;
     let req = ShieldReq {
         sender: sender.into(),
+        fee,
+        producer_fee: profile.dal_fee,
         v: amount,
         address,
         memo,
         proof,
-        client_cm: cm,
-        client_enc: Some(enc),
+        client_cm: client_note.cm,
+        client_enc: Some(client_note.enc),
+        producer_cm: producer_note.cm,
+        producer_enc: Some(producer_note.enc),
     };
 
     if generated_self_address {
@@ -5822,10 +6079,11 @@ fn cmd_shield_rollup(
     let kernel_req = shield_req_to_kernel(&req)?;
     let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
     println!(
-        "Submitted shield of {} from {} into note {}",
+        "Submitted shield of {} from {} into note {} (fee {})",
         amount,
         sender,
-        short(&req.client_cm)
+        short(&req.client_cm),
+        fee
     );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
@@ -5837,62 +6095,39 @@ fn cmd_transfer_rollup(
     profile: &WalletNetworkProfile,
     to_path: &str,
     amount: u64,
+    fee: u64,
     memo: Option<String>,
     pc: &ProveConfig,
 ) -> Result<(), String> {
+    ensure_min_tx_fee(fee)?;
+    ensure_positive_dal_fee(profile.dal_fee)?;
     let rollup = RollupRpc::new(profile);
     let snapshot = rollup.load_state_snapshot()?;
     let root = snapshot.current_root();
 
     let mut w = load_wallet(path)?;
     let recipient = load_address(to_path)?;
-    let selected = w.select_notes(amount)?;
+    let producer_address = &profile.dal_fee_address;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(profile.dal_fee))
+        .ok_or_else(|| "transfer total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - profile.dal_fee as u128) as u64;
 
     let nullifiers: Vec<F> = selected
         .iter()
         .map(|&i| note_nullifier(&w.notes[i]))
         .collect();
 
-    let rseed_1 = random_felt();
-    let rcm_1 = derive_rcm(&rseed_1);
-    let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_v
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_v")?,
-    )
-    .map_err(|_| "invalid ek_v")?;
-    let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_d
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_d")?,
-    )
-    .map_err(|_| "invalid ek_d")?;
-    let otag_1 = owner_tag(
-        &recipient.auth_root,
-        &recipient.auth_pub_seed,
-        &recipient.nk_tag,
-    );
-    let cm_1 = commit(&recipient.d_j, amount, &rcm_1, &otag_1);
-    let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
-    let enc_1 = encrypt_note(amount, &rseed_1, memo_bytes, &ek_v_recv, &ek_d_recv);
+    let note_1 = build_output_note(&recipient, amount, memo.as_deref().map(str::as_bytes))?;
 
     let (change_state, _change_addr) = w.next_address()?;
     let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-    let rseed_2 = random_felt();
-    let rcm_2 = derive_rcm(&rseed_2);
-    let otag_2 = owner_tag(
-        &change_state.auth_root,
-        &change_state.auth_pub_seed,
-        &change_state.nk_tag,
-    );
-    let cm_2 = commit(&change_state.d_j, change, &rcm_2, &otag_2);
-    let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v_c, &ek_d_c);
+    let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+    let note_2 = build_output_note(&change_address, change, None)?;
+    let note_3 = build_output_note(producer_address, profile.dal_fee, Some(b"dal"))?;
 
     let proof = {
         let auth_domain = snapshot.auth_domain;
@@ -5903,10 +6138,18 @@ fn cmd_transfer_rollup(
         let mut wots_sigs: Vec<Vec<F>> = vec![];
 
         let nfs_for_sh = nullifiers.clone();
-        let mh_1 = memo_ct_hash(&enc_1);
-        let mh_2 = memo_ct_hash(&enc_2);
-        let sighash =
-            transfer_sighash(&auth_domain, &root, &nfs_for_sh, &cm_1, &cm_2, &mh_1, &mh_2);
+        let sighash = transfer_sighash(
+            &auth_domain,
+            &root,
+            &nfs_for_sh,
+            fee,
+            &note_1.cm,
+            &note_2.cm,
+            &note_3.cm,
+            &note_1.mh,
+            &note_2.mh,
+            &note_3.mh,
+        );
 
         let mut wots_key_indices: Vec<u32> = vec![];
         let mut auth_pub_seeds: Vec<F> = vec![];
@@ -5939,11 +6182,12 @@ fn cmd_transfer_rollup(
             wots_key_indices.push(key_idx);
         }
 
-        let total_fields = 3 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 16;
+        let total_fields = 4 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 24;
         args.push(felt_u64_to_hex(total_fields as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
         args.push(felt_to_hex(&root));
+        args.push(felt_u64_to_hex(fee));
 
         for (idx, &si) in selected.iter().enumerate() {
             let note = &w.notes[si];
@@ -5974,23 +6218,32 @@ fn cmd_transfer_rollup(
             }
         }
 
-        args.push(felt_to_hex(&cm_1));
+        args.push(felt_to_hex(&note_1.cm));
         args.push(felt_to_hex(&recipient.d_j));
         args.push(felt_u64_to_hex(amount));
-        args.push(felt_to_hex(&rseed_1));
+        args.push(felt_to_hex(&note_1.rseed));
         args.push(felt_to_hex(&recipient.auth_root));
         args.push(felt_to_hex(&recipient.auth_pub_seed));
         args.push(felt_to_hex(&recipient.nk_tag));
-        args.push(felt_to_hex(&memo_ct_hash(&enc_1)));
+        args.push(felt_to_hex(&note_1.mh));
 
-        args.push(felt_to_hex(&cm_2));
+        args.push(felt_to_hex(&note_2.cm));
         args.push(felt_to_hex(&change_state.d_j));
         args.push(felt_u64_to_hex(change));
-        args.push(felt_to_hex(&rseed_2));
+        args.push(felt_to_hex(&note_2.rseed));
         args.push(felt_to_hex(&change_state.auth_root));
         args.push(felt_to_hex(&change_state.auth_pub_seed));
         args.push(felt_to_hex(&change_state.nk_tag));
-        args.push(felt_to_hex(&memo_ct_hash(&enc_2)));
+        args.push(felt_to_hex(&note_2.mh));
+
+        args.push(felt_to_hex(&note_3.cm));
+        args.push(felt_to_hex(&producer_address.d_j));
+        args.push(felt_u64_to_hex(profile.dal_fee));
+        args.push(felt_to_hex(&note_3.rseed));
+        args.push(felt_to_hex(&producer_address.auth_root));
+        args.push(felt_to_hex(&producer_address.auth_pub_seed));
+        args.push(felt_to_hex(&producer_address.nk_tag));
+        args.push(felt_to_hex(&note_3.mh));
 
         persist_wallet_and_make_proof(path, &w, pc, "run_transfer", &args)?
     };
@@ -5999,10 +6252,13 @@ fn cmd_transfer_rollup(
     let req = TransferReq {
         root,
         nullifiers: nullifiers.clone(),
-        cm_1,
-        cm_2,
-        enc_1,
-        enc_2,
+        fee,
+        cm_1: note_1.cm,
+        cm_2: note_2.cm,
+        cm_3: note_3.cm,
+        enc_1: note_1.enc,
+        enc_2: note_2.enc,
+        enc_3: note_3.enc,
         proof,
     };
     let kernel_req = transfer_req_to_kernel(&req)?;
@@ -6014,7 +6270,10 @@ fn cmd_transfer_rollup(
     );
     save_wallet(path, &w)?;
 
-    println!("Submitted transfer of {} with change {}", amount, change);
+    println!(
+        "Submitted transfer of {} with fee {} + dal fee {} and change {}",
+        amount, fee, profile.dal_fee, change
+    );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
     Ok(())
@@ -6024,17 +6283,25 @@ fn cmd_unshield_rollup(
     path: &str,
     profile: &WalletNetworkProfile,
     amount: u64,
+    fee: u64,
     recipient: &str,
     pc: &ProveConfig,
 ) -> Result<(), String> {
+    ensure_min_tx_fee(fee)?;
+    ensure_positive_dal_fee(profile.dal_fee)?;
     let rollup = RollupRpc::new(profile);
     let snapshot = rollup.load_state_snapshot()?;
     let root = snapshot.current_root();
 
     let mut w = load_wallet(path)?;
-    let selected = w.select_notes(amount)?;
+    let producer_address = &profile.dal_fee_address;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(profile.dal_fee))
+        .ok_or_else(|| "unshield total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - profile.dal_fee as u128) as u64;
 
     let nullifiers: Vec<F> = selected
         .iter()
@@ -6044,28 +6311,21 @@ fn cmd_unshield_rollup(
     let (cm_change, enc_change, change_data) = if change > 0 {
         let (change_state, _change_addr) = w.next_address()?;
         let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-        let rseed_c = random_felt();
-        let rcm_c = derive_rcm(&rseed_c);
-        let otag_c = owner_tag(
-            &change_state.auth_root,
-            &change_state.auth_pub_seed,
-            &change_state.nk_tag,
-        );
-        let cm = commit(&change_state.d_j, change, &rcm_c, &otag_c);
-        let enc = encrypt_note(change, &rseed_c, None, &ek_v_c, &ek_d_c);
-        let mh = memo_ct_hash(&enc);
+        let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+        let note = build_output_note(&change_address, change, None)?;
         let cd = ChangeData {
             d_j: change_state.d_j,
-            rseed: rseed_c,
+            rseed: note.rseed,
             auth_root: change_state.auth_root,
             auth_pub_seed: change_state.auth_pub_seed,
             nk_tag: change_state.nk_tag,
-            mh,
+            mh: note.mh,
         };
-        (cm, Some(enc), Some(cd))
+        (note.cm, Some(note.enc), Some(cd))
     } else {
         (ZERO, None, None)
     };
+    let producer_note = build_output_note(producer_address, profile.dal_fee, Some(b"dal"))?;
 
     let proof = {
         let auth_domain = snapshot.auth_domain;
@@ -6084,9 +6344,12 @@ fn cmd_unshield_rollup(
             &root,
             &nullifiers,
             amount,
+            fee,
             &recipient_f,
             &cm_change,
             &mh_change_f,
+            &producer_note.cm,
+            &producer_note.mh,
         );
 
         let mut wots_key_indices: Vec<u32> = vec![];
@@ -6119,12 +6382,13 @@ fn cmd_unshield_rollup(
             wots_key_indices.push(key_idx);
         }
 
-        let total = 5 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 8;
+        let total = 6 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 15;
         args.push(felt_u64_to_hex(total as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
         args.push(felt_to_hex(&root));
         args.push(felt_u64_to_hex(amount));
+        args.push(felt_u64_to_hex(fee));
         args.push(felt_to_hex(&recipient_f));
 
         for (idx, &si) in selected.iter().enumerate() {
@@ -6171,6 +6435,14 @@ fn cmd_unshield_rollup(
             }
         }
 
+        args.push(felt_to_hex(&producer_address.d_j));
+        args.push(felt_u64_to_hex(profile.dal_fee));
+        args.push(felt_to_hex(&producer_note.rseed));
+        args.push(felt_to_hex(&producer_address.auth_root));
+        args.push(felt_to_hex(&producer_address.auth_pub_seed));
+        args.push(felt_to_hex(&producer_address.nk_tag));
+        args.push(felt_to_hex(&producer_note.mh));
+
         persist_wallet_and_make_proof(path, &w, pc, "run_unshield", &args)?
     };
 
@@ -6179,9 +6451,12 @@ fn cmd_unshield_rollup(
         root,
         nullifiers: nullifiers.clone(),
         v_pub: amount,
+        fee,
         recipient: recipient.into(),
         cm_change,
         enc_change,
+        cm_fee: producer_note.cm,
+        enc_fee: producer_note.enc,
         proof,
     };
     let kernel_req = unshield_req_to_kernel(&req)?;
@@ -6194,8 +6469,8 @@ fn cmd_unshield_rollup(
     save_wallet(path, &w)?;
 
     println!(
-        "Submitted unshield of {} into public account {}",
-        amount, recipient
+        "Submitted unshield of {} into public account {} with fee {} + dal fee {}",
+        amount, recipient, fee, profile.dal_fee
     );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
@@ -6259,11 +6534,18 @@ fn prepare_transfer_skip_proof(
     root: F,
     recipient: &PaymentAddress,
     amount: u64,
+    fee: u64,
+    dal_fee: u64,
+    producer_address: &PaymentAddress,
     memo: Option<&str>,
 ) -> Result<PreparedTransferSubmit, String> {
-    let selected = w.select_notes(amount)?;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(dal_fee))
+        .ok_or_else(|| "transfer total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - dal_fee as u128) as u64;
     let nullifiers: Vec<F> = selected
         .iter()
         .map(|&i| {
@@ -6272,44 +6554,13 @@ fn prepare_transfer_skip_proof(
         })
         .collect();
 
-    let rseed_1 = random_felt();
-    let rcm_1 = derive_rcm(&rseed_1);
-    let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_v
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_v")?,
-    )
-    .map_err(|_| "invalid ek_v")?;
-    let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
-        recipient
-            .ek_d
-            .as_slice()
-            .try_into()
-            .map_err(|_| "bad ek_d")?,
-    )
-    .map_err(|_| "invalid ek_d")?;
-    let otag_1 = owner_tag(
-        &recipient.auth_root,
-        &recipient.auth_pub_seed,
-        &recipient.nk_tag,
-    );
-    let cm_1 = commit(&recipient.d_j, amount, &rcm_1, &otag_1);
-    let memo_bytes = memo.map(str::as_bytes);
-    let enc_1 = encrypt_note(amount, &rseed_1, memo_bytes, &ek_v_recv, &ek_d_recv);
+    let note_1 = build_output_note(recipient, amount, memo.map(str::as_bytes))?;
 
     let (change_state, _change_addr) = w.next_address()?;
     let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-    let rseed_2 = random_felt();
-    let rcm_2 = derive_rcm(&rseed_2);
-    let otag_2 = owner_tag(
-        &change_state.auth_root,
-        &change_state.auth_pub_seed,
-        &change_state.nk_tag,
-    );
-    let cm_2 = commit(&change_state.d_j, change, &rcm_2, &otag_2);
-    let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v_c, &ek_d_c);
+    let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+    let note_2 = build_output_note(&change_address, change, None)?;
+    let note_3 = build_output_note(producer_address, dal_fee, Some(b"dal"))?;
 
     Ok(PreparedTransferSubmit {
         selected,
@@ -6317,10 +6568,13 @@ fn prepare_transfer_skip_proof(
         req: TransferReq {
             root,
             nullifiers,
-            cm_1,
-            cm_2,
-            enc_1,
-            enc_2,
+            fee,
+            cm_1: note_1.cm,
+            cm_2: note_2.cm,
+            cm_3: note_3.cm,
+            enc_1: note_1.enc,
+            enc_2: note_2.enc,
+            enc_3: note_3.enc,
             proof: Proof::TrustMeBro,
         },
     })
@@ -6330,11 +6584,18 @@ fn prepare_unshield_skip_proof(
     w: &mut WalletFile,
     root: F,
     amount: u64,
+    fee: u64,
+    dal_fee: u64,
+    producer_address: &PaymentAddress,
     recipient: &str,
 ) -> Result<PreparedUnshieldSubmit, String> {
-    let selected = w.select_notes(amount)?;
+    let total_spend = amount
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(dal_fee))
+        .ok_or_else(|| "unshield total spend overflow".to_string())?;
+    let selected = w.select_notes(total_spend)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128) as u64;
+    let change = (sum_in - amount as u128 - fee as u128 - dal_fee as u128) as u64;
     let nullifiers: Vec<F> = selected
         .iter()
         .map(|&i| {
@@ -6346,28 +6607,21 @@ fn prepare_unshield_skip_proof(
     let (cm_change, enc_change, _change_data) = if change > 0 {
         let (change_state, _change_addr) = w.next_address()?;
         let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
-        let rseed_c = random_felt();
-        let rcm_c = derive_rcm(&rseed_c);
-        let otag_c = owner_tag(
-            &change_state.auth_root,
-            &change_state.auth_pub_seed,
-            &change_state.nk_tag,
-        );
-        let cm = commit(&change_state.d_j, change, &rcm_c, &otag_c);
-        let enc = encrypt_note(change, &rseed_c, None, &ek_v_c, &ek_d_c);
-        let mh = memo_ct_hash(&enc);
+        let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+        let note = build_output_note(&change_address, change, None)?;
         let cd = ChangeData {
             d_j: change_state.d_j,
-            rseed: rseed_c,
+            rseed: note.rseed,
             auth_root: change_state.auth_root,
             auth_pub_seed: change_state.auth_pub_seed,
             nk_tag: change_state.nk_tag,
-            mh,
+            mh: note.mh,
         };
-        (cm, Some(enc), Some(cd))
+        (note.cm, Some(note.enc), Some(cd))
     } else {
         (ZERO, None, None)
     };
+    let producer_note = build_output_note(producer_address, dal_fee, Some(b"dal"))?;
 
     Ok(PreparedUnshieldSubmit {
         selected,
@@ -6376,9 +6630,12 @@ fn prepare_unshield_skip_proof(
             root,
             nullifiers,
             v_pub: amount,
+            fee,
             recipient: recipient.into(),
             cm_change,
             enc_change,
+            cm_fee: producer_note.cm,
+            enc_fee: producer_note.enc,
             proof: Proof::TrustMeBro,
         },
     })
@@ -6412,6 +6669,11 @@ mod network_profile_tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn sample_dal_fee_address() -> PaymentAddress {
+        let wallet = super::tests::test_wallet(1);
+        super::tests::payment_address_for_wallet_address(&wallet, 0)
+    }
+
     #[test]
     fn network_profile_roundtrip_persists_shadownet_settings() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6421,6 +6683,8 @@ mod network_profile_tests {
             "https://rollup.shadownet.example".into(),
             "sr1ExampleRollup".into(),
             "KT1ExampleTicketer".into(),
+            1,
+            sample_dal_fee_address(),
             Some("https://operator.shadownet.example".into()),
             Some("operator-secret".into()),
             "alice".into(),
@@ -6447,6 +6711,8 @@ mod network_profile_tests {
             "https://saved-rollup.example".into(),
             "sr1SavedRollup".into(),
             "KT1SavedTicketer".into(),
+            1,
+            sample_dal_fee_address(),
             None,
             None,
             "bootstrap1".into(),
@@ -6472,6 +6738,8 @@ mod network_profile_tests {
             "https://saved-rollup.example".into(),
             "sr1SavedRollup".into(),
             "KT1SavedTicketer".into(),
+            1,
+            sample_dal_fee_address(),
             Some("https://operator.shadownet.example".into()),
             None,
             "bootstrap1".into(),
@@ -6498,6 +6766,8 @@ mod network_profile_tests {
             "rollup_node_url": "https://saved-rollup.example",
             "rollup_address": "sr1SavedRollup",
             "bridge_ticketer": "KT1SavedTicketer",
+            "dal_fee": 1,
+            "dal_fee_address": sample_dal_fee_address(),
             "operator_url": "https://operator.shadownet.example",
             "source_alias": "bootstrap1",
             "public_account": "bootstrap1",
@@ -6520,6 +6790,8 @@ mod network_profile_tests {
             "https://saved-rollup.example".into(),
             "sr1SavedRollup".into(),
             "KT1SavedTicketer".into(),
+            1,
+            sample_dal_fee_address(),
             Some("https://operator.shadownet.example".into()),
             Some("operator-secret".into()),
             "bootstrap1".into(),
@@ -6547,6 +6819,8 @@ mod network_profile_tests {
             "https://saved-rollup.example".into(),
             "sr1SavedRollup".into(),
             "KT1SavedTicketer".into(),
+            1,
+            sample_dal_fee_address(),
             Some("https://operator.shadownet.example".into()),
             Some("operator-secret".into()),
             "bootstrap1".into(),

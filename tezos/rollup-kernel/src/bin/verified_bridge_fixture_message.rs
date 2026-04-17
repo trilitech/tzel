@@ -84,11 +84,15 @@ mod with_verifier {
         KernelShieldReq {
             sender: req.sender.clone(),
             v: req.v,
+            fee: req.fee,
+            producer_fee: req.producer_fee,
             address: req.address.clone(),
             memo: req.memo.clone(),
             proof: kernel_proof_from_fixture(&req.proof),
             client_cm: req.client_cm,
             client_enc: req.client_enc.clone(),
+            producer_cm: req.producer_cm,
+            producer_enc: req.producer_enc.clone(),
         }
     }
 
@@ -96,10 +100,13 @@ mod with_verifier {
         KernelTransferReq {
             root: req.root,
             nullifiers: req.nullifiers.clone(),
+            fee: req.fee,
             cm_1: req.cm_1,
             cm_2: req.cm_2,
+            cm_3: req.cm_3,
             enc_1: req.enc_1.clone(),
             enc_2: req.enc_2.clone(),
+            enc_3: req.enc_3.clone(),
             proof: kernel_proof_from_fixture(&req.proof),
         }
     }
@@ -109,9 +116,12 @@ mod with_verifier {
             root: req.root,
             nullifiers: req.nullifiers.clone(),
             v_pub: req.v_pub,
+            fee: req.fee,
             recipient: req.recipient.clone(),
             cm_change: req.cm_change,
             enc_change: req.enc_change.clone(),
+            cm_fee: req.cm_fee,
+            enc_fee: req.enc_fee.clone(),
             proof: kernel_proof_from_fixture(&req.proof),
         }
     }

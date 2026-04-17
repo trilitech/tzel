@@ -402,8 +402,8 @@ Tests sighash fold with `H_sighash` (`sighSP__`).
 | # | Items |
 |---|-------|
 | 0 | `[felt_of_int(1), felt_of_int(2), felt_of_int(3)]` |
-| 1 | `[felt_of_int(0x01), H(UTF8("domain")), H(UTF8("root")), H(UTF8("nf0")), H(UTF8("cm1")), H(UTF8("cm2")), felt_zero, felt_zero]` — simulated transfer sighash |
-| 2 | `[felt_of_int(0x02), H(UTF8("domain")), H(UTF8("root")), H(UTF8("nf0")), felt_of_int(5000), account_id("bob"), felt_zero, felt_zero]` — simulated unshield sighash |
+| 1 | `[felt_of_int(0x01), H(UTF8("domain")), H(UTF8("root")), H(UTF8("nf0")), felt_of_int(100000), H(UTF8("cm1")), H(UTF8("cm2")), H(UTF8("cm3")), felt_zero, felt_zero, felt_zero]` — simulated transfer sighash |
+| 2 | `[felt_of_int(0x02), H(UTF8("domain")), H(UTF8("root")), H(UTF8("nf0")), felt_of_int(5000), felt_of_int(100000), account_id("bob"), felt_zero, felt_zero, felt_zero, felt_zero]` — simulated unshield sighash |
 
 | Field | Type | Description |
 |-------|------|-------------|
