@@ -1602,18 +1602,20 @@ impl<'a> RollupRpc<'a> {
         Self { profile }
     }
 
-    fn durable_value_url(&self, key: &str) -> String {
+    fn block_durable_value_url(&self, block_ref: &str, key: &str) -> String {
         format!(
-            "{}/global/block/head/durable/wasm_2_0_0/value?key={}",
+            "{}/global/block/{}/durable/wasm_2_0_0/value?key={}",
             self.profile.rollup_node_url.trim_end_matches('/'),
+            block_ref,
             key
         )
     }
 
-    fn durable_length_url(&self, key: &str) -> String {
+    fn block_durable_length_url(&self, block_ref: &str, key: &str) -> String {
         format!(
-            "{}/global/block/head/durable/wasm_2_0_0/length?key={}",
+            "{}/global/block/{}/durable/wasm_2_0_0/length?key={}",
             self.profile.rollup_node_url.trim_end_matches('/'),
+            block_ref,
             key
         )
     }
@@ -1625,21 +1627,26 @@ impl<'a> RollupRpc<'a> {
         )
     }
 
-    fn head_level_url(&self) -> String {
+    fn block_level_url(&self, block_ref: &str) -> String {
         format!(
-            "{}/global/block/head/level",
-            self.profile.rollup_node_url.trim_end_matches('/')
+            "{}/global/block/{}/level",
+            self.profile.rollup_node_url.trim_end_matches('/'),
+            block_ref
         )
     }
 
-    fn read_durable_text(&self, key: &str) -> Result<String, String> {
-        let url = self.durable_value_url(key);
+    fn read_durable_text_at_block(&self, block_ref: &str, key: &str) -> Result<String, String> {
+        let url = self.block_durable_value_url(block_ref, key);
         get_text(&url).map_err(|e| format!("rollup RPC {} failed: {}", url, e))
     }
 
-    fn read_durable_length(&self, key: &str) -> Result<Option<usize>, String> {
-        let url = self.durable_length_url(key);
+    fn read_durable_length_at_block(&self, block_ref: &str, key: &str) -> Result<Option<usize>, String> {
+        let url = self.block_durable_length_url(block_ref, key);
         let raw = get_text(&url).map_err(|e| format!("rollup RPC {} failed: {}", url, e))?;
+        Self::parse_durable_length(key, &raw)
+    }
+
+    fn parse_durable_length(key: &str, raw: &str) -> Result<Option<usize>, String> {
         let value: Option<serde_json::Value> =
             serde_json::from_str(&raw).map_err(|e| format!("parse durable length: {}", e))?;
         match value {
@@ -1667,15 +1674,137 @@ impl<'a> RollupRpc<'a> {
         }
     }
 
-    fn read_durable_bytes(&self, key: &str) -> Result<Vec<u8>, String> {
-        let raw = self.read_durable_text(key)?;
+    fn read_durable_bytes_at_block(&self, block_ref: &str, key: &str) -> Result<Vec<u8>, String> {
+        let raw = self.read_durable_text_at_block(block_ref, key)?;
         parse_rollup_rpc_bytes(&raw).map_err(|e| format!("decode durable value at {}: {}", key, e))
     }
 
-    fn read_published_note_bytes(&self, index: u64) -> Result<Option<Vec<u8>>, String> {
+    fn read_u64_at_block(&self, block_ref: &str, key: &str) -> Result<u64, String> {
+        let bytes = self.read_durable_bytes_at_block(block_ref, key)?;
+        Self::parse_u64(key, &bytes)
+    }
+
+    fn parse_u64(key: &str, bytes: &[u8]) -> Result<u64, String> {
+        if bytes.len() != 8 {
+            return Err(format!(
+                "durable u64 at {} has {} bytes, expected 8",
+                key,
+                bytes.len()
+            ));
+        }
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&bytes);
+        Ok(u64::from_le_bytes(out))
+    }
+
+    fn read_optional_u64_at_block(&self, block_ref: &str, key: &str) -> Result<Option<u64>, String> {
+        if self.read_durable_length_at_block(block_ref, key)?.is_none() {
+            return Ok(None);
+        }
+        let bytes = self.read_durable_bytes_at_block(block_ref, key)?;
+        Self::parse_u64(key, &bytes).map(Some)
+    }
+
+    fn read_optional_i32_at_block(&self, block_ref: &str, key: &str) -> Result<Option<i32>, String> {
+        if self.read_durable_length_at_block(block_ref, key)?.is_none() {
+            return Ok(None);
+        }
+        let bytes = self.read_durable_bytes_at_block(block_ref, key)?;
+        Self::parse_i32(key, &bytes).map(Some)
+    }
+
+    fn parse_i32(key: &str, bytes: &[u8]) -> Result<i32, String> {
+        if bytes.len() != 4 {
+            return Err(format!(
+                "durable i32 at {} has {} bytes, expected 4",
+                key,
+                bytes.len()
+            ));
+        }
+        let mut out = [0u8; 4];
+        out.copy_from_slice(&bytes);
+        Ok(i32::from_le_bytes(out))
+    }
+
+    fn read_felt_at_block(&self, block_ref: &str, key: &str) -> Result<F, String> {
+        let bytes = self.read_durable_bytes_at_block(block_ref, key)?;
+        Self::parse_felt(key, &bytes)
+    }
+
+    fn parse_felt(key: &str, bytes: &[u8]) -> Result<F, String> {
+        if bytes.len() != 32 {
+            return Err(format!(
+                "durable felt at {} has {} bytes, expected 32",
+                key,
+                bytes.len()
+            ));
+        }
+        let mut out = ZERO;
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    fn read_string_at_block(&self, block_ref: &str, key: &str) -> Result<String, String> {
+        let bytes = self.read_durable_bytes_at_block(block_ref, key)?;
+        Self::parse_string(key, bytes)
+    }
+
+    fn parse_string(key: &str, bytes: Vec<u8>) -> Result<String, String> {
+        String::from_utf8(bytes).map_err(|_| format!("durable string at {} is not UTF-8", key))
+    }
+
+    fn block_level(&self, block_ref: &str) -> Result<i32, String> {
+        let raw = get_text(&self.block_level_url(block_ref))?;
+        if let Ok(level) = serde_json::from_str::<i32>(&raw) {
+            return Ok(level);
+        }
+        if let Ok(text) = serde_json::from_str::<String>(&raw) {
+            return text
+                .parse::<i32>()
+                .map_err(|e| format!("parse head level integer: {}", e));
+        }
+        raw.trim()
+            .parse::<i32>()
+            .map_err(|e| format!("parse head level integer: {}", e))
+    }
+
+    fn current_required_tx_fee(&self) -> Result<u64, String> {
+        let head_hash = self.head_hash()?;
+        self.current_required_tx_fee_at_block(&head_hash)
+    }
+
+    fn current_required_tx_fee_at_block(&self, block_ref: &str) -> Result<u64, String> {
+        let head_level = self.block_level(block_ref)?;
+        let next_inbox_level = head_level.saturating_add(1);
+        let last_input_level =
+            self.read_optional_i32_at_block(block_ref, DURABLE_LAST_INPUT_LEVEL)?;
+        let fee_level =
+            self.read_optional_i32_at_block(block_ref, DURABLE_PRIVATE_TX_FEE_LEVEL)?;
+        let private_tx_count_in_level = if last_input_level == Some(next_inbox_level)
+            && fee_level == Some(next_inbox_level)
+        {
+            self.read_optional_u64_at_block(block_ref, DURABLE_PRIVATE_TX_COUNT_IN_LEVEL)?
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(required_tx_fee_for_private_tx_count(
+            private_tx_count_in_level,
+        ))
+    }
+
+    fn load_notes_since(&self, cursor: usize) -> Result<NotesFeedResp, String> {
+        self.load_notes_since_at_block("head", cursor)
+    }
+
+    fn read_published_note_bytes_at_block(
+        &self,
+        block_ref: &str,
+        index: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
         let direct_key = indexed_durable_key(DURABLE_NOTE_PREFIX, index);
-        if self.read_durable_length(&direct_key)?.is_some() {
-            let bytes = self.read_durable_bytes(&direct_key)?;
+        if self.read_durable_length_at_block(block_ref, &direct_key)?.is_some() {
+            let bytes = self.read_durable_bytes_at_block(block_ref, &direct_key)?;
             if bytes.len() > MAX_PUBLISHED_NOTE_BYTES {
                 return Err(format!(
                     "durable note {} at {} exceeds max supported size {}",
@@ -1686,11 +1815,11 @@ impl<'a> RollupRpc<'a> {
         }
 
         let len_key = indexed_durable_note_len_key(index);
-        if self.read_durable_length(&len_key)?.is_none() {
+        if self.read_durable_length_at_block(block_ref, &len_key)?.is_none() {
             return Ok(None);
         }
 
-        let total_len_u64 = self.read_u64(&len_key)?;
+        let total_len_u64 = self.read_u64_at_block(block_ref, &len_key)?;
         let total_len = usize::try_from(total_len_u64).map_err(|_| {
             format!(
                 "chunked durable note {} length does not fit in usize",
@@ -1707,7 +1836,7 @@ impl<'a> RollupRpc<'a> {
         let mut bytes = Vec::with_capacity(total_len);
         for chunk_index in 0..chunk_count {
             let chunk_key = indexed_durable_note_chunk_key(index, chunk_index);
-            let mut chunk = self.read_durable_bytes(&chunk_key)?;
+            let mut chunk = self.read_durable_bytes_at_block(block_ref, &chunk_key)?;
             bytes.append(&mut chunk);
         }
         if bytes.len() != total_len {
@@ -1721,102 +1850,13 @@ impl<'a> RollupRpc<'a> {
         Ok(Some(bytes))
     }
 
-    fn read_u64(&self, key: &str) -> Result<u64, String> {
-        let bytes = self.read_durable_bytes(key)?;
-        if bytes.len() != 8 {
-            return Err(format!(
-                "durable u64 at {} has {} bytes, expected 8",
-                key,
-                bytes.len()
-            ));
-        }
-        let mut out = [0u8; 8];
-        out.copy_from_slice(&bytes);
-        Ok(u64::from_le_bytes(out))
-    }
-
-    fn read_optional_u64(&self, key: &str) -> Result<Option<u64>, String> {
-        if self.read_durable_length(key)?.is_none() {
-            return Ok(None);
-        }
-        self.read_u64(key).map(Some)
-    }
-
-    fn read_i32(&self, key: &str) -> Result<i32, String> {
-        let bytes = self.read_durable_bytes(key)?;
-        if bytes.len() != 4 {
-            return Err(format!(
-                "durable i32 at {} has {} bytes, expected 4",
-                key,
-                bytes.len()
-            ));
-        }
-        let mut out = [0u8; 4];
-        out.copy_from_slice(&bytes);
-        Ok(i32::from_le_bytes(out))
-    }
-
-    fn read_optional_i32(&self, key: &str) -> Result<Option<i32>, String> {
-        if self.read_durable_length(key)?.is_none() {
-            return Ok(None);
-        }
-        self.read_i32(key).map(Some)
-    }
-
-    fn read_felt(&self, key: &str) -> Result<F, String> {
-        let bytes = self.read_durable_bytes(key)?;
-        if bytes.len() != 32 {
-            return Err(format!(
-                "durable felt at {} has {} bytes, expected 32",
-                key,
-                bytes.len()
-            ));
-        }
-        let mut out = ZERO;
-        out.copy_from_slice(&bytes);
-        Ok(out)
-    }
-
-    fn read_string(&self, key: &str) -> Result<String, String> {
-        let bytes = self.read_durable_bytes(key)?;
-        String::from_utf8(bytes).map_err(|_| format!("durable string at {} is not UTF-8", key))
-    }
-
-    fn head_level(&self) -> Result<i32, String> {
-        let raw = get_text(&self.head_level_url())?;
-        if let Ok(level) = serde_json::from_str::<i32>(&raw) {
-            return Ok(level);
-        }
-        if let Ok(text) = serde_json::from_str::<String>(&raw) {
-            return text
-                .parse::<i32>()
-                .map_err(|e| format!("parse head level integer: {}", e));
-        }
-        raw.trim()
-            .parse::<i32>()
-            .map_err(|e| format!("parse head level integer: {}", e))
-    }
-
-    fn current_required_tx_fee(&self) -> Result<u64, String> {
-        let head_level = self.head_level()?;
-        let last_input_level = self.read_optional_i32(DURABLE_LAST_INPUT_LEVEL)?;
-        let fee_level = self.read_optional_i32(DURABLE_PRIVATE_TX_FEE_LEVEL)?;
-        let private_tx_count_in_level = if last_input_level == Some(head_level)
-            && fee_level == Some(head_level)
-        {
-            self.read_optional_u64(DURABLE_PRIVATE_TX_COUNT_IN_LEVEL)?
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        Ok(required_tx_fee_for_private_tx_count(
-            private_tx_count_in_level,
-        ))
-    }
-
-    fn load_notes_since(&self, cursor: usize) -> Result<NotesFeedResp, String> {
+    fn load_notes_since_at_block(
+        &self,
+        block_ref: &str,
+        cursor: usize,
+    ) -> Result<NotesFeedResp, String> {
         let count: usize = self
-            .read_u64(DURABLE_TREE_SIZE)?
+            .read_u64_at_block(block_ref, DURABLE_TREE_SIZE)?
             .try_into()
             .map_err(|_| "tree size does not fit in usize".to_string())?;
         if cursor > count {
@@ -1828,7 +1868,7 @@ impl<'a> RollupRpc<'a> {
 
         let mut notes = Vec::with_capacity(count - cursor);
         for i in cursor..count {
-            let Some(bytes) = self.read_published_note_bytes(i as u64)? else {
+            let Some(bytes) = self.read_published_note_bytes_at_block(block_ref, i as u64)? else {
                 let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64);
                 return Err(format!(
                     "rollup durable state is missing note {} at {} while tree size is {}. This usually means the deployed rollup kernel does not persist published note payloads, or the rollup node is not serving the expected durable state.",
@@ -1845,13 +1885,17 @@ impl<'a> RollupRpc<'a> {
     }
 
     fn load_nullifiers(&self) -> Result<Vec<F>, String> {
+        self.load_nullifiers_at_block("head")
+    }
+
+    fn load_nullifiers_at_block(&self, block_ref: &str) -> Result<Vec<F>, String> {
         let count: usize = self
-            .read_u64(DURABLE_NULLIFIER_COUNT)?
+            .read_u64_at_block(block_ref, DURABLE_NULLIFIER_COUNT)?
             .try_into()
             .map_err(|_| "nullifier count does not fit in usize".to_string())?;
         let mut nullifiers = Vec::with_capacity(count);
         for i in 0..count {
-            nullifiers.push(self.read_felt(&indexed_durable_key(
+            nullifiers.push(self.read_felt_at_block(block_ref, &indexed_durable_key(
                 DURABLE_NULLIFIER_INDEX_PREFIX,
                 i as u64,
             ))?);
@@ -1860,24 +1904,38 @@ impl<'a> RollupRpc<'a> {
     }
 
     fn load_balances(&self) -> Result<std::collections::HashMap<String, u64>, String> {
+        self.load_balances_at_block("head")
+    }
+
+    fn load_balances_at_block(
+        &self,
+        block_ref: &str,
+    ) -> Result<std::collections::HashMap<String, u64>, String> {
         let count: usize = self
-            .read_u64(DURABLE_BALANCE_COUNT)?
+            .read_u64_at_block(block_ref, DURABLE_BALANCE_COUNT)?
             .try_into()
             .map_err(|_| "balance count does not fit in usize".to_string())?;
         let mut balances = std::collections::HashMap::with_capacity(count);
         for i in 0..count {
-            let account =
-                self.read_string(&indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, i as u64))?;
-            let amount = self.read_u64(&balance_durable_key(&account))?;
+            let account = self.read_string_at_block(
+                block_ref,
+                &indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, i as u64),
+            )?;
+            let amount = self.read_u64_at_block(block_ref, &balance_durable_key(&account))?;
             balances.insert(account, amount);
         }
         Ok(balances)
     }
 
     fn load_state_snapshot(&self) -> Result<RollupStateSnapshot, String> {
-        let auth_domain = self.read_felt(DURABLE_AUTH_DOMAIN)?;
-        let notes = self.load_notes_since(0)?.notes;
-        let persisted_root = self.read_felt(DURABLE_TREE_ROOT)?;
+        let head_hash = self.head_hash()?;
+        self.load_state_snapshot_at_block(&head_hash)
+    }
+
+    fn load_state_snapshot_at_block(&self, block_ref: &str) -> Result<RollupStateSnapshot, String> {
+        let auth_domain = self.read_felt_at_block(block_ref, DURABLE_AUTH_DOMAIN)?;
+        let notes = self.load_notes_since_at_block(block_ref, 0)?.notes;
+        let persisted_root = self.read_felt_at_block(block_ref, DURABLE_TREE_ROOT)?;
         let tree = MerkleTree::from_leaves(notes.iter().map(|note| note.cm).collect());
         let recomputed_root = tree.root();
         if recomputed_root != persisted_root {
@@ -1889,7 +1947,7 @@ impl<'a> RollupRpc<'a> {
         }
         Ok(RollupStateSnapshot {
             auth_domain,
-            required_tx_fee: self.current_required_tx_fee()?,
+            required_tx_fee: self.current_required_tx_fee_at_block(block_ref)?,
             tree,
             notes,
         })
@@ -5346,11 +5404,12 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     let wallet = load_wallet(path)?;
     let rollup = RollupRpc::new(profile);
     let head_hash = rollup.head_hash()?;
-    let snapshot = rollup.load_state_snapshot()?;
+    let snapshot = rollup.load_state_snapshot_at_block(&head_hash)?;
     let auth_domain = snapshot.auth_domain;
     let tree_size = snapshot.tree.leaves.len();
+    let required_tx_fee = snapshot.required_tx_fee;
     let public_balance = rollup
-        .load_balances()?
+        .load_balances_at_block(&head_hash)?
         .get(&profile.public_account)
         .copied()
         .unwrap_or(0);
@@ -5362,8 +5421,8 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     println!("Tree size: {}", tree_size);
     println!(
         "Current required burn fee: {} mutez ({} tez)",
-        snapshot.required_tx_fee,
-        mutez_to_tez_string(snapshot.required_tx_fee)
+        required_tx_fee,
+        mutez_to_tez_string(required_tx_fee)
     );
     println!(
         "Local wallet: notes={}, pending={}, scanned={}",
@@ -5382,17 +5441,6 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
         println!("Operator health: {}", health.trim());
     } else {
         println!("Operator health: not configured");
-    }
-
-    let note_check_limit = tree_size.min(wallet.scanned.max(1)).min(4);
-    for index in 0..note_check_limit {
-        let key = indexed_durable_key(DURABLE_NOTE_PREFIX, index as u64);
-        if rollup.read_published_note_bytes(index as u64)?.is_none() {
-            return Err(format!(
-                "rollup durable note {} is missing at {} while tree size is {}. This deployment cannot serve private note sync correctly.",
-                index, key, tree_size
-            ));
-        }
     }
 
     println!("Check passed");
@@ -7059,7 +7107,282 @@ mod network_profile_tests {
     #[test]
     fn rollup_rpc_current_required_tx_fee_resets_after_idle_level() {
         let base_url = super::tests::spawn_mock_http_server(HashMap::from([
-            ("/global/block/head/level".into(), (200, "11".into())),
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            ("/global/block/BLmockhead/level".into(), (200, "11".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "8".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(3u64.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        assert_eq!(rollup.current_required_tx_fee().unwrap(), MIN_TX_FEE);
+    }
+
+    #[test]
+    fn rollup_rpc_current_required_tx_fee_quotes_next_inbox_level_not_congested_head() {
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            ("/global/block/BLmockhead/level".into(), (200, "10".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "8".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(6u64.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        assert_eq!(rollup.current_required_tx_fee().unwrap(), MIN_TX_FEE);
+    }
+
+    #[test]
+    fn rollup_rpc_current_required_tx_fee_uses_pinned_head_next_level_congestion() {
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            ("/global/block/BLmockhead/level".into(), (200, "10".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "8".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(3u64.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        assert_eq!(
+            rollup.current_required_tx_fee().unwrap(),
+            required_tx_fee_for_private_tx_count(3)
+        );
+    }
+
+    #[test]
+    fn rollup_rpc_current_required_tx_fee_ignores_mismatched_fee_metadata() {
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            ("/global/block/BLmockhead/level".into(), (200, "10".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "4".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "8".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, format!("\"{}\"", hex::encode(6u64.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        assert_eq!(rollup.current_required_tx_fee().unwrap(), MIN_TX_FEE);
+    }
+
+    #[test]
+    fn rollup_rpc_current_required_tx_fee_does_not_require_tree_routes() {
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            ("/global/block/BLmockhead/level".into(), (200, "12".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        assert_eq!(rollup.current_required_tx_fee().unwrap(), MIN_TX_FEE);
+    }
+
+    #[test]
+    fn rollup_rpc_current_required_tx_fee_pins_reads_to_one_head_hash() {
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            ("/global/block/head/hash".into(), (200, "\"BLstable\"".into())),
+            ("/global/block/BLstable/level".into(), (200, "10".into())),
+            (
+                format!(
+                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            ("/global/block/head/level".into(), (200, "10".into())),
             (
                 format!(
                     "/global/block/head/durable/wasm_2_0_0/length?key={}",
@@ -7072,7 +7395,7 @@ mod network_profile_tests {
                     "/global/block/head/durable/wasm_2_0_0/value?key={}",
                     DURABLE_LAST_INPUT_LEVEL
                 ),
-                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+                (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
             ),
             (
                 format!(
@@ -7086,7 +7409,7 @@ mod network_profile_tests {
                     "/global/block/head/durable/wasm_2_0_0/value?key={}",
                     DURABLE_PRIVATE_TX_FEE_LEVEL
                 ),
-                (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
+                (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
             ),
             (
                 format!(
@@ -7100,7 +7423,7 @@ mod network_profile_tests {
                     "/global/block/head/durable/wasm_2_0_0/value?key={}",
                     DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
                 ),
-                (200, format!("\"{}\"", hex::encode(3u64.to_le_bytes()))),
+                (200, format!("\"{}\"", hex::encode(6u64.to_le_bytes()))),
             ),
         ]));
         let profile = super::tests::rollup_profile_for_url(&base_url);
@@ -7110,35 +7433,286 @@ mod network_profile_tests {
     }
 
     #[test]
-    fn rollup_rpc_current_required_tx_fee_does_not_require_tree_routes() {
+    fn cmd_wallet_check_fails_when_full_snapshot_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let profile_path = default_network_profile_path(wallet_path_str);
+        let wallet = super::tests::test_wallet(1);
+        let note =
+            super::tests::note_memo_for_wallet_address(&wallet, 0, 91, felt_tag(b"check"), None);
+        let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
+            .expect("published note should encode");
+
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
         let base_url = super::tests::spawn_mock_http_server(HashMap::from([
-            ("/global/block/head/level".into(), (200, "12".into())),
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            ("/global/block/BLmockhead/level".into(), (200, "12".into())),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_AUTH_DOMAIN
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_SIZE
+                ),
+                (200, format!("\"{}\"", hex::encode(2u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_ROOT
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                "/global/block/BLmockhead/durable/wasm_2_0_0/value?key=/tzel/v1/state/balances/count"
+                    .into(),
+                (200, format!("\"{}\"", hex::encode(0u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, "1".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", hex::encode(encoded))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 1)
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_note_len_key(1)
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
                     DURABLE_LAST_INPUT_LEVEL
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
                     DURABLE_PRIVATE_TX_FEE_LEVEL
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
                     DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
                 ),
                 (200, "null".into()),
             ),
         ]));
-        let profile = super::tests::rollup_profile_for_url(&base_url);
-        let rollup = RollupRpc::new(&profile);
 
-        assert_eq!(rollup.current_required_tx_fee().unwrap(), MIN_TX_FEE);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        let err = cmd_wallet_check(wallet_path_str, &profile)
+            .expect_err("wallet check should fail when the rollup snapshot is incomplete");
+        assert!(
+            err.contains("missing note 1"),
+            "expected missing note error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cmd_wallet_check_succeeds_with_consistent_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let profile_path = default_network_profile_path(wallet_path_str);
+        let wallet = super::tests::test_wallet(1);
+        let note =
+            super::tests::note_memo_for_wallet_address(&wallet, 0, 91, felt_tag(b"check-ok"), None);
+        let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
+            .expect("published note should encode");
+        let root = MerkleTree::from_leaves(vec![note.cm]).root();
+
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            ("/global/block/BLmockhead/level".into(), (200, "12".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_AUTH_DOMAIN
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_SIZE
+                ),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_ROOT
+                ),
+                (200, format!("\"{}\"", hex::encode(root))),
+            ),
+            (
+                "/global/block/BLmockhead/durable/wasm_2_0_0/value?key=/tzel/v1/state/balances/count"
+                    .into(),
+                (200, format!("\"{}\"", hex::encode(0u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, encoded.len().to_string()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", hex::encode(encoded))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+        ]));
+
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        cmd_wallet_check(wallet_path_str, &profile).expect("wallet check should succeed");
+    }
+
+    #[test]
+    fn cmd_wallet_check_fails_on_tree_root_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let profile_path = default_network_profile_path(wallet_path_str);
+        let wallet = super::tests::test_wallet(1);
+        let note =
+            super::tests::note_memo_for_wallet_address(&wallet, 0, 52, felt_tag(b"root"), None);
+        let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
+            .expect("published note should encode");
+
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            ("/global/block/BLmockhead/level".into(), (200, "12".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_AUTH_DOMAIN
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_SIZE
+                ),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_ROOT
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                "/global/block/BLmockhead/durable/wasm_2_0_0/value?key=/tzel/v1/state/balances/count"
+                    .into(),
+                (200, format!("\"{}\"", hex::encode(0u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, encoded.len().to_string()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", hex::encode(encoded))),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+        ]));
+
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        let err = cmd_wallet_check(wallet_path_str, &profile)
+            .expect_err("wallet check should fail on tree root mismatch");
+        assert!(
+            err.contains("tree root mismatch"),
+            "expected tree root mismatch error, got: {err}"
+        );
     }
 
     #[test]
