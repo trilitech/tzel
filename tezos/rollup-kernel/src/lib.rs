@@ -41,6 +41,7 @@ use tzel_core::{
         KernelSignedBridgeConfig, KernelSignedVerifierConfig, KernelVerifierConfig,
         KERNEL_BRIDGE_CONFIG_KEY_INDEX, KERNEL_VERIFIER_CONFIG_KEY_INDEX,
     },
+    required_tx_fee_for_private_tx_count,
     verify_wots_signature_against_leaf, EncryptedNote, Ledger, LedgerState, WithdrawalRecord,
     DEPTH, F, ZERO,
 };
@@ -79,6 +80,8 @@ const PATH_LAST_INPUT_LEVEL: &[u8] = b"/tzel/v1/state/last_input_level";
 const PATH_LAST_INPUT_ID: &[u8] = b"/tzel/v1/state/last_input_id";
 const PATH_LAST_INPUT_LEN: &[u8] = b"/tzel/v1/state/last_input_len";
 const PATH_LAST_INPUT_PAYLOAD: &[u8] = b"/tzel/v1/state/last_input_payload";
+const PATH_PRIVATE_TX_FEE_LEVEL: &[u8] = b"/tzel/v1/state/fees/private_tx_level";
+const PATH_PRIVATE_TX_COUNT_IN_LEVEL: &[u8] = b"/tzel/v1/state/fees/private_tx_count_in_level";
 const PATH_AUTH_DOMAIN: &[u8] = b"/tzel/v1/state/auth_domain";
 const PATH_TREE_SIZE: &[u8] = b"/tzel/v1/state/tree/size";
 const PATH_TREE_ROOT: &[u8] = b"/tzel/v1/state/tree/root";
@@ -293,6 +296,19 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
         self.host
             .write_store(&path, &encode_withdrawal_record(record));
     }
+
+    fn current_private_tx_count_in_level(&self) -> Result<u64, String> {
+        let Some(current_level) = read_i32(self.host, PATH_LAST_INPUT_LEVEL) else {
+            return Ok(0);
+        };
+        let Some(stored_level) = read_i32(self.host, PATH_PRIVATE_TX_FEE_LEVEL) else {
+            return Ok(0);
+        };
+        if stored_level != current_level {
+            return Ok(0);
+        }
+        Ok(self.read_u64(PATH_PRIVATE_TX_COUNT_IN_LEVEL)?.unwrap_or(0))
+    }
 }
 
 impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
@@ -314,6 +330,12 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
         }
         self.write_u64(&path, amount);
         Ok(())
+    }
+
+    fn required_tx_fee(&self) -> Result<u64, String> {
+        Ok(required_tx_fee_for_private_tx_count(
+            self.current_private_tx_count_in_level()?,
+        ))
     }
 
     fn has_valid_root(&self, root: &F) -> Result<bool, String> {
@@ -403,6 +425,17 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
         );
         self.write_u64(PATH_WITHDRAWAL_COUNT, index + 1);
         usize::try_from(index).map_err(|_| "withdrawal index does not fit in usize".into())
+    }
+
+    fn note_private_tx_applied(&mut self) {
+        let Some(current_level) = read_i32(self.host, PATH_LAST_INPUT_LEVEL) else {
+            return;
+        };
+        let next = self.current_private_tx_count_in_level().unwrap_or(0) + 1;
+        self.host
+            .write_store(PATH_PRIVATE_TX_FEE_LEVEL, &current_level.to_le_bytes());
+        self.host
+            .write_store(PATH_PRIVATE_TX_COUNT_IN_LEVEL, &next.to_le_bytes());
     }
 }
 
@@ -641,6 +674,23 @@ pub fn read_stats<H: Host>(host: &H) -> KernelStats {
         last_input_id: read_i32(host, PATH_LAST_INPUT_ID),
         last_input_len: read_u32(host, PATH_LAST_INPUT_LEN),
     }
+}
+
+pub fn read_private_tx_count_in_current_level<H: Host>(host: &H) -> u64 {
+    let Some(current_level) = read_i32(host, PATH_LAST_INPUT_LEVEL) else {
+        return 0;
+    };
+    let Some(stored_level) = read_i32(host, PATH_PRIVATE_TX_FEE_LEVEL) else {
+        return 0;
+    };
+    if stored_level != current_level {
+        return 0;
+    }
+    read_u64(host, PATH_PRIVATE_TX_COUNT_IN_LEVEL).unwrap_or(0)
+}
+
+pub fn read_required_tx_fee<H: Host>(host: &H) -> u64 {
+    required_tx_fee_for_private_tx_count(read_private_tx_count_in_current_level(host))
 }
 
 pub fn read_last_input<H: Host>(host: &H) -> Option<InputMessage> {
@@ -1508,8 +1558,8 @@ mod tests {
             KernelBridgeConfig, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
             KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig, KernelWithdrawReq,
         },
-        owner_tag, PaymentAddress, ProgramHashes, ShieldResp, TransferResp, UnshieldResp,
-        WithdrawResp, MIN_TX_FEE, ZERO,
+        owner_tag, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp, TransferResp,
+        UnshieldResp, WithdrawResp, MIN_TX_FEE, ZERO, u64_to_felt,
     };
 
     #[derive(Default)]
@@ -1681,6 +1731,60 @@ mod tests {
         assert_eq!(stats.raw_input_count, 0);
         assert_eq!(stats.raw_input_bytes, 0);
         assert!(host.debug.contains("no inbox messages"));
+    }
+
+    #[test]
+    fn private_tx_fee_steps_up_with_same_level_traffic_and_resets_on_next_level() {
+        let mut host = MockHost::default();
+        host.write_store(PATH_LAST_INPUT_LEVEL, &10i32.to_le_bytes());
+        let address = sample_payment_address();
+
+        let make_shield = |seed: u64, fee: u64| ShieldReq {
+            sender: "alice".into(),
+            fee,
+            v: 1,
+            producer_fee: 1,
+            address: address.clone(),
+            memo: None,
+            proof: Proof::TrustMeBro,
+            client_cm: sample_commitment(&address, 1, u64_to_felt(seed)),
+            client_enc: Some(sample_encrypted_note(
+                &address,
+                1,
+                u64_to_felt(seed),
+                b"user",
+            )),
+            producer_cm: sample_commitment(&address, 1, u64_to_felt(seed + 100)),
+            producer_enc: Some(sample_encrypted_note(
+                &address,
+                1,
+                u64_to_felt(seed + 100),
+                b"dal",
+            )),
+        };
+
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            apply_deposit(&mut state, "alice", 400_000).unwrap();
+
+            apply_shield(&mut state, &make_shield(1, MIN_TX_FEE)).unwrap();
+            assert_eq!(state.required_tx_fee().unwrap(), MIN_TX_FEE);
+            assert_eq!(read_private_tx_count_in_current_level(state.host), 1);
+
+            apply_shield(&mut state, &make_shield(2, MIN_TX_FEE)).unwrap();
+            assert_eq!(state.required_tx_fee().unwrap(), MIN_TX_FEE * 2);
+            assert_eq!(read_private_tx_count_in_current_level(state.host), 2);
+
+            let err = apply_shield(&mut state, &make_shield(3, MIN_TX_FEE)).unwrap_err();
+            assert!(err.contains(&(MIN_TX_FEE * 2).to_string()));
+
+            state
+                .host
+                .write_store(PATH_LAST_INPUT_LEVEL, &11i32.to_le_bytes());
+            assert_eq!(state.required_tx_fee().unwrap(), MIN_TX_FEE);
+        }
+
+        assert_eq!(read_required_tx_fee(&host), MIN_TX_FEE);
     }
 
     #[test]

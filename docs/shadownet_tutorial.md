@@ -3,9 +3,14 @@
 This tutorial covers a Shadownet `deposit -> shield -> send` flow against a
 deployed rollup using the operator box.
 
-The current rollup policy burns `100000` mutez (`0.1 tez`) on every `shield`,
-`send`, and `unshield`, and each of those transactions also pays a separate
-private DAL-producer fee note.
+The current rollup policy burns at least `100000` mutez (`0.1 tez`) on every
+`shield`, `send`, and `unshield`. The first two accepted private transactions at
+a given inbox level pay that floor; each additional private transaction at the
+same level doubles the required burn fee, capped after 6 steps. Each of those
+transactions also pays a separate private DAL-producer fee note.
+
+If you omit `--fee`, `tzel-wallet` uses the rollup's currently quoted required
+burn fee.
 
 It assumes:
 

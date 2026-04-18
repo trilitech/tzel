@@ -25,6 +25,8 @@ pub const NOTE_AEAD_NONCE_BYTES: usize = 12;
 pub const ENCRYPTED_NOTE_BYTES: usize = 8 + 32 + MEMO_SIZE + 16;
 pub const MAX_VALID_ROOTS: usize = 4096;
 pub const MIN_TX_FEE: u64 = 100_000;
+pub const BASE_PRIVATE_TXS_PER_LEVEL: u64 = 2;
+pub const MAX_DYNAMIC_FEE_STEP: u32 = 6;
 
 /// Generate a random valid felt252 (251-bit value).
 #[cfg(not(target_arch = "wasm32"))]
@@ -1469,6 +1471,19 @@ pub struct BalanceResp {
 pub struct ConfigResp {
     #[serde(with = "hex_f")]
     pub auth_domain: F,
+    #[serde(default = "default_required_tx_fee")]
+    pub required_tx_fee: u64,
+}
+
+pub const fn default_required_tx_fee() -> u64 {
+    MIN_TX_FEE
+}
+
+pub fn required_tx_fee_for_private_tx_count(accepted_private_txs_in_level: u64) -> u64 {
+    let step = accepted_private_txs_in_level
+        .saturating_sub(BASE_PRIVATE_TXS_PER_LEVEL.saturating_sub(1))
+        .min(MAX_DYNAMIC_FEE_STEP as u64) as u32;
+    MIN_TX_FEE.saturating_mul(1u64 << step)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1492,6 +1507,7 @@ pub trait LedgerState {
     fn auth_domain(&self) -> Result<F, String>;
     fn balance(&self, addr: &str) -> Result<u64, String>;
     fn set_balance(&mut self, addr: &str, amount: u64) -> Result<(), String>;
+    fn required_tx_fee(&self) -> Result<u64, String>;
     fn has_valid_root(&self, root: &F) -> Result<bool, String>;
     fn has_nullifier(&self, nf: &F) -> Result<bool, String>;
     fn insert_nullifier(&mut self, nf: F) -> Result<(), String>;
@@ -1499,6 +1515,7 @@ pub trait LedgerState {
     fn append_note(&mut self, cm: F, enc: EncryptedNote) -> Result<usize, String>;
     fn snapshot_root(&mut self) -> Result<(), String>;
     fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String>;
+    fn note_private_tx_applied(&mut self);
 }
 
 impl Ledger {
@@ -1590,6 +1607,10 @@ impl LedgerState for Ledger {
         Ok(())
     }
 
+    fn required_tx_fee(&self) -> Result<u64, String> {
+        Ok(MIN_TX_FEE)
+    }
+
     fn has_valid_root(&self, root: &F) -> Result<bool, String> {
         Ok(self.valid_roots.contains(root))
     }
@@ -1638,6 +1659,8 @@ impl LedgerState for Ledger {
         });
         Ok(index)
     }
+
+    fn note_private_tx_applied(&mut self) {}
 }
 
 pub fn apply_deposit<S: LedgerState>(
@@ -1657,8 +1680,9 @@ pub fn apply_fund<S: LedgerState>(state: &mut S, addr: &str, amount: u64) -> Res
 }
 
 pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<ShieldResp, String> {
-    if req.fee < MIN_TX_FEE {
-        return Err(format!("fee below minimum: {} < {}", req.fee, MIN_TX_FEE));
+    let required_fee = state.required_tx_fee()?;
+    if req.fee < required_fee {
+        return Err(format!("fee below minimum: {} < {}", req.fee, required_fee));
     }
     if req.producer_fee == 0 {
         return Err("producer fee must be greater than zero".into());
@@ -1786,6 +1810,7 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
     let index = state.append_note(cm, enc)?;
     let producer_index = state.append_note(req.producer_cm, producer_enc.clone())?;
     state.snapshot_root()?;
+    state.note_private_tx_applied();
     Ok(ShieldResp {
         cm,
         index,
@@ -1798,8 +1823,9 @@ pub fn apply_transfer<S: LedgerState>(
     state: &mut S,
     req: &TransferReq,
 ) -> Result<TransferResp, String> {
-    if req.fee < MIN_TX_FEE {
-        return Err(format!("fee below minimum: {} < {}", req.fee, MIN_TX_FEE));
+    let required_fee = state.required_tx_fee()?;
+    if req.fee < required_fee {
+        return Err(format!("fee below minimum: {} < {}", req.fee, required_fee));
     }
     let n = req.nullifiers.len();
     if n == 0 || n > 7 {
@@ -1896,6 +1922,7 @@ pub fn apply_transfer<S: LedgerState>(
         state.insert_nullifier(*nf)?;
     }
     state.snapshot_root()?;
+    state.note_private_tx_applied();
     Ok(TransferResp {
         index_1,
         index_2,
@@ -1907,8 +1934,9 @@ pub fn apply_unshield<S: LedgerState>(
     state: &mut S,
     req: &UnshieldReq,
 ) -> Result<UnshieldResp, String> {
-    if req.fee < MIN_TX_FEE {
-        return Err(format!("fee below minimum: {} < {}", req.fee, MIN_TX_FEE));
+    let required_fee = state.required_tx_fee()?;
+    if req.fee < required_fee {
+        return Err(format!("fee below minimum: {} < {}", req.fee, required_fee));
     }
     let n = req.nullifiers.len();
     if n == 0 || n > 7 {
@@ -2025,6 +2053,7 @@ pub fn apply_unshield<S: LedgerState>(
     let producer_index = state.append_note(req.cm_fee, req.enc_fee.clone())?;
     state.set_balance(&req.recipient, next_balance)?;
     state.snapshot_root()?;
+    state.note_private_tx_applied();
     Ok(UnshieldResp {
         change_index,
         producer_index,
@@ -2212,6 +2241,7 @@ mod tests {
     struct LimitedAppendLedgerState {
         inner: Ledger,
         remaining_note_capacity: usize,
+        required_tx_fee: u64,
     }
 
     impl LimitedAppendLedgerState {
@@ -2219,7 +2249,13 @@ mod tests {
             Self {
                 inner,
                 remaining_note_capacity,
+                required_tx_fee: MIN_TX_FEE,
             }
+        }
+
+        fn with_required_tx_fee(mut self, required_tx_fee: u64) -> Self {
+            self.required_tx_fee = required_tx_fee;
+            self
         }
     }
 
@@ -2234,6 +2270,10 @@ mod tests {
 
         fn set_balance(&mut self, addr: &str, amount: u64) -> Result<(), String> {
             self.inner.set_balance(addr, amount)
+        }
+
+        fn required_tx_fee(&self) -> Result<u64, String> {
+            Ok(self.required_tx_fee)
         }
 
         fn has_valid_root(&self, root: &F) -> Result<bool, String> {
@@ -2270,6 +2310,8 @@ mod tests {
         fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String> {
             self.inner.enqueue_withdrawal(recipient, amount)
         }
+
+        fn note_private_tx_applied(&mut self) {}
     }
 
     fn fake_stark(output_preimage: Vec<F>) -> Proof {
@@ -3340,6 +3382,48 @@ mod tests {
         assert!(err.contains("fee below minimum"));
         assert_eq!(ledger.balance("alice").unwrap(), MIN_TX_FEE + 200);
         assert!(ledger.memos.is_empty());
+    }
+
+    #[test]
+    fn test_required_tx_fee_for_private_tx_count_steps_up_after_two_transactions() {
+        assert_eq!(required_tx_fee_for_private_tx_count(0), MIN_TX_FEE);
+        assert_eq!(required_tx_fee_for_private_tx_count(1), MIN_TX_FEE);
+        assert_eq!(required_tx_fee_for_private_tx_count(2), MIN_TX_FEE * 2);
+        assert_eq!(required_tx_fee_for_private_tx_count(3), MIN_TX_FEE * 4);
+        assert_eq!(
+            required_tx_fee_for_private_tx_count(100),
+            MIN_TX_FEE * (1u64 << MAX_DYNAMIC_FEE_STEP)
+        );
+    }
+
+    #[test]
+    fn test_apply_shield_uses_state_required_fee() {
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x8A, 0);
+        let mut state =
+            LimitedAppendLedgerState::new(Ledger::new(), 4).with_required_tx_fee(MIN_TX_FEE * 2);
+        state.inner.fund("alice", MIN_TX_FEE * 2 + 126).unwrap();
+        let (producer_enc, producer_cm) = deterministic_note(&addr, 1, u(63), Some(b"dal"));
+
+        let err = apply_shield(
+            &mut state,
+            &ShieldReq {
+                sender: "alice".into(),
+                fee: MIN_TX_FEE,
+                v: 125,
+                producer_fee: 1,
+                address: addr,
+                memo: None,
+                proof: Proof::TrustMeBro,
+                client_cm: ZERO,
+                client_enc: None,
+                producer_cm,
+                producer_enc: Some(producer_enc),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains(&format!("{}", MIN_TX_FEE * 2)));
+        assert!(state.inner.memos.is_empty());
     }
 
     #[test]

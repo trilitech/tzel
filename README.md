@@ -24,7 +24,7 @@ A UTXO-based private transaction system where:
 - **Deposits** (shield) move public tokens into private notes
 - **Transfers** spend 1-7 private notes and create recipient, change, and DAL-producer fee notes
 - **Withdrawals** (unshield) destroy private notes, release value publicly, and create a DAL-producer fee note plus optional change
-- **Every shield / transfer / unshield burns a fixed 100000 mutez (0.1 tez)** in the current rollup deployment
+- **Every shield / transfer / unshield burns at least 100000 mutez (0.1 tez)**, with a simple per-level stepped fee under congestion in the current rollup deployment
 - **Every shield / transfer / unshield also creates a separate private DAL-producer fee note**
 - Every spend is proven with a **zero-knowledge STARK** that verifies the **WOTS+ signature inside the circuit** — the proof itself proves spend authorization
 

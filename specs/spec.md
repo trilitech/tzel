@@ -205,15 +205,24 @@ This prevents an attacker from creating two identical commitments (same d_j, v, 
 
 ## Transaction Types
 
-The reference rollup currently enforces a fixed transaction fee:
+The reference rollup currently enforces a burned transaction fee with a floor of:
 
 ```
 MIN_TX_FEE = 100000 mutez   // 0.1 tez
 ```
 
-Shield, transfer, and unshield transactions MUST publish `fee >= MIN_TX_FEE`.
-That fee is burned: it is deducted from consumed value and is not recreated as a
-public or private output.
+Shield, transfer, and unshield transactions MUST publish `fee >= required_tx_fee`,
+where `required_tx_fee >= MIN_TX_FEE`.
+
+For the current POC rollup deployment:
+
+- the first two accepted private transactions at a given inbox level require `100000` mutez
+- each additional accepted private transaction at that same inbox level doubles the required fee
+- the doubling schedule is capped after 6 steps
+- when the inbox level advances, the required fee resets to the floor
+
+That burned fee is deducted from consumed value and is not recreated as a public
+or private output.
 
 Each private transaction also carries a distinct `producer_fee > 0` that is
 paid to the DAL slot producer as an ordinary shielded note output. This is a
@@ -238,7 +247,7 @@ separate resource price from the burned rollup fee above.
 `H(ct_d || tag || ct_v || nonce || encrypted_data)` — covering ALL on-chain
 note data — and passed into the circuit as public inputs.
 
-**Contract / ledger checks:** proof valid, sender binding per [Shield sender binding](#shield-sender-binding), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= MIN_TX_FEE`.
+**Contract / ledger checks:** proof valid, sender binding per [Shield sender binding](#shield-sender-binding), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= required_tx_fee`.
 
 **State changes:** deduct `v_pub + fee + producer_fee` from sender, append `cm_new` and `cm_producer` to T.
 
@@ -272,7 +281,7 @@ XMSS-style WOTS+ signature verification happens inside the STARK. No auth leaves
 5. `sum(v_inputs) = v_1 + v_2 + v_3 + fee` (in u128)
 5. All values are u64 (implicit range check)
 
-**Contract checks:** proof valid, `fee >= MIN_TX_FEE`. No signature verification needed — the STARK proof proves spend authorization.
+**Contract checks:** proof valid, `fee >= required_tx_fee`. No signature verification needed — the STARK proof proves spend authorization.
 
 ### Unshield (N->withdrawal + optional change, where 1 <= N <= 7)
 
@@ -296,7 +305,7 @@ producer-fee note plus an optional private change note.
 6. `v_fee > 0`
 7. `sum(v_inputs) = v_pub + v_change + v_fee + fee`
 
-**Contract / ledger checks:** proof valid, `fee >= MIN_TX_FEE`. Verify recipient binding per [Public Account Identifier Encoding](#public-account-identifier-encoding), credit `v_pub` to that recipient account, append `cm_change` to T (if nonzero), append `cm_fee` to T. No signature verification needed — the STARK proof proves spend authorization.
+**Contract / ledger checks:** proof valid, `fee >= required_tx_fee`. Verify recipient binding per [Public Account Identifier Encoding](#public-account-identifier-encoding), credit `v_pub` to that recipient account, append `cm_change` to T (if nonzero), append `cm_fee` to T. No signature verification needed — the STARK proof proves spend authorization.
 
 ## Contract Consensus Rules
 

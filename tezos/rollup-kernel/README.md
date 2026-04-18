@@ -32,6 +32,16 @@ The kernel does not keep the full ledger as one serialized blob. It stores:
 - per-account bridge balances used for deposit/withdrawal accounting
 - queued withdrawals under append-only per-index paths
 
+The current POC kernel uses a simple congestion fee policy for private
+transactions:
+
+- floor: `100000` mutez
+- first two accepted private transactions per inbox level pay that floor
+- each additional accepted private transaction at that same level doubles the
+  required burn fee
+- the doubling schedule is capped after 6 steps
+- when the inbox level advances, the required fee resets to the floor
+
 Durable storage paths:
 - `/tzel/v1/stats/raw_input_count`
 - `/tzel/v1/stats/raw_input_bytes`
@@ -39,6 +49,7 @@ Durable storage paths:
 - `/tzel/v1/state/last_input_id`
 - `/tzel/v1/state/last_input_len`
 - `/tzel/v1/state/last_input_payload`
+- `/tzel/v1/state/fees/*`
 - `/tzel/v1/state/auth_domain`
 - `/tzel/v1/state/tree/*`
 - `/tzel/v1/state/notes/*`
