@@ -38,7 +38,16 @@ mod with_verifier {
         bridge_ticketer: &'a str,
         withdrawal_recipient: &'a str,
         shield_sender: &'a str,
-        shield_amount: u64,
+        // Total mutez the sandbox must deposit into the bridge so that the
+        // fixture shield applies cleanly.  `apply_shield` debits
+        // `v + fee + producer_fee` from the sender's public balance (see
+        // `core/src/lib.rs::apply_shield`, added by the "Add burned rollup
+        // fees and DAL producer note outputs" commit).  Exposing the sum
+        // rather than just `v` keeps the sandbox in sync with the kernel
+        // debit semantics; exposing only `v` (the historical behaviour)
+        // leaves the balance short by `fee + producer_fee` and the shield
+        // fails with "insufficient balance".
+        shield_bridge_deposit: u64,
     }
 
     fn usage() -> ! {
@@ -151,7 +160,9 @@ mod with_verifier {
                     bridge_ticketer: &fixture.bridge_ticketer,
                     withdrawal_recipient: &fixture.withdrawal_recipient,
                     shield_sender: &fixture.shield.sender,
-                    shield_amount: fixture.shield.v,
+                    shield_bridge_deposit: fixture.shield.v
+                        + fixture.shield.fee
+                        + fixture.shield.producer_fee,
                 };
                 println!(
                     "{}",

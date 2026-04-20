@@ -323,7 +323,7 @@ print(data["shield_program_hash"])
 print(data["transfer_program_hash"])
 print(data["unshield_program_hash"])
 print(data["shield_sender"])
-print(data["shield_amount"])
+print(data["shield_bridge_deposit"])
 ' <<<"${metadata_json}"
 }
 
@@ -667,23 +667,27 @@ main() {
   local fixture_fields
   fixture_fields="$(extract_fixture_fields "$(fixture_metadata)")"
   mapfile -t fixture_lines <<<"${fixture_fields}"
-  local auth_domain_hex shield_hash_hex transfer_hash_hex unshield_hash_hex shield_sender shield_amount
+  local auth_domain_hex shield_hash_hex transfer_hash_hex unshield_hash_hex shield_sender shield_bridge_deposit
   auth_domain_hex="${fixture_lines[0]}"
   shield_hash_hex="${fixture_lines[1]}"
   transfer_hash_hex="${fixture_lines[2]}"
   unshield_hash_hex="${fixture_lines[3]}"
   shield_sender="${fixture_lines[4]}"
-  shield_amount="${fixture_lines[5]}"
+  # `apply_shield` debits `v + fee + producer_fee` from the sender's public
+  # balance, not just `v`.  The fixture-message binary exposes the total
+  # under `shield_bridge_deposit`; the sandbox uses that to size the bridge
+  # deposit so the post-shield balance lands at zero.
+  shield_bridge_deposit="${fixture_lines[5]}"
 
   send_configure_verifier_message "${rollup_address}" "${auth_domain_hex}" "${shield_hash_hex}" "${transfer_hash_hex}" "${unshield_hash_hex}"
   send_configure_bridge_message "${rollup_address}" "${ticketer_address}"
   await_bridge_ticketer "${ticketer_address}"
 
-  deposit_to_bridge "${ticketer_address}" "${rollup_address}" "${shield_sender}" "${shield_amount}"
+  deposit_to_bridge "${ticketer_address}" "${rollup_address}" "${shield_sender}" "${shield_bridge_deposit}"
 
   local balance_key
   balance_key="/tzel/v1/state/balances/by-key/$(printf '%s' "${shield_sender}" | xxd -ps -c 0 | tr -d '\n')"
-  await_rollup_u64 "${balance_key}" "${shield_amount}" "public bridge balance"
+  await_rollup_u64 "${balance_key}" "${shield_bridge_deposit}" "public bridge balance"
 
   local shield_payload_file
   shield_payload_file="${WORKDIR}/shield-payload.bin"
@@ -691,7 +695,11 @@ main() {
   publish_shield_via_dal_and_inject_pointer "${rollup_address}" "${shield_payload_file}"
 
   await_rollup_u64 "${balance_key}" "0" "public balance drain after shield"
-  await_rollup_u64 "/tzel/v1/state/tree/size" "1" "shielded note insertion"
+  # `apply_shield` appends two notes to the Merkle tree: the sender's own
+  # commitment and the producer's compensation commitment (bde1347 added
+  # the producer output).  Expecting size 1 here — the pre-fees value —
+  # stalls the smoke even though the shield applied cleanly.
+  await_rollup_u64 "/tzel/v1/state/tree/size" "2" "shielded note insertion"
 
   echo "octez rollup sandbox DAL smoke passed"
   echo "rollup=${rollup_address}"
