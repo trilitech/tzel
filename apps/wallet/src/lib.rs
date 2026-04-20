@@ -1967,9 +1967,12 @@ fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
         KernelInboxMessage::Shield(_) => RollupSubmissionKind::Shield,
         KernelInboxMessage::Transfer(_) => RollupSubmissionKind::Transfer,
         KernelInboxMessage::Unshield(_) => RollupSubmissionKind::Unshield,
-        KernelInboxMessage::Withdraw(_)
-        | KernelInboxMessage::ConfigureVerifier(_)
-        | KernelInboxMessage::ConfigureBridge(_) => RollupSubmissionKind::Withdraw,
+        KernelInboxMessage::Withdraw(_) => RollupSubmissionKind::Withdraw,
+        KernelInboxMessage::ConfigureVerifier(_)
+        | KernelInboxMessage::ConfigureBridge(_) => unreachable!(
+            "wallet does not submit admin Configure* messages; they flow \
+             through `octez_kernel_message` + `octez-client` directly"
+        ),
         KernelInboxMessage::DalPointer(_) => {
             unreachable!("wallet should not submit raw DAL pointer messages")
         }

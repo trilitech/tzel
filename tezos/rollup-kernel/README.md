@@ -73,14 +73,30 @@ If a future message exceeds 4096 bytes and must reach the kernel:
 1. Add a variant to `KernelDalPayloadKind` in `core/src/kernel_wire.rs`
    (next free wire tag).
 2. Add the reciprocal arm in `fetch_kernel_message_from_dal` in this
-   crate's `lib.rs` and in `dal_payload_kind_name`.
-3. Mirror the variant in `RollupSubmissionKind` and the operator's
-   `submission_kind_matches_message` / `dal_pointer_from_submission`.
+   crate's `lib.rs` and in `dal_payload_kind_name`.  The outer match
+   is exhaustive on `KernelDalPayloadKind`, so the compiler will
+   refuse to build until both arms are present.
+3. Decide which submission path applies:
+   - **User-facing payloads** (Shield / Transfer / Unshield and
+     similar): mirror the variant in `RollupSubmissionKind` and the
+     operator's `kernel_message_matches_submission_kind` /
+     `dal_pointer_from_submission`, so the wallet can submit via the
+     operator.
+   - **Admin-signed payloads** (`Configure*` and anything else
+     authenticated by the config-admin WOTS key): do **not** route
+     through the operator.  Admin messages are injected directly with
+     `octez_kernel_message` + `octez-client send smart rollup
+     message`, using the admin's own L1 key and WOTS ask.  This keeps
+     the operator surface narrow and prevents a bearer-token leak
+     from granting admin injection.
 4. Update the `octez_kernel_message` CLI: add a `<cmd>-payload`
    subcommand that outputs the raw unframed bytes, and extend
    `parse_dal_kind` with the new token.
 5. Add a size-sentinel test under `core/src/kernel_wire.rs::tests`
-   (see `configure_verifier_serialized_size_sentinel`).
+   (see `configure_verifier_serialized_size_sentinel`).  The
+   variant-exhaustive test `inbox_size_invariant_covers_all_variants`
+   will also refuse to build until the new variant is classified as
+   `FitsL1` or `RequiresDal` in its `required_routing`.
 
 If a change *reduces* an existing message below 4096 bytes, the direct
 L1 path becomes usable again but the DAL path can remain for uniformity
