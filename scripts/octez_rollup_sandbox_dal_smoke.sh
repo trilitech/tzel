@@ -180,7 +180,14 @@ data.pop("chain_id", None)
 data.pop("initial_timestamp", None)
 data["minimal_block_delay"] = "1"
 data["delay_increment_per_round"] = "1"
-data.setdefault("dal_parametric", {})["attestation_lag"] = int(attestation_lag)
+dal = data.setdefault("dal_parametric", {})
+dal["attestation_lag"] = int(attestation_lag)
+# Protocol constraint (added by tezos master 8499ce19ac on 2025-12-04):
+#   The last element of attestation_lags must equal attestation_lag.
+# Default mockup populates attestation_lags with [1,2,3,4,5], breaking the
+# invariant when attestation_lag is overridden to anything other than 5.
+# Force a single-element list here.
+dal["attestation_lags"] = [int(attestation_lag)]
 
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, sort_keys=True)
@@ -263,8 +270,39 @@ build_kernel_and_tools() {
   fi
   rustup target list --installed "${rustup_toolchain_args[@]}" | grep -qx 'wasm32-unknown-unknown' \
     || rustup target add "${rustup_toolchain_args[@]}" wasm32-unknown-unknown >/dev/null
-  cargo "${cargo_toolchain_args[@]}" build -q -p tzel-rollup-kernel --target wasm32-unknown-unknown --release "${kernel_cargo_args[@]}"
+
+  # Build octez_kernel_message first so we can derive admin material from
+  # a fresh random ask.  The release kernel WASM rejects admin config
+  # messages unless the matching pub-seed/leaves are baked in at compile
+  # time via TZEL_ROLLUP_CONFIG_ADMIN_*_HEX env vars.  Mirror the flow of
+  # scripts/build_rollup_kernel_release.sh.
   cargo "${cargo_toolchain_args[@]}" build -q -p tzel-rollup-kernel --bin octez_kernel_message --bin verified_bridge_fixture_message "${kernel_cargo_args[@]}"
+
+  local admin_state_dir="${WORKDIR}/rollup-config-admin"
+  "${ROOT}/scripts/prepare_rollup_config_admin.sh" \
+    --workspace-root "${ROOT}" \
+    --state-dir "${admin_state_dir}" \
+    --octez-kernel-message "${ROOT}/target/debug/octez_kernel_message" \
+    >/dev/null
+
+  # Load the secret ask into this shell so configure-{verifier,bridge}[-payload]
+  # CLI calls sign with the matching key the kernel will have baked in.
+  # The `set -a` propagates TZEL_ROLLUP_CONFIG_ADMIN_ASK_HEX into every
+  # descendant process.  This is fine inside a sandbox run (the ask is
+  # generated fresh per WORKDIR and discarded on exit) but DO NOT copy
+  # this pattern to production runners — in shadownet / mainnet, the ask
+  # should be read at invocation time and not inherited by unrelated
+  # child processes.
+  # shellcheck disable=SC1090
+  set -a
+  source "${admin_state_dir}/rollup-config-admin-runtime.env"
+  source "${admin_state_dir}/rollup-config-admin-build.env"
+  set +a
+
+  # Build the release kernel WASM — the TZEL_ROLLUP_CONFIG_ADMIN_*_HEX env
+  # vars sourced above are picked up by option_env!() in the kernel source
+  # and baked into the WASM blob.
+  cargo "${cargo_toolchain_args[@]}" build -q -p tzel-rollup-kernel --target wasm32-unknown-unknown --release "${kernel_cargo_args[@]}"
 }
 
 fixture_metadata() {
@@ -364,26 +402,33 @@ start_rollup_node() {
 }
 
 send_configure_verifier_message() {
+  # ConfigureVerifier is WOTS-signed and larger than
+  # sc_rollup_message_size_limit (4096 bytes), so it cannot be sent via
+  # the direct L1 external-message path.  We publish the raw
+  # KernelInboxMessage bytes to DAL and inject a DalPointer on L1.
   local rollup_address="$1"
   local auth_domain="$2"
   local shield_hash="$3"
   local transfer_hash="$4"
   local unshield_hash="$5"
-  local message_hex
-  message_hex="$("${ROOT}/target/debug/octez_kernel_message" configure-verifier "${rollup_address}" "${auth_domain}" "${shield_hash}" "${transfer_hash}" "${unshield_hash}")"
-  octez-client -d "${CLIENT_DIR}" -E "${NODE_ENDPOINT}" -p "${ALPHA_HASH}" -w none \
-    send smart rollup message "hex:[ \"${message_hex}\" ]" from operator >/dev/null
-  bake_block with-dal
+  local payload_file
+  payload_file="${WORKDIR}/configure-verifier-payload.bin"
+  "${ROOT}/target/debug/octez_kernel_message" configure-verifier-payload \
+    "${auth_domain}" "${shield_hash}" "${transfer_hash}" "${unshield_hash}" \
+    | xxd -r -p > "${payload_file}"
+  publish_payload_via_dal_and_inject_pointer configure_verifier "${rollup_address}" "${payload_file}"
 }
 
 send_configure_bridge_message() {
+  # Same reason as send_configure_verifier_message: WOTS-signed, oversized,
+  # routed via DAL.
   local rollup_address="$1"
   local ticketer="$2"
-  local message_hex
-  message_hex="$("${ROOT}/target/debug/octez_kernel_message" configure-bridge "${rollup_address}" "${ticketer}")"
-  octez-client -d "${CLIENT_DIR}" -E "${NODE_ENDPOINT}" -p "${ALPHA_HASH}" -w none \
-    send smart rollup message "hex:[ \"${message_hex}\" ]" from operator >/dev/null
-  bake_block with-dal
+  local payload_file
+  payload_file="${WORKDIR}/configure-bridge-payload.bin"
+  "${ROOT}/target/debug/octez_kernel_message" configure-bridge-payload "${ticketer}" \
+    | xxd -r -p > "${payload_file}"
+  publish_payload_via_dal_and_inject_pointer configure_bridge "${rollup_address}" "${payload_file}"
 }
 
 read_rollup_u64() {
@@ -426,7 +471,9 @@ await_rollup_u64() {
 await_bridge_ticketer() {
   local ticketer="$1"
   local encoded_ticketer response
-  encoded_ticketer="$(printf '%s' "${ticketer}" | xxd -ps -c 0)"
+  # `xxd -ps -c 0` wraps at ~60 chars on some xxd versions despite the
+  # docs; strip newlines to get a single hex string.
+  encoded_ticketer="$(printf '%s' "${ticketer}" | xxd -ps -c 0 | tr -d '\n')"
   local url="${ROLLUP_ENDPOINT}/global/block/head/durable/wasm_2_0_0/value?key=/tzel/v1/state/bridge/ticketer"
   local i
   for ((i = 0; i < 180; i++)); do
@@ -446,7 +493,7 @@ deposit_to_bridge() {
   local recipient="$3"
   local amount_mutez="$4"
   local recipient_hex tez_amount
-  recipient_hex="$(printf '%s' "${recipient}" | xxd -ps -c 0)"
+  recipient_hex="$(printf '%s' "${recipient}" | xxd -ps -c 0 | tr -d '\n')"
   tez_amount="$(mutez_to_tez "${amount_mutez}")"
   octez-client -d "${CLIENT_DIR}" -E "${NODE_ENDPOINT}" -p "${ALPHA_HASH}" -w none \
     transfer "${tez_amount}" from operator to "${ticketer}" \
@@ -551,9 +598,13 @@ await_dal_attested() {
   return 1
 }
 
-publish_shield_via_dal_and_inject_pointer() {
-  local rollup_address="$1"
-  local payload_file="$2"
+publish_payload_via_dal_and_inject_pointer() {
+  # kind must be one of the tokens accepted by
+  # `octez_kernel_message dal-pointer`: shield, transfer, unshield,
+  # configure_verifier, configure_bridge.
+  local kind="$1"
+  local rollup_address="$2"
+  local payload_file="$3"
   local payload_len payload_hash number_of_slots slot_size
   payload_len="$(stat -c%s "${payload_file}")"
   payload_hash="$(payload_hash_hex "${payload_file}")"
@@ -582,10 +633,14 @@ print(data["commitment_proof"])
   done < "${DAL_CHUNKS_FILE}"
 
   local message_hex
-  message_hex="$("${ROOT}/target/debug/octez_kernel_message" dal-pointer "${rollup_address}" shield "${payload_hash}" "${payload_len}" "${pointer_args[@]}")"
+  message_hex="$("${ROOT}/target/debug/octez_kernel_message" dal-pointer "${rollup_address}" "${kind}" "${payload_hash}" "${payload_len}" "${pointer_args[@]}")"
   octez-client -d "${CLIENT_DIR}" -E "${NODE_ENDPOINT}" -p "${ALPHA_HASH}" -w none \
     send smart rollup message "hex:[ \"${message_hex}\" ]" from operator >/dev/null
   bake_block with-dal
+}
+
+publish_shield_via_dal_and_inject_pointer() {
+  publish_payload_via_dal_and_inject_pointer shield "$@"
 }
 
 main() {
@@ -627,7 +682,7 @@ main() {
   deposit_to_bridge "${ticketer_address}" "${rollup_address}" "${shield_sender}" "${shield_amount}"
 
   local balance_key
-  balance_key="/tzel/v1/state/balances/by-key/$(printf '%s' "${shield_sender}" | xxd -ps -c 0)"
+  balance_key="/tzel/v1/state/balances/by-key/$(printf '%s' "${shield_sender}" | xxd -ps -c 0 | tr -d '\n')"
   await_rollup_u64 "${balance_key}" "${shield_amount}" "public bridge balance"
 
   local shield_payload_file
