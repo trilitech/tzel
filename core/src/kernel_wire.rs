@@ -2520,4 +2520,225 @@ mod tests {
             L1_INBOX_MESSAGE_LIMIT,
         );
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Variant-exhaustive framed-size invariant.
+    //
+    // The two sentinels above lock exact byte counts for the admin
+    // config messages.  This test is broader: for **every** variant of
+    // `KernelInboxMessage`, it checks the on-wire size (after wrapping
+    // in `ExternalMessageFrame::Targetted` — the actual bytes
+    // `octez-client send smart rollup message` transmits) against the
+    // routing the kernel + tooling assume for that variant.
+    //
+    // Why it exists in addition to the sentinels:
+    //   - It measures the **framed** size.  The protocol caps the
+    //     framed bytes at `sc_rollup_message_size_limit = 4096`, and
+    //     the frame adds 21 bytes (1 tag + 20 bytes rollup-address
+    //     hash) on top of `encode_kernel_inbox_message`.  A message
+    //     that sits just below 4096 unframed can still be rejected by
+    //     the L1 inbox.
+    //   - It is **exhaustive on `KernelInboxMessage` at compile time**
+    //     via `required_routing`.  When a future commit adds a new
+    //     variant (mirroring 2c45d9c, which added WOTS signatures that
+    //     silently grew `Configure*` past 4096 without any test
+    //     failing), the author is forced to classify the new variant
+    //     as `FitsL1` or `RequiresDal` — there is no `_ =>` arm to
+    //     hide behind.
+    //   - It is **two-sided**: a variant that shrinks below 4096 after
+    //     being classified `RequiresDal` also fails the test, flagging
+    //     a dead DAL path that should be either kept intentionally or
+    //     removed.
+    //
+    // When this test fails:
+    //   - The assertion message tells you which variant broke which
+    //     direction.  Either rebuild the representative instance to
+    //     match today's size, update the `required_routing`
+    //     classification, or prune the DAL routing for a variant that
+    //     no longer needs it.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Routing {
+        /// Framed size must stay `<= L1_INBOX_MESSAGE_LIMIT` — the
+        /// message is routed directly through the L1 rollup inbox.
+        FitsL1,
+        /// Framed size must stay `> L1_INBOX_MESSAGE_LIMIT` — the
+        /// message is chunked and routed via DAL, then referenced from
+        /// L1 via a `DalPointer`.  If a `RequiresDal` variant ever
+        /// shrinks to fit in L1, the DAL routing for it becomes dead
+        /// code and the classification needs to be reconsidered.
+        RequiresDal,
+    }
+
+    fn required_routing(message: &KernelInboxMessage) -> Routing {
+        // Exhaustive match on purpose: any new `KernelInboxMessage`
+        // variant MUST be classified here, forcing the author to
+        // decide whether it fits in L1 or needs DAL chunking.
+        match message {
+            KernelInboxMessage::ConfigureVerifier(_)
+            | KernelInboxMessage::ConfigureBridge(_) => Routing::RequiresDal,
+            KernelInboxMessage::Shield(_)
+            | KernelInboxMessage::Transfer(_)
+            | KernelInboxMessage::Unshield(_) => Routing::RequiresDal,
+            KernelInboxMessage::Withdraw(_) => Routing::FitsL1,
+            KernelInboxMessage::DalPointer(_) => Routing::FitsL1,
+        }
+    }
+
+    /// Frame overhead added by `ExternalMessageFrame::Targetted` on
+    /// top of the raw `encode_kernel_inbox_message` bytes when
+    /// `octez-client send smart rollup message` injects a payload.
+    ///
+    /// Layout:
+    ///   - 1 byte for the `Targetted` tag
+    ///   - 20 bytes for the `SmartRollupHash` (no length prefix on
+    ///     wire; the type is fixed-size)
+    ///
+    /// Verified empirically against the hex output of
+    /// `octez_kernel_message dal-pointer …` on a valid sr1 address.
+    /// Replicated here to avoid dragging
+    /// `tezos-smart-rollup-encoding` (which pins a different
+    /// `tezos_data_encoding` major than `core`'s direct dep) into
+    /// this crate's test deps.
+    const EXTERNAL_MESSAGE_FRAME_OVERHEAD: usize = 21;
+
+    /// Return the on-wire size the L1 inbox sees for this message,
+    /// i.e. `encode_kernel_inbox_message(...).len()` plus the fixed
+    /// `ExternalMessageFrame::Targetted` overhead.  This is the
+    /// value subject to `sc_rollup_message_size_limit = 4096`.
+    fn framed_len(message: &KernelInboxMessage) -> usize {
+        let payload = encode_kernel_inbox_message(message).expect("encode message");
+        payload.len() + EXTERNAL_MESSAGE_FRAME_OVERHEAD
+    }
+
+    /// A proof large enough to push Shield/Transfer/Unshield over the
+    /// L1 size limit once framed.  Production STARK proofs are
+    /// hundreds of kilobytes; 4096 bytes of filler is the cheapest
+    /// size that makes the RequiresDal classification hold
+    /// unambiguously while staying well below `MAX_PROOF_BYTES`.
+    fn oversize_kernel_stark_proof() -> KernelStarkProof {
+        KernelStarkProof {
+            proof_bytes: vec![0xaa; 4096],
+            output_preimage: vec![[7u8; 32]],
+            verify_meta: vec![1, 2, 3, 4],
+        }
+    }
+
+    #[test]
+    fn inbox_size_invariant_covers_all_variants() {
+        let ask = crate::hash(b"tzel-dev-rollup-config-admin");
+
+        let configure_verifier = KernelInboxMessage::ConfigureVerifier(
+            sign_kernel_verifier_config(
+                &ask,
+                KernelVerifierConfig {
+                    auth_domain: [0xAA; 32],
+                    verified_program_hashes: ProgramHashes {
+                        shield: [0xBB; 32],
+                        transfer: [0xCC; 32],
+                        unshield: [0xDD; 32],
+                    },
+                },
+            )
+            .expect("sign verifier"),
+        );
+        let configure_bridge = KernelInboxMessage::ConfigureBridge(
+            sign_kernel_bridge_config(
+                &ask,
+                KernelBridgeConfig {
+                    ticketer: "KT1Fq8fPi2NjhWUXtcXBggbL6zFjZctGkmso".to_string(),
+                },
+            )
+            .expect("sign bridge"),
+        );
+        let shield = KernelInboxMessage::Shield(KernelShieldReq {
+            sender: "alice".into(),
+            fee: 100,
+            v: 400,
+            producer_fee: 1,
+            address: sample_payment_address(),
+            memo: None,
+            proof: oversize_kernel_stark_proof(),
+            client_cm: ZERO,
+            client_enc: None,
+            producer_cm: [0; 32],
+            producer_enc: Some(sample_encrypted_note(0x42)),
+        });
+        let transfer = KernelInboxMessage::Transfer(KernelTransferReq {
+            root: [1; 32],
+            nullifiers: vec![[2; 32]],
+            fee: 100,
+            cm_1: [4; 32],
+            cm_2: [5; 32],
+            cm_3: [6; 32],
+            enc_1: sample_encrypted_note(0x11),
+            enc_2: sample_encrypted_note(0x22),
+            enc_3: sample_encrypted_note(0x33),
+            proof: oversize_kernel_stark_proof(),
+        });
+        let unshield = KernelInboxMessage::Unshield(KernelUnshieldReq {
+            root: [1; 32],
+            nullifiers: vec![[2; 32]],
+            v_pub: 100,
+            fee: 100,
+            recipient: "alice".into(),
+            cm_change: [3; 32],
+            enc_change: None,
+            cm_fee: [4; 32],
+            enc_fee: sample_encrypted_note(0x11),
+            proof: oversize_kernel_stark_proof(),
+        });
+        let withdraw = KernelInboxMessage::Withdraw(KernelWithdrawReq {
+            sender: "alice".into(),
+            recipient: "tz1target".into(),
+            amount: 42,
+        });
+        let dal_pointer = KernelInboxMessage::DalPointer(KernelDalPayloadPointer {
+            kind: KernelDalPayloadKind::Shield,
+            chunks: vec![KernelDalChunkPointer {
+                published_level: 100,
+                slot_index: 0,
+                payload_len: 4096,
+            }],
+            payload_len: 4096,
+            payload_hash: [0xA5; 32],
+        });
+
+        let cases: [(&str, &KernelInboxMessage); 7] = [
+            ("ConfigureVerifier", &configure_verifier),
+            ("ConfigureBridge", &configure_bridge),
+            ("Shield", &shield),
+            ("Transfer", &transfer),
+            ("Unshield", &unshield),
+            ("Withdraw", &withdraw),
+            ("DalPointer", &dal_pointer),
+        ];
+
+        for (name, message) in cases {
+            let expected = required_routing(message);
+            let size = framed_len(message);
+            match expected {
+                Routing::FitsL1 => assert!(
+                    size <= L1_INBOX_MESSAGE_LIMIT,
+                    "{}: classified FitsL1 but framed size {} > {}; either the \
+                     message grew past the L1 limit and needs a DAL route, or \
+                     the classification in `required_routing` is wrong",
+                    name,
+                    size,
+                    L1_INBOX_MESSAGE_LIMIT,
+                ),
+                Routing::RequiresDal => assert!(
+                    size > L1_INBOX_MESSAGE_LIMIT,
+                    "{}: classified RequiresDal but framed size {} <= {}; the \
+                     message now fits in L1, making the DAL routing for this \
+                     variant dead code — either downgrade to FitsL1 (and prune \
+                     the DAL plumbing) or grow the representative instance",
+                    name,
+                    size,
+                    L1_INBOX_MESSAGE_LIMIT,
+                ),
+            }
+        }
+    }
 }
