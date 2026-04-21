@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=tzel
 EnvironmentFile=/etc/tzel/shadownet.env
+EnvironmentFile=-/usr/local/etc/tzel/rollup-config-admin-build.env
 ExecStart=${TZEL_OPERATOR_BIN} \
   --listen=${TZEL_OPERATOR_LISTEN} \
   --source-alias=${TZEL_SOURCE_ALIAS} \

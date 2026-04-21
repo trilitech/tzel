@@ -28,7 +28,7 @@ by the rest of the DAL network. In practice that means:
   - standard prover deployment paths plus preflight for `reprove` and the Cairo executables
 - `../../scripts/install_tzel_binaries.sh`
   - installs `tzel-operator`, `tzel-wallet`, `tzel-detect`, `sp-client`, `octez_kernel_message`,
-    `verified_bridge_fixture_message`, `reprove`, and the Cairo executable JSON files
+    `verified_bridge_fixture_message`, `submit_rollup_config`, `reprove`, and the Cairo executable JSON files
   - installs `rollup-config-admin-{runtime,build}.env` and wraps `octez_kernel_message` so
     config messages stay usable after install
 - `../../scripts/shadownet_operator_preflight.sh`

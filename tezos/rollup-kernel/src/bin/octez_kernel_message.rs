@@ -15,7 +15,7 @@ use tzel_core::{
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  octez_kernel_message admin-material\n  octez_kernel_message configure-bridge <sr1...> <KT1...>\n  octez_kernel_message configure-verifier <sr1...> <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message dal-pointer <sr1...> <shield|transfer|unshield> <payload_hash_hex> <payload_len> (<published_level> <slot_index> <chunk_len>)+"
+        "usage:\n  octez_kernel_message admin-material\n  octez_kernel_message configure-bridge <sr1...> <KT1...>\n  octez_kernel_message configure-verifier <sr1...> <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message raw-configure-bridge <KT1...>\n  octez_kernel_message raw-configure-verifier <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message dal-pointer <sr1...> <configure-verifier|configure-bridge|shield|transfer|unshield> <payload_hash_hex> <payload_len> (<published_level> <slot_index> <chunk_len>)+"
     );
     std::process::exit(2);
 }
@@ -55,11 +55,49 @@ fn config_admin_ask() -> F {
 
 fn parse_dal_kind(kind: &str) -> KernelDalPayloadKind {
     match kind {
+        "configure-verifier" => KernelDalPayloadKind::ConfigureVerifier,
+        "configure-bridge" => KernelDalPayloadKind::ConfigureBridge,
         "shield" => KernelDalPayloadKind::Shield,
         "transfer" => KernelDalPayloadKind::Transfer,
         "unshield" => KernelDalPayloadKind::Unshield,
         _ => usage(),
     }
+}
+
+fn signed_bridge_message(ticketer: String) -> KernelInboxMessage {
+    let ask = config_admin_ask();
+    KernelInboxMessage::ConfigureBridge(
+        sign_kernel_bridge_config(&ask, KernelBridgeConfig { ticketer })
+            .expect("bridge config should sign"),
+    )
+}
+
+fn signed_verifier_message(
+    auth_domain: String,
+    shield: String,
+    transfer: String,
+    unshield: String,
+) -> KernelInboxMessage {
+    let ask = config_admin_ask();
+    KernelInboxMessage::ConfigureVerifier(
+        sign_kernel_verifier_config(
+            &ask,
+            KernelVerifierConfig {
+                auth_domain: parse_felt(&auth_domain),
+                verified_program_hashes: ProgramHashes {
+                    shield: parse_felt(&shield),
+                    transfer: parse_felt(&transfer),
+                    unshield: parse_felt(&unshield),
+                },
+            },
+        )
+        .expect("verifier config should sign"),
+    )
+}
+
+fn emit_raw_message(message: &KernelInboxMessage) {
+    let payload = encode_kernel_inbox_message(message).expect("kernel message should encode");
+    println!("{}", hex_encode(payload));
 }
 
 fn main() {
@@ -104,14 +142,7 @@ fn main() {
             if args.next().is_some() {
                 usage();
             }
-            let ask = config_admin_ask();
-            emit_targeted_message(
-                &rollup_address,
-                &KernelInboxMessage::ConfigureBridge(
-                    sign_kernel_bridge_config(&ask, KernelBridgeConfig { ticketer })
-                        .expect("bridge config should sign"),
-                ),
-            );
+            emit_targeted_message(&rollup_address, &signed_bridge_message(ticketer));
         }
         "configure-verifier" => {
             let Some(rollup_address) = args.next() else {
@@ -132,24 +163,42 @@ fn main() {
             if args.next().is_some() {
                 usage();
             }
-            let ask = config_admin_ask();
             emit_targeted_message(
                 &rollup_address,
-                &KernelInboxMessage::ConfigureVerifier(
-                    sign_kernel_verifier_config(
-                        &ask,
-                        KernelVerifierConfig {
-                            auth_domain: parse_felt(&auth_domain),
-                            verified_program_hashes: ProgramHashes {
-                                shield: parse_felt(&shield),
-                                transfer: parse_felt(&transfer),
-                                unshield: parse_felt(&unshield),
-                            },
-                        },
-                    )
-                    .expect("verifier config should sign"),
-                ),
+                &signed_verifier_message(auth_domain, shield, transfer, unshield),
             );
+        }
+        "raw-configure-bridge" => {
+            let Some(ticketer) = args.next() else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            emit_raw_message(&signed_bridge_message(ticketer));
+        }
+        "raw-configure-verifier" => {
+            let Some(auth_domain) = args.next() else {
+                usage();
+            };
+            let Some(shield) = args.next() else {
+                usage();
+            };
+            let Some(transfer) = args.next() else {
+                usage();
+            };
+            let Some(unshield) = args.next() else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            emit_raw_message(&signed_verifier_message(
+                auth_domain,
+                shield,
+                transfer,
+                unshield,
+            ));
         }
         "dal-pointer" => {
             let Some(rollup_address) = args.next() else {

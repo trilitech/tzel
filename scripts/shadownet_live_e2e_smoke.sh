@@ -97,6 +97,10 @@ extract_public_balance() {
   sed -n 's/^Public rollup balance (.*): //p' | tail -n1
 }
 
+extract_secret_deposit_balance() {
+  sed -n 's/^Secret-bound deposit balance: \([0-9][0-9]*\) across .*$/\1/p' | tail -n1
+}
+
 extract_private_available() {
   sed -n 's/^Private available: //p' | tail -n1
 }
@@ -155,6 +159,23 @@ wait_for_public_balance_equals() {
   return 1
 }
 
+wait_for_secret_deposit_balance_at_least() {
+  local wallet="$1"
+  local expected="$2"
+  local attempt output balance
+  for ((attempt = 1; attempt <= TZEL_SMOKE_MAX_POLLS; attempt++)); do
+    output="$(wallet_cmd "${wallet}" balance)"
+    printf '%s\n' "${output}"
+    balance="$(extract_secret_deposit_balance <<<"${output}")"
+    if [[ -n "${balance}" && "${balance}" =~ ^[0-9]+$ && "${balance}" -ge "${expected}" ]]; then
+      return 0
+    fi
+    sleep "${TZEL_SMOKE_POLL_SECS}"
+  done
+  echo "timed out waiting for secret-bound deposit balance >= ${expected}" >&2
+  return 1
+}
+
 wait_for_private_available_at_least() {
   local wallet="$1"
   local expected="$2"
@@ -205,8 +226,8 @@ wallet_cmd "${BOB_WALLET}" receive | tail -n +2 > "${BOB_ADDRESS_JSON}"
 wallet_cmd "${ALICE_WALLET}" check
 wallet_cmd "${BOB_WALLET}" check
 
-wallet_cmd "${ALICE_WALLET}" deposit --amount "${TZEL_SMOKE_DEPOSIT_AMOUNT}" --public-account alice
-wait_for_public_balance_at_least "${ALICE_WALLET}" "${TZEL_SMOKE_DEPOSIT_AMOUNT}"
+wallet_cmd "${ALICE_WALLET}" deposit --amount "${TZEL_SMOKE_DEPOSIT_AMOUNT}"
+wait_for_secret_deposit_balance_at_least "${ALICE_WALLET}" "${TZEL_SMOKE_DEPOSIT_AMOUNT}"
 
 shield_output="$(wallet_prove_cmd "${ALICE_WALLET}" shield --amount "${TZEL_SMOKE_SHIELD_AMOUNT}")"
 printf '%s\n' "${shield_output}"

@@ -4,13 +4,6 @@ shopt -s inherit_errexit
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-for cmd in octez-node octez-client octez-smart-rollup-node octez-dal-node smart-rollup-installer cargo curl python3 xxd rustup; do
-  command -v "${cmd}" >/dev/null 2>&1 || {
-    echo "missing required command: ${cmd}" >&2
-    exit 1
-  }
-done
-
 WORKDIR="${TZEL_OCTEZ_DAL_SANDBOX_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/tzel-octez-dal-sandbox.XXXXXX")}"
 PRESERVE="${TZEL_OCTEZ_SANDBOX_PRESERVE:-0}"
 RUST_TOOLCHAIN="${TZEL_ROLLUP_RUST_TOOLCHAIN:-stable}"
@@ -60,16 +53,6 @@ ALPHA_HASH="ProtoALphaALphaALphaALphaALphaALphaALphaALphaDdp3zK"
 ACTIVATOR_SK="unencrypted:edsk31vznjHSSpGExDMHYASz45VZqXN4DPxvsa4hAyY8dHM28cZzp6"
 ACTIVATOR_PK="edpkuSLWfVU1Vq7Jg9FucPyKmma6otcMHac9zG4oU1KMHSTBpJuGQ2"
 
-mkdir -p \
-  "${CLIENT_DIR}" \
-  "${NODE_DIR}" \
-  "${ROLLUP_DIR}" \
-  "${ROLLUP_PREIMAGES_DIR}" \
-  "${DAL_DIR}" \
-  "${DAL_CHUNKS_DIR}" \
-  "${OPERATOR_STATE_DIR}" \
-  "${LOG_DIR}"
-
 cleanup() {
   local code=$?
   if [[ -n "${ROLLUP_PID:-}" ]]; then
@@ -98,8 +81,26 @@ on_err() {
   return "${code}"
 }
 
-trap on_err ERR
-trap cleanup EXIT
+require_commands() {
+  for cmd in octez-node octez-client octez-smart-rollup-node octez-dal-node smart-rollup-installer cargo curl python3 xxd rustup; do
+    command -v "${cmd}" >/dev/null 2>&1 || {
+      echo "missing required command: ${cmd}" >&2
+      exit 1
+    }
+  done
+}
+
+prepare_workdir() {
+  mkdir -p \
+    "${CLIENT_DIR}" \
+    "${NODE_DIR}" \
+    "${ROLLUP_DIR}" \
+    "${ROLLUP_PREIMAGES_DIR}" \
+    "${DAL_DIR}" \
+    "${DAL_CHUNKS_DIR}" \
+    "${OPERATOR_STATE_DIR}" \
+    "${LOG_DIR}"
+}
 
 wait_for() {
   local description="$1"
@@ -161,31 +162,17 @@ build_alpha_sandbox_params() {
   pk4="$(mockup_public_key bootstrap4)"
   pk5="$(mockup_public_key bootstrap5)"
 
-  python3 - "${RAW_PARAMS}" "${BOOTSTRAP_ACCOUNTS}" "${PARAMS_FILE}" "${operator_pk}" "${DAL_ATTESTATION_LAG}" "${pk1}" "${pk2}" "${pk3}" "${pk4}" "${pk5}" <<'PY'
-import json, sys
-
-constants_path, accounts_path, out_path, operator_pk, attestation_lag, *bootstrap_pks = sys.argv[1:]
-with open(constants_path, "r", encoding="utf-8") as f:
-    data = json.load(f)
-with open(accounts_path, "r", encoding="utf-8") as f:
-    accounts = json.load(f)
-
-bootstrap_accounts = []
-for account, pk in zip(accounts, bootstrap_pks):
-    bootstrap_accounts.append([pk, account["amount"]])
-bootstrap_accounts.append([operator_pk, "3800000000000"])
-
-data["bootstrap_accounts"] = bootstrap_accounts
-data.pop("chain_id", None)
-data.pop("initial_timestamp", None)
-data["minimal_block_delay"] = "1"
-data["delay_increment_per_round"] = "1"
-data.setdefault("dal_parametric", {})["attestation_lag"] = int(attestation_lag)
-
-with open(out_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, sort_keys=True)
-    f.write("\n")
-PY
+  python3 "${ROOT}/scripts/build_alpha_sandbox_params.py" \
+    --raw-constants "${RAW_PARAMS}" \
+    --bootstrap-accounts "${BOOTSTRAP_ACCOUNTS}" \
+    --out "${PARAMS_FILE}" \
+    --operator-pk "${operator_pk}" \
+    --attestation-lag "${DAL_ATTESTATION_LAG}" \
+    --bootstrap-pk "${pk1}" \
+    --bootstrap-pk "${pk2}" \
+    --bootstrap-pk "${pk3}" \
+    --bootstrap-pk "${pk4}" \
+    --bootstrap-pk "${pk5}"
 }
 
 import_bootstrap_identities() {
@@ -284,9 +271,18 @@ print(data["auth_domain"])
 print(data["shield_program_hash"])
 print(data["transfer_program_hash"])
 print(data["unshield_program_hash"])
-print(data["shield_sender"])
+print(data["shield_deposit_id"])
 print(data["shield_amount"])
+print(data["shield_total_debit"])
+print(data["shield_tree_size_after"])
 ' <<<"${metadata_json}"
+}
+
+await_fixture_shield_postconditions() {
+  local balance_key="$1"
+  local expected_tree_size="$2"
+  await_rollup_u64 "${balance_key}" "0" "public balance drain after shield"
+  await_rollup_u64 "/tzel/v1/state/tree/size" "${expected_tree_size}" "shielded note insertion"
 }
 
 mutez_to_tez() {
@@ -361,29 +357,6 @@ start_rollup_node() {
     >"${ROLLUP_LOG}" 2>&1 &
   ROLLUP_PID=$!
   wait_for "smart rollup node rpc" 60 curl -fsS "${ROLLUP_ENDPOINT}/openapi"
-}
-
-send_configure_verifier_message() {
-  local rollup_address="$1"
-  local auth_domain="$2"
-  local shield_hash="$3"
-  local transfer_hash="$4"
-  local unshield_hash="$5"
-  local message_hex
-  message_hex="$("${ROOT}/target/debug/octez_kernel_message" configure-verifier "${rollup_address}" "${auth_domain}" "${shield_hash}" "${transfer_hash}" "${unshield_hash}")"
-  octez-client -d "${CLIENT_DIR}" -E "${NODE_ENDPOINT}" -p "${ALPHA_HASH}" -w none \
-    send smart rollup message "hex:[ \"${message_hex}\" ]" from operator >/dev/null
-  bake_block with-dal
-}
-
-send_configure_bridge_message() {
-  local rollup_address="$1"
-  local ticketer="$2"
-  local message_hex
-  message_hex="$("${ROOT}/target/debug/octez_kernel_message" configure-bridge "${rollup_address}" "${ticketer}")"
-  octez-client -d "${CLIENT_DIR}" -E "${NODE_ENDPOINT}" -p "${ALPHA_HASH}" -w none \
-    send smart rollup message "hex:[ \"${message_hex}\" ]" from operator >/dev/null
-  bake_block with-dal
 }
 
 read_rollup_u64() {
@@ -551,9 +524,10 @@ await_dal_attested() {
   return 1
 }
 
-publish_shield_via_dal_and_inject_pointer() {
+publish_payload_via_dal_and_inject_pointer() {
   local rollup_address="$1"
-  local payload_file="$2"
+  local kind="$2"
+  local payload_file="$3"
   local payload_len payload_hash number_of_slots slot_size
   payload_len="$(stat -c%s "${payload_file}")"
   payload_hash="$(payload_hash_hex "${payload_file}")"
@@ -582,13 +556,17 @@ print(data["commitment_proof"])
   done < "${DAL_CHUNKS_FILE}"
 
   local message_hex
-  message_hex="$("${ROOT}/target/debug/octez_kernel_message" dal-pointer "${rollup_address}" shield "${payload_hash}" "${payload_len}" "${pointer_args[@]}")"
+  message_hex="$("${ROOT}/target/debug/octez_kernel_message" dal-pointer "${rollup_address}" "${kind}" "${payload_hash}" "${payload_len}" "${pointer_args[@]}")"
   octez-client -d "${CLIENT_DIR}" -E "${NODE_ENDPOINT}" -p "${ALPHA_HASH}" -w none \
     send smart rollup message "hex:[ \"${message_hex}\" ]" from operator >/dev/null
   bake_block with-dal
 }
 
 main() {
+  require_commands
+  prepare_workdir
+  trap on_err ERR
+  trap cleanup EXIT
   prepare_client_material
   init_node
   start_node
@@ -612,35 +590,47 @@ main() {
   local fixture_fields
   fixture_fields="$(extract_fixture_fields "$(fixture_metadata)")"
   mapfile -t fixture_lines <<<"${fixture_fields}"
-  local auth_domain_hex shield_hash_hex transfer_hash_hex unshield_hash_hex shield_sender shield_amount
+  local auth_domain_hex shield_hash_hex transfer_hash_hex unshield_hash_hex shield_deposit_id shield_amount shield_total_debit shield_tree_size_after
   auth_domain_hex="${fixture_lines[0]}"
   shield_hash_hex="${fixture_lines[1]}"
   transfer_hash_hex="${fixture_lines[2]}"
   unshield_hash_hex="${fixture_lines[3]}"
-  shield_sender="${fixture_lines[4]}"
+  shield_deposit_id="${fixture_lines[4]}"
   shield_amount="${fixture_lines[5]}"
+  shield_total_debit="${fixture_lines[6]}"
+  shield_tree_size_after="${fixture_lines[7]}"
 
-  send_configure_verifier_message "${rollup_address}" "${auth_domain_hex}" "${shield_hash_hex}" "${transfer_hash_hex}" "${unshield_hash_hex}"
-  send_configure_bridge_message "${rollup_address}" "${ticketer_address}"
+  local verifier_payload_file bridge_payload_file
+  verifier_payload_file="${WORKDIR}/configure-verifier.bin"
+  bridge_payload_file="${WORKDIR}/configure-bridge.bin"
+  "${ROOT}/target/debug/octez_kernel_message" raw-configure-verifier \
+    "${auth_domain_hex}" "${shield_hash_hex}" "${transfer_hash_hex}" "${unshield_hash_hex}" \
+    | xxd -r -p > "${verifier_payload_file}"
+  "${ROOT}/target/debug/octez_kernel_message" raw-configure-bridge "${ticketer_address}" \
+    | xxd -r -p > "${bridge_payload_file}"
+  publish_payload_via_dal_and_inject_pointer "${rollup_address}" configure-verifier "${verifier_payload_file}"
+  publish_payload_via_dal_and_inject_pointer "${rollup_address}" configure-bridge "${bridge_payload_file}"
   await_bridge_ticketer "${ticketer_address}"
 
-  deposit_to_bridge "${ticketer_address}" "${rollup_address}" "${shield_sender}" "${shield_amount}"
+  deposit_to_bridge "${ticketer_address}" "${rollup_address}" "${shield_deposit_id}" "${shield_total_debit}"
 
   local balance_key
-  balance_key="/tzel/v1/state/balances/by-key/$(printf '%s' "${shield_sender}" | xxd -ps -c 0)"
-  await_rollup_u64 "${balance_key}" "${shield_amount}" "public bridge balance"
+  balance_key="/tzel/v1/state/balances/by-key/$(printf '%s' "${shield_deposit_id}" | xxd -ps -c 0)"
+  await_rollup_u64 "${balance_key}" "${shield_total_debit}" "public bridge balance"
 
   local shield_payload_file
   shield_payload_file="${WORKDIR}/shield-payload.bin"
   fixture_shield_raw_hex | xxd -r -p > "${shield_payload_file}"
-  publish_shield_via_dal_and_inject_pointer "${rollup_address}" "${shield_payload_file}"
+  publish_payload_via_dal_and_inject_pointer "${rollup_address}" shield "${shield_payload_file}"
 
   await_rollup_u64 "${balance_key}" "0" "public balance drain after shield"
-  await_rollup_u64 "/tzel/v1/state/tree/size" "1" "shielded note insertion"
+  await_fixture_shield_postconditions "${balance_key}" "${shield_tree_size_after}"
 
   echo "octez rollup sandbox DAL smoke passed"
   echo "rollup=${rollup_address}"
   echo "ticketer=${ticketer_address}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -37,8 +37,10 @@ mod with_verifier {
         unshield_program_hash: String,
         bridge_ticketer: &'a str,
         withdrawal_recipient: &'a str,
-        shield_sender: &'a str,
+        shield_deposit_id: String,
         shield_amount: u64,
+        shield_total_debit: u64,
+        shield_tree_size_after: u64,
     }
 
     fn usage() -> ! {
@@ -82,7 +84,7 @@ mod with_verifier {
 
     fn kernel_shield_req_from_fixture(req: &ShieldReq) -> KernelShieldReq {
         KernelShieldReq {
-            sender: req.sender.clone(),
+            deposit_id: req.deposit_id,
             v: req.v,
             fee: req.fee,
             producer_fee: req.producer_fee,
@@ -131,6 +133,21 @@ mod with_verifier {
         println!("{}", hex::encode(payload));
     }
 
+    fn fixture_metadata(fixture: &VerifiedBridgeFixture) -> FixtureMetadata<'_> {
+        FixtureMetadata {
+            auth_domain: felt_hex(&fixture.auth_domain),
+            shield_program_hash: felt_hex(&fixture.program_hashes.shield),
+            transfer_program_hash: felt_hex(&fixture.program_hashes.transfer),
+            unshield_program_hash: felt_hex(&fixture.program_hashes.unshield),
+            bridge_ticketer: &fixture.bridge_ticketer,
+            withdrawal_recipient: &fixture.withdrawal_recipient,
+            shield_deposit_id: tzel_core::deposit_balance_key(&fixture.shield.deposit_id),
+            shield_amount: fixture.shield.v,
+            shield_total_debit: fixture.shield.v + fixture.shield.fee + fixture.shield.producer_fee,
+            shield_tree_size_after: 2,
+        }
+    }
+
     pub fn main() {
         let mut args = env::args().skip(1);
         let Some(cmd) = args.next() else {
@@ -143,16 +160,7 @@ mod with_verifier {
 
         match cmd.as_str() {
             "metadata" => {
-                let metadata = FixtureMetadata {
-                    auth_domain: felt_hex(&fixture.auth_domain),
-                    shield_program_hash: felt_hex(&fixture.program_hashes.shield),
-                    transfer_program_hash: felt_hex(&fixture.program_hashes.transfer),
-                    unshield_program_hash: felt_hex(&fixture.program_hashes.unshield),
-                    bridge_ticketer: &fixture.bridge_ticketer,
-                    withdrawal_recipient: &fixture.withdrawal_recipient,
-                    shield_sender: &fixture.shield.sender,
-                    shield_amount: fixture.shield.v,
-                };
+                let metadata = fixture_metadata(&fixture);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&metadata)
@@ -175,6 +183,24 @@ mod with_verifier {
                 ));
             }
             _ => usage(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn metadata_reports_full_shield_requirements() {
+            let fixture = load_fixture(None);
+            let metadata = fixture_metadata(&fixture);
+
+            assert_eq!(metadata.shield_amount, fixture.shield.v);
+            assert_eq!(
+                metadata.shield_total_debit,
+                fixture.shield.v + fixture.shield.fee + fixture.shield.producer_fee
+            );
+            assert_eq!(metadata.shield_tree_size_after, 2);
         }
     }
 }

@@ -64,7 +64,7 @@ pub struct KernelStarkProof {
 
 #[derive(Debug, Clone)]
 pub struct KernelShieldReq {
-    pub sender: String,
+    pub deposit_id: F,
     pub fee: u64,
     pub v: u64,
     pub producer_fee: u64,
@@ -114,6 +114,8 @@ pub struct KernelWithdrawReq {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelDalPayloadKind {
+    ConfigureVerifier,
+    ConfigureBridge,
     Shield,
     Transfer,
     Unshield,
@@ -224,8 +226,7 @@ struct WireSignedKernelBridgeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireKernelShieldReq {
-    #[encoding(string = "MAX_ACCOUNT_ID_BYTES")]
-    sender: String,
+    deposit_id: WireFelt,
     fee: WireU64Le,
     v: WireU64Le,
     producer_fee: WireU64Le,
@@ -284,6 +285,10 @@ enum WireKernelDalPayloadKind {
     Transfer,
     #[encoding(tag = 2)]
     Unshield,
+    #[encoding(tag = 3)]
+    ConfigureVerifier,
+    #[encoding(tag = 4)]
+    ConfigureBridge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -582,7 +587,7 @@ pub fn kernel_proof_to_host(proof: &KernelStarkProof) -> Proof {
 
 pub fn kernel_shield_req_to_host(req: &KernelShieldReq) -> ShieldReq {
     ShieldReq {
-        sender: req.sender.clone(),
+        deposit_id: req.deposit_id,
         fee: req.fee,
         v: req.v,
         producer_fee: req.producer_fee,
@@ -698,6 +703,8 @@ fn signed_bridge_config_from_wire(
 
 fn kernel_dal_payload_kind_to_wire(kind: &KernelDalPayloadKind) -> WireKernelDalPayloadKind {
     match kind {
+        KernelDalPayloadKind::ConfigureVerifier => WireKernelDalPayloadKind::ConfigureVerifier,
+        KernelDalPayloadKind::ConfigureBridge => WireKernelDalPayloadKind::ConfigureBridge,
         KernelDalPayloadKind::Shield => WireKernelDalPayloadKind::Shield,
         KernelDalPayloadKind::Transfer => WireKernelDalPayloadKind::Transfer,
         KernelDalPayloadKind::Unshield => WireKernelDalPayloadKind::Unshield,
@@ -708,6 +715,8 @@ fn kernel_dal_payload_kind_from_wire(
     kind: WireKernelDalPayloadKind,
 ) -> Result<KernelDalPayloadKind, String> {
     Ok(match kind {
+        WireKernelDalPayloadKind::ConfigureVerifier => KernelDalPayloadKind::ConfigureVerifier,
+        WireKernelDalPayloadKind::ConfigureBridge => KernelDalPayloadKind::ConfigureBridge,
         WireKernelDalPayloadKind::Shield => KernelDalPayloadKind::Shield,
         WireKernelDalPayloadKind::Transfer => KernelDalPayloadKind::Transfer,
         WireKernelDalPayloadKind::Unshield => KernelDalPayloadKind::Unshield,
@@ -970,7 +979,7 @@ fn encoded_felt_list_from_wire(wire: WireEncodedFeltList) -> Result<Vec<F>, Stri
 
 fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldReq, String> {
     Ok(WireKernelShieldReq {
-        sender: req.sender.clone(),
+        deposit_id: felt_to_wire(&req.deposit_id),
         fee: u64_to_wire(req.fee),
         v: u64_to_wire(req.v),
         producer_fee: u64_to_wire(req.producer_fee),
@@ -994,7 +1003,7 @@ fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldRe
 
 fn kernel_shield_req_from_wire(wire: WireKernelShieldReq) -> Result<KernelShieldReq, String> {
     Ok(KernelShieldReq {
-        sender: wire.sender,
+        deposit_id: wire_to_felt(wire.deposit_id)?,
         fee: wire_to_u64(wire.fee)?,
         v: wire_to_u64(wire.v)?,
         producer_fee: wire_to_u64(wire.producer_fee)?,
@@ -1335,8 +1344,9 @@ mod tests {
 
     #[test]
     fn kernel_inbox_roundtrip_preserves_shield_request() {
+        let deposit_id = [0x42; 32];
         let message = KernelInboxMessage::Shield(KernelShieldReq {
-            sender: "alice".into(),
+            deposit_id,
             fee: 3,
             v: 42,
             producer_fee: 5,
@@ -1352,7 +1362,7 @@ mod tests {
         let decoded = decode_kernel_inbox_message(&encoded).unwrap();
         match decoded {
             KernelInboxMessage::Shield(req) => {
-                assert_eq!(req.sender, "alice");
+                assert_eq!(req.deposit_id, deposit_id);
                 assert_eq!(req.fee, 3);
                 assert_eq!(req.v, 42);
                 assert_eq!(req.producer_fee, 5);
@@ -1456,7 +1466,7 @@ mod tests {
             verify_meta: vec![0xf7, 0xc3, 0x0c, 0x6e, 0x48, 0xb5, 0x22, 0x26],
         };
         let message = KernelInboxMessage::Shield(KernelShieldReq {
-            sender: "alice".to_string(),
+            deposit_id: [0x42; 32],
             fee: 1,
             v: 7,
             producer_fee: 3,
@@ -1487,7 +1497,7 @@ mod tests {
             verify_meta: (0..32).map(|i| (0xf0u8).wrapping_add(i as u8)).collect(),
         };
         let message = KernelInboxMessage::Shield(KernelShieldReq {
-            sender: "alice".to_string(),
+            deposit_id: [0x42; 32],
             fee: 2,
             v: 7,
             producer_fee: 4,
@@ -1752,7 +1762,7 @@ mod tests {
     #[test]
     fn kernel_inbox_roundtrip_preserves_dal_pointer() {
         let message = KernelInboxMessage::DalPointer(KernelDalPayloadPointer {
-            kind: KernelDalPayloadKind::Transfer,
+            kind: KernelDalPayloadKind::ConfigureVerifier,
             chunks: vec![
                 KernelDalChunkPointer {
                     published_level: 101,
@@ -1773,7 +1783,7 @@ mod tests {
         let KernelInboxMessage::DalPointer(pointer) = decoded else {
             panic!("unexpected decoded message");
         };
-        assert_eq!(pointer.kind, KernelDalPayloadKind::Transfer);
+        assert_eq!(pointer.kind, KernelDalPayloadKind::ConfigureVerifier);
         assert_eq!(pointer.chunks.len(), 2);
         assert_eq!(pointer.chunks[0].published_level, 101);
         assert_eq!(pointer.chunks[0].slot_index, 3);
@@ -1825,7 +1835,7 @@ mod tests {
     proptest! {
         #[test]
         fn prop_kernel_shield_roundtrip_preserves_fields(
-            sender in small_string(32),
+            deposit_id in arb_felt(),
             memo in prop::option::of(small_string(64)),
             fee in any::<u64>(),
             v in any::<u64>(),
@@ -1838,7 +1848,7 @@ mod tests {
             producer_enc in arb_encrypted_note(),
         ) {
             let message = KernelInboxMessage::Shield(KernelShieldReq {
-                sender: sender.clone(),
+                deposit_id,
                 fee,
                 v,
                 producer_fee,
@@ -1856,7 +1866,7 @@ mod tests {
             let KernelInboxMessage::Shield(req) = decoded else {
                 panic!("decoded wrong kernel message variant");
             };
-            prop_assert_eq!(req.sender, sender);
+            prop_assert_eq!(req.deposit_id, deposit_id);
             prop_assert_eq!(req.fee, fee);
             prop_assert_eq!(req.v, v);
             prop_assert_eq!(req.producer_fee, producer_fee);
@@ -2106,7 +2116,7 @@ mod tests {
 
         #[test]
         fn prop_kernel_requests_to_host_preserve_fields(
-            sender in small_string(32),
+            deposit_id in arb_felt(),
             memo in prop::option::of(small_string(64)),
             recipient in small_string(32),
             root in arb_felt(),
@@ -2131,7 +2141,7 @@ mod tests {
             producer_enc in arb_encrypted_note(),
         ) {
             let shield = KernelShieldReq {
-                sender: sender.clone(),
+                deposit_id,
                 fee,
                 v: value,
                 producer_fee,
@@ -2144,7 +2154,7 @@ mod tests {
                 producer_enc: Some(producer_enc.clone()),
             };
             let shield_host = kernel_shield_req_to_host(&shield);
-            prop_assert_eq!(shield_host.sender, sender);
+            prop_assert_eq!(shield_host.deposit_id, deposit_id);
             prop_assert_eq!(shield_host.fee, fee);
             prop_assert_eq!(shield_host.v, value);
             prop_assert_eq!(shield_host.producer_fee, producer_fee);

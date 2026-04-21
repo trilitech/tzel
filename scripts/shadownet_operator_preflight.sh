@@ -64,6 +64,17 @@ check_cmd "octez-dal-node" "$TZEL_DAL_NODE_BIN"
 check_cmd "octez-smart-rollup-node" "$TZEL_ROLLUP_NODE_BIN"
 check_cmd "tzel-operator" "$TZEL_OPERATOR_BIN"
 
+CONFIG_ADMIN_BUILD_ENV_FILE="/usr/local/etc/tzel/rollup-config-admin-build.env"
+if [[ ! -f "$CONFIG_ADMIN_BUILD_ENV_FILE" ]]; then
+  echo "missing rollup config admin build env: $CONFIG_ADMIN_BUILD_ENV_FILE" >&2
+  exit 1
+fi
+if [[ ! -r "$CONFIG_ADMIN_BUILD_ENV_FILE" ]]; then
+  echo "rollup config admin build env is not readable: $CONFIG_ADMIN_BUILD_ENV_FILE" >&2
+  exit 1
+fi
+echo "ok: rollup config admin build env -> $CONFIG_ADMIN_BUILD_ENV_FILE"
+
 if [[ ! -f "$TZEL_OPERATOR_BEARER_TOKEN_FILE" ]]; then
   echo "missing operator bearer token file: $TZEL_OPERATOR_BEARER_TOKEN_FILE" >&2
   exit 1

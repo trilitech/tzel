@@ -1,0 +1,619 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!45!black,
+  urlcolor=blue!45!black,
+  citecolor=blue!45!black
+}
+
+\newcommand{\TzEL}{TzEL}
+\newcommand{\tez}{\ensuremath{\mathrm{\text{ꜩ}}}}
+\newcommand{\mutez}{\ensuremath{\mu\tez}}
+\newcommand{\Hash}{\mathsf{H}}
+\newcommand{\cm}{\mathsf{cm}}
+\newcommand{\nf}{\mathsf{nf}}
+\newcommand{\rcm}{\mathsf{rcm}}
+
+\title{\TzEL: A Lite Whitepaper\\
+\large Post-Quantum Private Transactions on Tezos Smart Rollups}
+\author{TzEL contributors}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\TzEL{} is a shielded-payment protocol for Tezos smart rollups. It keeps the
+standard private-UTXO architecture of notes, commitments, nullifiers, and
+historical Merkle roots, but instantiates the privacy path without primitives
+that large-scale quantum computers are expected to break. Notes are encrypted
+with ML-KEM-based memo keys; spends are authorized with one-time hash-based
+signatures verified inside the zero-knowledge proof; and proofs are recursive
+STARKs. The design target is a shielded-payment rollup whose archived note
+ciphertexts and spend authorizations do not depend on discrete-log hardness.
+\end{abstract}
+
+\section{Scope}
+
+This is a compact design paper. The normative protocol specification, exact
+encodings, constants, hash personalizations, and test vectors are in
+\texttt{specs/spec.md}. Security notes and caveats are in
+\texttt{specs/security.md}.
+
+\section{Motivation}
+
+Privacy-preserving payment systems on blockchains publish ciphertexts as part
+of transaction data. Those ciphertexts can be archived indefinitely. If the
+encryption protecting them is later broken, old note payloads and memos can be
+decrypted retroactively. This is the private-payment form of
+harvest-now-decrypt-later.
+
+Hiding values today is therefore not enough when the ciphertexts are protected
+by assumptions that large-scale quantum computers are expected to break.
+\TzEL{} asks whether the shielded-payment model can be instantiated end to end
+with components chosen for that threat model, while still fitting the execution
+and data costs of a Tezos rollup.
+
+\section{Protocol at a Glance}
+
+\TzEL{} is an append-only private UTXO system. The rollup maintains:
+
+\begin{itemize}
+  \item a commitment tree of note commitments;
+  \item a set of spent nullifiers;
+  \item a set of historical Merkle roots used as spend anchors;
+  \item public bridge balances and bridge configuration;
+  \item verifier configuration and fee-policy state.
+\end{itemize}
+
+There are three private transaction families:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Transaction & Inputs & Outputs \\
+\midrule
+Shield & public balance & user note, DAL-producer note \\
+Transfer & 1--7 private notes & recipient note, change note, DAL-producer note \\
+Unshield & 1--7 private notes & public credit, optional change note, DAL-producer note \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Every shield, transfer, and unshield pays two separate resource prices. The
+first is a burned rollup fee, used to price rollup execution congestion. The
+second is a private DAL-producer fee note, used to pay the party publishing the
+large payload into DAL.
+
+\section{Cryptographic Profile}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Role & Instantiation & Purpose \\
+\midrule
+Commitments & BLAKE2s-derived field hashes & Bind value, address, and owner tag \\
+Nullifiers & BLAKE2s-derived field hashes & Prevent double spends \\
+Memo encryption & ML-KEM-768 + ChaCha20-Poly1305 & Encrypt note payloads and memos \\
+Detection & ML-KEM-768 clue + short tag & Watch-only candidate filtering \\
+Spend authorization & WOTS-style hash signatures & One-time authorization per spent note \\
+Zero knowledge & Cairo AIR + recursive STARK & Prove spend validity and authorization \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The protocol does not claim that commitments, nullifiers, or Merkle trees are
+new. They are the standard shielded-UTXO skeleton. The important substitution is
+that the encryption, authorization, and proof systems are chosen to avoid
+assumptions, such as discrete logarithms, that large-scale quantum computers
+are expected to break.
+
+\paragraph{Why these primitives.}
+The cryptographic choices follow from the public permanence of shielded-payment
+data. Memo encryption must remain private even if ciphertexts are archived for
+many years, hence ML-KEM is used for the key encapsulation layer. Spend
+authorization must not rely on reusable signatures that are vulnerable to
+quantum discrete-log attacks, hence one-time hash signatures are used and
+consumed through an authorization tree. The proof system must verify private
+state transitions without introducing a pairing-based verification assumption,
+hence recursive STARKs are used for the proof path. Hash functions then provide
+the common substrate for commitments, nullifiers, Merkle nodes, address binding,
+and one-time-signature chains.
+
+\section{Keys, Capabilities, and Addresses}
+
+The wallet derives independent spending and incoming branches from a master
+secret. The spending branch contains nullifier and authorization material. The
+incoming branch contains diversifier, viewing, and detection material.
+
+\[
+\begin{aligned}
+spend\_seed &= \Hash(\mathrm{TAG\_SPEND}, master\_sk) \\
+incoming\_seed &= \Hash(\mathrm{TAG\_INCOMING}, master\_sk)
+\end{aligned}
+\]
+
+This split is deliberate. A user may want to delegate scanning without
+delegating spending. They may also want to detect likely incoming notes without
+letting the scanning service read memo contents. Separating the branches makes
+those reduced-capability exports possible.
+
+For address index \(j\), the wallet derives:
+
+\begin{itemize}
+  \item \(d_j\), the address diversifier;
+  \item \(nk\_spend_j\), the per-address nullifier secret;
+  \item \(nk\_tag_j = \Hash_{\mathrm{nktg}}(nk\_spend_j)\), the public
+        nullifier binding tag;
+  \item \(auth\_root_j, pub\_seed_j\), the public authorization-tree key;
+  \item ML-KEM viewing and detection keypairs.
+\end{itemize}
+
+The address diversifier \(d_j\) lets one wallet derive many unlinkable receiving
+addresses. The per-address nullifier secret \(nk\_spend_j\) prevents a single
+global nullifier key from being exposed to a prover. The public \(nk\_tag_j\)
+lets the sender bind a note to the correct nullifier derivation without learning
+the nullifier secret. The authorization root and public seed identify the
+address's one-time spend-authority tree. The two ML-KEM keys separate note
+viewing from cheap note detection.
+
+Viewing and detection keys are derived deterministically from the incoming
+branch and the address index. This makes wallet recovery and watch-only export
+well defined: the same master material and index reproduce the same ML-KEM
+keypairs, while different address indices produce independent receiving
+addresses.
+
+A payment address is:
+
+\[
+address_j =
+(d_j, auth\_root_j, pub\_seed_j, nk\_tag_j, ek^v_j, ek^d_j)
+\]
+
+The capability hierarchy is:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Capability & What it can do \\
+\midrule
+Detection & Flag likely incoming notes with false positives \\
+Incoming view & Decrypt incoming memos and recover received notes \\
+Full view & Track spent/unspent status for known address metadata \\
+Spend & Authorize transactions with nullifier and auth material \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Incoming viewing alone does not reconstruct the authorization root or nullifier
+binding metadata for arbitrary historical addresses. A wallet accepts a note
+only after matching local address metadata and recomputing the note commitment.
+
+\paragraph{Detection keys.}
+The detection key exists for scalability. A wallet or detection service should
+not have to try full memo decryption against every published note, and a
+watch-only service should not need the memo viewing key. The sender therefore
+creates a detection ciphertext and a short tag under \(ek^d_j\). A detector
+holding the corresponding detection secret can cheaply test whether a note is a
+candidate. The result is intentionally fuzzy: true notes are detected, unrelated
+notes may false-positive, and malicious senders can omit or corrupt the clue.
+Detection narrows the scan set; it is not note acceptance.
+
+\paragraph{Viewing keys.}
+The viewing key decrypts the note payload \(v \parallel rseed \parallel memo\).
+It is separated from detection because reading memos is a strictly stronger
+capability than flagging candidate notes. After decryption, the wallet still
+recomputes the commitment using local address metadata; decryption alone is not
+enough to accept funds.
+
+\section{Notes and Owner Binding}
+
+A note commitment binds the recipient address, value, note randomness, and a
+fused owner tag. For note value \(v\), note seed \(rseed\), and address
+metadata \((d_j, auth\_root_j, pub\_seed_j, nk\_tag_j)\):
+
+\[
+  \rcm = \Hash(\Hash(\mathrm{TAG\_RCM}), rseed)
+\]
+
+\[
+  owner\_tag_j =
+  \Hash_{\mathrm{owner}}(auth\_root_j, pub\_seed_j, nk\_tag_j)
+\]
+
+\[
+  \cm =
+  \Hash_{\mathrm{commit}}(d_j, v, \rcm, owner\_tag_j)
+\]
+
+The owner tag is important. Without it, an attacker could try to spend a
+commitment under unrelated nullifier material. The chain
+
+\[
+nk\_spend_j \rightarrow nk\_tag_j \rightarrow owner\_tag_j \rightarrow \cm
+\]
+
+forces the commitment to be consistent with the nullifier key material that is
+later used in the spend proof.
+
+This also explains why the payment address includes both authorization material
+and nullifier-binding material. A sender needs enough public information to
+construct a note that the recipient can later spend, but not enough information
+to compute the recipient's nullifiers or spend authorizations.
+
+\section{Position-Dependent Nullifiers}
+
+The nullifier includes both the commitment and the leaf position:
+
+\[
+  \nf =
+  \Hash_{\mathrm{nf}}(nk\_spend_j,
+    \Hash_{\mathrm{nf}}(\cm, pos))
+\]
+
+This prevents two identical commitments inserted at different leaves from
+collapsing to one nullifier. The circuit proves the nullifier computation and
+Merkle membership of the commitment at \(pos\). The rollup then checks that the
+nullifier has not appeared before and inserts it into the global nullifier set.
+
+\section{One-Time Spend Authorization}
+
+Each address owns an XMSS-style tree of one-time WOTS public keys. The default
+authorization depth is 16, giving \(2^{16}\) one-time keys per address. A spend
+uses exactly one unused key index.
+
+The WOTS parameters are:
+
+\begin{itemize}
+  \item base \(w = 4\);
+  \item 133 chains: 128 message digits and 5 checksum digits;
+  \item chain length \(w - 1 = 3\).
+\end{itemize}
+
+The wallet signs a transaction sighash with the one-time secret key. Inside the
+STARK, the circuit:
+
+\begin{enumerate}
+  \item recomputes the transaction sighash from public outputs;
+  \item decomposes it into base-4 WOTS digits;
+  \item hashes each signature chain forward to recover the WOTS public key;
+  \item compresses the recovered public key with the address L-tree;
+  \item proves membership of that leaf under \(auth\_root_j\).
+\end{enumerate}
+
+No authorization leaf, public key, or signature is published. The STARK proof is
+the public evidence that the spend was authorized.
+
+\paragraph{Why hide the authorization leaf.}
+Publishing the one-time public key or auth-tree leaf would create an additional
+public handle for linking spends to address material. Instead, the proof shows
+that a valid one-time key exists under the private note owner's authorization
+root, while the public outputs reveal only the nullifiers and commitments needed
+by the rollup.
+
+\paragraph{Why one-time signatures.}
+WOTS-style signatures are hash-based and simple to verify in a STARK, but they
+are one-time. Reusing a key leaks chain preimages that can enable forgery. This
+is why the wallet must advance and persist the next authorization index before
+submission, and why address rotation is required before the finite auth tree is
+exhausted.
+
+\section{Delegated Proving}
+
+The prover is not trusted to choose transaction effects. The wallet constructs
+the outputs, computes the sighash, signs it with the relevant one-time keys,
+and gives the prover only the witness needed to prove the statement. Because
+the WOTS verification happens inside the circuit over the public outputs, a
+prover cannot change recipients, nullifiers, commitments, fees, withdrawal
+targets, or memo hashes without invalidating the proof.
+
+The public statement intentionally contains only what the rollup needs:
+historical root, nullifiers, fees, output commitments, public account binding
+fields, and memo hashes. Spend authorization material remains private witness.
+
+\section{Sighash and Replay Binding}
+
+For transfer and unshield, the one-time signature is over a circuit-specific
+sighash derived from the public outputs. The circuit recomputes this sighash
+internally before checking the WOTS signature. The sighash includes:
+
+\begin{itemize}
+  \item a transaction-type tag;
+  \item the deployment authorization domain;
+  \item the input root;
+  \item all nullifiers;
+  \item public values such as fee, public withdrawal amount, and recipient id;
+  \item output commitments and memo hashes.
+\end{itemize}
+
+The transaction-type tag prevents a signature for one circuit from being reused
+in another circuit. The authorization domain separates deployments, forks, and
+verifier migrations that might otherwise share a root history. Including
+commitments, public account identifiers, fees, and memo hashes prevents an
+untrusted prover or relayer from changing the transaction effects after the
+wallet authorizes them.
+
+There is no separate public signature verification step for private spends.
+The proof itself is the authorization check.
+
+\section{Transaction Statements}
+
+\subsection{Shield}
+
+Shield moves public balance into two private notes: the user's note and the
+DAL-producer fee note. The public outputs are:
+
+\[
+[v_{pub}, fee, producer\_fee, \cm_{user}, \cm_{producer},
+sender\_id, mh_{user}, mh_{producer}]
+\]
+
+The circuit proves both commitments and enforces \(producer\_fee > 0\). The
+rollup checks sender binding, memo hashes, proof validity, and the current
+required burned fee. The sender is debited by:
+
+\[
+v_{pub} + fee + producer\_fee
+\]
+
+Shield has no private input note, so it does not need a Merkle path, nullifier,
+or WOTS spend authorization. Instead, it must bind the proved public
+\(sender\_id\) to the submitted public account. In the reference environment,
+the account string is hashed into a felt. A production verifier environment
+would replace that demo binding with a chain-native account serialization and
+check.
+
+\subsection{Transfer}
+
+Transfer consumes \(N\) private notes, where \(1 \leq N \leq 7\), and creates
+recipient, change, and producer-fee notes. The public outputs are:
+
+\[
+[auth\_domain, root, \nf_0,\ldots,\nf_{N-1}, fee,
+\cm_1, \cm_2, \cm_3, mh_1, mh_2, mh_3]
+\]
+
+The circuit proves input note commitments, Merkle paths, nullifiers, WOTS
+authorization, output commitments, pairwise nullifier distinctness, and:
+
+\[
+\sum_{i=0}^{N-1} v_i = v_1 + v_2 + v_3 + fee
+\]
+
+where \(v_3\) is the DAL-producer fee note and must be positive.
+
+All input nullifiers are constrained pairwise distinct inside the circuit. The
+rollup additionally checks them against the global nullifier set. All values are
+range-checked as 64-bit quantities and arithmetic is performed with enough
+width to avoid wraparound.
+
+The input count \(N\) is not private. It is visible from the number of
+nullifiers in the public output list.
+
+\subsection{Unshield}
+
+Unshield consumes \(N\) private notes, releases public value, and creates a
+producer-fee note plus optional private change. The public outputs are:
+
+\[
+[auth\_domain, root, \nf_0,\ldots,\nf_{N-1}, v_{pub}, fee,
+recipient\_id, \cm_{change}, mh_{change}, \cm_{fee}, mh_{fee}]
+\]
+
+The circuit proves the same spend authorization and input validity as transfer,
+then enforces:
+
+\[
+\sum_{i=0}^{N-1} v_i =
+v_{pub} + v_{change} + v_{producer} + fee
+\]
+
+If there is no change output, the change commitment, change memo hash, and
+change witness data are constrained to zero.
+
+Constraining the unused change witness prevents prover malleability: a prover
+cannot hide nonzero private change data behind a zero public commitment.
+
+\section{Fees}
+
+The burned fee is a rollup-level congestion price. It is deducted from consumed
+value and recreated nowhere. The current fee policy has a floor of
+\(100000\) \mutez{}; the first two accepted private transactions at an inbox
+level pay the floor, and each additional accepted private transaction at that
+same level doubles the required fee up to a cap. When the inbox level advances,
+the counter resets.
+
+The DAL-producer fee is separate. It is represented as an ordinary shielded
+output note. A DAL publisher can choose whether to include a payload based on
+whether it can detect and decrypt a producer-fee note paying its configured
+address. This is not a consensus rule; it is an operator admission policy.
+
+\paragraph{Why the two fees are separate.}
+The burned fee and producer fee price different resources. The burned fee
+protects rollup nodes from an execution backlog; no party receives it. The
+producer fee pays for scarce DAL publication capacity; it must be recoverable by
+the publisher and therefore appears as an ordinary private note output. Keeping
+the producer fee as a normal output avoids adding special recipient semantics to
+consensus.
+
+\section{Encrypted Notes, Memos, and Detection}
+
+Each output note carries:
+
+\begin{itemize}
+  \item the commitment \(\cm\);
+  \item an ML-KEM detection ciphertext \(ct_d\);
+  \item a short detection tag;
+  \item an ML-KEM viewing ciphertext \(ct_v\);
+  \item a derived AEAD nonce;
+  \item encrypted note plaintext \(v \parallel rseed \parallel memo\).
+\end{itemize}
+
+The encrypted plaintext includes a fixed-size user memo. The memo can carry
+payment references, return addresses, human-readable text, or application data.
+It is padded so the ciphertext does not reveal the memo length.
+
+Detection lets a watch-only service test whether a note is probably relevant
+without decrypting the memo. It is only a candidate filter: false positives are
+expected, and malicious senders can make detection fail. The wallet accepts a
+note only by decrypting it, recomputing the commitment from local address
+metadata, and checking equality with the posted commitment.
+
+The circuit does not decrypt memos. Instead, the wallet hashes the posted note
+data and includes the resulting memo hash in the public outputs. The rollup
+recomputes the hash over posted note data, preventing a relayer from swapping or
+stripping ciphertext fields after the proof is produced.
+
+\paragraph{Why ciphertext correctness is outside the circuit.}
+The proof binds commitments and memo hashes, but it does not prove that the
+viewing ciphertext decrypts to the same \((v, rseed, memo)\) used in the
+commitment. That check belongs to the recipient wallet. This keeps the circuit
+focused on consensus-critical spend validity while still giving wallets a clear
+acceptance rule: decrypt, recompute the commitment from local address metadata,
+and reject if it does not match.
+
+\section{Consensus Checks Outside the STARK}
+
+The STARK proves private consistency. The rollup still enforces public
+consensus rules:
+
+\begin{itemize}
+  \item the proof verifies under the expected program hash;
+  \item \(auth\_domain\) matches the configured deployment domain;
+  \item the input root is a known historical root;
+  \item nullifiers are globally fresh;
+  \item output commitments match posted note data;
+  \item memo hashes match posted note ciphertexts;
+  \item shield sender and unshield recipient identifiers match submitted
+        public account data;
+  \item the burned fee meets the current rollup fee policy;
+  \item appending all output commitments succeeds atomically.
+\end{itemize}
+
+These checks are part of the protocol. For example, accepting a proof without
+checking the historical root would allow spends against fake local trees, and
+accepting memo data without checking the memo hash would allow relayers to
+mutate note ciphertexts.
+
+\paragraph{Root validation.}
+The root in a spend proof must be one of the rollup's historical roots. Without
+this check, an attacker could prove a spend against a private tree that contains
+self-created notes.
+
+\paragraph{Executable binding.}
+The verifier environment must know which circuit was proved. A proof that some
+Cairo task ran is insufficient; the rollup checks that the proved executable
+hash matches the configured shield, transfer, or unshield program hash.
+
+\paragraph{Public account identifiers.}
+Shield and unshield cross the private/public boundary, so the proof includes a
+public account identifier. The reference implementation hashes UTF-8 account
+strings into field elements. That is a testing and deployment convention, not a
+universal account model; any deployment using chain-native addresses must define
+the exact byte encoding.
+
+\paragraph{Tree append ordering and atomicity.}
+Output commitments are appended in order, and the new root is recorded after the
+transaction. Multi-output transactions must preflight capacity so a failed append
+cannot leave the tree, nullifier set, or public balances partially updated.
+
+\section{Rollup and DAL Path}
+
+Recursive proof payloads are roughly 300 KB, so they are routed through DAL.
+The operator publishes large payload chunks to DAL and injects a small rollup
+inbox pointer on L1. The kernel resolves the pointer, decodes the payload, and
+applies the same state transition as direct messages.
+
+Rollup configuration messages can also exceed the direct L1 inbox limit. The
+configuration path therefore uses the same DAL pointer mechanism, but with an
+extra operator-side validation step: verifier and bridge configuration payloads
+are authenticated before publication because they are privileged admin actions.
+
+\section{Wire Formats and Interoperability}
+
+The protocol uses canonical binary encodings based on Tezos Data Encoding for
+core objects such as payment addresses, encrypted notes, published notes, and
+note-feed items. JSON exposed by the reference command-line tools is a
+convenience transport, not the normative wire format.
+
+All field elements are 32-byte little-endian felt252 values. Hash outputs are
+BLAKE2s-256 truncated into the felt252 range. Hash roles are separated by
+personalization strings or explicit domain-tag constants, as specified in the
+normative spec.
+
+\paragraph{Merkle tree structure.}
+The commitment and authorization trees are left-right binary Merkle trees.
+Leaves are raw field elements, internal nodes are domain-separated BLAKE2s
+hashes, and zero nodes are derived recursively. Commitment positions and
+authorization key indices are range-checked so that an out-of-range index cannot
+alias a valid path.
+
+\paragraph{Domain separation.}
+The same hash family is used for many roles: commitments, nullifiers, Merkle
+nodes, owner tags, WOTS chains, sighashes, memo hashes, and key derivation.
+Domain separation is therefore not cosmetic. It prevents an output from one
+role from being reused as a meaningful input in another role.
+
+\section{Transaction Size}
+
+Each encrypted output note is roughly 3.2 KB. The recursive proof dominates
+transaction size at roughly 295 KB. Typical payloads are therefore:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Transaction & Note data & Approximate total \\
+\midrule
+Shield & 2 output notes & about 302 KB \\
+Transfer & 3 output notes & about 305 KB plus nullifiers \\
+Unshield & 1--2 output notes & about 299--303 KB plus nullifiers \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+These sizes are why the DAL path is part of the architecture. Direct L1 inbox
+messages remain useful for small pointers and selected small messages, but not
+for full recursive proof payloads.
+
+\section{Known Leakage and Limitations}
+
+\begin{itemize}
+  \item The number of nullifiers reveals the number of inputs.
+  \item Transaction type, ordering, and timing are public.
+  \item Detection is honest-sender and only a filtering mechanism.
+  \item There is no outgoing viewing key in the current protocol.
+  \item Delegated provers receive per-address witness material and can learn
+        spent-state information for that address.
+  \item Reusing a WOTS one-time key compromises spend authority.
+  \item Wallet backup and multi-device state management are security-critical
+        because they protect one-time key freshness.
+\end{itemize}
+
+\section{Performance Snapshot}
+
+The recursive proof payloads in the reference stack are around 300 KB, with
+verification around tens of milliseconds in the current benchmark environment.
+Proof generation is heavier, measured in tens of seconds for the benchmark
+cases, with peak memory in the tens of GB for large-input transactions. These
+numbers are implementation measurements, not protocol limits, but they explain
+why the Tezos DAL is part of the system design rather than an afterthought.
+
+\section{Conclusion}
+
+\TzEL{} is a post-quantum instantiation of a shielded-payment rollup.
+It keeps the private-UTXO model that has proven useful in earlier systems, but
+changes the cryptographic substrate: ML-KEM for note encryption, hash-based
+one-time signatures for spend authorization, hash-based commitments and
+nullifiers, and recursive STARKs for zero knowledge. The result is an
+end-to-end Tezos rollup architecture for private payments whose archived note
+ciphertexts and spend authorizations do not rely on discrete-log hardness.
+
+\end{document}

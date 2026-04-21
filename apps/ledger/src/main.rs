@@ -86,8 +86,8 @@ async fn shield_handler(
     let mut ledger = st.ledger.lock().unwrap();
     let resp = ledger.shield(&req).map_err(err)?;
     eprintln!(
-        "[shield] {} deposited {} -> cm={} idx={}",
-        req.sender,
+        "[shield] deposit {} shielded {} -> cm={} idx={}",
+        deposit_balance_key(&req.deposit_id),
         req.v,
         short(&resp.cm),
         resp.index
@@ -202,6 +202,7 @@ async fn config_handler(State(st): State<AppState>) -> Json<ConfigResp> {
     let ledger = st.ledger.lock().unwrap();
     Json(ConfigResp {
         auth_domain: ledger.auth_domain,
+        required_tx_fee: MIN_TX_FEE,
     })
 }
 
@@ -376,6 +377,7 @@ mod tests {
 
         let Json(config) = config_handler(State(st.clone())).await;
         assert_eq!(config.auth_domain, auth_domain);
+        assert_eq!(config.required_tx_fee, MIN_TX_FEE);
 
         let Json(tree) = tree_handler(State(st.clone())).await;
         assert_eq!(tree.size, 2);
@@ -480,7 +482,7 @@ mod tests {
         let err = shield_handler(
             State(st),
             Json(ShieldReq {
-                sender: "alice".into(),
+                deposit_id: deposit_id_from_label("alice"),
                 v: 5,
                 fee: MIN_TX_FEE,
                 producer_fee: 1,

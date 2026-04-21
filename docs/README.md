@@ -6,17 +6,34 @@ This directory is the entry point for the project documentation.
 
 - [../README.md](../README.md)
   - project overview, local quick start, workspace layout
+  - also explains the split between the local developer wallet stack
+    (`sp-client` + `sp-ledger`) and the rollup wallet stack (`tzel-wallet`)
 - [../specs/spec.md](../specs/spec.md)
   - protocol definition
 - [../specs/security.md](../specs/security.md)
   - security notes and known limitations
+- [tzel_lite_whitepaper.tex](./tzel_lite_whitepaper.tex)
+  - lite whitepaper for readers who want the motivation, architecture, and
+    security model without the full normative encoding spec
 
 ## Tutorials And Guides
 
 - [shadownet_tutorial.md](./shadownet_tutorial.md)
-  - step-by-step Shadownet `deposit -> shield -> send` tutorial with the current burned `100000` mutez rollup fee plus a private DAL-producer fee note
+  - step-by-step `tzel-wallet` tutorial for Shadownet `deposit -> shield -> send`
+    with the current burned `100000` mutez rollup fee plus a private
+    DAL-producer fee note
 - [wallet_detection_service.md](./wallet_detection_service.md)
-  - watch-only wallet flow and `tzel-detect`
+  - watch-only `tzel-wallet` flow and `tzel-detect`
+
+## Wallets
+
+- `sp-client`
+  - local developer/test wallet that talks to `sp-ledger`
+- `tzel-wallet`
+  - rollup-backed wallet that talks to the rollup node, optional operator, and
+    L1 tooling
+- `tzel-detect`
+  - watch-only service built on the same rollup-backed wallet model
 
 ## Deployment Docs
 

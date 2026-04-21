@@ -189,6 +189,7 @@ fi
 install -m 0755 "$ROOT_DIR/target/release/octez_kernel_message" "$BIN_DIR/octez_kernel_message.bin"
 install -m 0755 "$ROOT_DIR/target/release/verified_bridge_fixture_message" "$BIN_DIR/verified_bridge_fixture_message"
 install -m 0755 "$ROOT_DIR/apps/prover/target/release/reprove" "$BIN_DIR/reprove"
+install -m 0755 "$ROOT_DIR/scripts/submit_rollup_config.sh" "$BIN_DIR/submit_rollup_config"
 install -o "$CONFIG_ADMIN_OWNER" -g "$CONFIG_ADMIN_GROUP" -m 0600 \
   "$CONFIG_ADMIN_RUNTIME_ENV" "$CONFIG_ADMIN_DIR/rollup-config-admin-runtime.env"
 install -o "$CONFIG_ADMIN_OWNER" -g "$CONFIG_ADMIN_GROUP" -m 0644 \
@@ -227,6 +228,7 @@ fi
 echo "  - octez_kernel_message"
 echo "  - verified_bridge_fixture_message"
 echo "  - reprove"
+echo "  - submit_rollup_config"
 echo "installed rollup config admin env files into $CONFIG_ADMIN_DIR"
 echo "  - rollup-config-admin-runtime.env"
 echo "  - rollup-config-admin-build.env"

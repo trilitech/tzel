@@ -1,8 +1,9 @@
 use tzel_core::{
-    commit, derive_account, derive_address, derive_ask, derive_auth_pub_seed, derive_nk_tag,
-    derive_rcm, felt_tag, hash, hash_two, nullifier, owner_tag, transfer_sighash, u64_to_felt,
-    unshield_sighash, wots_pk, wots_pk_to_leaf, wots_sign, xmss_tree_node_hash, Account,
-    CircuitKind, MerkleTree, AUTH_DEPTH, AUTH_TREE_SIZE, DEPTH, F, MIN_TX_FEE, WOTS_CHAINS,
+    commit, deposit_id_from_secret, deposit_secret_from_label, derive_account, derive_address,
+    derive_ask, derive_auth_pub_seed, derive_nk_tag, derive_rcm, felt_tag, hash, hash_two,
+    nullifier, owner_tag, transfer_sighash, u64_to_felt, unshield_sighash, wots_pk,
+    wots_pk_to_leaf, wots_sign, xmss_tree_node_hash, Account, CircuitKind, MerkleTree, AUTH_DEPTH,
+    AUTH_TREE_SIZE, DEPTH, F, MIN_TX_FEE, WOTS_CHAINS,
 };
 
 pub const MAX_BENCH_INPUTS: usize = 7;
@@ -86,7 +87,8 @@ fn synthetic_output_fields(base: u64) -> (F, F, F, F, F, F) {
 }
 
 pub fn build_shield_bench_witness() -> BenchWitness {
-    let sender = hash(b"bench-sender");
+    let deposit_secret = deposit_secret_from_label("bench-sender");
+    let deposit_id = deposit_id_from_secret(&deposit_secret);
     let (d_j, auth_root, auth_pub_seed, nk_tag, memo_ct_hash_f, rseed) =
         synthetic_output_fields(0xC000);
     let (
@@ -118,15 +120,16 @@ pub fn build_shield_bench_witness() -> BenchWitness {
     );
 
     let args = vec![
-        felt_u64_to_hex(18),
+        felt_u64_to_hex(19),
         felt_u64_to_hex(v_pub),
         felt_u64_to_hex(fee),
         felt_u64_to_hex(producer_fee),
         felt_to_hex(&cm),
         felt_to_hex(&producer_cm),
-        felt_to_hex(&sender),
+        felt_to_hex(&deposit_id),
         felt_to_hex(&memo_ct_hash_f),
         felt_to_hex(&producer_memo_ct_hash_f),
+        felt_to_hex(&deposit_secret),
         felt_to_hex(&auth_root),
         felt_to_hex(&auth_pub_seed),
         felt_to_hex(&nk_tag),
@@ -147,7 +150,7 @@ pub fn build_shield_bench_witness() -> BenchWitness {
             u64_to_felt(producer_fee),
             cm,
             producer_cm,
-            sender,
+            deposit_id,
             memo_ct_hash_f,
             producer_memo_ct_hash_f,
         ],

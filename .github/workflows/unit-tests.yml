@@ -49,6 +49,7 @@ jobs:
           cargo test --manifest-path services/tzel/Cargo.toml --bin tzel-operator
           cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --lib
           cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --test bridge_flow
+          cargo test -p tzel-rollup-kernel --bin verified_bridge_fixture_message
           cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --no-default-features --lib
           cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --no-default-features --test bridge_flow
           cargo test -p tzel-wallet-app --lib
@@ -57,12 +58,24 @@ jobs:
 
       - name: Check deployment script syntax
         run: |
+          bash -n scripts/octez_rollup_sandbox_smoke.sh
+          bash -n scripts/octez_rollup_sandbox_dal_smoke.sh
           bash -n scripts/prepare_rollup_config_admin.sh
+          bash -n scripts/submit_rollup_config.sh
           bash -n scripts/build_rollup_kernel_release.sh
           bash -n scripts/install_tzel_binaries.sh
           bash -n scripts/init_shadownet_operator_box.sh
           bash -n scripts/shadownet_operator_preflight.sh
           bash -n scripts/shadownet_live_e2e_smoke.sh
+
+      - name: Run script unit tests
+        run: |
+          PYTHONPATH=. python3 -m unittest \
+            scripts.tests.test_build_alpha_sandbox_params \
+            scripts.tests.test_submit_rollup_config \
+            scripts.tests.test_octez_rollup_sandbox_dal_smoke \
+            scripts.tests.test_shadownet_operator_paths \
+            scripts.tests.test_workflow_references
 
       - name: Run Cairo unit tests
         working-directory: cairo

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RollupSubmissionKind {
+    ConfigureVerifier,
+    ConfigureBridge,
     Shield,
     Transfer,
     Unshield,
@@ -73,7 +75,7 @@ mod tests {
     #[test]
     fn submit_request_hex_roundtrip() {
         let req = SubmitRollupMessageReq {
-            kind: RollupSubmissionKind::Shield,
+            kind: RollupSubmissionKind::ConfigureBridge,
             rollup_address: "sr1abc".into(),
             payload: vec![0xde, 0xad, 0xbe, 0xef],
         };

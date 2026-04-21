@@ -3,9 +3,14 @@
 This tutorial covers a Shadownet `deposit -> shield -> send` flow against a
 deployed rollup using the operator box.
 
-The current rollup policy burns `100000` mutez (`0.1 tez`) on every `shield`,
-`send`, and `unshield`, and each of those transactions also pays a separate
-private DAL-producer fee note.
+The current rollup policy burns at least `100000` mutez (`0.1 tez`) on every
+`shield`, `send`, and `unshield`. The first two accepted private transactions at
+a given inbox level pay that floor; each additional private transaction at the
+same level doubles the required burn fee, capped after 6 steps. Each of those
+transactions also pays a separate private DAL-producer fee note.
+
+If you omit `--fee`, `tzel-wallet` uses the rollup's currently quoted required
+burn fee.
 
 It assumes:
 
@@ -49,6 +54,7 @@ The wallet commands below assume:
 - `/usr/local/bin/tzel-wallet`
 - `/usr/local/bin/reprove`
 - `/usr/local/bin/octez_kernel_message`
+- `/usr/local/bin/submit_rollup_config`
 - `/usr/local/bin/verified_bridge_fixture_message`
 - Cairo executables in `/opt/tzel/cairo/target/dev`
 - rollup config admin env files in `/usr/local/etc/tzel/rollup-config-admin-{runtime,build}.env`
@@ -104,11 +110,10 @@ These commands are one-time per deployed rollup.
 Set the shell variables first:
 
 ```bash
-export CLIENT_DIR=/var/lib/tzel/octez-client
-export NODE_ENDPOINT=http://127.0.0.1:8732
+export OPERATOR_URL=http://127.0.0.1:8787
+export OPERATOR_BEARER_TOKEN="$(cat /etc/tzel/operator-bearer-token)"
 export ROLLUP_ADDRESS=sr1REPLACE_ME
 export BRIDGE_TICKETER=KT1REPLACE_ME
-export SOURCE_ALIAS=tzelshadownet
 ```
 
 Extract the verifier metadata from the checked-in verified fixture:
@@ -123,32 +128,36 @@ export TRANSFER_HASH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)[
 export UNSHIELD_HASH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["unshield_program_hash"])' <<<"$META_JSON")"
 ```
 
-Send `configure-verifier`:
+Submit `configure-verifier` through the operator:
 
 ```bash
-MSG_HEX="$(/usr/local/bin/octez_kernel_message configure-verifier \
-  "$ROLLUP_ADDRESS" \
+/usr/local/bin/submit_rollup_config \
+  --operator-url "$OPERATOR_URL" \
+  --bearer-token "$OPERATOR_BEARER_TOKEN" \
+  --rollup-address "$ROLLUP_ADDRESS" \
+  configure-verifier \
   "$AUTH_DOMAIN" \
   "$SHIELD_HASH" \
   "$TRANSFER_HASH" \
-  "$UNSHIELD_HASH")"
-
-octez-client -d "$CLIENT_DIR" -E "$NODE_ENDPOINT" \
-  send smart rollup message "hex:[ \"$MSG_HEX\" ]" from "$SOURCE_ALIAS"
+  "$UNSHIELD_HASH"
 ```
 
-Send `configure-bridge`:
+Submit `configure-bridge` through the operator:
 
 ```bash
-MSG_HEX="$(/usr/local/bin/octez_kernel_message configure-bridge \
-  "$ROLLUP_ADDRESS" \
-  "$BRIDGE_TICKETER")"
-
-octez-client -d "$CLIENT_DIR" -E "$NODE_ENDPOINT" \
-  send smart rollup message "hex:[ \"$MSG_HEX\" ]" from "$SOURCE_ALIAS"
+/usr/local/bin/submit_rollup_config \
+  --operator-url "$OPERATOR_URL" \
+  --bearer-token "$OPERATOR_BEARER_TOKEN" \
+  --rollup-address "$ROLLUP_ADDRESS" \
+  configure-bridge \
+  "$BRIDGE_TICKETER"
 ```
 
-Wait for both operations to be included, then verify local services again:
+The operator automatically falls back to DAL when a config message is too large
+for the direct inbox path, which is the normal case for the signed config
+payloads now. Each command returns JSON with a `submission.id`; poll
+`$OPERATOR_URL/v1/rollup/submissions/<id>` until both submissions reach
+`submitted_to_l1`, then verify local services again:
 
 ```bash
 ./scripts/shadownet_operator_preflight.sh /etc/tzel/shadownet.env
@@ -241,20 +250,20 @@ Create Shadownet profiles:
 
 Notes:
 
-- `public-account` is the rollup-visible transparent account string, not an L1 address
 - `dal_fee_address` is the shielded address that receives the DAL inclusion fee note
+- each `deposit` creates a fresh secret-bound rollup deposit id in the wallet and credits the canonical `deposit:<hex(deposit_id)>` rollup balance key; `shield` later proves knowledge of that deposit secret
+- `public_account` in the profile is only used for transparent balances produced by `unshield` and later `withdraw`
 - keep Alice and Bob distinct
 
-## 6. Fund Alice On L1 And Wait For The Public Rollup Balance
+## 6. Fund Alice On L1 And Wait For The Secret-Bound Deposit Balance
 
-Deposit into the bridge for Alice’s public rollup account:
+Deposit into the bridge for Alice’s next shield. The wallet generates and stores a fresh deposit secret, then asks the bridge to credit the canonical `deposit:<hex(deposit_id)>` balance key for `deposit_id = H("deposit", deposit_secret)`:
 
 ```bash
 /usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
   deposit \
-  --amount 300000 \
-  --public-account alice
+  --amount 300000
 ```
 
 The wallet prints an L1 operation hash. Wait for it to land, then poll:
@@ -263,10 +272,10 @@ The wallet prints an L1 operation hash. Wait for it to land, then poll:
 /usr/local/bin/tzel-wallet --wallet alice.wallet balance
 ```
 
-Do not continue until Alice shows a non-zero line like:
+Do not continue until Alice shows a non-zero secret-bound deposit line like:
 
 ```text
-Public rollup balance (alice): 300000
+Secret-bound deposit balance: 300000 across 1 pending deposits
 ```
 
 ## 7. Shield Alice’s Funds
@@ -305,7 +314,7 @@ Keep polling until the operator reports a final state. Then sync Alice:
 
 Acceptance:
 
-- Alice’s public rollup balance drops by the shielded amount plus the fixed `100000` mutez burn and the configured DAL-producer fee
+- Alice’s secret-bound deposit balance drops by the shielded amount plus the fixed `100000` mutez burn and the configured DAL-producer fee
 - Alice’s private available balance becomes non-zero
 
 ## 8. Derive Bob’s Receive Address
@@ -382,7 +391,7 @@ For the first successful live run, save:
   - DAL node is up, but slot publication / commitment inclusion is not advancing
 - `unattested`:
   - the public DAL node is not reachable enough from the network
-- `public balance` never changes after deposit:
+- `Secret-bound deposit balance` never changes after deposit:
   - bridge config is wrong or the rollup node is not following the right rollup
 - `sync` finds nothing after a successful operator state:
   - rollup node is stale, wrong `rollup_node_url`, or wrong wallet profile

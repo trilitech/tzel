@@ -21,10 +21,10 @@ Privacy on blockchains today relies on elliptic curve cryptography that quantum 
 ### How it works
 
 A UTXO-based private transaction system where:
-- **Deposits** (shield) move public tokens into private notes
+- **Deposits** credit a namespaced secret-bound rollup deposit key; `shield` proves knowledge of the underlying deposit secret and moves that value into private notes
 - **Transfers** spend 1-7 private notes and create recipient, change, and DAL-producer fee notes
 - **Withdrawals** (unshield) destroy private notes, release value publicly, and create a DAL-producer fee note plus optional change
-- **Every shield / transfer / unshield burns a fixed 100000 mutez (0.1 tez)** in the current rollup deployment
+- **Every shield / transfer / unshield burns at least 100000 mutez (0.1 tez)**, with a simple per-level stepped fee under congestion in the current rollup deployment
 - **Every shield / transfer / unshield also creates a separate private DAL-producer fee note**
 - Every spend is proven with a **zero-knowledge STARK** that verifies the **WOTS+ signature inside the circuit** — the proof itself proves spend authorization
 
@@ -64,7 +64,7 @@ For deployment-oriented installs with standard paths instead of a workspace chec
 
 > **WARNING:** The ledger refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
 >
-> **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. Its public-balance layer intentionally uses submitted strings such as `"alice"` as stand-ins for chain-native caller identity. It is not a network-authenticated wallet service and should not be exposed as a real public endpoint.
+> **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. For local shield testing, `sp-client fund --addr alice` and `sp-client shield --sender alice` deterministically derive a secret-bound deposit id from the label `alice`. The public-balance layer is not a network-authenticated account service and should not be exposed as a real public endpoint.
 >
 > **DEVELOPER WALLET NOTE:** `sp-client` is a developer/reference CLI used for local testing, demos, and integration flows. It persists plaintext secrets and wallet state in local JSON files and is not intended to be a hardened end-user wallet.
 

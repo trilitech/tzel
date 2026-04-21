@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[test]
-#[ignore = "requires installed Octez binaries and local sandbox networking"]
+#[ignore = "requires installed Octez and DAL binaries plus local sandbox networking"]
 fn octez_sandbox_configure_bridge_roundtrip() {
     if std::env::var_os("TZEL_RUN_OCTEZ_ROLLUP_SANDBOX").is_none() {
         eprintln!("skipping: set TZEL_RUN_OCTEZ_ROLLUP_SANDBOX=1 to run");
