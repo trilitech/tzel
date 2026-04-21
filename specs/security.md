@@ -43,7 +43,7 @@ This document is informative, not normative. The canonical protocol rules and en
 
 - **The reference CLI ledger is demo-only for public balances:** `sp-ledger` is a localhost/reference verifier for proof and state-transition checks, not a real authenticated public account service.
 - **Public account identifiers must be specified exactly in deployments:** the reference ledger uses `H(UTF8(account_string))`, but any replacement must define the exact byte encoding and verifier rule.
-- **Shield proofs are not yet domain-bound:** shield carries `sender_id` but no `auth_domain`, so mirrored deployments with identical sender namespaces can accept the same shield proof object unless deployment separation is enforced externally.
+- **Shield proofs are not yet domain-bound:** shield carries `deposit_id` but no `auth_domain`, so mirrored deployments with identical deposit identifiers can accept the same shield proof object if they also have matching funded deposit balances. Deployment separation must be enforced externally for shield.
 - **Proof verification must remain bound to the intended executable and authorization domain:** otherwise a valid proof may be accepted in the wrong verifier context.
 
 ## Additional Cryptographic Assumptions and Review Burden

@@ -29,8 +29,9 @@ fn ocaml_scenario() -> InteropScenario {
 }
 
 fn shield_req(step: &InteropShieldStep) -> ShieldReq {
+    let deposit_id = deposit_id_from_label(&step.sender);
     ShieldReq {
-        sender: step.sender.clone(),
+        deposit_id,
         v: step.v,
         fee: step.fee,
         producer_fee: step.producer_fee,
@@ -44,7 +45,7 @@ fn shield_req(step: &InteropShieldStep) -> ShieldReq {
                 u64_to_felt(step.producer_fee),
                 step.cm,
                 step.producer_cm,
-                hash(step.sender.as_bytes()),
+                deposit_id,
                 step.memo_ct_hash,
                 step.producer_memo_ct_hash,
             ],
@@ -118,7 +119,10 @@ fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     let scenario = ocaml_scenario();
     let mut ledger = Ledger::with_auth_domain(scenario.auth_domain);
     ledger
-        .fund("alice", scenario.initial_alice_balance)
+        .fund(
+            &deposit_balance_key(&deposit_id_from_label(&scenario.shield.sender)),
+            scenario.initial_alice_balance,
+        )
         .expect("fund alice");
 
     let shield_resp = ledger

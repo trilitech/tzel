@@ -86,8 +86,8 @@ async fn shield_handler(
     let mut ledger = st.ledger.lock().unwrap();
     let resp = ledger.shield(&req).map_err(err)?;
     eprintln!(
-        "[shield] {} deposited {} -> cm={} idx={}",
-        req.sender,
+        "[shield] deposit {} shielded {} -> cm={} idx={}",
+        deposit_balance_key(&req.deposit_id),
         req.v,
         short(&resp.cm),
         resp.index
@@ -482,7 +482,7 @@ mod tests {
         let err = shield_handler(
             State(st),
             Json(ShieldReq {
-                sender: "alice".into(),
+                deposit_id: deposit_id_from_label("alice"),
                 v: 5,
                 fee: MIN_TX_FEE,
                 producer_fee: 1,

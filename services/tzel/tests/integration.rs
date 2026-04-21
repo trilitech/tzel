@@ -348,7 +348,8 @@ fn generate_shield_proof(
     let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
     let cm = commit(&address.d_j, amount, &rcm, &otag);
     let producer_cm = commit(&address.d_j, producer_fee, &producer_rcm, &otag);
-    let sender_f = hash(sender.as_bytes());
+    let deposit_secret = deposit_secret_from_label(sender);
+    let deposit_id = deposit_id_from_secret(&deposit_secret);
 
     let ek_v = ml_kem_768::EncapsulationKey::new(address.ek_v.as_slice().try_into().unwrap())
         .expect("valid ek_v");
@@ -360,15 +361,16 @@ fn generate_shield_proof(
     let producer_memo_ct_hash_f = memo_ct_hash(&producer_enc);
 
     let args: Vec<String> = vec![
-        felt_u64_to_hex(18),
+        felt_u64_to_hex(19),
         felt_u64_to_hex(amount),
         felt_u64_to_hex(fee),
         felt_u64_to_hex(producer_fee),
         felt_to_hex(&cm),
         felt_to_hex(&producer_cm),
-        felt_to_hex(&sender_f),
+        felt_to_hex(&deposit_id),
         felt_to_hex(&memo_ct_hash_f),
         felt_to_hex(&producer_memo_ct_hash_f),
+        felt_to_hex(&deposit_secret),
         felt_to_hex(&address.auth_root),
         felt_to_hex(&address.auth_pub_seed),
         felt_to_hex(&address.nk_tag),
@@ -557,7 +559,10 @@ fn test_e2e_trust_me_bro() {
             .read_json()
             .unwrap();
         let balances = resp.get("balances").unwrap();
-        assert_eq!(balances.get("alice").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            balances.get("alice").and_then(|v| v.as_u64()).unwrap_or(0),
+            0
+        );
         assert_eq!(
             balances.get("alice_pub").and_then(|v| v.as_u64()),
             Some(100000)
@@ -711,7 +716,7 @@ fn test_shield_proof_roundtrip() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let fund_resp = post_json_allow_status(
             &format!("{}/fund", l),
-            &serde_json::json!({ "addr": "alice", "amount": 300001 }),
+            &serde_json::json!({ "addr": deposit_balance_key(&deposit_id_from_label("alice")), "amount": 300001 }),
         );
         assert_eq!(fund_resp.status(), 200);
 
@@ -719,7 +724,7 @@ fn test_shield_proof_roundtrip() {
         let (proof, cm, enc, producer_cm, producer_enc) =
             generate_shield_proof("alice", 200_000, MIN_TX_FEE, &address);
         let req = ShieldReq {
-            sender: "alice".into(),
+            deposit_id: deposit_id_from_label("alice"),
             v: 200_000,
             fee: MIN_TX_FEE,
             producer_fee: 1,

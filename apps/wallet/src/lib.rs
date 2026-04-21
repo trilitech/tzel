@@ -471,6 +471,8 @@ struct WalletFile {
     wots_key_indices: std::collections::HashMap<u32, u32>,
     #[serde(default)]
     pending_spends: Vec<PendingSpend>,
+    #[serde(default)]
+    pending_deposits: Vec<PendingDeposit>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -487,6 +489,17 @@ struct PendingSpend {
     #[serde(with = "hex_f_vec")]
     nullifiers: Vec<F>,
     description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingDeposit {
+    #[serde(with = "hex_f")]
+    deposit_id: F,
+    #[serde(with = "hex_f")]
+    secret: F,
+    amount: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operation_hash: Option<String>,
 }
@@ -1780,6 +1793,7 @@ impl<'a> RollupRpc<'a> {
             .map_err(|e| format!("parse head level integer: {}", e))
     }
 
+    #[cfg(test)]
     fn current_required_tx_fee(&self) -> Result<u64, String> {
         let head_hash = self.head_hash()?;
         self.current_required_tx_fee_at_block(&head_hash)
@@ -2007,13 +2021,14 @@ impl<'a> RollupRpc<'a> {
 
     fn deposit_to_bridge(
         &self,
-        public_account: &str,
+        deposit_id: &F,
         amount_mutez: u64,
     ) -> Result<RollupSubmissionReceipt, String> {
         let tez_amount = mutez_to_tez_string(amount_mutez);
+        let recipient = deposit_balance_key(deposit_id);
         let mint_arg = format!(
             "Pair 0x{} \"{}\"",
-            hex::encode(public_account.as_bytes()),
+            hex::encode(recipient.as_bytes()),
             self.profile.rollup_address
         );
         let mut args = vec![
@@ -2348,7 +2363,7 @@ fn host_stark_proof_to_kernel(proof: &Proof) -> Result<KernelStarkProof, String>
 
 fn shield_req_to_kernel(req: &ShieldReq) -> Result<KernelShieldReq, String> {
     Ok(KernelShieldReq {
-        sender: req.sender.clone(),
+        deposit_id: req.deposit_id,
         fee: req.fee,
         producer_fee: req.producer_fee,
         v: req.v,
@@ -2678,12 +2693,10 @@ enum UserCmd {
     Balance,
     /// Check whether the wallet profile, operator, and rollup node are usable.
     Check,
-    /// Deposit tez on L1 into the configured bridge ticketer for your public rollup account.
+    /// Deposit tez on L1 into the configured bridge ticketer for a secret-bound shield.
     Deposit {
         #[arg(long)]
         amount: u64,
-        #[arg(long)]
-        public_account: Option<String>,
     },
     /// Shield public bridge balance into a private note.
     Shield {
@@ -2691,9 +2704,9 @@ enum UserCmd {
         amount: u64,
         #[arg(long)]
         fee: Option<u64>,
-        /// Override the public rollup account to shield from.
+        /// Select a pending secret-bound deposit by its deposit id.
         #[arg(long)]
-        sender: Option<String>,
+        deposit_id: Option<String>,
         /// Path to recipient address JSON. Defaults to a newly generated self-address.
         #[arg(long)]
         to: Option<String>,
@@ -2921,13 +2934,13 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Init
         | UserCmd::Receive
         | UserCmd::Sync { .. }
+        | UserCmd::Deposit { .. }
         | UserCmd::Shield { .. }
         | UserCmd::Send { .. }
         | UserCmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
         UserCmd::Profile { .. }
         | UserCmd::Balance
         | UserCmd::Check
-        | UserCmd::Deposit { .. }
         | UserCmd::Status { .. }
         | UserCmd::Withdraw { .. }
         | UserCmd::ExportDetect { .. }
@@ -2966,24 +2979,28 @@ fn run_user(cli: UserCli) -> Result<(), String> {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_wallet_check(&cli.wallet, &profile)
         }
-        UserCmd::Deposit {
-            amount,
-            public_account,
-        } => {
+        UserCmd::Deposit { amount } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            let public_account = public_account.unwrap_or_else(|| profile.public_account.clone());
-            cmd_bridge_deposit(&profile, amount, &public_account)
+            cmd_bridge_deposit(&cli.wallet, &profile, amount)
         }
         UserCmd::Shield {
             amount,
             fee,
-            sender,
+            deposit_id,
             to,
             memo,
         } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            let sender = sender.unwrap_or_else(|| profile.public_account.clone());
-            cmd_shield_rollup(&cli.wallet, &profile, &sender, amount, fee, to, memo, &pc)
+            cmd_shield_rollup(
+                &cli.wallet,
+                &profile,
+                deposit_id.as_deref(),
+                amount,
+                fee,
+                to,
+                memo,
+                &pc,
+            )
         }
         UserCmd::Send {
             to,
@@ -3106,6 +3123,27 @@ fn felt_u64_to_hex(v: u64) -> String {
     format!("0x{:x}", v)
 }
 
+fn parse_deposit_id_hex(value: &str) -> Result<F, String> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    let value = value
+        .strip_prefix(DEPOSIT_BALANCE_KEY_PREFIX)
+        .unwrap_or(value);
+    let bytes = hex::decode(value).map_err(|e| format!("invalid deposit id hex: {}", e))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "invalid deposit id: expected 32 bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let mut out = ZERO;
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn deposit_id_hex(deposit_id: &F) -> String {
+    hex::encode(deposit_id)
+}
+
 /// Call the reprover to generate a ZK proof.
 /// `circuit` is "run_shield", "run_transfer", or "run_unshield".
 /// `args` is the list of felt252 values (already length-prefixed for Array<felt252>).
@@ -3194,6 +3232,7 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
         scanned: 0,
         wots_key_indices: std::collections::HashMap::new(),
         pending_spends: vec![],
+        pending_deposits: vec![],
     };
     save_wallet(path, &w)?;
     println!("Wallet created: {}", path);
@@ -3601,6 +3640,7 @@ mod tests {
             scanned: 0,
             wots_key_indices: std::collections::HashMap::new(),
             pending_spends: vec![],
+            pending_deposits: vec![],
         };
         if addr_counter as usize > cached {
             wallet
@@ -4569,6 +4609,7 @@ mod tests {
             scanned: 0,
             wots_key_indices: std::collections::HashMap::new(),
             pending_spends: vec![],
+            pending_deposits: vec![],
         };
 
         let (state0, addr0) = wallet.next_address().expect("first fixture address");
@@ -4593,6 +4634,7 @@ mod tests {
             scanned: 0,
             wots_key_indices: std::collections::HashMap::new(),
             pending_spends: vec![],
+            pending_deposits: vec![],
         };
 
         wallet
@@ -5403,14 +5445,26 @@ fn cmd_user_balance(path: &str) -> Result<(), String> {
     if profile_path.exists() {
         let profile = load_network_profile(&profile_path)?;
         let rollup = RollupRpc::new(&profile);
-        let public_balance = rollup
-            .load_balances()?
-            .get(&profile.public_account)
-            .copied()
-            .unwrap_or(0);
+        let balances = rollup.load_balances()?;
+        let public_balance = balances.get(&profile.public_account).copied().unwrap_or(0);
+        let pending_deposit_balance = w
+            .pending_deposits
+            .iter()
+            .map(|deposit| {
+                balances
+                    .get(&deposit_balance_key(&deposit.deposit_id))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
         println!(
             "Public rollup balance ({}): {}",
             profile.public_account, public_balance
+        );
+        println!(
+            "Secret-bound deposit balance: {} across {} pending deposits",
+            pending_deposit_balance,
+            w.pending_deposits.len()
         );
     }
     Ok(())
@@ -5424,11 +5478,18 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     let auth_domain = snapshot.auth_domain;
     let tree_size = snapshot.tree.leaves.len();
     let required_tx_fee = snapshot.required_tx_fee;
-    let public_balance = rollup
-        .load_balances_at_block(&head_hash)?
-        .get(&profile.public_account)
-        .copied()
-        .unwrap_or(0);
+    let balances = rollup.load_balances_at_block(&head_hash)?;
+    let public_balance = balances.get(&profile.public_account).copied().unwrap_or(0);
+    let pending_deposit_balance = wallet
+        .pending_deposits
+        .iter()
+        .map(|deposit| {
+            balances
+                .get(&deposit_balance_key(&deposit.deposit_id))
+                .copied()
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
 
     println!("Wallet file: {}", path);
     println!("Network: {}", profile.network);
@@ -5449,6 +5510,11 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     println!(
         "Public rollup balance ({}): {}",
         profile.public_account, public_balance
+    );
+    println!(
+        "Secret-bound deposit balance: {} across {} pending deposits",
+        pending_deposit_balance,
+        wallet.pending_deposits.len()
     );
 
     if let Some(operator_url) = &profile.operator_url {
@@ -5475,18 +5541,26 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
     let nullifiers = rollup.load_nullifiers()?;
     let summary = apply_scan_feed(&mut w, &feed, nullifiers);
     save_wallet(path, &w)?;
-    let public_balance = rollup
-        .load_balances()?
-        .get(&profile.public_account)
-        .copied()
-        .unwrap_or(0);
+    let balances = rollup.load_balances()?;
+    let public_balance = balances.get(&profile.public_account).copied().unwrap_or(0);
+    let pending_deposit_balance = w
+        .pending_deposits
+        .iter()
+        .map(|deposit| {
+            balances
+                .get(&deposit_balance_key(&deposit.deposit_id))
+                .copied()
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
     println!(
-        "Synced: {} new notes, {} spent removed, {} pending confirmed, private_available={}, public_balance={}",
+        "Synced: {} new notes, {} spent removed, {} pending confirmed, private_available={}, public_balance={}, secret_deposit_balance={}",
         summary.found,
         summary.spent,
         summary.confirmed_pending,
         w.available_balance(),
-        public_balance
+        public_balance,
+        pending_deposit_balance
     );
     Ok(())
 }
@@ -5507,16 +5581,68 @@ fn cmd_rollup_sync_watch(
     }
 }
 
+fn select_pending_deposit<'a>(
+    wallet: &'a WalletFile,
+    balances: &std::collections::HashMap<String, u64>,
+    requested_deposit_id: Option<F>,
+    total_debit: u64,
+) -> Result<(&'a PendingDeposit, u64), String> {
+    let mut saw_requested = false;
+    for deposit in &wallet.pending_deposits {
+        if let Some(requested) = requested_deposit_id {
+            if deposit.deposit_id != requested {
+                continue;
+            }
+            saw_requested = true;
+        }
+        let balance = balances
+            .get(&deposit_balance_key(&deposit.deposit_id))
+            .copied()
+            .unwrap_or(0);
+        if balance >= total_debit {
+            return Ok((deposit, balance));
+        }
+    }
+
+    if requested_deposit_id.is_some() && !saw_requested {
+        return Err("requested deposit id is not tracked by this wallet".into());
+    }
+    Err(format!(
+        "no tracked secret-bound deposit has enough rollup balance: need {}",
+        total_debit
+    ))
+}
+
 fn cmd_bridge_deposit(
+    path: &str,
     profile: &WalletNetworkProfile,
     amount: u64,
-    public_account: &str,
 ) -> Result<(), String> {
+    let mut wallet = load_wallet(path)?;
+    let secret = random_felt();
+    let deposit_id = deposit_id_from_secret(&secret);
+    wallet.pending_deposits.push(PendingDeposit {
+        deposit_id,
+        secret,
+        amount,
+        operation_hash: None,
+    });
+    save_wallet(path, &wallet)?;
+
     let rollup = RollupRpc::new(profile);
-    let submission = rollup.deposit_to_bridge(public_account, amount)?;
+    let submission = rollup.deposit_to_bridge(&deposit_id, amount)?;
+    if let Some(pending) = wallet
+        .pending_deposits
+        .iter_mut()
+        .find(|pending| pending.deposit_id == deposit_id && pending.secret == secret)
+    {
+        pending.operation_hash = submission.operation_hash.clone();
+    }
+    save_wallet(path, &wallet)?;
     println!(
-        "Submitted L1 bridge deposit of {} mutez for public account {}",
-        amount, public_account
+        "Submitted L1 bridge deposit of {} mutez for deposit {}",
+        amount,
+        deposit_id_hex(&deposit_id)
     );
     if let Some(op_hash) = submission.operation_hash {
         println!("Operation hash: {}", op_hash);
@@ -5524,7 +5650,7 @@ fn cmd_bridge_deposit(
     if !submission.output.is_empty() {
         println!("{}", submission.output);
     }
-    println!("Run `tzel-wallet sync` after the deposit is included and processed by the rollup.");
+    println!("Run `tzel-wallet shield --amount ...` after the deposit is processed by the rollup.");
     Ok(())
 }
 
@@ -5592,17 +5718,19 @@ fn cmd_shield(
     let client_note = build_output_note(&address, amount, memo.as_deref().map(str::as_bytes))?;
     let producer_note = build_output_note(&producer_address, dal_fee, Some(b"dal"))?;
     let proof = if !pc.skip_proof {
-        let sender_f = hash(sender.as_bytes());
+        let deposit_secret = deposit_secret_from_label(sender);
+        let deposit_id = deposit_id_from_secret(&deposit_secret);
         let args: Vec<String> = vec![
-            felt_u64_to_hex(18),
+            felt_u64_to_hex(19),
             felt_u64_to_hex(amount),
             felt_u64_to_hex(fee),
             felt_u64_to_hex(dal_fee),
             felt_to_hex(&client_note.cm),
             felt_to_hex(&producer_note.cm),
-            felt_to_hex(&sender_f),
+            felt_to_hex(&deposit_id),
             felt_to_hex(&client_note.mh),
             felt_to_hex(&producer_note.mh),
+            felt_to_hex(&deposit_secret),
             felt_to_hex(&address.auth_root),
             felt_to_hex(&address.auth_pub_seed),
             felt_to_hex(&address.nk_tag),
@@ -5620,7 +5748,7 @@ fn cmd_shield(
     };
 
     let req = ShieldReq {
-        sender: sender.into(),
+        deposit_id: deposit_id_from_label(sender),
         fee,
         producer_fee: dal_fee,
         v: amount,
@@ -6147,7 +6275,7 @@ fn cmd_unshield(
 fn cmd_shield_rollup(
     path: &str,
     profile: &WalletNetworkProfile,
-    sender: &str,
+    deposit_id_arg: Option<&str>,
     amount: u64,
     fee: Option<u64>,
     to: Option<String>,
@@ -6160,19 +6288,17 @@ fn cmd_shield_rollup(
     ensure_positive_dal_fee(profile.dal_fee)?;
     let balances = rollup.load_balances_at_block(&head_hash)?;
     let producer_address = &profile.dal_fee_address;
-    let public_balance = balances.get(sender).copied().unwrap_or(0);
     let total_debit = amount
         .checked_add(fee)
         .and_then(|value| value.checked_add(profile.dal_fee))
         .ok_or_else(|| "shield total spend overflow".to_string())?;
-    if public_balance < total_debit {
-        return Err(format!(
-            "insufficient public rollup balance for {}: have {}, need {}",
-            sender, public_balance, total_debit
-        ));
-    }
 
     let mut w = load_wallet(path)?;
+    let requested_deposit_id = deposit_id_arg.map(parse_deposit_id_hex).transpose()?;
+    let (selected_deposit, public_balance) =
+        select_pending_deposit(&w, &balances, requested_deposit_id, total_debit)?;
+    let deposit_id = selected_deposit.deposit_id;
+    let deposit_secret = selected_deposit.secret;
     let (address, generated_self_address) = if let Some(addr_path) = to {
         (load_address(&addr_path)?, false)
     } else {
@@ -6182,17 +6308,17 @@ fn cmd_shield_rollup(
 
     let client_note = build_output_note(&address, amount, memo.as_deref().map(str::as_bytes))?;
     let producer_note = build_output_note(producer_address, profile.dal_fee, Some(b"dal"))?;
-    let sender_f = hash(sender.as_bytes());
     let args: Vec<String> = vec![
-        felt_u64_to_hex(18),
+        felt_u64_to_hex(19),
         felt_u64_to_hex(amount),
         felt_u64_to_hex(fee),
         felt_u64_to_hex(profile.dal_fee),
         felt_to_hex(&client_note.cm),
         felt_to_hex(&producer_note.cm),
-        felt_to_hex(&sender_f),
+        felt_to_hex(&deposit_id),
         felt_to_hex(&client_note.mh),
         felt_to_hex(&producer_note.mh),
+        felt_to_hex(&deposit_secret),
         felt_to_hex(&address.auth_root),
         felt_to_hex(&address.auth_pub_seed),
         felt_to_hex(&address.nk_tag),
@@ -6206,7 +6332,7 @@ fn cmd_shield_rollup(
     ];
     let proof = pc.make_proof("run_shield", &args)?;
     let req = ShieldReq {
-        sender: sender.into(),
+        deposit_id,
         fee,
         producer_fee: profile.dal_fee,
         v: amount,
@@ -6226,11 +6352,12 @@ fn cmd_shield_rollup(
     let kernel_req = shield_req_to_kernel(&req)?;
     let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
     println!(
-        "Submitted shield of {} from {} into note {} (fee {})",
+        "Submitted shield of {} from deposit {} into note {} (fee {}, deposit balance before {})",
         amount,
-        sender,
+        deposit_id_hex(&deposit_id),
         short(&req.client_cm),
-        fee
+        fee,
+        public_balance
     );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
@@ -6802,12 +6929,18 @@ fn finalize_successful_spend(
 }
 
 fn cmd_fund(ledger: &str, addr: &str, amount: u64) -> Result<(), String> {
+    let deposit_id = deposit_id_from_label(addr);
     let req = FundReq {
-        recipient: addr.into(),
+        recipient: deposit_balance_key(&deposit_id),
         amount,
     };
     let _: serde_json::Value = post_json(&format!("{}/fund", ledger), &req)?;
-    println!("Funded {} with {}", addr, amount);
+    println!(
+        "Funded deposit {} ({}) with {}",
+        felt_to_hex(&deposit_id),
+        addr,
+        amount
+    );
     Ok(())
 }
 
@@ -6929,6 +7062,78 @@ mod network_profile_tests {
 
         let err = load_required_network_profile(wallet_path_str).unwrap_err();
         assert!(err.contains("operator_url requires operator_bearer_token"));
+    }
+
+    #[test]
+    fn rollup_rpc_load_balances_preserves_raw_json_deposit_balance_key() {
+        let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+        let amount = 123u64;
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_BALANCE_COUNT
+                ),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", deposit_key)),
+            ),
+            (
+                format!(
+                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
+                    balance_durable_key(&deposit_key)
+                ),
+                (200, format!("\"{}\"", hex::encode(amount.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+
+        let balances = RollupRpc::new(&profile).load_balances().unwrap();
+
+        assert_eq!(balances.get(&deposit_key), Some(&amount));
+    }
+
+    #[test]
+    fn bridge_deposit_persists_secret_before_l1_submission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        save_wallet(wallet_path_str, &super::tests::test_wallet(1)).expect("save wallet");
+
+        let octez_client = dir.path().join("fake-octez-client.sh");
+        let wallet_path_quoted = wallet_path_str.replace('\'', "'\\''");
+        std::fs::write(
+            &octez_client,
+            format!(
+                "#!/bin/sh\nif ! grep -q '\"deposit_id\"' '{}'; then\n  echo missing deposit secret >&2\n  exit 42\nfi\necho 'Operation hash is ooPersistedDepositSecret'\n",
+                wallet_path_quoted
+            ),
+        )
+        .expect("write fake octez-client");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&octez_client, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake octez-client");
+        }
+
+        let mut profile = super::tests::rollup_profile_for_url("http://127.0.0.1:9");
+        profile.octez_client_bin = octez_client.to_str().unwrap().into();
+
+        cmd_bridge_deposit(wallet_path_str, &profile, 123).expect("deposit command");
+
+        let wallet = load_wallet(wallet_path_str).expect("load wallet");
+        assert_eq!(wallet.pending_deposits.len(), 1);
+        assert_eq!(wallet.pending_deposits[0].amount, 123);
+        assert_eq!(
+            wallet.pending_deposits[0].operation_hash.as_deref(),
+            Some("ooPersistedDepositSecret")
+        );
     }
 
     #[test]
@@ -7472,7 +7677,17 @@ mod network_profile_tests {
         let dir = tempfile::tempdir().unwrap();
         let wallet_path = dir.path().join("wallet.json");
         let wallet_path_str = wallet_path.to_str().unwrap();
-        let wallet = super::tests::test_wallet(1);
+        let mut wallet = super::tests::test_wallet(1);
+        let sender = "alice";
+        let deposit_secret = deposit_secret_from_label(sender);
+        let deposit_id = deposit_id_from_secret(&deposit_secret);
+        let deposit_key = deposit_balance_key(&deposit_id);
+        wallet.pending_deposits.push(PendingDeposit {
+            deposit_id,
+            secret: deposit_secret,
+            amount: 0,
+            operation_hash: None,
+        });
         save_wallet(wallet_path_str, &wallet).expect("save wallet");
         let recipient_path = dir.path().join("recipient.json");
         let recipient = super::tests::payment_address_for_wallet_address(&wallet, 0);
@@ -7482,13 +7697,15 @@ mod network_profile_tests {
         )
         .expect("write recipient");
 
-        let sender = "alice";
         let amount = 10u64;
         let old_head_balance = amount + MIN_TX_FEE;
         let new_head_balance = old_head_balance + 1;
 
         let base_url = super::tests::spawn_mock_http_server(HashMap::from([
-            ("/global/block/head/hash".into(), (200, "\"BLoldhead\"".into())),
+            (
+                "/global/block/head/hash".into(),
+                (200, "\"BLoldhead\"".into()),
+            ),
             ("/global/block/BLoldhead/level".into(), (200, "10".into())),
             (
                 format!(
@@ -7523,14 +7740,17 @@ mod network_profile_tests {
                     "/global/block/BLoldhead/durable/wasm_2_0_0/value?key={}",
                     indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, 0)
                 ),
-                (200, format!("\"{}\"", hex::encode(sender.as_bytes()))),
+                (200, format!("\"{}\"", hex::encode(deposit_key.as_bytes()))),
             ),
             (
                 format!(
                     "/global/block/BLoldhead/durable/wasm_2_0_0/value?key={}",
-                    balance_durable_key(sender)
+                    balance_durable_key(&deposit_key)
                 ),
-                (200, format!("\"{}\"", hex::encode(old_head_balance.to_le_bytes()))),
+                (
+                    200,
+                    format!("\"{}\"", hex::encode(old_head_balance.to_le_bytes())),
+                ),
             ),
             (
                 format!(
@@ -7544,14 +7764,17 @@ mod network_profile_tests {
                     "/global/block/head/durable/wasm_2_0_0/value?key={}",
                     indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, 0)
                 ),
-                (200, format!("\"{}\"", hex::encode(sender.as_bytes()))),
+                (200, format!("\"{}\"", hex::encode(deposit_key.as_bytes()))),
             ),
             (
                 format!(
                     "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    balance_durable_key(sender)
+                    balance_durable_key(&deposit_key)
                 ),
-                (200, format!("\"{}\"", hex::encode(new_head_balance.to_le_bytes()))),
+                (
+                    200,
+                    format!("\"{}\"", hex::encode(new_head_balance.to_le_bytes())),
+                ),
             ),
         ]));
         let profile = super::tests::rollup_profile_for_url(&base_url);
@@ -7564,7 +7787,7 @@ mod network_profile_tests {
         let err = cmd_shield_rollup(
             wallet_path_str,
             &profile,
-            sender,
+            None,
             amount,
             None,
             Some(recipient_path.to_str().unwrap().into()),
@@ -7573,8 +7796,8 @@ mod network_profile_tests {
         )
         .expect_err("shield should reject a mixed-head fee/balance snapshot");
         assert!(
-            err.contains("insufficient public rollup balance"),
-            "expected insufficient balance from pinned reads, got: {err}"
+            err.contains("no tracked secret-bound deposit has enough rollup balance"),
+            "expected insufficient deposit balance from pinned reads, got: {err}"
         );
     }
 

@@ -250,20 +250,20 @@ Create Shadownet profiles:
 
 Notes:
 
-- `public-account` is the rollup-visible transparent account string, not an L1 address
 - `dal_fee_address` is the shielded address that receives the DAL inclusion fee note
+- each `deposit` creates a fresh secret-bound rollup deposit id in the wallet and credits the canonical `deposit:<hex(deposit_id)>` rollup balance key; `shield` later proves knowledge of that deposit secret
+- `public_account` in the profile is only used for transparent balances produced by `unshield` and later `withdraw`
 - keep Alice and Bob distinct
 
-## 6. Fund Alice On L1 And Wait For The Public Rollup Balance
+## 6. Fund Alice On L1 And Wait For The Secret-Bound Deposit Balance
 
-Deposit into the bridge for Alice’s public rollup account:
+Deposit into the bridge for Alice’s next shield. The wallet generates and stores a fresh deposit secret, then asks the bridge to credit the canonical `deposit:<hex(deposit_id)>` balance key for `deposit_id = H("deposit", deposit_secret)`:
 
 ```bash
 /usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
   deposit \
-  --amount 300000 \
-  --public-account alice
+  --amount 300000
 ```
 
 The wallet prints an L1 operation hash. Wait for it to land, then poll:
@@ -272,10 +272,10 @@ The wallet prints an L1 operation hash. Wait for it to land, then poll:
 /usr/local/bin/tzel-wallet --wallet alice.wallet balance
 ```
 
-Do not continue until Alice shows a non-zero line like:
+Do not continue until Alice shows a non-zero secret-bound deposit line like:
 
 ```text
-Public rollup balance (alice): 300000
+Secret-bound deposit balance: 300000 across 1 pending deposits
 ```
 
 ## 7. Shield Alice’s Funds
@@ -314,7 +314,7 @@ Keep polling until the operator reports a final state. Then sync Alice:
 
 Acceptance:
 
-- Alice’s public rollup balance drops by the shielded amount plus the fixed `100000` mutez burn and the configured DAL-producer fee
+- Alice’s secret-bound deposit balance drops by the shielded amount plus the fixed `100000` mutez burn and the configured DAL-producer fee
 - Alice’s private available balance becomes non-zero
 
 ## 8. Derive Bob’s Receive Address
@@ -391,7 +391,7 @@ For the first successful live run, save:
   - DAL node is up, but slot publication / commitment inclusion is not advancing
 - `unattested`:
   - the public DAL node is not reachable enough from the network
-- `public balance` never changes after deposit:
+- `Secret-bound deposit balance` never changes after deposit:
   - bridge config is wrong or the rollup node is not following the right rollup
 - `sync` finds nothing after a successful operator state:
   - rollup node is stale, wrong `rollup_node_url`, or wrong wallet profile

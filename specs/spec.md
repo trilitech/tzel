@@ -230,26 +230,27 @@ separate resource price from the burned rollup fee above.
 
 ### Shield (public -> private)
 
-**Public outputs:** `[v_pub, fee, producer_fee, cm_new, cm_producer, sender_id, memo_ct_hash, producer_memo_ct_hash]`
+**Public outputs:** `[v_pub, fee, producer_fee, cm_new, cm_producer, deposit_id, memo_ct_hash, producer_memo_ct_hash]`
 
-`sender_id` is defined in [Public Account Identifier Encoding](#public-account-identifier-encoding). `auth_root` does NOT appear in the public outputs; it is a private input used only to compute `owner_tag`.
+`deposit_id` is defined in [Secret-Bound Deposit Identifiers](#secret-bound-deposit-identifiers). `auth_root` does NOT appear in the public outputs; it is a private input used only to compute `owner_tag`.
 
 **Circuit constraints:**
-1. `rcm = H(H(TAG_RCM), rseed)`
-2. `owner_tag = H_owner(auth_root, pub_seed, nk_tag)` where `auth_root`, `pub_seed`, and `nk_tag` are private inputs from the recipient's payment address
-3. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
-4. `producer_rcm = H(H(TAG_RCM), producer_rseed)`
-5. `producer_owner_tag = H_owner(producer_auth_root, producer_pub_seed, producer_nk_tag)` where those values are private inputs from the DAL producer's payment address
-6. `cm_producer = H_commit(producer_d_j, producer_fee, producer_rcm, producer_owner_tag)`
-7. `producer_fee > 0`
+1. `deposit_id = H(TAG_DEPOSIT, deposit_secret)`
+2. `rcm = H(H(TAG_RCM), rseed)`
+3. `owner_tag = H_owner(auth_root, pub_seed, nk_tag)` where `auth_root`, `pub_seed`, and `nk_tag` are private inputs from the recipient's payment address
+4. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
+5. `producer_rcm = H(H(TAG_RCM), producer_rseed)`
+6. `producer_owner_tag = H_owner(producer_auth_root, producer_pub_seed, producer_nk_tag)` where those values are private inputs from the DAL producer's payment address
+7. `cm_producer = H_commit(producer_d_j, producer_fee, producer_rcm, producer_owner_tag)`
+8. `producer_fee > 0`
 
 `memo_ct_hash` and `producer_memo_ct_hash` are computed client-side as
 `H(ct_d || tag || ct_v || nonce || encrypted_data)` — covering ALL on-chain
 note data — and passed into the circuit as public inputs.
 
-**Contract / ledger checks:** proof valid, sender binding per [Shield sender binding](#shield-sender-binding), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= required_tx_fee`.
+**Contract / ledger checks:** proof valid, deposit binding per [Shield deposit binding](#shield-deposit-binding), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= required_tx_fee`.
 
-**State changes:** deduct `v_pub + fee + producer_fee` from sender, append `cm_new` and `cm_producer` to T.
+**State changes:** deduct `v_pub + fee + producer_fee` from the public rollup balance keyed by `deposit_key = "deposit:" || lowercase_hex_32(deposit_id)`, append `cm_new` and `cm_producer` to T. A secret-bound deposit balance is not directly withdrawable; it must first be consumed by a shield proof proving knowledge of `deposit_secret`.
 
 ### Transfer (N->recipient + change + producer fee, where 1 <= N <= 7)
 
@@ -335,9 +336,11 @@ For each output note, the contract MUST verify that the `cm` in the posted note 
 
 For each output note, the contract MUST verify `H(posted_note_calldata) == memo_ct_hash` where `memo_ct_hash` is from the proof's public outputs. This prevents relayers or sequencers from swapping or stripping memo data.
 
-### Shield sender binding
+### Shield deposit binding
 
-For shield transactions, the verifier environment MUST bind the submitted public sender account to the proved `sender_id` using the exact rule defined in [Public Account Identifier Encoding](#public-account-identifier-encoding).
+Bridge deposits for shielding MUST credit a public rollup balance keyed by the secret-bound deposit balance key for `deposit_id`. The shield proof MUST prove knowledge of `deposit_secret` such that `deposit_id = H(TAG_DEPOSIT, deposit_secret)`, and the ledger MUST debit the balance associated with that exact deposit key.
+
+The ledger MUST reject direct withdraws from secret-bound deposit balances. Otherwise the public `deposit_id` would be enough to withdraw deposited funds before shielding, defeating the ownership binding.
 
 ### Spend authorization (all spending transactions)
 
@@ -456,10 +459,10 @@ encrypted_data  — 1,080 bytes   ChaCha20-Poly1305(v:8 || rseed:32 || memo:1024
 
 ```
 proof             — ~295 KB    circuit proof (ZK, two-level recursive STARK)
-public_outputs    —  256 B     [v_pub, fee, producer_fee, cm_new, cm_producer, sender_id, memo_ct_hash, producer_memo_ct_hash] (8 x 32 bytes)
+public_outputs    —  256 B     [v_pub, fee, producer_fee, cm_new, cm_producer, deposit_id, memo_ct_hash, producer_memo_ct_hash] (8 x 32 bytes)
 note_data         —  6.4 KB    2 output notes
                   ----------
-                  ~302 KB total (no spend signature — sender bound by external verifier check)
+                  ~302 KB total (no spend signature — ownership is proved by deposit-secret preimage knowledge)
 ```
 
 ### Transfer (N->recipient + change + producer fee)
@@ -620,13 +623,32 @@ The reference CLI currently exposes JSON over HTTP. That JSON must map losslessl
 - raw byte fields are serialized as lowercase hex strings, no `0x` prefix
 - `index` is serialized as a JSON integer
 - canonical binary `index` is `u64le`; the JSON mapping uses the same integer value
-- public sender / recipient account identifiers remain JSON strings outside the circuit
+- shield requests carry `deposit_id` as a `felt252` hex field
+- public recipient account identifiers for unshield and public sender identifiers for withdraw remain JSON strings outside the circuit
 
 This JSON mapping is a convenience API, not the normative interoperability format.
 
+### Secret-Bound Deposit Identifiers
+
+The bridge receiver for a shield deposit is a namespaced secret-bound deposit balance key:
+
+```text
+deposit_id = H(TAG_DEPOSIT, deposit_secret)
+TAG_DEPOSIT = felt_tag("deposit")
+deposit_key = "deposit:" || lowercase_hex_32(deposit_id)
+```
+
+`felt_tag("deposit")` is the same tag construction used by the Rust reference implementation: interpret the ASCII bytes as a big-endian integer and encode that felt in canonical little-endian field form. In Cairo notation this tag is `0x6465706f736974`.
+
+The `deposit:` namespace is part of the canonical public balance key. It prevents a raw 64-character hex deposit id from being confused with hex-encoded durable bytes by rollup RPC clients. The bridge MUST reject non-canonical deposit keys, including missing prefixes, mixed-case hex, and malformed lengths.
+
+The wallet generates a fresh random `deposit_secret` for each L1 bridge deposit, stores it locally, and asks the bridge to credit the rollup balance key `deposit:<hex(deposit_id)>`. The later shield proof uses `deposit_secret` as private witness and publishes `deposit_id`. The ledger only checks the public balance for that deposit key; it never learns `deposit_secret`.
+
+This replaces any public-account-string ownership assumption for shield. A bridge deposit to `deposit_key` can only be shielded by someone who knows the preimage for the embedded `deposit_id`, and direct withdraw from a `deposit_key` balance is rejected.
+
 ### Public Account Identifier Encoding
 
-The current reference ledger represents public sender / recipient accounts as UTF-8 strings outside the circuit and hashes them into felt public outputs:
+The current reference ledger represents public recipient accounts as UTF-8 strings outside the circuit and hashes them into felt public outputs:
 
 ```text
 account_id = H(UTF8(account_string))
@@ -634,11 +656,10 @@ account_id = H(UTF8(account_string))
 
 using unpersonalized BLAKE2s-256 truncated to 251 bits.
 
-- Shield proves `sender_id = account_id(sender_string)`
 - Unshield proves `recipient_id = account_id(recipient_string)`
 - The submitted string is checked by re-hashing it and comparing to the proved felt
 
-The reference CLI ledger's string-based public accounts are intentionally a demo-only stand-in for verifier-environment identity. They are suitable for local testing and for illustrating what the proof must bind, but not as a secure networked account model. Deployments that replace this with chain-native addresses MUST specify the exact byte serialization and verifier check. "Address" alone is not a sufficient consensus definition.
+The reference CLI ledger's string-based public accounts are intentionally a demo-only stand-in for verifier-environment identity. They are suitable for local testing and for illustrating what unshield must bind, but not as a secure networked account model. Deployments that replace this with chain-native addresses MUST specify the exact byte serialization and verifier check. "Address" alone is not a sufficient consensus definition.
 
 ### Merkle Tree Structure
 

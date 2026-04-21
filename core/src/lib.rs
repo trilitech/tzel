@@ -195,6 +195,36 @@ pub fn derive_rcm(rseed: &F) -> F {
     hash_two(&hash(&tag), rseed)
 }
 
+pub fn deposit_id_from_secret(secret: &F) -> F {
+    hash_two(&felt_tag(b"deposit"), secret)
+}
+
+pub fn deposit_secret_from_label(label: &str) -> F {
+    hash(label.as_bytes())
+}
+
+pub fn deposit_id_from_label(label: &str) -> F {
+    deposit_id_from_secret(&deposit_secret_from_label(label))
+}
+
+pub const DEPOSIT_BALANCE_KEY_PREFIX: &str = "deposit:";
+
+pub fn deposit_balance_key(deposit_id: &F) -> String {
+    format!("{}{}", DEPOSIT_BALANCE_KEY_PREFIX, hex::encode(deposit_id))
+}
+
+pub fn is_deposit_balance_key(value: &str) -> bool {
+    let Some(hex_id) = value.strip_prefix(DEPOSIT_BALANCE_KEY_PREFIX) else {
+        return false;
+    };
+    if hex_id.len() != 64 {
+        return false;
+    }
+    hex::decode(hex_id)
+        .map(|bytes| bytes.len() == 32 && hex::encode(bytes) == hex_id)
+        .unwrap_or(false)
+}
+
 pub fn derive_nk_spend(nk: &F, d_j: &F) -> F {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(nk);
@@ -1329,7 +1359,8 @@ pub struct PaymentAddress {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShieldReq {
-    pub sender: String,
+    #[serde(with = "hex_f")]
+    pub deposit_id: F,
     pub fee: u64,
     pub v: u64,
     pub producer_fee: u64,
@@ -1687,7 +1718,8 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
     if req.producer_fee == 0 {
         return Err("producer fee must be greater than zero".into());
     }
-    let bal = state.balance(&req.sender)?;
+    let balance_key = deposit_balance_key(&req.deposit_id);
+    let bal = state.balance(&balance_key)?;
     let debit = req
         .v
         .checked_add(req.fee)
@@ -1748,8 +1780,8 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
             if tail[4] != req.producer_cm {
                 return Err("proof producer_cm mismatch".into());
             }
-            if tail[5] != hash(req.sender.as_bytes()) {
-                return Err("proof sender mismatch".into());
+            if tail[5] != req.deposit_id {
+                return Err("proof deposit_id mismatch".into());
             }
             if let Some(ref enc) = req.client_enc {
                 let mh = memo_ct_hash(enc);
@@ -1806,7 +1838,7 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
     };
 
     state.ensure_note_capacity(2)?;
-    state.set_balance(&req.sender, bal - debit)?;
+    state.set_balance(&balance_key, bal - debit)?;
     let index = state.append_note(cm, enc)?;
     let producer_index = state.append_note(req.producer_cm, producer_enc.clone())?;
     state.snapshot_root()?;
@@ -2064,6 +2096,9 @@ pub fn apply_withdraw<S: LedgerState>(
     state: &mut S,
     req: &WithdrawReq,
 ) -> Result<WithdrawResp, String> {
+    if is_deposit_balance_key(&req.sender) {
+        return Err("cannot withdraw from a secret-bound deposit balance; shield it first".into());
+    }
     let balance = state.balance(&req.sender)?;
     if balance < req.amount {
         return Err("insufficient balance".into());
@@ -2092,6 +2127,14 @@ mod tests {
 
     fn u(v: u64) -> F {
         u64_to_felt(v)
+    }
+
+    fn test_deposit_id(label: &str) -> F {
+        deposit_id_from_label(label)
+    }
+
+    fn test_deposit_key(label: &str) -> String {
+        deposit_balance_key(&test_deposit_id(label))
     }
 
     fn recompute_root_from_path(leaf: F, index: usize, siblings: &[F]) -> F {
@@ -2338,7 +2381,7 @@ mod tests {
         let mut ledger = Ledger::new();
         ledger
             .fund(
-                sender,
+                &test_deposit_key(sender),
                 amount
                     .checked_mul(2)
                     .and_then(|v| v.checked_add(producer_fee))
@@ -2348,7 +2391,7 @@ mod tests {
             .unwrap();
         let resp = ledger
             .shield(&ShieldReq {
-                sender: sender.into(),
+                deposit_id: test_deposit_id(sender),
                 fee: MIN_TX_FEE,
                 v: amount,
                 producer_fee,
@@ -3132,7 +3175,9 @@ mod tests {
         let mut ledger = Ledger::new();
         let fee = MIN_TX_FEE;
         let producer_fee = 7;
-        ledger.fund("alice", 125 + producer_fee + fee + 70).unwrap();
+        ledger
+            .fund(&test_deposit_key("alice"), 125 + producer_fee + fee + 70)
+            .unwrap();
 
         let (enc, cm) = deterministic_note(&addr, 125, u(15), Some(b"shield"));
         let (producer_enc, producer_cm) =
@@ -3144,7 +3189,7 @@ mod tests {
         let resp = apply_shield(
             &mut ledger,
             &ShieldReq {
-                sender: "alice".into(),
+                deposit_id: test_deposit_id("alice"),
                 fee,
                 v: 125,
                 producer_fee,
@@ -3156,7 +3201,7 @@ mod tests {
                     u(producer_fee),
                     cm,
                     producer_cm,
-                    hash(b"alice"),
+                    test_deposit_id("alice"),
                     memo_hash,
                     producer_memo_hash,
                 ]),
@@ -3172,10 +3217,58 @@ mod tests {
         assert_eq!(resp.index, 0);
         assert_eq!(resp.producer_cm, producer_cm);
         assert_eq!(resp.producer_index, 1);
-        assert_eq!(ledger.balance("alice").unwrap(), 70);
+        assert_eq!(ledger.balance(&test_deposit_key("alice")).unwrap(), 70);
         assert_eq!(ledger.memos.len(), 2);
         assert_ne!(ledger.tree.root(), root_before);
         assert!(ledger.valid_roots.contains(&ledger.tree.root()));
+    }
+
+    #[test]
+    fn test_apply_shield_stark_binds_deposit_id_to_proof() {
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x91, 0);
+        let mut ledger = Ledger::new();
+        let fee = MIN_TX_FEE;
+        let producer_fee = 7;
+        ledger
+            .fund(&test_deposit_key("alice"), 125 + producer_fee + fee)
+            .unwrap();
+
+        let (enc, cm) = deterministic_note(&addr, 125, u(17), Some(b"shield"));
+        let (producer_enc, producer_cm) =
+            deterministic_note(&addr, producer_fee, u(18), Some(b"dal"));
+        let err = apply_shield(
+            &mut ledger,
+            &ShieldReq {
+                deposit_id: test_deposit_id("alice"),
+                fee,
+                v: 125,
+                producer_fee,
+                address: addr,
+                memo: None,
+                proof: fake_stark(vec![
+                    u(125),
+                    u(fee),
+                    u(producer_fee),
+                    cm,
+                    producer_cm,
+                    test_deposit_id("mallory"),
+                    memo_ct_hash(&enc),
+                    memo_ct_hash(&producer_enc),
+                ]),
+                client_cm: cm,
+                client_enc: Some(enc),
+                producer_cm,
+                producer_enc: Some(producer_enc),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("proof deposit_id mismatch"));
+        assert_eq!(
+            ledger.balance(&test_deposit_key("alice")).unwrap(),
+            125 + producer_fee + fee
+        );
+        assert!(ledger.memos.is_empty());
     }
 
     #[test]
@@ -3358,13 +3451,15 @@ mod tests {
     fn test_apply_shield_rejects_fee_below_minimum() {
         let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x76, 0);
         let mut ledger = Ledger::new();
-        ledger.fund("alice", MIN_TX_FEE + 200).unwrap();
+        ledger
+            .fund(&test_deposit_key("alice"), MIN_TX_FEE + 200)
+            .unwrap();
         let (producer_enc, producer_cm) = deterministic_note(&addr, 1, u(61), Some(b"dal"));
 
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
-                sender: "alice".into(),
+                deposit_id: test_deposit_id("alice"),
                 fee: MIN_TX_FEE - 1,
                 v: 125,
                 producer_fee: 1,
@@ -3380,7 +3475,10 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("fee below minimum"));
-        assert_eq!(ledger.balance("alice").unwrap(), MIN_TX_FEE + 200);
+        assert_eq!(
+            ledger.balance(&test_deposit_key("alice")).unwrap(),
+            MIN_TX_FEE + 200
+        );
         assert!(ledger.memos.is_empty());
     }
 
@@ -3401,13 +3499,16 @@ mod tests {
         let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x8A, 0);
         let mut state =
             LimitedAppendLedgerState::new(Ledger::new(), 4).with_required_tx_fee(MIN_TX_FEE * 2);
-        state.inner.fund("alice", MIN_TX_FEE * 2 + 126).unwrap();
+        state
+            .inner
+            .fund(&test_deposit_key("alice"), MIN_TX_FEE * 2 + 126)
+            .unwrap();
         let (producer_enc, producer_cm) = deterministic_note(&addr, 1, u(63), Some(b"dal"));
 
         let err = apply_shield(
             &mut state,
             &ShieldReq {
-                sender: "alice".into(),
+                deposit_id: test_deposit_id("alice"),
                 fee: MIN_TX_FEE,
                 v: 125,
                 producer_fee: 1,
@@ -3430,18 +3531,21 @@ mod tests {
     fn test_apply_shield_preflights_two_note_capacity_before_debiting_sender() {
         let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x90, 0);
         let mut state = LimitedAppendLedgerState::new(Ledger::new(), 1);
-        state.inner.fund("alice", MIN_TX_FEE + 126).unwrap();
+        state
+            .inner
+            .fund(&test_deposit_key("alice"), MIN_TX_FEE + 126)
+            .unwrap();
         let (client_enc, client_cm) = deterministic_note(&addr, 125, u(91), Some(b"shield"));
         let (producer_enc, producer_cm) = deterministic_note(&addr, 1, u(92), Some(b"dal"));
 
-        let balance_before = state.inner.balance("alice").unwrap();
+        let balance_before = state.inner.balance(&test_deposit_key("alice")).unwrap();
         let leaves_before = state.inner.tree.leaves.clone();
         let memos_before = state.inner.memos.len();
 
         let err = apply_shield(
             &mut state,
             &ShieldReq {
-                sender: "alice".into(),
+                deposit_id: test_deposit_id("alice"),
                 fee: MIN_TX_FEE,
                 v: 125,
                 producer_fee: 1,
@@ -3457,7 +3561,10 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("Merkle tree full"));
-        assert_eq!(state.inner.balance("alice").unwrap(), balance_before);
+        assert_eq!(
+            state.inner.balance(&test_deposit_key("alice")).unwrap(),
+            balance_before
+        );
         assert_eq!(state.inner.tree.leaves, leaves_before);
         assert_eq!(state.inner.memos.len(), memos_before);
     }
@@ -3644,6 +3751,38 @@ mod tests {
         assert!(err.contains("insufficient balance"));
         assert_eq!(ledger.balance("bob").unwrap(), 10);
         assert!(ledger.withdrawals.is_empty());
+    }
+
+    #[test]
+    fn test_apply_withdraw_rejects_secret_bound_deposit_balance() {
+        let mut ledger = Ledger::new();
+        let key = test_deposit_key("alice");
+        ledger.deposit(&key, 10).unwrap();
+
+        let err = apply_withdraw(
+            &mut ledger,
+            &WithdrawReq {
+                sender: key.clone(),
+                recipient: "tz1-target".into(),
+                amount: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("shield it first"));
+        assert_eq!(ledger.balance(&key).unwrap(), 10);
+        assert!(ledger.withdrawals.is_empty());
+    }
+
+    #[test]
+    fn test_deposit_balance_key_is_namespaced_and_canonical() {
+        let deposit_id = test_deposit_id("alice");
+        let key = deposit_balance_key(&deposit_id);
+
+        assert!(key.starts_with(DEPOSIT_BALANCE_KEY_PREFIX));
+        assert!(is_deposit_balance_key(&key));
+        assert!(!is_deposit_balance_key(&hex::encode(deposit_id)));
+        assert!(!is_deposit_balance_key(&key.to_uppercase()));
     }
 
     #[test]

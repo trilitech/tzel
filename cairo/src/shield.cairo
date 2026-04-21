@@ -1,7 +1,7 @@
 /// Shield circuit: deposit public tokens into a private note.
 ///
 /// # Public outputs
-///   [v_note, fee, producer_fee, cm_new, cm_producer, sender, memo_ct_hash, producer_memo_ct_hash]
+///   [v_note, fee, producer_fee, cm_new, cm_producer, deposit_id, memo_ct_hash, producer_memo_ct_hash]
 ///
 /// # Constraint
 ///   owner_tag = H_owner(auth_root, auth_pub_seed, nk_tag)
@@ -10,7 +10,8 @@
 ///
 /// auth_root, auth_pub_seed, and nk_tag come from the recipient's payment address.
 /// Neither appears in public outputs — they are private inputs.
-/// Shield requires no spend authorization (sender authenticated by msg.sender).
+/// Shield proves knowledge of the deposit secret whose hash owns the credited
+/// public rollup balance.
 
 use tzel::blake_hash as hash;
 
@@ -20,9 +21,10 @@ pub fn verify(
     producer_fee: u64,
     cm_new: felt252,
     cm_producer: felt252,
-    sender: felt252,
+    deposit_id: felt252,
     memo_ct_hash: felt252,
     producer_memo_ct_hash: felt252,
+    deposit_secret: felt252,
     // private inputs
     auth_root: felt252,
     auth_pub_seed: felt252,
@@ -35,6 +37,7 @@ pub fn verify(
     producer_d_j: felt252,
     producer_rseed: felt252,
 ) -> Array<felt252> {
+    assert(hash::hash2_generic(0x6465706f736974, deposit_secret) == deposit_id, 'shield deposit id');
     let otag = hash::owner_tag(auth_root, auth_pub_seed, nk_tag);
     let rcm = hash::derive_rcm(rseed);
     assert(hash::commit(d_j, v_note, rcm, otag) == cm_new, 'shield: bad commitment');
@@ -53,7 +56,7 @@ pub fn verify(
         producer_fee.into(),
         cm_new,
         cm_producer,
-        sender,
+        deposit_id,
         memo_ct_hash,
         producer_memo_ct_hash,
     ]
@@ -71,9 +74,10 @@ mod tests {
         producer_fee: u64,
         cm_new: felt252,
         cm_producer: felt252,
-        sender: felt252,
+        deposit_id: felt252,
         memo_ct_hash: felt252,
         producer_memo_ct_hash: felt252,
+        deposit_secret: felt252,
         auth_root: felt252,
         auth_pub_seed: felt252,
         nk_tag: felt252,
@@ -90,7 +94,8 @@ mod tests {
         let v_note = 19_u64;
         let fee = 4_u64;
         let producer_fee = 3_u64;
-        let sender = 0x1111;
+        let deposit_secret = 0x1111;
+        let deposit_id = hash::hash2_generic(0x6465706f736974, deposit_secret);
         let memo_ct_hash = 0x2222;
         let producer_memo_ct_hash = 0x2323;
         let auth_root = 0x3333;
@@ -117,9 +122,10 @@ mod tests {
             producer_fee,
             cm_new,
             cm_producer,
-            sender,
+            deposit_id,
             memo_ct_hash,
             producer_memo_ct_hash,
+            deposit_secret,
             auth_root,
             auth_pub_seed,
             nk_tag,
@@ -142,9 +148,10 @@ mod tests {
             fixture.producer_fee,
             fixture.cm_new,
             fixture.cm_producer,
-            fixture.sender,
+            fixture.deposit_id,
             fixture.memo_ct_hash,
             fixture.producer_memo_ct_hash,
+            fixture.deposit_secret,
             fixture.auth_root,
             fixture.auth_pub_seed,
             fixture.nk_tag,
@@ -162,9 +169,36 @@ mod tests {
         assert(*outputs.at(2) == fixture.producer_fee.into(), 'shield out producer fee');
         assert(*outputs.at(3) == fixture.cm_new, 'shield out cm');
         assert(*outputs.at(4) == fixture.cm_producer, 'shield out producer cm');
-        assert(*outputs.at(5) == fixture.sender, 'shield out sender');
+        assert(*outputs.at(5) == fixture.deposit_id, 'shield out deposit');
         assert(*outputs.at(6) == fixture.memo_ct_hash, 'shield out memo');
         assert(*outputs.at(7) == fixture.producer_memo_ct_hash, 'shield out producer memo');
+    }
+
+    #[test]
+    #[should_panic(expected: ('shield deposit id',))]
+    fn test_shield_rejects_wrong_deposit_secret() {
+        let fixture = build_fixture();
+        verify(
+            fixture.v_note,
+            fixture.fee,
+            fixture.producer_fee,
+            fixture.cm_new,
+            fixture.cm_producer,
+            fixture.deposit_id,
+            fixture.memo_ct_hash,
+            fixture.producer_memo_ct_hash,
+            fixture.deposit_secret + 1,
+            fixture.auth_root,
+            fixture.auth_pub_seed,
+            fixture.nk_tag,
+            fixture.d_j,
+            fixture.rseed,
+            fixture.producer_auth_root,
+            fixture.producer_auth_pub_seed,
+            fixture.producer_nk_tag,
+            fixture.producer_d_j,
+            fixture.producer_rseed,
+        );
     }
 
     #[test]
@@ -177,9 +211,10 @@ mod tests {
             fixture.producer_fee,
             fixture.cm_new + 1,
             fixture.cm_producer,
-            fixture.sender,
+            fixture.deposit_id,
             fixture.memo_ct_hash,
             fixture.producer_memo_ct_hash,
+            fixture.deposit_secret,
             fixture.auth_root,
             fixture.auth_pub_seed,
             fixture.nk_tag,
@@ -203,9 +238,10 @@ mod tests {
             fixture.producer_fee,
             fixture.cm_new,
             fixture.cm_producer,
-            fixture.sender,
+            fixture.deposit_id,
             fixture.memo_ct_hash,
             fixture.producer_memo_ct_hash,
+            fixture.deposit_secret,
             fixture.auth_root,
             fixture.auth_pub_seed + 1,
             fixture.nk_tag,
@@ -229,9 +265,10 @@ mod tests {
             fixture.producer_fee,
             fixture.cm_new,
             fixture.cm_producer,
-            fixture.sender,
+            fixture.deposit_id,
             fixture.memo_ct_hash,
             fixture.producer_memo_ct_hash,
+            fixture.deposit_secret,
             fixture.auth_root,
             fixture.auth_pub_seed,
             fixture.nk_tag,
@@ -255,9 +292,10 @@ mod tests {
             fixture.producer_fee,
             fixture.cm_new,
             fixture.cm_producer,
-            fixture.sender,
+            fixture.deposit_id,
             fixture.memo_ct_hash,
             fixture.producer_memo_ct_hash,
+            fixture.deposit_secret,
             fixture.auth_root + 1,
             fixture.auth_pub_seed,
             fixture.nk_tag,
@@ -281,9 +319,10 @@ mod tests {
             fixture.producer_fee,
             fixture.cm_new,
             fixture.cm_producer,
-            fixture.sender,
+            fixture.deposit_id,
             fixture.memo_ct_hash,
             fixture.producer_memo_ct_hash,
+            fixture.deposit_secret,
             fixture.auth_root,
             fixture.auth_pub_seed,
             fixture.nk_tag + 1,
@@ -307,9 +346,10 @@ mod tests {
             fixture.producer_fee,
             fixture.cm_new,
             fixture.cm_producer,
-            fixture.sender,
+            fixture.deposit_id,
             fixture.memo_ct_hash,
             fixture.producer_memo_ct_hash,
+            fixture.deposit_secret,
             fixture.auth_root,
             fixture.auth_pub_seed,
             fixture.nk_tag,
@@ -333,9 +373,10 @@ mod tests {
             fixture.producer_fee,
             fixture.cm_new,
             fixture.cm_producer,
-            fixture.sender,
+            fixture.deposit_id,
             fixture.memo_ct_hash,
             fixture.producer_memo_ct_hash,
+            fixture.deposit_secret,
             fixture.auth_root,
             fixture.auth_pub_seed,
             fixture.nk_tag,

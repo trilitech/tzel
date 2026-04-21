@@ -15,7 +15,7 @@ class OctezRollupSandboxDalSmokeTest(unittest.TestCase):
               "shield_program_hash": "bb",
               "transfer_program_hash": "cc",
               "unshield_program_hash": "dd",
-              "shield_sender": "alice",
+              "shield_deposit_id": "deposit:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
               "shield_amount": 400000,
               "shield_total_debit": 500001,
               "shield_tree_size_after": 2
@@ -43,7 +43,16 @@ class OctezRollupSandboxDalSmokeTest(unittest.TestCase):
 
         self.assertEqual(
             proc.stdout.splitlines(),
-            ["aa", "bb", "cc", "dd", "alice", "400000", "500001", "2"],
+            [
+                "aa",
+                "bb",
+                "cc",
+                "dd",
+                "deposit:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "400000",
+                "500001",
+                "2",
+            ],
         )
 
     def test_await_fixture_shield_postconditions_uses_expected_tree_size(self) -> None:

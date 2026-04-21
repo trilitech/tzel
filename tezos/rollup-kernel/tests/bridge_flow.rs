@@ -30,7 +30,7 @@ use tzel_core::kernel_wire::{
     sign_kernel_verifier_config, KernelShieldReq, KernelStarkProof, KernelTransferReq,
     KernelUnshieldReq, KernelVerifierConfig,
 };
-use tzel_core::{hash, F};
+use tzel_core::{deposit_balance_key, deposit_id_from_label, hash, F};
 #[cfg(feature = "proof-verifier")]
 use tzel_core::{ProgramHashes, Proof, ShieldReq, TransferReq, UnshieldReq};
 use tzel_rollup_kernel::{
@@ -39,6 +39,9 @@ use tzel_rollup_kernel::{
 };
 
 const PATH_BRIDGE_TICKETER: &[u8] = b"/tzel/v1/state/bridge/ticketer";
+const PATH_BALANCE_ACCOUNT_COUNT: &[u8] = b"/tzel/v1/state/balances/count";
+const PATH_BALANCE_PREFIX: &[u8] = b"/tzel/v1/state/balances/by-key/";
+const PATH_BALANCE_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/balances/index/";
 const PATH_WITHDRAWAL_PREFIX: &[u8] = b"/tzel/v1/state/withdrawals/index/";
 
 #[derive(Clone, Default)]
@@ -196,14 +199,19 @@ fn bridge_roundtrip_survives_restarts_and_preserves_append_only_withdrawals() {
         KernelResult::Configured
     ));
 
-    host.push_input(1, 0, encode_ticket_deposit_message("alice", 75));
+    let alice_deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+    host.push_input(1, 0, encode_ticket_deposit_message(&alice_deposit_key, 75));
     run_with_host(&mut host);
 
     assert!(matches!(
         read_last_result(&host).unwrap(),
         KernelResult::Deposit
     ));
-    assert_eq!(read_ledger(&host).unwrap().balances.get("alice"), Some(&75));
+    assert_eq!(
+        read_ledger(&host).unwrap().balances.get(&alice_deposit_key),
+        Some(&75)
+    );
+    write_public_balance(&mut host, "alice", 75);
 
     let first_withdraw =
         encode_external_kernel_message(KernelInboxMessage::Withdraw(KernelWithdrawReq {
@@ -231,7 +239,8 @@ fn bridge_roundtrip_survives_restarts_and_preserves_append_only_withdrawals() {
 
     let mut restarted = TestHost::from_store(host.store.clone());
     restarted.outputs = host.outputs.clone();
-    restarted.push_input(3, 0, encode_ticket_deposit_message("alice", 10));
+    write_public_balance(&mut restarted, "alice", 45);
+    restarted.push_input(3, 0, encode_ticket_deposit_message(&alice_deposit_key, 10));
     restarted.push_input(
         4,
         0,
@@ -322,7 +331,8 @@ fn bridge_configuration_can_be_delivered_via_dal_pointer() {
 #[test]
 fn bridge_deposit_requires_configuration_and_recovers_after_external_configuration() {
     let mut host = TestHost::default();
-    let deposit = encode_ticket_deposit_message("alice", 12);
+    let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+    let deposit = encode_ticket_deposit_message(&deposit_key, 12);
     host.push_input(0, 0, deposit.clone());
 
     run_with_host(&mut host);
@@ -348,11 +358,65 @@ fn bridge_deposit_requires_configuration_and_recovers_after_external_configurati
 
     let stats = read_stats(&host);
     assert_eq!(stats.raw_input_count, 3);
-    assert_eq!(read_ledger(&host).unwrap().balances.get("alice"), Some(&12));
+    assert_eq!(
+        read_ledger(&host).unwrap().balances.get(&deposit_key),
+        Some(&12)
+    );
     assert!(matches!(
         read_last_result(&host).unwrap(),
         KernelResult::Deposit
     ));
+}
+
+#[test]
+fn bridge_deposit_rejects_non_deposit_id_receiver() {
+    let mut host = TestHost::default();
+    host.push_input(
+        0,
+        0,
+        encode_external_kernel_message(signed_bridge_message(KernelBridgeConfig {
+            ticketer: sample_ticketer().into(),
+        })),
+    );
+    host.push_input(1, 0, encode_ticket_deposit_message("alice", 12));
+
+    run_with_host(&mut host);
+
+    assert!(read_ledger(&host).unwrap().balances.is_empty());
+    match read_last_result(&host).unwrap() {
+        KernelResult::Error { message } => {
+            assert!(message.contains("deposit receiver must be a secret-bound deposit key"))
+        }
+        other => panic!("unexpected rollup result: {:?}", other),
+    }
+}
+
+#[test]
+fn bridge_deposit_rejects_non_canonical_deposit_id_receiver() {
+    let mut host = TestHost::default();
+    let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+    let (_, hex_id) = deposit_key.split_once(':').unwrap();
+    let non_canonical_key = format!("deposit:{}", hex_id.to_uppercase());
+    assert_ne!(deposit_key, non_canonical_key);
+
+    host.push_input(
+        0,
+        0,
+        encode_external_kernel_message(signed_bridge_message(KernelBridgeConfig {
+            ticketer: sample_ticketer().into(),
+        })),
+    );
+    host.push_input(1, 0, encode_ticket_deposit_message(&non_canonical_key, 12));
+
+    run_with_host(&mut host);
+
+    assert!(read_ledger(&host).unwrap().balances.is_empty());
+    match read_last_result(&host).unwrap() {
+        KernelResult::Error { message } => {
+            assert!(message.contains("deposit receiver must be a secret-bound deposit key"))
+        }
+        other => panic!("unexpected rollup result: {:?}", other),
+    }
 }
 
 #[cfg(feature = "proof-verifier")]
@@ -383,7 +447,7 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
         read_ledger(&host)
             .unwrap()
             .balances
-            .get(fixture.shield.sender.as_str()),
+            .get(&deposit_balance_key(&fixture.shield.deposit_id)),
         Some(&(fixture.shield.v + fixture.shield.fee + fixture.shield.producer_fee))
     );
 
@@ -399,7 +463,9 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
     }
     let ledger = read_ledger(&host).unwrap();
     assert_eq!(
-        ledger.balances.get(fixture.shield.sender.as_str()),
+        ledger
+            .balances
+            .get(&deposit_balance_key(&fixture.shield.deposit_id)),
         Some(&0)
     );
     assert_eq!(
@@ -800,6 +866,30 @@ fn indexed_path(prefix: &[u8], index: u64) -> Vec<u8> {
     path
 }
 
+fn balance_path(addr: &str) -> Vec<u8> {
+    let mut path = Vec::with_capacity(PATH_BALANCE_PREFIX.len() + addr.len() * 2);
+    path.extend_from_slice(PATH_BALANCE_PREFIX);
+    path.extend_from_slice(hex::encode(addr.as_bytes()).as_bytes());
+    path
+}
+
+fn write_public_balance(host: &mut TestHost, account: &str, amount: u64) {
+    let count = host
+        .read_store(PATH_BALANCE_ACCOUNT_COUNT, 8)
+        .map(|bytes| {
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&bytes[..8]);
+            u64::from_le_bytes(raw)
+        })
+        .unwrap_or(0);
+    host.write_store(
+        &indexed_path(PATH_BALANCE_INDEX_PREFIX, count),
+        account.as_bytes(),
+    );
+    host.write_store(PATH_BALANCE_ACCOUNT_COUNT, &(count + 1).to_le_bytes());
+    host.write_store(&balance_path(account), &amount.to_le_bytes());
+}
+
 #[cfg(feature = "proof-verifier")]
 fn assert_ledger_state_unchanged(before: &tzel_core::Ledger, after: &tzel_core::Ledger) {
     assert_eq!(after.auth_domain, before.auth_domain);
@@ -855,7 +945,7 @@ fn kernel_proof_from_fixture(proof: &Proof) -> KernelStarkProof {
 #[cfg(feature = "proof-verifier")]
 fn kernel_shield_req_from_fixture(req: &ShieldReq) -> KernelShieldReq {
     KernelShieldReq {
-        sender: req.sender.clone(),
+        deposit_id: req.deposit_id,
         v: req.v,
         fee: req.fee,
         producer_fee: req.producer_fee,
@@ -988,7 +1078,7 @@ fn apply_fixture_deposit(host: &mut TestHost, fixture: &VerifiedBridgeFixture, l
         level,
         0,
         encode_custom_ticket_deposit_message(
-            fixture.shield.sender.as_bytes().to_vec(),
+            deposit_balance_key(&fixture.shield.deposit_id).into_bytes(),
             fixture.shield.v + fixture.shield.fee + fixture.shield.producer_fee,
             &fixture.bridge_ticketer,
             &fixture.bridge_ticketer,

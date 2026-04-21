@@ -37,7 +37,7 @@ mod with_verifier {
         unshield_program_hash: String,
         bridge_ticketer: &'a str,
         withdrawal_recipient: &'a str,
-        shield_sender: &'a str,
+        shield_deposit_id: String,
         shield_amount: u64,
         shield_total_debit: u64,
         shield_tree_size_after: u64,
@@ -84,7 +84,7 @@ mod with_verifier {
 
     fn kernel_shield_req_from_fixture(req: &ShieldReq) -> KernelShieldReq {
         KernelShieldReq {
-            sender: req.sender.clone(),
+            deposit_id: req.deposit_id,
             v: req.v,
             fee: req.fee,
             producer_fee: req.producer_fee,
@@ -133,7 +133,7 @@ mod with_verifier {
         println!("{}", hex::encode(payload));
     }
 
-    fn fixture_metadata<'a>(fixture: &'a VerifiedBridgeFixture) -> FixtureMetadata<'a> {
+    fn fixture_metadata(fixture: &VerifiedBridgeFixture) -> FixtureMetadata<'_> {
         FixtureMetadata {
             auth_domain: felt_hex(&fixture.auth_domain),
             shield_program_hash: felt_hex(&fixture.program_hashes.shield),
@@ -141,7 +141,7 @@ mod with_verifier {
             unshield_program_hash: felt_hex(&fixture.program_hashes.unshield),
             bridge_ticketer: &fixture.bridge_ticketer,
             withdrawal_recipient: &fixture.withdrawal_recipient,
-            shield_sender: &fixture.shield.sender,
+            shield_deposit_id: tzel_core::deposit_balance_key(&fixture.shield.deposit_id),
             shield_amount: fixture.shield.v,
             shield_total_debit: fixture.shield.v + fixture.shield.fee + fixture.shield.producer_fee,
             shield_tree_size_after: 2,

@@ -243,7 +243,7 @@ fn build_fixture() -> Result<VerifiedBridgeFixture, String> {
         bridge_ticketer: BRIDGE_TICKETER.into(),
         withdrawal_recipient: WITHDRAWAL_RECIPIENT.into(),
         shield: ShieldReq {
-            sender: "alice".into(),
+            deposit_id: deposit_id_from_label("alice"),
             v: SHIELD_AMOUNT,
             fee: MIN_TX_FEE,
             producer_fee: DAL_PRODUCER_FEE,
@@ -297,16 +297,19 @@ fn generate_shield_proof(
     producer_enc: &EncryptedNote,
     producer_cm: F,
 ) -> Result<Proof, String> {
+    let deposit_secret = deposit_secret_from_label(sender);
+    let deposit_id = deposit_id_from_secret(&deposit_secret);
     let args = vec![
-        felt_u64_to_hex(18),
+        felt_u64_to_hex(19),
         felt_u64_to_hex(amount),
         felt_u64_to_hex(fee),
         felt_u64_to_hex(producer_fee),
         felt_to_hex(&cm),
         felt_to_hex(&producer_cm),
-        felt_to_hex(&hash(sender.as_bytes())),
+        felt_to_hex(&deposit_id),
         felt_to_hex(&memo_ct_hash(enc)),
         felt_to_hex(&memo_ct_hash(producer_enc)),
+        felt_to_hex(&deposit_secret),
         felt_to_hex(&address.auth_root),
         felt_to_hex(&address.auth_pub_seed),
         felt_to_hex(&address.nk_tag),

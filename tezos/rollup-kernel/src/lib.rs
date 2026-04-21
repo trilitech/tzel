@@ -639,6 +639,12 @@ fn validate_bridge_deposit<H: Host>(
     if configured != deposit.ticketer {
         return Err("deposit sent from unexpected ticketer".into());
     }
+    if !tzel_core::is_deposit_balance_key(&deposit.recipient) {
+        return Err(
+            "deposit receiver must be a secret-bound deposit key: deposit:<32-byte lowercase hex>"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -997,6 +1003,11 @@ fn apply_kernel_message<H: Host>(
         }
         KernelInboxMessage::Withdraw(req) => {
             let host_req = kernel_withdraw_req_to_host(&req);
+            if tzel_core::is_deposit_balance_key(&host_req.sender) {
+                return Err(
+                    "cannot withdraw from a secret-bound deposit balance; shield it first".into(),
+                );
+            }
             let ticketer = ledger
                 .read_string(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)?
                 .ok_or_else(|| "bridge ticketer is not configured".to_string())?;
@@ -1553,9 +1564,9 @@ mod tests {
     };
     use tzel_core::kernel_wire::KernelDalChunkPointer;
     use tzel_core::{
-        commit, default_auth_domain, derive_account, derive_address, derive_ask,
-        derive_auth_pub_seed, derive_kem_keys, derive_nk_spend, derive_nk_tag, derive_rcm,
-        encrypt_note_deterministic, felt_tag, hash, hash_two,
+        commit, default_auth_domain, deposit_balance_key, deposit_id_from_label, derive_account,
+        derive_address, derive_ask, derive_auth_pub_seed, derive_kem_keys, derive_nk_spend,
+        derive_nk_tag, derive_rcm, encrypt_note_deterministic, felt_tag, hash, hash_two,
         kernel_wire::{
             encode_kernel_inbox_message, sign_kernel_bridge_config, sign_kernel_verifier_config,
             KernelBridgeConfig, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
@@ -1743,7 +1754,7 @@ mod tests {
         let address = sample_payment_address();
 
         let make_shield = |seed: u64, fee: u64| ShieldReq {
-            sender: "alice".into(),
+            deposit_id: deposit_id_from_label("alice"),
             fee,
             v: 1,
             producer_fee: 1,
@@ -1768,7 +1779,12 @@ mod tests {
 
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 400_000).unwrap();
+            apply_deposit(
+                &mut state,
+                &deposit_balance_key(&deposit_id_from_label("alice")),
+                400_000,
+            )
+            .unwrap();
 
             apply_shield(&mut state, &make_shield(1, MIN_TX_FEE)).unwrap();
             assert_eq!(state.required_tx_fee().unwrap(), MIN_TX_FEE);
@@ -1866,14 +1882,22 @@ mod tests {
         host.inputs.push_back(InputMessage {
             level: 1,
             id: 0,
-            payload: encode_ticket_deposit_message("alice", 75),
+            payload: encode_ticket_deposit_message(
+                &deposit_balance_key(&deposit_id_from_label("alice")),
+                75,
+            ),
         });
 
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.auth_domain, default_auth_domain());
-        assert_eq!(ledger.balances.get("alice"), Some(&75));
+        assert_eq!(
+            ledger
+                .balances
+                .get(&deposit_balance_key(&deposit_id_from_label("alice"))),
+            Some(&75)
+        );
         match read_last_result(&host).unwrap() {
             KernelResult::Deposit => {}
             other => panic!("unexpected rollup result: {:?}", other),
@@ -1886,7 +1910,12 @@ mod tests {
         let producer_fee = 1;
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 50 + producer_fee + MIN_TX_FEE).unwrap();
+            apply_deposit(
+                &mut state,
+                &deposit_balance_key(&deposit_id_from_label("alice")),
+                50 + producer_fee + MIN_TX_FEE,
+            )
+            .unwrap();
         }
 
         let config = KernelVerifierConfig {
@@ -1903,7 +1932,7 @@ mod tests {
         let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
         let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
         let shield_req = KernelShieldReq {
-            sender: "alice".into(),
+            deposit_id: deposit_id_from_label("alice"),
             fee: MIN_TX_FEE,
             producer_fee,
             v: 50,
@@ -1925,7 +1954,12 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("alice"), Some(&0));
+        assert_eq!(
+            ledger
+                .balances
+                .get(&deposit_balance_key(&deposit_id_from_label("alice"))),
+            Some(&0)
+        );
         assert_eq!(ledger.tree.leaves.len(), 2);
         match read_last_result(&host).unwrap() {
             KernelResult::Shield(ShieldResp {
@@ -1948,7 +1982,12 @@ mod tests {
         let producer_fee = 1;
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 50 + producer_fee + MIN_TX_FEE).unwrap();
+            apply_deposit(
+                &mut state,
+                &deposit_balance_key(&deposit_id_from_label("alice")),
+                50 + producer_fee + MIN_TX_FEE,
+            )
+            .unwrap();
         }
 
         let config = KernelVerifierConfig {
@@ -1971,7 +2010,7 @@ mod tests {
         assert!(encoded.len() > MAX_NOTE_CHUNK_BYTES);
 
         let shield_req = KernelShieldReq {
-            sender: "alice".into(),
+            deposit_id: deposit_id_from_label("alice"),
             fee: MIN_TX_FEE,
             producer_fee,
             v: 50,
@@ -2025,7 +2064,12 @@ mod tests {
         let producer_fee = 1;
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 50 + producer_fee + MIN_TX_FEE).unwrap();
+            apply_deposit(
+                &mut state,
+                &deposit_balance_key(&deposit_id_from_label("alice")),
+                50 + producer_fee + MIN_TX_FEE,
+            )
+            .unwrap();
         }
 
         let address = sample_payment_address();
@@ -2033,7 +2077,7 @@ mod tests {
         let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
         let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
         let payload = encode_kernel_inbox_message(&KernelInboxMessage::Shield(KernelShieldReq {
-            sender: "alice".into(),
+            deposit_id: deposit_id_from_label("alice"),
             fee: MIN_TX_FEE,
             producer_fee,
             v: 50,
@@ -2063,7 +2107,12 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("alice"), Some(&0));
+        assert_eq!(
+            ledger
+                .balances
+                .get(&deposit_balance_key(&deposit_id_from_label("alice"))),
+            Some(&0)
+        );
         assert_eq!(ledger.tree.leaves.len(), 2);
         match read_last_result(&host).unwrap() {
             KernelResult::Shield(ShieldResp {
@@ -2159,7 +2208,12 @@ mod tests {
         let producer_fee = 1;
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 50 + producer_fee + MIN_TX_FEE).unwrap();
+            apply_deposit(
+                &mut state,
+                &deposit_balance_key(&deposit_id_from_label("alice")),
+                50 + producer_fee + MIN_TX_FEE,
+            )
+            .unwrap();
         }
 
         let address = sample_payment_address();
@@ -2167,7 +2221,7 @@ mod tests {
         let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
         let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
         let payload = encode_kernel_inbox_message(&KernelInboxMessage::Shield(KernelShieldReq {
-            sender: "alice".into(),
+            deposit_id: deposit_id_from_label("alice"),
             fee: MIN_TX_FEE,
             producer_fee,
             v: 50,
@@ -2200,7 +2254,9 @@ mod tests {
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(
-            ledger.balances.get("alice"),
+            ledger
+                .balances
+                .get(&deposit_balance_key(&deposit_id_from_label("alice"))),
             Some(&(50 + producer_fee + MIN_TX_FEE))
         );
         assert!(ledger.tree.leaves.is_empty());
@@ -2218,7 +2274,12 @@ mod tests {
         let producer_fee = 1;
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 50 + producer_fee + MIN_TX_FEE).unwrap();
+            apply_deposit(
+                &mut state,
+                &deposit_balance_key(&deposit_id_from_label("alice")),
+                50 + producer_fee + MIN_TX_FEE,
+            )
+            .unwrap();
         }
 
         let mut proof = sample_kernel_test_proof();
@@ -2228,7 +2289,7 @@ mod tests {
         let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
         let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
         let payload = encode_kernel_inbox_message(&KernelInboxMessage::Shield(KernelShieldReq {
-            sender: "alice".into(),
+            deposit_id: deposit_id_from_label("alice"),
             fee: MIN_TX_FEE,
             producer_fee,
             v: 50,
@@ -2257,7 +2318,12 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("alice"), Some(&0));
+        assert_eq!(
+            ledger
+                .balances
+                .get(&deposit_balance_key(&deposit_id_from_label("alice"))),
+            Some(&0)
+        );
         assert_eq!(ledger.tree.leaves.len(), 2);
         match read_last_result(&host).unwrap() {
             KernelResult::Shield(ShieldResp {
@@ -2484,6 +2550,43 @@ mod tests {
         assert!(host.outputs.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => assert!(message.contains("outbox full")),
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn withdraw_from_secret_bound_deposit_key_does_not_emit_outbox() {
+        let mut host = MockHost::default();
+        install_test_bridge(&mut host);
+        let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            apply_deposit(&mut state, &deposit_key, 44).unwrap();
+        }
+
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
+                sender: deposit_key.clone(),
+                recipient: sample_l1_receiver().into(),
+                amount: 33,
+            }))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 33,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.balances.get(&deposit_key), Some(&44));
+        assert!(ledger.withdrawals.is_empty());
+        assert!(host.outputs.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("secret-bound deposit balance"))
+            }
             other => panic!("unexpected rollup result: {:?}", other),
         }
     }
@@ -2788,7 +2891,7 @@ mod tests {
         let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
         let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
         let shield_req = KernelShieldReq {
-            sender: "alice".into(),
+            deposit_id: deposit_id_from_label("alice"),
             fee: MIN_TX_FEE,
             producer_fee,
             v: 50,
@@ -2858,7 +2961,7 @@ mod tests {
                 id: 2,
                 payload: encode_kernel_inbox_message(&KernelInboxMessage::Shield(
                     KernelShieldReq {
-                        sender: "alice".into(),
+                        deposit_id: deposit_id_from_label("alice"),
                         v: 50,
                         fee: MIN_TX_FEE,
                         producer_fee: 1,
@@ -3175,18 +3278,31 @@ mod tests {
         install_test_bridge(&mut host);
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            state.set_balance("alice", u64::MAX).unwrap();
+            state
+                .set_balance(
+                    &deposit_balance_key(&deposit_id_from_label("alice")),
+                    u64::MAX,
+                )
+                .unwrap();
         }
         host.inputs.push_back(InputMessage {
             level: 13,
             id: 0,
-            payload: encode_ticket_deposit_message("alice", 1),
+            payload: encode_ticket_deposit_message(
+                &deposit_balance_key(&deposit_id_from_label("alice")),
+                1,
+            ),
         });
 
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("alice"), Some(&u64::MAX));
+        assert_eq!(
+            ledger
+                .balances
+                .get(&deposit_balance_key(&deposit_id_from_label("alice"))),
+            Some(&u64::MAX)
+        );
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("public balance overflow"))

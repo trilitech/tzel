@@ -19,7 +19,7 @@ use tezos_data_encoding_05::enc::BinWriter as _;
 use tezos_smart_rollup_encoding::{inbox::ExternalMessageFrame, smart_rollup::SmartRollupAddress};
 use tzel_core::{
     auth_leaf_hash, commit, decrypt_memo, derive_auth_pub_seed, derive_kem_keys, derive_rcm,
-    detect, hash, verify_wots_signature_against_leaf,
+    detect, hash,
     kernel_wire::{
         decode_kernel_inbox_message, encode_kernel_inbox_message, kernel_bridge_config_sighash,
         kernel_verifier_config_sighash, KernelDalChunkPointer, KernelDalPayloadKind,
@@ -30,7 +30,7 @@ use tzel_core::{
         RollupDalChunk, RollupSubmission, RollupSubmissionKind, RollupSubmissionStatus,
         RollupSubmissionTransport, SubmitRollupMessageReq, SubmitRollupMessageResp,
     },
-    owner_tag, EncryptedNote, PaymentAddress, F,
+    owner_tag, verify_wots_signature_against_leaf, EncryptedNote, PaymentAddress, F,
 };
 
 const DEFAULT_DIRECT_MAX_MESSAGE_BYTES: usize = 4096;
@@ -403,8 +403,7 @@ fn dev_config_admin_ask() -> F {
 
 fn parse_runtime_felt_hex(var: &str) -> Result<F, String> {
     let value = std::env::var(var).map_err(|_| format!("missing required env var: {}", var))?;
-    let bytes = hex::decode(&value)
-        .map_err(|e| format!("{} is not valid hex: {}", var, e))?;
+    let bytes = hex::decode(&value).map_err(|e| format!("{} is not valid hex: {}", var, e))?;
     if bytes.len() != 32 {
         return Err(format!(
             "{} must decode to exactly 32 bytes, got {}",
@@ -1586,7 +1585,7 @@ mod tests {
         let policy = sample_fee_policy();
         encode_kernel_inbox_message(&KernelInboxMessage::Shield(
             tzel_core::kernel_wire::KernelShieldReq {
-                sender: "alice".into(),
+                deposit_id: tzel_core::deposit_id_from_label("alice"),
                 fee: 100_000,
                 v: 25,
                 producer_fee,
@@ -2166,11 +2165,9 @@ mod tests {
         config.octez_node_endpoint = Some(endpoint);
 
         let payload = sample_configure_bridge_payload();
-        let targeted = encode_targeted_rollup_message(
-            "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP",
-            &payload,
-        )
-        .unwrap();
+        let targeted =
+            encode_targeted_rollup_message("sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP", &payload)
+                .unwrap();
         assert!(targeted.len() > config.direct_max_message_bytes);
 
         let submission = process_submission(

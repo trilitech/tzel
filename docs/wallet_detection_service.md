@@ -54,6 +54,10 @@ tzel-wallet --wallet alice.watch.json profile init-shadownet \
   --public-account alice
 ```
 
+`public-account` is only the transparent rollup account used after unshield and
+withdraw. Shield deposits use wallet-held secret-bound deposit ids and are not
+part of the watch-only material.
+
 ## Sync Manually
 
 ```bash
