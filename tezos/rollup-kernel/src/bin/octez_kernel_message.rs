@@ -8,7 +8,7 @@ use tzel_core::{
     kernel_wire::{
         encode_kernel_inbox_message, sign_kernel_bridge_config, sign_kernel_verifier_config,
         KernelBridgeConfig, KernelDalChunkPointer, KernelDalPayloadKind, KernelDalPayloadPointer,
-        KernelInboxMessage, KernelVerifierConfig,
+        KernelInboxMessage, KernelVerifierConfig, KernelWithdrawReq,
     },
     ProgramHashes, F,
 };
@@ -79,6 +79,26 @@ fn main() {
     };
 
     match cmd.as_str() {
+        "withdraw" => {
+            // POC HELPER: emit a framed Withdraw KernelInboxMessage.
+            // No signature, no proof — the kernel accepts any Withdraw
+            // and writes an outbox message crediting `recipient` with
+            // `amount` from the public balance of `sender`.
+            let Some(rollup_address) = args.next() else { usage(); };
+            let Some(sender) = args.next() else { usage(); };
+            let Some(recipient) = args.next() else { usage(); };
+            let Some(amount) = args.next() else { usage(); };
+            if args.next().is_some() { usage(); }
+            let amount = amount.parse::<u64>().expect("amount should parse as u64");
+            emit_targeted_message(
+                &rollup_address,
+                &KernelInboxMessage::Withdraw(KernelWithdrawReq {
+                    sender,
+                    recipient,
+                    amount,
+                }),
+            );
+        }
         "admin-material" => {
             if args.next().is_some() {
                 usage();
