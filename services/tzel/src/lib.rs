@@ -6,7 +6,7 @@ pub mod proof_bench;
 pub mod protocol_vectors;
 
 pub use tzel_core::*;
-use tzel_verifier::{decode_verify_meta, ProofBundle as VerifyProofBundle};
+use tzel_verifier::ProofBundle as VerifyProofBundle;
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +20,33 @@ pub struct LedgerProofVerifier {
 struct VerifiedProofConfig {
     reprove_bin: String,
     program_hashes: ProgramHashes,
+    executable_paths: Option<VerifiedExecutablePaths>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedExecutablePaths {
+    shield: PathBuf,
+    transfer: PathBuf,
+    unshield: PathBuf,
+}
+
+impl VerifiedExecutablePaths {
+    fn from_dir(executables_dir: &str) -> Self {
+        let base = PathBuf::from(executables_dir);
+        Self {
+            shield: base.join(CircuitKind::Shield.executable_filename()),
+            transfer: base.join(CircuitKind::Transfer.executable_filename()),
+            unshield: base.join(CircuitKind::Unshield.executable_filename()),
+        }
+    }
+
+    fn path_for(&self, circuit: CircuitKind) -> &Path {
+        match circuit {
+            CircuitKind::Shield => &self.shield,
+            CircuitKind::Transfer => &self.transfer,
+            CircuitKind::Unshield => &self.unshield,
+        }
+    }
 }
 
 impl LedgerProofVerifier {
@@ -40,6 +67,7 @@ impl LedgerProofVerifier {
             verified_mode: Some(VerifiedProofConfig {
                 reprove_bin,
                 program_hashes,
+                executable_paths: None,
             }),
         }
     }
@@ -50,18 +78,26 @@ impl LedgerProofVerifier {
         executables_dir: &str,
     ) -> Result<Self, String> {
         let program_hashes = load_program_hashes(&reprove_bin, executables_dir)?;
-        Ok(Self::verified(
+        Ok(Self {
             allow_trust_me_bro,
-            reprove_bin,
-            program_hashes,
-        ))
+            verified_mode: Some(VerifiedProofConfig {
+                reprove_bin,
+                program_hashes,
+                executable_paths: Some(VerifiedExecutablePaths::from_dir(executables_dir)),
+            }),
+        })
     }
 
     pub fn validate(&self, proof: &Proof, circuit: CircuitKind) -> Result<(), String> {
         self.check_proof(proof)?;
         if let Some(ref verified_mode) = self.verified_mode {
-            verify_stark_proof(&verified_mode.reprove_bin, proof)?;
             validate_stark_circuit(proof, circuit, &verified_mode.program_hashes)?;
+            let executable = verified_mode
+                .executable_paths
+                .as_ref()
+                .map(|paths| paths.path_for(circuit))
+                .unwrap_or_else(|| Path::new("dummy"));
+            verify_stark_proof(&verified_mode.reprove_bin, executable, proof)?;
         }
         Ok(())
     }
@@ -77,7 +113,6 @@ impl LedgerProofVerifier {
             Proof::Stark {
                 proof_bytes,
                 output_preimage,
-                verify_meta: _,
             } => {
                 if self.verified_mode.is_none() {
                     return Err(
@@ -96,27 +131,22 @@ impl LedgerProofVerifier {
     }
 }
 
-fn verify_stark_proof(reprove_bin: &str, proof: &Proof) -> Result<(), String> {
+fn verify_stark_proof(reprove_bin: &str, executable: &Path, proof: &Proof) -> Result<(), String> {
     let Proof::Stark {
         proof_bytes,
         output_preimage,
-        verify_meta,
     } = proof
     else {
         return Ok(());
     };
 
-    if verify_meta.is_none() {
-        return Err("Stark proof missing verify_meta — cannot verify".into());
-    }
-
     let bundle_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
-    let encoded = encode_verify_bundle_json(proof_bytes, output_preimage, verify_meta)
+    let encoded = encode_verify_bundle_json(proof_bytes, output_preimage)
         .map_err(|e| format!("encode bundle: {}", e))?;
     std::fs::write(bundle_file.path(), encoded).map_err(|e| format!("write bundle: {}", e))?;
 
     let output = std::process::Command::new(reprove_bin)
-        .arg("dummy")
+        .arg(executable)
         .arg("--verify")
         .arg(bundle_file.path())
         .stdout(std::process::Stdio::piped())
@@ -138,16 +168,10 @@ fn verify_stark_proof(reprove_bin: &str, proof: &Proof) -> Result<(), String> {
 fn encode_verify_bundle_json(
     proof_bytes: &Vec<u8>,
     output_preimage: &Vec<F>,
-    verify_meta: &Option<Vec<u8>>,
 ) -> Result<Vec<u8>, String> {
-    let verify_meta = verify_meta
-        .as_ref()
-        .map(|bytes| decode_verify_meta(bytes))
-        .transpose()?;
     serde_json::to_vec(&VerifyProofBundle {
         proof_bytes: proof_bytes.clone(),
         output_preimage: output_preimage.clone(),
-        verify_meta,
     })
     .map_err(|e| e.to_string())
 }
@@ -251,7 +275,6 @@ mod tests {
     use super::*;
     use ml_kem::KeyExport;
     use tzel_core::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES;
-    use tzel_verifier::{encode_verify_meta, VerifyMeta};
 
     const TEST_FEE: u64 = MIN_TX_FEE;
 
@@ -361,40 +384,11 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_bundle_json_uses_explicit_byte_strings() {
+    fn test_verify_bundle_json_uses_explicit_byte_strings_without_metadata() {
         let proof_bytes = vec![0xAB, 0xCD];
         let output_preimage = vec![u(7), u(9)];
-        let verify_meta = VerifyMeta {
-            n_pow_bits: 1,
-            n_preprocessed_columns: 2,
-            n_trace_columns: 3,
-            n_interaction_columns: 4,
-            trace_columns_per_component: vec![5, 6],
-            interaction_columns_per_component: vec![7, 8],
-            cumulative_sum_columns: vec![true, false],
-            n_components: 9,
-            fri_log_trace_size: 10,
-            fri_log_blowup: 11,
-            fri_log_last_layer: 12,
-            fri_n_queries: 13,
-            fri_fold_step: 14,
-            interaction_pow_bits: 15,
-            circuit_pow_bits: 16,
-            circuit_fri_log_blowup: 17,
-            circuit_fri_log_last_layer: 18,
-            circuit_fri_n_queries: 19,
-            circuit_fri_fold_step: 20,
-            circuit_lifting: Some(21),
-            output_addresses: vec![22, 23],
-            n_blake_gates: 24,
-            preprocessed_column_ids: vec!["left".into(), "right".into()],
-            preprocessed_root: vec![25, 26, 27, 28, 29, 30, 31, 32],
-            public_output_values: vec![33, 34, 35, 36],
-        };
-        let verify_meta =
-            Some(encode_verify_meta(&verify_meta).expect("verify_meta should encode"));
 
-        let encoded = encode_verify_bundle_json(&proof_bytes, &output_preimage, &verify_meta)
+        let encoded = encode_verify_bundle_json(&proof_bytes, &output_preimage)
             .expect("bundle encoding should succeed");
         let json: serde_json::Value =
             serde_json::from_slice(&encoded).expect("encoded bundle should be valid JSON");
@@ -404,11 +398,7 @@ mod tests {
             json["output_preimage"],
             serde_json::json!([hex::encode(u(7)), hex::encode(u(9)),])
         );
-        assert_eq!(json["verify_meta"]["n_pow_bits"], serde_json::json!(1));
-        assert_eq!(
-            json["verify_meta"]["preprocessed_column_ids"],
-            serde_json::json!(["left", "right"])
-        );
+        assert!(json.get("verify_meta").is_none());
     }
 
     /// Verify that auth_leaf_hash using WOTS+ key derivation produces a valid
@@ -553,7 +543,6 @@ mod tests {
         Proof::Stark {
             proof_bytes: vec![0xDE; 128], // non-empty garbage
             output_preimage,
-            verify_meta: None,
         }
     }
 
@@ -1178,7 +1167,6 @@ mod tests {
                 mh,
                 mh_3,
             ],
-            verify_meta: None,
         };
 
         let r = ledger.transfer(&TransferReq {
@@ -2144,9 +2132,9 @@ mod tests {
         assert!(r.unwrap_err().contains("bad nullifier count"));
     }
 
-    /// Ledger: output_preimage too short for transfer.
+    /// Ledger: transfer proof public outputs must exactly match the nullifier count.
     #[test]
-    fn test_transfer_preimage_too_short_rejected() {
+    fn test_transfer_public_output_length_mismatch_rejected() {
         let (mut ledger, _, nf, root, enc) = setup_with_note();
         let (cm_3, enc_3, _mh_3) = test_output_note(0x45);
         let r = ledger.transfer(&TransferReq {
@@ -2159,10 +2147,10 @@ mod tests {
             enc_1: enc.clone(),
             enc_2: enc.clone(),
             enc_3,
-            proof: fake_stark(vec![u(1), u(2)]), // way too short
+            proof: fake_stark(vec![u(1), u(2)]),
         });
         assert!(r.is_err());
-        assert!(r.unwrap_err().contains("too short"));
+        assert!(r.unwrap_err().contains("public output length mismatch"));
     }
 
     /// Shield with Stark proof: client_cm used instead of server-generated.
@@ -3166,7 +3154,6 @@ mod tests {
         Proof::Stark {
             proof_bytes: vec![0],
             output_preimage: vec![u(1), u(5), program_hash, u(11), u(22), u(33)],
-            verify_meta: None,
         }
     }
 
@@ -3202,6 +3189,116 @@ mod tests {
             err.contains("transfer"),
             "expected circuit name in error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_ledger_proof_verifier_rejects_unexpected_program_hash_before_external_verify() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("external-verifier-ran");
+        let script = temp.path().join("fake-reprove");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf ran > '{}'\necho external verifier should not run >&2\nexit 42\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let proof = fake_stark_with_program_hash(u(12345));
+        let verifier = LedgerProofVerifier::verified(
+            false,
+            script.display().to_string(),
+            ProgramHashes {
+                shield: u(111),
+                transfer: u(99999),
+                unshield: u(333),
+            },
+        );
+
+        let err = verifier
+            .validate(&proof, CircuitKind::Transfer)
+            .unwrap_err();
+
+        assert!(
+            err.contains("unexpected circuit program hash"),
+            "wrong circuit should be rejected by public output preflight, got: {err}"
+        );
+        assert!(
+            !marker.exists(),
+            "external verifier must not run for a proof whose public program hash is already wrong"
+        );
+    }
+
+    #[test]
+    fn test_ledger_proof_verifier_passes_operation_executable_to_external_verify() {
+        let temp = tempfile::tempdir().unwrap();
+        let executables_dir = temp.path().join("executables");
+        std::fs::create_dir(&executables_dir).unwrap();
+        for name in [
+            CircuitKind::Shield.executable_filename(),
+            CircuitKind::Transfer.executable_filename(),
+            CircuitKind::Unshield.executable_filename(),
+        ] {
+            std::fs::write(executables_dir.join(name), "{}").unwrap();
+        }
+
+        let marker = temp.path().join("verify-executable-arg");
+        let script = temp.path().join("fake-reprove");
+        let transfer_hash = u(222);
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+if [ "$2" = "--program-hash" ]; then
+  case "$1" in
+    *run_shield.executable.json) printf '{}\n' ;;
+    *run_transfer.executable.json) printf '{}\n' ;;
+    *run_unshield.executable.json) printf '{}\n' ;;
+    *) echo "unknown executable: $1" >&2; exit 2 ;;
+  esac
+  exit 0
+fi
+if [ "$2" = "--verify" ]; then
+  printf '%s' "$1" > '{}'
+  exit 0
+fi
+echo "unexpected invocation" >&2
+exit 2
+"#,
+                hex::encode(u(111)),
+                hex::encode(transfer_hash),
+                hex::encode(u(333)),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let verifier = LedgerProofVerifier::from_reprove_bin(
+            false,
+            script.display().to_string(),
+            executables_dir.to_str().unwrap(),
+        )
+        .unwrap();
+        let proof = fake_stark_with_program_hash(transfer_hash);
+
+        verifier.validate(&proof, CircuitKind::Transfer).unwrap();
+
+        let invoked_executable = std::fs::read_to_string(marker).unwrap();
+        assert!(
+            invoked_executable.ends_with(CircuitKind::Transfer.executable_filename()),
+            "external verifier should receive the operation executable, got: {invoked_executable}"
         );
     }
 

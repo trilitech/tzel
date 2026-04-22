@@ -116,7 +116,7 @@ export ROLLUP_ADDRESS=sr1REPLACE_ME
 export BRIDGE_TICKETER=KT1REPLACE_ME
 ```
 
-Extract the verifier metadata from the checked-in verified fixture:
+Extract the verifier configuration values from the checked-in verified fixture:
 
 ```bash
 export FIXTURE_JSON=tezos/rollup-kernel/testdata/verified_bridge_flow.json

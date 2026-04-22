@@ -2,7 +2,8 @@
 //!
 //! Exposes:
 //! - `prove(executable_path)` → proof bytes + public outputs
-//! - `verify(proof_bytes, output_preimage)` → ok/err
+//! - `prove_with_args_file(executable_path, args_file)` → proof bytes + public outputs
+//! - `compute_executable_program_hash(executable_path)` → bootloader-authenticated program hash
 //! - `CustomProofOutput` struct with proof data and timing
 
 pub mod custom_circuit;
@@ -27,7 +28,6 @@ use stwo_cairo_prover::prover::prove_cairo;
 use tempfile::NamedTempFile;
 
 pub use custom_circuit::CustomProofOutput;
-pub use custom_circuit::ProofBundle;
 
 /// Run a Cairo executable through the privacy bootloader,
 /// generate a two-level recursive ZK proof.

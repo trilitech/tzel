@@ -3,9 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tzel_services::*;
-use tzel_verifier::{
-    encode_verify_meta, load_program_hashes, DirectProofVerifier, ProofBundle as VerifyProofBundle,
-};
+use tzel_verifier::{load_program_hashes, DirectProofVerifier, ProofBundle as VerifyProofBundle};
 
 const PROVER_TOOLCHAIN: &str = "+nightly-2025-07-14";
 const FIXTURE_PATH: &str = "tezos/rollup-kernel/testdata/verified_bridge_flow.json";
@@ -552,11 +550,6 @@ fn proof_from_bundle(bundle: VerifyProofBundle) -> Proof {
     Proof::Stark {
         proof_bytes: bundle.proof_bytes,
         output_preimage: bundle.output_preimage,
-        verify_meta: bundle
-            .verify_meta
-            .map(|meta| encode_verify_meta(&meta))
-            .transpose()
-            .expect("verify_meta should encode"),
     }
 }
 

@@ -14,7 +14,7 @@ use tzel_services::operator_api::{
     SubmitRollupMessageReq, SubmitRollupMessageResp,
 };
 use tzel_services::*;
-use tzel_verifier::{encode_verify_meta, ProofBundle as VerifyProofBundle};
+use tzel_verifier::ProofBundle as VerifyProofBundle;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Wallet file
@@ -2484,13 +2484,9 @@ fn host_stark_proof_to_kernel(proof: &Proof) -> Result<KernelStarkProof, String>
         Proof::Stark {
             proof_bytes,
             output_preimage,
-            verify_meta,
         } => Ok(KernelStarkProof {
             proof_bytes: proof_bytes.clone(),
             output_preimage: output_preimage.clone(),
-            verify_meta: verify_meta
-                .clone()
-                .ok_or_else(|| "STARK proof is missing verify_meta".to_string())?,
         }),
     }
 }
@@ -3347,10 +3343,6 @@ fn generate_proof(
     Ok(Proof::Stark {
         proof_bytes: bundle.proof_bytes,
         output_preimage: bundle.output_preimage,
-        verify_meta: bundle
-            .verify_meta
-            .map(|meta| encode_verify_meta(&meta))
-            .transpose()?,
     })
 }
 

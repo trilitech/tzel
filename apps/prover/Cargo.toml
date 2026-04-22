@@ -18,3 +18,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tzel-verifier = { path = "../../verifier" }
 tzel-reprover = { path = "../../services/reprover" }
+tzel-core = { path = "../../core" }

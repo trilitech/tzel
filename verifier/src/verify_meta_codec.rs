@@ -4,6 +4,7 @@ use crate::bundle::VerifyMeta;
 
 const VERIFY_META_MAGIC: &[u8; 4] = b"TVM1";
 
+#[cfg(test)]
 pub fn encode(meta: &VerifyMeta) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     out.extend_from_slice(VERIFY_META_MAGIC);
@@ -85,6 +86,7 @@ pub fn decode(bytes: &[u8]) -> Result<VerifyMeta, String> {
     Ok(meta)
 }
 
+#[cfg(test)]
 fn push_len(out: &mut Vec<u8>, value: usize) -> Result<(), String> {
     push_u32(
         out,
@@ -93,10 +95,12 @@ fn push_len(out: &mut Vec<u8>, value: usize) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn push_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
+#[cfg(test)]
 fn push_option_u32(out: &mut Vec<u8>, value: Option<u32>) {
     match value {
         Some(value) => {
@@ -107,6 +111,7 @@ fn push_option_u32(out: &mut Vec<u8>, value: Option<u32>) {
     }
 }
 
+#[cfg(test)]
 fn push_vec_u32(out: &mut Vec<u8>, values: &[u32]) -> Result<(), String> {
     push_len(out, values.len())?;
     for value in values {
@@ -115,6 +120,7 @@ fn push_vec_u32(out: &mut Vec<u8>, values: &[u32]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn push_vec_usize(out: &mut Vec<u8>, values: &[usize]) -> Result<(), String> {
     push_len(out, values.len())?;
     for value in values {
@@ -123,6 +129,7 @@ fn push_vec_usize(out: &mut Vec<u8>, values: &[usize]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn push_vec_bool(out: &mut Vec<u8>, values: &[bool]) -> Result<(), String> {
     push_len(out, values.len())?;
     for value in values {
@@ -131,6 +138,7 @@ fn push_vec_bool(out: &mut Vec<u8>, values: &[bool]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn push_vec_string(out: &mut Vec<u8>, values: &[String]) -> Result<(), String> {
     push_len(out, values.len())?;
     for value in values {

@@ -930,13 +930,9 @@ fn kernel_proof_from_fixture(proof: &Proof) -> KernelStarkProof {
         Proof::Stark {
             proof_bytes,
             output_preimage,
-            verify_meta,
         } => KernelStarkProof {
             proof_bytes: proof_bytes.clone(),
             output_preimage: output_preimage.clone(),
-            verify_meta: verify_meta
-                .clone()
-                .expect("fixture Stark proof verify_meta"),
         },
         Proof::TrustMeBro => panic!("fixture should contain real Stark proofs"),
     }

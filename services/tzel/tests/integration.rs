@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tzel_services::*;
-use tzel_verifier::{encode_verify_meta, ProofBundle as VerifyProofBundle};
+use tzel_verifier::{DirectProofVerifier, ProofBundle as VerifyProofBundle};
 use ureq::{http, RequestExt};
 
 const PROVER_TOOLCHAIN: &str = "+nightly-2025-07-14";
@@ -409,11 +409,6 @@ fn generate_shield_proof(
         Proof::Stark {
             proof_bytes: bundle.proof_bytes,
             output_preimage: bundle.output_preimage,
-            verify_meta: bundle
-                .verify_meta
-                .map(|meta| encode_verify_meta(&meta))
-                .transpose()
-                .unwrap(),
         },
         cm,
         enc,
@@ -444,6 +439,40 @@ fn generate_stark_bundle(executable_filename: &str, args: &[String]) -> VerifyPr
 
     let bundle_json = std::fs::read_to_string(proof_file.path()).unwrap();
     serde_json::from_str(&bundle_json).unwrap()
+}
+
+fn bootloader_cairo_array_public_outputs(output_preimage: &[F]) -> &[F] {
+    let parsed = parse_single_task_output_preimage(output_preimage)
+        .expect("bootloader output preimage should parse");
+    let (declared_len_felt, public_outputs) = parsed
+        .public_outputs
+        .split_first()
+        .expect("bootloader task output should contain a Cairo array length");
+    let declared_len = felt_to_usize(declared_len_felt)
+        .expect("Cairo public-output array length should fit usize");
+    assert_eq!(
+        declared_len,
+        public_outputs.len(),
+        "Cairo public-output array length prefix must match stripped output length",
+    );
+    public_outputs
+}
+
+#[test]
+fn bootloader_public_outputs_strip_cairo_array_length_prefix() {
+    let expected_public_outputs = vec![u64_to_felt(11), u64_to_felt(22), u64_to_felt(33)];
+    let mut output_preimage = vec![
+        u64_to_felt(1),
+        u64_to_felt((expected_public_outputs.len() + 3) as u64),
+        u64_to_felt(12345),
+        u64_to_felt(expected_public_outputs.len() as u64),
+    ];
+    output_preimage.extend(expected_public_outputs.iter().copied());
+
+    assert_eq!(
+        bootloader_cairo_array_public_outputs(&output_preimage),
+        expected_public_outputs.as_slice(),
+    );
 }
 
 fn post_json_allow_status<Req: Serialize>(url: &str, body: &Req) -> http::Response<ureq::Body> {
@@ -846,6 +875,14 @@ fn test_transfer_proof_roundtrip() {
             out
         );
 
+        let (ok, out) = client_tmb(&alice, &["scan", "-l", &l]);
+        assert!(ok, "post-transfer scan: {}", out);
+        assert!(
+            out.contains("1 new notes found"),
+            "post-transfer scan should recover Alice's change note: {}",
+            out
+        );
+
         let (ok, out) = client_tmb(&alice, &["balance"]);
         assert!(ok, "alice balance: {}", out);
         assert!(
@@ -887,22 +924,25 @@ fn test_transfer_7_inputs_proof_roundtrip() {
 
     let witness = proof_bench::build_transfer_bench_witness(7);
     let bundle = generate_stark_bundle("run_transfer.executable.json", &witness.args);
-    let parsed = parse_single_task_output_preimage(&bundle.output_preimage)
-        .expect("bootloader output preimage should parse");
+    let public_outputs = bootloader_cairo_array_public_outputs(&bundle.output_preimage);
 
     assert_eq!(
-        parsed.public_outputs,
+        public_outputs,
         witness.expected_public_outputs.as_slice(),
         "n=7 transfer proof public outputs must match the witness, including the final nullifier",
-    );
-    assert!(
-        bundle.verify_meta.is_some(),
-        "proof bundle should carry verification metadata"
     );
     assert!(
         !bundle.proof_bytes.is_empty(),
         "proof bytes should be nonempty"
     );
+    let proof = Proof::Stark {
+        proof_bytes: bundle.proof_bytes,
+        output_preimage: bundle.output_preimage,
+    };
+    DirectProofVerifier::from_executables_dir(false, &executables_dir())
+        .expect("test executables should provide program hashes")
+        .validate(&proof, CircuitKind::Transfer)
+        .expect("n=7 transfer proof should verify with canonical metadata");
 }
 
 /// Focused real-proof test: setup a private note quickly with TrustMeBro, then generate one unshield proof.

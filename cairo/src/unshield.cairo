@@ -156,16 +156,6 @@ pub fn verify(
         i += 1;
     }
 
-    let mut a: u32 = 0;
-    while a < n {
-        let mut b: u32 = a + 1;
-        while b < n {
-            assert(*nf_list.at(a) != *nf_list.at(b), 'unshield: dup nf');
-            b += 1;
-        }
-        a += 1;
-    }
-
     assert(v_fee > 0_u64, 'unshield prod fee');
     let sum_out: u128 = v_pub.into() + v_change.into() + v_fee.into() + fee.into();
     assert(sum_in == sum_out, 'unshield: balance mismatch');
@@ -726,7 +716,7 @@ mod tests {
     }
 
     fn build_duplicate_nf_fixture() -> UnshieldFixture {
-        let base = build_fixture_with_values_and_fee(80_u64, 47_u64, 25_u64, 3_u64, 5_u64);
+        let base = build_fixture_with_values_and_fee(80_u64, 100_u64, 52_u64, 3_u64, 5_u64);
         let cm_change = change_commitment_or_zero(
             base.has_change,
             base.d_j_change,
@@ -1092,8 +1082,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected: ('unshield: dup nf',))]
-    fn test_unshield_rejects_duplicate_nullifiers_after_all_other_checks() {
+    fn test_unshield_leaves_duplicate_nullifier_rejection_to_consensus() {
         let fixture = build_duplicate_nf_fixture();
         run_verify(@fixture);
     }

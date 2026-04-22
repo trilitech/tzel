@@ -2282,8 +2282,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut proof = sample_kernel_test_proof();
-        proof.verify_meta = vec![0xAB; 5_000];
+        let proof = sample_kernel_test_proof();
         let address = sample_payment_address();
         let producer_rseed = sample_felt(0x35);
         let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
@@ -2405,6 +2404,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_transfer_with_duplicate_public_nullifiers_before_state_change() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+
+        let address = sample_payment_address();
+        let enc_1 = sample_encrypted_note(&address, 11, [0x31; 32], b"one");
+        let enc_2 = sample_encrypted_note(&address, 12, [0x32; 32], b"two");
+        let enc_3 = sample_encrypted_note(&address, 1, [0x33; 32], b"dal");
+        let cm_1 = sample_commitment(&address, 11, [0x31; 32]);
+        let cm_2 = sample_commitment(&address, 12, [0x32; 32]);
+        let cm_3 = sample_commitment(&address, 1, [0x33; 32]);
+        let nf = sample_felt(0x93);
+        let root = read_ledger(&host).unwrap().tree.root();
+
+        let req = KernelTransferReq {
+            root,
+            nullifiers: vec![nf, nf],
+            fee: MIN_TX_FEE,
+            cm_1,
+            cm_2,
+            cm_3,
+            enc_1,
+            enc_2,
+            enc_3,
+            proof: sample_kernel_test_proof(),
+        };
+        let message = encode_kernel_inbox_message(&KernelInboxMessage::Transfer(req)).unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 5,
+            id: 1,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => assert!(message.contains("duplicate nullifier")),
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+
+        let ledger = read_ledger(&host).unwrap();
+        assert!(ledger.tree.leaves.is_empty());
+        assert!(ledger.nullifiers.is_empty());
+        assert!(!host.store.contains_key(&nullifier_path(&nf)));
+        assert!(read_persisted_note(&host, 0).is_none());
+    }
+
+    #[test]
     fn applies_unshield_message_with_change_and_balance_update() {
         let mut host = MockHost::default();
         install_test_verifier(&mut host);
@@ -2460,6 +2507,54 @@ mod tests {
         assert!(host.store.contains_key(&nullifier_path(&nf)));
         assert!(read_persisted_note(&host, 0).is_some());
         assert!(read_persisted_note(&host, 1).is_some());
+    }
+
+    #[test]
+    fn rejects_unshield_with_duplicate_public_nullifiers_before_state_change() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+
+        let address = sample_payment_address();
+        let enc_change = sample_encrypted_note(&address, 7, [0x41; 32], b"change");
+        let enc_fee = sample_encrypted_note(&address, 1, [0x42; 32], b"dal");
+        let cm_change = sample_commitment(&address, 7, [0x41; 32]);
+        let cm_fee = sample_commitment(&address, 1, [0x42; 32]);
+        let nf = sample_felt(0xA3);
+        let root = read_ledger(&host).unwrap().tree.root();
+
+        let req = KernelUnshieldReq {
+            root,
+            nullifiers: vec![nf, nf],
+            v_pub: 33,
+            fee: MIN_TX_FEE,
+            recipient: "bob".into(),
+            cm_change,
+            enc_change: Some(enc_change),
+            cm_fee,
+            enc_fee,
+            proof: sample_kernel_test_proof(),
+        };
+        let message = encode_kernel_inbox_message(&KernelInboxMessage::Unshield(req)).unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 2,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => assert!(message.contains("duplicate nullifier")),
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.balances.get("bob"), None);
+        assert!(ledger.tree.leaves.is_empty());
+        assert!(ledger.nullifiers.is_empty());
+        assert!(!host.store.contains_key(&balance_path("bob")));
+        assert!(!host.store.contains_key(&nullifier_path(&nf)));
+        assert!(read_persisted_note(&host, 0).is_none());
     }
 
     #[test]
@@ -3003,14 +3098,15 @@ mod tests {
         let proof = KernelStarkProof {
             proof_bytes: vec![0x00, 0x11, 0x22],
             output_preimage: vec![[9u8; 32], [10u8; 32]],
-            verify_meta: vec![1, 2, 3],
         };
 
         let err = verifier
             .validate_kernel(&proof, tzel_core::CircuitKind::Transfer)
             .unwrap_err();
         assert!(
-            err.contains("invalid verify_meta") || err.contains("proof bundle missing verify_meta"),
+            err.contains("invalid output_preimage")
+                || err.contains("zstd decompress")
+                || err.contains("circuit verification FAILED"),
             "unexpected verifier error: {}",
             err
         );
@@ -3710,7 +3806,6 @@ mod tests {
         KernelStarkProof {
             proof_bytes: b"kernel-test-skip-verify".to_vec(),
             output_preimage: vec![],
-            verify_meta: vec![],
         }
     }
 
@@ -3718,7 +3813,6 @@ mod tests {
         KernelStarkProof {
             proof_bytes: vec![0x00, 0x11, 0x22],
             output_preimage: vec![[9u8; 32], [10u8; 32]],
-            verify_meta: vec![1, 2, 3],
         }
     }
 

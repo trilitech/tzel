@@ -89,9 +89,10 @@ For local testing and fast integration loops, `--trust-me-bro` is useful: `sp-cl
 |                     | (WOTS+ sig verified in-circuit) | |
 |                     +------+--------------------------+ |
 |                            |                            |
-|                      proof | (public outputs: root,     |
-|                            |  nullifiers, commitments,  |
-|                            |  memo hashes only)         |
+|                      proof | (public outputs: auth      |
+|                            |  domain/root, nullifiers,  |
+|                            |  fees, commitments, memo   |
+|                            |  hashes, recipient ids)    |
 |                            v                            |
 +-----------------------+---+-----------------------------+
                         | proof + note_data
@@ -117,22 +118,30 @@ master_sk
 |   |       +-- nk_tag_j -- public binding tag (in payment address)
 |   +-- ask_base
 |       +-- ask_j       -- per-address auth secret (never leaves wallet)
+|           +-- auth_pub_seed_j
 |           +-- auth_root_j -- Merkle root of 65536 one-time WOTS+ keys
 |
 +-- incoming_seed
-    +-- dsk
-        +-- d_j         -- per-address diversifier
+|   +-- dsk
+|   |   +-- d_j         -- per-address diversifier
+|   +-- view_root
+|   |   +-- seed_v_j    -- per-address ML-KEM viewing key seed
+|   +-- detect_root
+|       +-- seed_d_j    -- per-address ML-KEM detection key seed
+|
++-- outgoing_seed       -- sender-side recovery key for created outputs
 ```
 
 - **nk_spend** given to the prover (can generate proof but not sign)
 - **ask** never leaves the wallet (derives one-time WOTS+ signing keys)
-- **auth_root** bound into the commitment, stays private on-chain
+- **auth_root** and **auth_pub_seed** are bound into the commitment, stay private on-chain
 - **d_j** identifies which address a note was sent to
+- **outgoing_seed** decrypts sender-recovery ciphertexts only for outputs this wallet created
 
 ## Note structure
 
 ```
-owner_tag = H(auth_root, nk_tag)
+owner_tag = H_owner(auth_root, auth_pub_seed, nk_tag)
 cm = H_commit(d_j, v, rcm, owner_tag)   -- commitment (in Merkle tree)
 nf = H_nf(nk_spend, H_nf(cm, pos))      -- nullifier (prevents double-spend)
 ```

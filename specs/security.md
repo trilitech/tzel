@@ -26,7 +26,7 @@ This document is informative, not normative. The canonical protocol rules and en
 
 - **Detection is honest-sender:** a malicious sender can post bogus `ct_d`, causing detection to fail. The recipient then has to rely on viewing-key scanning.
 - **Viewing ciphertext correctness is not proven in-circuit:** the proof binds ciphertext bytes, not that `ct_v` / `encrypted_data` decrypt to the same `(v, rseed, memo)` used in the commitment.
-- **Recipient address fields are not self-authenticating to the sender:** shield and transfer outputs can be created with malformed `auth_root` / `nk_tag`, producing unspendable notes. This is sender self-griefing, not theft.
+- **Recipient address fields are not self-authenticating to the sender:** shield and transfer outputs can be created with malformed `auth_root` / `pub_seed` / `nk_tag`, producing unspendable notes. This is sender self-griefing, not theft.
 - **Memo integrity is transport integrity, not semantic correctness:** `memo_ct_hash` prevents relayer mutation of posted note ciphertext fields, but does not prove that the sender encrypted the intended plaintext.
 - **Wallets must recompute commitments before showing funds as received:** detection and decryption alone are not enough; note acceptance should be based on exact recomputation of `cm` from local address metadata and decrypted plaintext.
 

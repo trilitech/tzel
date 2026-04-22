@@ -471,9 +471,13 @@ enforces
 \sum_{i=0}^{N-1} v_i = v_1 + v_2 + v_3 + fee,
 \]
 
-with \(v_3 > 0\) for the producer-fee note. The circuit also enforces pairwise
-distinct nullifiers within the transaction, while the rollup checks each
-published nullifier against the global nullifier set.
+with \(v_3 > 0\) for the producer-fee note.
+
+The rollup state transition checks the public nullifier list before applying the
+transfer. After validating and stripping the bootloader's Cairo array length
+prefix, the verified public-output vector must have exactly the length implied by
+\(N\), the published nullifiers must be pairwise distinct, and none of them may
+already appear in the global nullifier set.
 
 \subsection{Unshield}
 
@@ -497,6 +501,12 @@ If there is no change note, the change commitment, change note-data hash, and al
 corresponding witness values are constrained to zero. That removes a source of
 prover malleability: the prover cannot hide nonzero private change behind a
 zero public commitment.
+
+The rollup applies the same public nullifier checks as transfer: after validating
+and stripping the bootloader's Cairo array length prefix, the verified
+public-output vector length must match \(N\), the published nullifiers must be
+pairwise distinct, and every published nullifier must be fresh with respect to
+the global nullifier set.
 
 \section{Encrypted Note Delivery and Detection}
 
@@ -582,7 +592,10 @@ state-transition rules that are not handled inside the proof. These include:
   \item \(auth\_domain\) matching the configured deployment domain for
         spending transactions;
   \item the input root being a recognized historical root;
-  \item global freshness of every published nullifier;
+  \item exact agreement between the verified public-output length and the
+        number of published nullifiers;
+  \item pairwise distinctness and global freshness of every published
+        nullifier;
   \item equality between posted note commitments and the commitments in the
         proof outputs;
   \item equality between posted note data and the note-data hashes in the
@@ -600,6 +613,11 @@ Without historical-root validation, a prover could spend against a fabricated lo
 tree. Without executable binding, a verifier could accept the wrong Cairo task.
 Without note-data binding, a relayer could swap ciphertext fields after the
 proof was produced.
+
+Verifier parameters are not supplied by the transaction. The rollup infers the
+expected circuit from the operation type, checks the corresponding configured
+executable hash, and derives the verifier inputs from the proof output
+preimage.
 
 The large proof and note payloads are why the Tezos DAL is structurally part of
 the design. The DAL is a companion data-availability network for rollups: it
@@ -625,8 +643,10 @@ attack against archived shielded data.
         equations for shield, transfer, and unshield are enforced inside the
         circuit.
   \item \textbf{Double-spend resistance.} Nullifiers are unique per
-        note-position pair, pairwise distinct within a transaction, and checked
-        against a global on-chain set.
+        note-position pair. The circuit binds each public nullifier to the
+        corresponding private input witness, and the rollup enforces that the
+        public nullifier list has no duplicates and is disjoint from the global
+        spent-nullifier set before applying the transaction.
   \item \textbf{Commitment binding.} The chain
         \(nk\_spend \rightarrow nk\_tag \rightarrow owner\_tag \rightarrow \cm\)
         ties each note to the nullifier lineage that will later be used to

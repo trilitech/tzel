@@ -64,7 +64,6 @@ fn shield_req(step: &InteropShieldStep) -> ShieldReq {
                 step.memo_ct_hash,
                 step.producer_memo_ct_hash,
             ],
-            verify_meta: None,
         },
         client_cm: step.cm,
         client_enc: Some(step.enc.clone()),
@@ -96,7 +95,6 @@ fn transfer_req(step: &InteropTransferStep, auth_domain: &F) -> TransferReq {
         proof: Proof::Stark {
             proof_bytes: vec![1],
             output_preimage,
-            verify_meta: None,
         },
     }
 }
@@ -124,7 +122,6 @@ fn unshield_req(step: &InteropUnshieldStep, auth_domain: &F) -> UnshieldReq {
         proof: Proof::Stark {
             proof_bytes: vec![1],
             output_preimage,
-            verify_meta: None,
         },
     }
 }

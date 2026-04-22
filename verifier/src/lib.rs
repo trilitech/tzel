@@ -9,7 +9,7 @@ use tzel_core::{
     validate_single_task_program_hash, CircuitKind, ProgramHashes, Proof,
 };
 
-pub use bundle::{ProofBundle, VerifyMeta};
+pub use bundle::ProofBundle;
 
 #[cfg(not(target_arch = "wasm32"))]
 use cairo_program_runner_lib::hints::compute_program_hash_chain;
@@ -63,8 +63,8 @@ impl DirectProofVerifier {
         check_proof_shape(proof, self.allow_trust_me_bro, self.verified_mode.is_some())?;
         match (&self.verified_mode, proof) {
             (Some(cfg), Proof::Stark { .. }) => {
-                verify_stark_bundle(proof)?;
-                validate_stark_circuit(proof, circuit, &cfg.program_hashes)
+                validate_stark_circuit(proof, circuit, &cfg.program_hashes)?;
+                verify_stark_bundle(proof)
             }
             _ => Ok(()),
         }
@@ -96,7 +96,6 @@ pub fn check_proof_shape(
         Proof::Stark {
             proof_bytes,
             output_preimage,
-            verify_meta,
         } => {
             if !verified_mode {
                 return Err(
@@ -108,9 +107,6 @@ pub fn check_proof_shape(
             }
             if output_preimage.is_empty() {
                 return Err("empty output_preimage".into());
-            }
-            if verify_meta.is_none() {
-                return Err("Stark proof missing verify_meta — cannot verify".into());
             }
             Ok(())
         }
@@ -139,35 +135,20 @@ pub fn validate_stark_circuit(
         })
 }
 
-pub fn verify_stark_bundle(proof: &Proof) -> Result<(), String> {
+fn verify_stark_bundle(proof: &Proof) -> Result<(), String> {
     let Proof::Stark {
         proof_bytes,
         output_preimage,
-        verify_meta,
     } = proof
     else {
         return Ok(());
     };
 
-    let verify_meta = verify_meta
-        .clone()
-        .ok_or_else(|| "Stark proof missing verify_meta — cannot verify".to_string())
-        .and_then(|bytes| decode_verify_meta(&bytes))?;
-
     let bundle = ProofBundle {
         proof_bytes: proof_bytes.clone(),
         output_preimage: output_preimage.clone(),
-        verify_meta: Some(verify_meta),
     };
     bundle.verify().map_err(stringify_bundle_verify_error)
-}
-
-pub fn encode_verify_meta(meta: &VerifyMeta) -> Result<Vec<u8>, String> {
-    verify_meta_codec::encode(meta)
-}
-
-pub fn decode_verify_meta(bytes: &[u8]) -> Result<VerifyMeta, String> {
-    verify_meta_codec::decode(bytes)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -225,6 +206,8 @@ mod tests {
     use serde::Deserialize;
     use tzel_core::{u64_to_felt, F};
 
+    use crate::bundle::{canonical_verify_meta, validate_canonical_verify_meta};
+
     use super::*;
 
     #[derive(Clone, Deserialize)]
@@ -261,7 +244,6 @@ mod tests {
         Proof::Stark {
             proof_bytes: vec![1, 2, 3],
             output_preimage,
-            verify_meta: Some(vec![1, 2, 3]),
         }
     }
 
@@ -278,7 +260,6 @@ mod tests {
             &Proof::Stark {
                 proof_bytes: vec![1],
                 output_preimage: vec![f(1), f(2), f(3)],
-                verify_meta: Some(vec![0]),
             },
             false,
             false,
@@ -290,7 +271,6 @@ mod tests {
             &Proof::Stark {
                 proof_bytes: vec![],
                 output_preimage: vec![f(1), f(2), f(3)],
-                verify_meta: Some(vec![0]),
             },
             false,
             true,
@@ -302,25 +282,12 @@ mod tests {
             &Proof::Stark {
                 proof_bytes: vec![1],
                 output_preimage: vec![],
-                verify_meta: Some(vec![0]),
             },
             false,
             true,
         )
         .unwrap_err();
         assert!(err.contains("empty output_preimage"));
-
-        let err = check_proof_shape(
-            &Proof::Stark {
-                proof_bytes: vec![1],
-                output_preimage: vec![f(1), f(2), f(3)],
-                verify_meta: None,
-            },
-            false,
-            true,
-        )
-        .unwrap_err();
-        assert!(err.contains("missing verify_meta"));
     }
 
     #[test]
@@ -335,10 +302,10 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_stark_bundle_rejects_invalid_verify_meta() {
+    fn test_verify_stark_bundle_rejects_invalid_proof_bytes_without_metadata() {
         let err = verify_stark_bundle(&sample_stark_proof(vec![f(1), f(5), f(22), f(99), f(100)]))
             .unwrap_err();
-        assert!(err.contains("invalid verify_meta"));
+        assert!(err.contains("zstd decompress"));
     }
 
     #[test]
@@ -353,7 +320,6 @@ mod tests {
                 &Proof::Stark {
                     proof_bytes: vec![1],
                     output_preimage: vec![f(1), f(4), f(11), f(99), f(100)],
-                    verify_meta: Some(vec![0]),
                 },
                 CircuitKind::Shield,
             )
@@ -380,12 +346,11 @@ mod tests {
                 &KernelStarkProof {
                     proof_bytes: vec![1, 2, 3],
                     output_preimage: vec![f(1), f(4), f(22), f(99), f(100)],
-                    verify_meta: vec![1, 2, 3],
                 },
                 CircuitKind::Transfer,
             )
             .unwrap_err();
-        assert!(err.contains("invalid verify_meta"));
+        assert!(err.contains("zstd decompress"));
     }
 
     #[test]
@@ -426,6 +391,49 @@ mod tests {
     }
 
     #[test]
+    fn test_embedded_verify_meta_matches_canonical_template() {
+        let meta = canonical_verify_meta().unwrap();
+        validate_canonical_verify_meta(&meta).unwrap();
+        assert!(!meta.public_output_values.is_empty());
+    }
+
+    #[test]
+    fn test_verified_bridge_fixture_proofs_do_not_carry_verify_meta() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tezos/rollup-kernel/testdata/verified_bridge_flow.json"
+        ))
+        .expect("checked-in verified bridge fixture should parse as JSON");
+
+        for name in ["shield", "transfer", "unshield"] {
+            assert!(
+                value[name]["proof"].get("verify_meta").is_none(),
+                "{name} fixture proof should not carry verifier metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn test_proof_bundle_rejects_verifier_metadata_json() {
+        let fixture = verified_bridge_fixture();
+        let Proof::Stark {
+            proof_bytes,
+            output_preimage,
+        } = &fixture.transfer.proof
+        else {
+            panic!("fixture transfer proof should be Stark");
+        };
+        let json = serde_json::json!({
+            "proof_bytes": hex::encode(proof_bytes),
+            "output_preimage": output_preimage.iter().map(hex::encode).collect::<Vec<_>>(),
+            "verify_meta": {"unexpected": "metadata"},
+        });
+        let err = serde_json::from_value::<ProofBundle>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `verify_meta`"), "{err}");
+    }
+
+    #[test]
     fn test_verified_real_bridge_fixture_rejects_tampered_output_preimage() {
         let fixture = verified_bridge_fixture();
         let mut proof = fixture.transfer.proof.clone();
@@ -439,6 +447,6 @@ mod tests {
         output_preimage[0] = f(999);
 
         let err = verify_stark_bundle(&proof).unwrap_err();
-        assert!(err.contains("output_preimage does not match verified public_output_values"));
+        assert!(err.contains("circuit verification FAILED"));
     }
 }

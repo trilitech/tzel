@@ -277,15 +277,14 @@ XMSS-style WOTS+ signature verification happens inside the STARK. No auth leaves
    - XMSS-style WOTS+ verification: the circuit computes the sighash from the public outputs, decomposes it into 128 base-4 digits + 5 checksum digits, then for each of the 133 chains recovers the final public-key endpoint with `H_chain^{w-1-digit}(sig_j, pub_seed_i, ADRS_j)`. The digits are NOT witness data — they are deterministically derived inside the circuit.
    - `auth_leaf_i = LTree(pub_seed_i, key_idx_i, pk_0, ..., pk_132)` from those recovered chain endpoints
    - Merkle membership of that exact `auth_leaf_i` at position `key_idx_i` against `auth_root_i` using the XMSS tree-node hash (auth key tree)
-2. All nullifiers pairwise distinct
-3. For all three outputs:
+2. For all three outputs:
    - `owner_tag_out = H_owner(auth_root_out, pub_seed_out, nk_tag_out)` where `auth_root_out`, `pub_seed_out`, and `nk_tag_out` are private inputs from the recipient's payment address
    - `cm_out = H_commit(d_j_out, v_out, rcm_out, owner_tag_out)`
-4. `v_3 > 0`
-5. `sum(v_inputs) = v_1 + v_2 + v_3 + fee` (in u128)
+3. `v_3 > 0`
+4. `sum(v_inputs) = v_1 + v_2 + v_3 + fee` (in u128)
 5. All values are u64 (implicit range check)
 
-**Contract checks:** proof valid, `fee >= required_tx_fee`. No signature verification needed — the STARK proof proves spend authorization.
+**Contract / ledger checks:** proof valid, `fee >= required_tx_fee`, every public nullifier is unique within the transaction, and no public nullifier has already been spent. No signature verification needed — the STARK proof proves spend authorization.
 
 ### Unshield (N->withdrawal + optional change, where 1 <= N <= 7)
 
@@ -300,16 +299,15 @@ producer-fee note plus an optional private change note.
 
 **Circuit constraints:**
 1. Same per-input verification as Transfer (including auth tree membership proof and WOTS+ signature verification)
-2. All nullifiers pairwise distinct
-3. If change:
+2. If change:
    - `owner_tag_c = H_owner(auth_root_c, pub_seed_c, nk_tag_c)` where `auth_root_c`, `pub_seed_c`, and `nk_tag_c` are private inputs
    - `cm_change = H_commit(d_j_c, v_change, rcm_c, owner_tag_c)`
-4. If no change: all change witness data constrained to zero (`v_change`, `d_j_change`, `rseed_change`, `auth_root_change`, `pub_seed_change`, `nk_tag_change`, `memo_ct_hash_change` = 0) to eliminate prover malleability
-5. `cm_fee = H_commit(d_j_fee, v_fee, rcm_fee, owner_tag_fee)` for the DAL producer note
-6. `v_fee > 0`
-7. `sum(v_inputs) = v_pub + v_change + v_fee + fee`
+3. If no change: all change witness data constrained to zero (`v_change`, `d_j_change`, `rseed_change`, `auth_root_change`, `pub_seed_change`, `nk_tag_change`, `memo_ct_hash_change` = 0) to eliminate prover malleability
+4. `cm_fee = H_commit(d_j_fee, v_fee, rcm_fee, owner_tag_fee)` for the DAL producer note
+5. `v_fee > 0`
+6. `sum(v_inputs) = v_pub + v_change + v_fee + fee`
 
-**Contract / ledger checks:** proof valid, `fee >= required_tx_fee`. Verify recipient binding per [Public Account Identifier Encoding](#public-account-identifier-encoding), credit `v_pub` to that recipient account, append `cm_change` to T (if nonzero), append `cm_fee` to T. No signature verification needed — the STARK proof proves spend authorization.
+**Contract / ledger checks:** proof valid, `fee >= required_tx_fee`, every public nullifier is unique within the transaction, and no public nullifier has already been spent. Verify recipient binding per [Public Account Identifier Encoding](#public-account-identifier-encoding), credit `v_pub` to that recipient account, append `cm_change` to T (if nonzero), append `cm_fee` to T. No signature verification needed — the STARK proof proves spend authorization.
 
 ## Contract Consensus Rules
 
@@ -327,9 +325,11 @@ The contract or verifier environment MUST verify that `auth_domain` (from the pr
 
 If proofs are produced through a bootloader or recursive verifier wrapper, the verifier environment MUST also authenticate which circuit executable was actually proved. In the reference implementation this means checking the bootloader-reported task program hash against the deployment's expected `run_shield`, `run_transfer`, or `run_unshield` executable hash before interpreting the public outputs. Verifying "some valid Cairo task" is not sufficient.
 
-### Global nullifier uniqueness (all spending transactions)
+### Public nullifier uniqueness (all spending transactions)
 
-The circuit enforces pairwise nullifier distinctness within a single transaction (`nf_i != nf_j`). The contract MUST additionally reject any `nf_i` that already exists in the global on-chain nullifier set. This prevents double-spends across transactions. After validation, the contract inserts all `nf_i` into the global set.
+The public output list determines `N`, the number of spent inputs, and exposes exactly `nf_0..nf_{N-1}`. Because those nullifiers and their count are public, pairwise distinctness is a consensus rule rather than a private circuit constraint. The contract MUST reject a transfer or unshield if the public nullifier list contains duplicates, and MUST also reject any `nf_i` that already exists in the global on-chain nullifier set. This prevents double-spends both within one transaction and across transactions. After all validation succeeds, the contract inserts all `nf_i` into the global set. The reference rollup kernel enforces this before appending output notes, crediting public balances, or inserting nullifiers.
+
+For proof-verified transactions, the ledger MUST bind `N` to the exact verified public-output vector. The single bootloader task output is a serialized Cairo array, so the ledger first validates and strips the array length prefix. The resulting Transfer vector MUST have exactly `2 + N + 7` public felts, and the resulting Unshield vector MUST have exactly `2 + N + 7` public felts. Accepting a longer vector and interpreting only a suffix is forbidden, because that would make the public input count ambiguous.
 
 ### Commitment binding (all transactions with outputs)
 
@@ -391,7 +391,7 @@ The contract appends commitments to the tree in sequential order (each new commi
 ## Delegated Proving
 
 1. User constructs the transaction, computing the WOTS+ signature over the sighash with `sk_i` for each input.
-2. User gives the prover per-input: `(nk_spend_j, auth_root_j, wots_sig_i, auth_tree_path_i, d_j, v, rseed, commitment_tree_path, pos)`, plus output data including `auth_root` and `nk_tag` for output notes.
+2. User gives the prover per-input: `(nk_spend_j, auth_root_j, pub_seed_j, wots_sig_i, auth_tree_path_i, d_j, v, rseed, commitment_tree_path, pos)`, plus output data including `auth_root`, `pub_seed`, and `nk_tag` for output notes.
 3. Prover generates the STARK proof. The WOTS+ signature is verified inside the circuit.
 4. Prover returns proof to user. Public outputs contain only `[auth_domain, root, nullifiers, fee, commitments, memo hashes]` (or `[auth_domain, root, nullifiers, v_pub, fee, recipient_id, cm_change, memo_ct_hash_change, cm_fee, memo_ct_hash_fee]` for unshield) — no auth leaves, public keys, or signatures.
 5. Transaction (proof + note data) submitted on-chain. No separate signatures or public keys needed.
@@ -486,7 +486,7 @@ note_data         —  6.8 KB    2 output notes
 
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
-public_outputs    — (N+8)*32 B  [auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3, mh_1, mh_2, mh_3]
+public_outputs    — (N+9)*32 B  [auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3, mh_1, mh_2, mh_3]
 note_data         — 10.2 KB    3 output notes
                   ----------
                   ~306 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
@@ -498,7 +498,7 @@ For a typical N=2 transfer: ~306 KB total.
 
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
-public_outputs    — (N+8)*32 B  [auth_domain, root, nf_0..nf_{N-1}, v_pub, fee, recipient_id, cm_change, mh_change, cm_fee, mh_fee]
+public_outputs    — (N+9)*32 B  [auth_domain, root, nf_0..nf_{N-1}, v_pub, fee, recipient_id, cm_change, mh_change, cm_fee, mh_fee]
 note_data         — 3.4-6.8 KB  producer fee note plus optional change note
                   ----------
                   ~299-303 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
@@ -506,7 +506,7 @@ note_data         — 3.4-6.8 KB  producer fee note plus optional change note
 
 For a typical N=2 unshield: ~300-303 KB total.
 
-For transfer and unshield public-output parsing, the verifier infers the input count as `N = total_public_output_felts - 8`. That is, after the leading `auth_domain` and `root`, the final six felts are fixed-format outputs and the remaining middle slice is the nullifier list.
+For transfer and unshield public-output parsing, the verifier infers the input count as `N = total_public_output_felts - 9`. That is, after the leading `auth_domain` and `root`, the final seven felts are fixed-format outputs and the remaining middle slice is the nullifier list.
 
 ## Domain Separation
 
@@ -632,7 +632,7 @@ Notes:
 - `PaymentAddress` and `EncryptedNote` are consensus-relevant application objects and MUST decode exactly as above in interoperable implementations.
 - `PublishedNote` is the canonical binary form of posted note data (`cm` plus memo/detection ciphertexts).
 - `NoteMemo` is the canonical binary form of the reference ledger's notes feed item.
-- The STARK proof envelope (`proof bytes`, `output_preimage`, verifier metadata) is intentionally **not** part of this canonical core schema yet. It is verifier-stack-specific and remains a reference-implementation transport detail in this version of the spec.
+- The STARK proof envelope carries `proof_bytes` and `output_preimage` outside this canonical core schema. Proof-system verifier metadata is not caller-supplied on the consensus path; the verifier derives the canonical verifier parameters from the configured executable and the verified output preimage.
 - The repository includes deterministic reference vectors for this schema in `specs/test_vectors/canonical_wire_v1.json`.
 
 ### Reference JSON Mapping

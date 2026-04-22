@@ -4494,6 +4494,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "tzel-core",
  "tzel-reprover",
  "tzel-verifier",
 ]

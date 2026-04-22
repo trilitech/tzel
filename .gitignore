@@ -16,6 +16,12 @@ mutants.out*/
 aws_creds
 third_party/patched-git/
 
+# Generated LaTeX artifacts
+docs/whitepaper.aux
+docs/whitepaper.log
+docs/whitepaper.out
+docs/whitepaper.pdf
+
 # Local agent/editor scratch
 .claude/
 .attic/

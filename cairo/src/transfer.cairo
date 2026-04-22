@@ -131,16 +131,6 @@ pub fn verify(
         i += 1;
     }
 
-    let mut a: u32 = 0;
-    while a < n {
-        let mut b: u32 = a + 1;
-        while b < n {
-            assert(*nf_list.at(a) != *nf_list.at(b), 'transfer: dup nf');
-            b += 1;
-        }
-        a += 1;
-    }
-
     let rcm_1 = hash::derive_rcm(rseed_1);
     let otag_1 = hash::owner_tag(auth_root_1, auth_pub_seed_1, nk_tag_1);
     assert(hash::commit(d_j_1, v_1, rcm_1, otag_1) == cm_1, 'transfer: bad cm_1');
@@ -1096,7 +1086,7 @@ mod tests {
     }
 
     fn build_duplicate_nf_fixture() -> TransferFixture {
-        let base = build_fixture_with_values_and_fee(70_u64, 37_u64, 25_u64, 3_u64, 5_u64);
+        let base = build_fixture_with_values_and_fee(70_u64, 80_u64, 52_u64, 3_u64, 5_u64);
         let sighash = transfer_sighash(
             base.auth_domain,
             base.root,
@@ -1387,8 +1377,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected: ('transfer: dup nf',))]
-    fn test_transfer_rejects_duplicate_nullifiers_after_all_other_checks() {
+    fn test_transfer_leaves_duplicate_nullifier_rejection_to_consensus() {
         let fixture = build_duplicate_nf_fixture();
         run_verify(@fixture);
     }

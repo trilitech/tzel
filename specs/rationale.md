@@ -7,7 +7,7 @@ This document is informative, not normative. The canonical protocol rules and en
 The note commitment includes:
 
 ```text
-owner_tag = H_owner(auth_root, nk_tag)
+owner_tag = H_owner(auth_root, pub_seed, nk_tag)
 cm        = H_commit(d_j, v, rcm, owner_tag)
 ```
 
@@ -22,7 +22,7 @@ cm = H_commit(d_j, v, rcm)
 In that weaker design, an attacker observing `cm` could choose an arbitrary nullifier key and try to spend the same commitment under a fresh nullifier. The owner-tag chain:
 
 ```text
-nk_spend -> nk_tag -> owner_tag -> cm
+nk_spend -> nk_tag -> owner_tag(auth_root, pub_seed, nk_tag) -> cm
 ```
 
 forces the commitment to be tied to the spender's nullifier derivation path. The spending proof then has to be consistent with the same bound commitment.

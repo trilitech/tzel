@@ -12,7 +12,7 @@ This directory is the entry point for the project documentation.
   - protocol definition
 - [../specs/security.md](../specs/security.md)
   - security notes and known limitations
-- [tzel_lite_whitepaper.tex](./tzel_lite_whitepaper.tex)
+- [whitepaper.tex](./whitepaper.tex)
   - lite whitepaper for readers who want the motivation, architecture, and
     security model without the full normative encoding spec
 

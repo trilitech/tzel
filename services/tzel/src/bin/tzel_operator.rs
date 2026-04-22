@@ -1594,7 +1594,6 @@ mod tests {
                 proof: tzel_core::kernel_wire::KernelStarkProof {
                     proof_bytes: vec![],
                     output_preimage: vec![],
-                    verify_meta: vec![],
                 },
                 client_cm: [0u8; 32],
                 client_enc: None,

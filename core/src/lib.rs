@@ -1376,9 +1376,6 @@ pub enum Proof {
         /// Public outputs (raw felt252 values) — the circuit commits to these.
         #[serde(with = "hex_f_vec")]
         output_preimage: Vec<F>,
-        /// Verification metadata as a typed binary blob.
-        #[serde(default, with = "hex_bytes_opt")]
-        verify_meta: Option<Vec<u8>>,
     },
 }
 
@@ -1447,6 +1444,35 @@ pub fn validate_single_task_program_hash<'a>(
         ));
     }
     Ok(parsed.public_outputs)
+}
+
+fn parse_cairo_array_public_outputs(task_public_outputs: &[F]) -> Result<&[F], String> {
+    let Some((len_felt, public_outputs)) = task_public_outputs.split_first() else {
+        return Err("bootloader public output array missing length".into());
+    };
+    let declared_len =
+        felt_to_usize(len_felt).map_err(|_| "invalid public output array length".to_string())?;
+    if declared_len != public_outputs.len() {
+        return Err(format!(
+            "public output array length mismatch: {} != {}",
+            declared_len,
+            public_outputs.len()
+        ));
+    }
+    Ok(public_outputs)
+}
+
+fn transition_public_outputs(
+    output_preimage: &[F],
+    expected_output_len: usize,
+) -> Result<&[F], String> {
+    if let Ok(parsed) = parse_single_task_output_preimage(output_preimage) {
+        return parse_cairo_array_public_outputs(parsed.public_outputs);
+    }
+    if output_preimage.len() == expected_output_len {
+        return Ok(output_preimage);
+    }
+    Ok(output_preimage)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1909,7 +1935,6 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
         Proof::Stark {
             proof_bytes: _,
             output_preimage,
-            verify_meta: _,
         } => {
             if req.client_cm == ZERO {
                 return Err(
@@ -2054,18 +2079,17 @@ pub fn apply_transfer<S: LedgerState>(
         Proof::Stark {
             proof_bytes: _,
             output_preimage,
-            verify_meta: _,
         } => {
-            let expected_tail_len = 2 + n + 7;
-            if output_preimage.len() < expected_tail_len {
+            let expected_output_len = 2 + n + 7;
+            let public_outputs = transition_public_outputs(output_preimage, expected_output_len)?;
+            if public_outputs.len() != expected_output_len {
                 return Err(format!(
-                    "output_preimage too short: {} < {}",
-                    output_preimage.len(),
-                    expected_tail_len
+                    "transfer public output length mismatch: {} != {}",
+                    public_outputs.len(),
+                    expected_output_len
                 ));
             }
-            let tail_start = output_preimage.len() - expected_tail_len;
-            let tail = &output_preimage[tail_start..];
+            let tail = public_outputs;
 
             if tail[0] != state.auth_domain()? {
                 return Err("proof auth_domain mismatch".into());
@@ -2172,14 +2196,17 @@ pub fn apply_unshield<S: LedgerState>(
         Proof::Stark {
             proof_bytes: _,
             output_preimage,
-            verify_meta: _,
         } => {
-            let expected_tail_len = 2 + n + 7;
-            if output_preimage.len() < expected_tail_len {
-                return Err("output_preimage too short".into());
+            let expected_output_len = 2 + n + 7;
+            let public_outputs = transition_public_outputs(output_preimage, expected_output_len)?;
+            if public_outputs.len() != expected_output_len {
+                return Err(format!(
+                    "unshield public output length mismatch: {} != {}",
+                    public_outputs.len(),
+                    expected_output_len
+                ));
             }
-            let tail_start = output_preimage.len() - expected_tail_len;
-            let tail = &output_preimage[tail_start..];
+            let tail = public_outputs;
 
             if tail[0] != state.auth_domain()? {
                 return Err("proof auth_domain mismatch".into());
@@ -2560,8 +2587,18 @@ mod tests {
         Proof::Stark {
             proof_bytes: vec![1],
             output_preimage,
-            verify_meta: None,
         }
+    }
+
+    fn bootloader_wrapped_public_outputs(program_hash: F, public_outputs: Vec<F>) -> Vec<F> {
+        let mut out = vec![
+            u(1),
+            u(u64::try_from(public_outputs.len() + 3).unwrap()),
+            program_hash,
+            u(u64::try_from(public_outputs.len()).unwrap()),
+        ];
+        out.extend(public_outputs);
+        out
     }
 
     fn shielded_note_setup(
@@ -2919,6 +2956,47 @@ mod tests {
                 .unwrap_err()
                 .contains("unexpected circuit program hash")
         );
+    }
+
+    #[test]
+    fn test_transition_public_outputs_rejects_bad_bootloader_array_length() {
+        let output_preimage = vec![u(1), u(5), u(12345), u(3), u(11), u(22)];
+
+        let err = transition_public_outputs(&output_preimage, 2).unwrap_err();
+
+        assert!(err.contains("public output array length mismatch"));
+    }
+
+    #[test]
+    fn test_transition_public_outputs_prefers_valid_bootloader_wrapper_over_ambiguous_flat_len() {
+        let inner_public_outputs = (0..10).map(|i| u(100 + i)).collect::<Vec<_>>();
+        let output_preimage =
+            bootloader_wrapped_public_outputs(u(12345), inner_public_outputs.clone());
+
+        assert_eq!(
+            output_preimage.len(),
+            14,
+            "one-input wrapped transfer/unshield output collides with five-input flat length"
+        );
+        let normalized = transition_public_outputs(&output_preimage, 14).unwrap();
+
+        assert_eq!(normalized, inner_public_outputs.as_slice());
+    }
+
+    #[test]
+    fn test_transition_public_outputs_rejects_ambiguous_malformed_bootloader_wrapper() {
+        let inner_public_outputs = (0..10).map(|i| u(200 + i)).collect::<Vec<_>>();
+        let mut output_preimage = bootloader_wrapped_public_outputs(u(12345), inner_public_outputs);
+        output_preimage[3] = u(9);
+
+        assert_eq!(
+            output_preimage.len(),
+            14,
+            "malformed wrapper must not be accepted as a same-length flat vector"
+        );
+        let err = transition_public_outputs(&output_preimage, 14).unwrap_err();
+
+        assert!(err.contains("public output array length mismatch"));
     }
 
     fn blake2s_personalized_iv(personal: &[u8; 8]) -> [u32; 8] {
@@ -3517,6 +3595,49 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_transfer_accepts_bootloader_wrapped_public_outputs() {
+        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x82, "alice", 250_000);
+        let root = ledger.tree.root();
+        let auth_domain = ledger.auth_domain;
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (enc_1, cm_1) = deterministic_note(&addr, 60_000, u(24), Some(b"out-1"));
+        let (enc_2, cm_2) = deterministic_note(&addr, 70_000, u(25), Some(b"out-2"));
+        let (enc_3, cm_3) = deterministic_note(&addr, 20_000, u(26), Some(b"dal"));
+
+        let public_outputs = vec![
+            auth_domain,
+            root,
+            nf,
+            u(MIN_TX_FEE),
+            cm_1,
+            cm_2,
+            cm_3,
+            memo_ct_hash(&enc_1),
+            memo_ct_hash(&enc_2),
+            memo_ct_hash(&enc_3),
+        ];
+        let resp = apply_transfer(
+            &mut ledger,
+            &TransferReq {
+                root,
+                nullifiers: vec![nf],
+                fee: MIN_TX_FEE,
+                cm_1,
+                cm_2,
+                cm_3,
+                enc_1,
+                enc_2,
+                enc_3,
+                proof: fake_stark(bootloader_wrapped_public_outputs(u(12345), public_outputs)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!((resp.index_1, resp.index_2, resp.index_3), (2, 3, 4));
+        assert!(ledger.nullifiers.contains(&nf));
+    }
+
+    #[test]
     fn test_apply_transfer_rejects_bad_memo_hash_without_mutation() {
         let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x73, "alice", 250_000);
         let root = ledger.tree.root();
@@ -3567,6 +3688,53 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_transfer_rejects_extra_public_outputs_for_nullifier_count() {
+        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x80, "alice", 250_000);
+        let root = ledger.tree.root();
+        let auth_domain = ledger.auth_domain;
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (enc_1, cm_1) = deterministic_note(&addr, 60_000, u(34), Some(b"out-1"));
+        let (enc_2, cm_2) = deterministic_note(&addr, 70_000, u(35), Some(b"out-2"));
+        let (enc_3, cm_3) = deterministic_note(&addr, 20_000, u(36), Some(b"dal"));
+        let leaves_before = ledger.tree.leaves.clone();
+        let memos_before = ledger.memos.len();
+
+        let err = apply_transfer(
+            &mut ledger,
+            &TransferReq {
+                root,
+                nullifiers: vec![nf],
+                fee: MIN_TX_FEE,
+                cm_1,
+                cm_2,
+                cm_3,
+                enc_1: enc_1.clone(),
+                enc_2: enc_2.clone(),
+                enc_3: enc_3.clone(),
+                proof: fake_stark(vec![
+                    ZERO,
+                    auth_domain,
+                    root,
+                    nf,
+                    u(MIN_TX_FEE),
+                    cm_1,
+                    cm_2,
+                    cm_3,
+                    memo_ct_hash(&enc_1),
+                    memo_ct_hash(&enc_2),
+                    memo_ct_hash(&enc_3),
+                ]),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("transfer public output length mismatch"));
+        assert!(!ledger.nullifiers.contains(&nf));
+        assert_eq!(ledger.tree.leaves, leaves_before);
+        assert_eq!(ledger.memos.len(), memos_before);
+    }
+
+    #[test]
     fn test_apply_unshield_stark_path_with_change_updates_balance_and_note() {
         let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x74, "alice", 180_000);
         let root = ledger.tree.root();
@@ -3609,6 +3777,97 @@ mod tests {
         assert!(ledger.nullifiers.contains(&nf));
         assert_eq!(ledger.memos.len(), 4);
         assert!(ledger.valid_roots.contains(&ledger.tree.root()));
+    }
+
+    #[test]
+    fn test_apply_unshield_accepts_bootloader_wrapped_public_outputs() {
+        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x83, "alice", 180_000);
+        let root = ledger.tree.root();
+        let auth_domain = ledger.auth_domain;
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (enc_change, cm_change) = deterministic_note(&addr, 30, u(46), Some(b"change"));
+        let (enc_fee, cm_fee) = deterministic_note(&addr, 29_970, u(47), Some(b"dal"));
+
+        let public_outputs = vec![
+            auth_domain,
+            root,
+            nf,
+            u(50),
+            u(MIN_TX_FEE),
+            hash(b"bob"),
+            cm_change,
+            memo_ct_hash(&enc_change),
+            cm_fee,
+            memo_ct_hash(&enc_fee),
+        ];
+        let resp = apply_unshield(
+            &mut ledger,
+            &UnshieldReq {
+                root,
+                nullifiers: vec![nf],
+                v_pub: 50,
+                fee: MIN_TX_FEE,
+                recipient: "bob".into(),
+                cm_change,
+                enc_change: Some(enc_change),
+                cm_fee,
+                enc_fee,
+                proof: fake_stark(bootloader_wrapped_public_outputs(u(12345), public_outputs)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resp.change_index, Some(2));
+        assert_eq!(resp.producer_index, 3);
+        assert_eq!(ledger.balance("bob").unwrap(), 50);
+        assert!(ledger.nullifiers.contains(&nf));
+    }
+
+    #[test]
+    fn test_apply_unshield_rejects_extra_public_outputs_for_nullifier_count() {
+        let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x81, "alice", 180_000);
+        let root = ledger.tree.root();
+        let auth_domain = ledger.auth_domain;
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (enc_change, cm_change) = deterministic_note(&addr, 30, u(44), Some(b"change"));
+        let (enc_fee, cm_fee) = deterministic_note(&addr, 29_970, u(45), Some(b"dal"));
+        let leaves_before = ledger.tree.leaves.clone();
+        let memos_before = ledger.memos.len();
+
+        let err = apply_unshield(
+            &mut ledger,
+            &UnshieldReq {
+                root,
+                nullifiers: vec![nf],
+                v_pub: 50,
+                fee: MIN_TX_FEE,
+                recipient: "bob".into(),
+                cm_change,
+                enc_change: Some(enc_change.clone()),
+                cm_fee,
+                enc_fee: enc_fee.clone(),
+                proof: fake_stark(vec![
+                    ZERO,
+                    auth_domain,
+                    root,
+                    nf,
+                    u(50),
+                    u(MIN_TX_FEE),
+                    hash(b"bob"),
+                    cm_change,
+                    memo_ct_hash(&enc_change),
+                    cm_fee,
+                    memo_ct_hash(&enc_fee),
+                ]),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("unshield public output length mismatch"));
+        assert_eq!(ledger.balance("bob").unwrap(), 0);
+        assert!(!ledger.nullifiers.contains(&nf));
+        assert_eq!(ledger.tree.leaves, leaves_before);
+        assert_eq!(ledger.memos.len(), memos_before);
     }
 
     #[test]
@@ -3802,6 +4061,44 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_transfer_rejects_duplicate_public_nullifiers_without_mutation() {
+        let (mut ledger, _shield_addr, nk_spend, shield_resp) =
+            shielded_note_setup(0x7C, "alice", 150_000);
+        let root = ledger.tree.root();
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x7D, 0);
+        let (enc_1, cm_1) = deterministic_note(&addr, 20_000, u(54), Some(b"out-1"));
+        let (enc_2, cm_2) = deterministic_note(&addr, 29_999, u(55), Some(b"out-2"));
+        let (enc_3, cm_3) = deterministic_note(&addr, 1, u(56), Some(b"dal"));
+        let leaves_before = ledger.tree.leaves.clone();
+        let memos_before = ledger.memos.len();
+        let roots_before = ledger.valid_roots.len();
+
+        let err = apply_transfer(
+            &mut ledger,
+            &TransferReq {
+                root,
+                nullifiers: vec![nf, nf],
+                fee: MIN_TX_FEE,
+                cm_1,
+                cm_2,
+                cm_3,
+                enc_1,
+                enc_2,
+                enc_3,
+                proof: Proof::TrustMeBro,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "duplicate nullifier");
+        assert!(!ledger.nullifiers.contains(&nf));
+        assert_eq!(ledger.tree.leaves, leaves_before);
+        assert_eq!(ledger.memos.len(), memos_before);
+        assert_eq!(ledger.valid_roots.len(), roots_before);
+    }
+
+    #[test]
     fn test_apply_transfer_preflights_three_note_capacity_before_mutation() {
         let (ledger, _addr, nk_spend, shield_resp) = shielded_note_setup(0x91, "alice", 150_000);
         let root = ledger.tree.root();
@@ -3867,6 +4164,43 @@ mod tests {
         assert!(err.contains("fee below minimum"));
         assert_eq!(ledger.balance("bob").unwrap(), 0);
         assert!(!ledger.nullifiers.contains(&nf));
+    }
+
+    #[test]
+    fn test_apply_unshield_rejects_duplicate_public_nullifiers_without_mutation() {
+        let (mut ledger, _shield_addr, nk_spend, shield_resp) =
+            shielded_note_setup(0x7E, "alice", 150_000);
+        let root = ledger.tree.root();
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x7F, 0);
+        let (enc_fee, cm_fee) = deterministic_note(&addr, 1, u(64), Some(b"dal"));
+        let leaves_before = ledger.tree.leaves.clone();
+        let memos_before = ledger.memos.len();
+        let roots_before = ledger.valid_roots.len();
+
+        let err = apply_unshield(
+            &mut ledger,
+            &UnshieldReq {
+                root,
+                nullifiers: vec![nf, nf],
+                v_pub: 50_000,
+                fee: MIN_TX_FEE,
+                recipient: "bob".into(),
+                cm_change: ZERO,
+                enc_change: None,
+                cm_fee,
+                enc_fee,
+                proof: Proof::TrustMeBro,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "duplicate nullifier");
+        assert_eq!(ledger.balance("bob").unwrap(), 0);
+        assert!(!ledger.nullifiers.contains(&nf));
+        assert_eq!(ledger.tree.leaves, leaves_before);
+        assert_eq!(ledger.memos.len(), memos_before);
+        assert_eq!(ledger.valid_roots.len(), roots_before);
     }
 
     #[test]
