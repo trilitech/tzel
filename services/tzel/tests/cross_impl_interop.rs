@@ -13,8 +13,23 @@ fn workspace_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
+fn ocaml_dune_command() -> Command {
+    if Command::new("dune")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+    {
+        Command::new("dune")
+    } else {
+        let mut cmd = Command::new("opam");
+        cmd.args(["exec", "--", "dune"]);
+        cmd
+    }
+}
+
 fn ocaml_scenario() -> InteropScenario {
-    let out = Command::new("dune")
+    let out = ocaml_dune_command()
         .current_dir(workspace_root().join("ocaml"))
         .args(["exec", "test/gen_interop_scenario.exe"])
         .output()

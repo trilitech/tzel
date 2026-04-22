@@ -39,6 +39,20 @@ jobs:
         with:
           scarb-version: "2.16.1"
 
+      - name: Install OCaml system prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgmp-dev pkg-config
+
+      - name: Set up OCaml for Rust/OCaml interop tests
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.2.0"
+
+      - name: Install OCaml dependencies for Rust/OCaml interop tests
+        run: |
+          opam install -y dune alcotest cstruct ctypes ctypes-foreign hex mirage-crypto yojson
+
       - name: Run Rust unit tests
         run: |
           cargo test -p tzel-core --lib
