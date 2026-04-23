@@ -109,7 +109,7 @@ The main design goals are:
   \item Support reduced-capability exports such as detection-only and
         incoming-view monitoring and sender-side outgoing accounting.
   \item Fit the execution and data model of Tezos smart rollups and the Tezos
-        Data Availability Layer (DAL).
+        Data Availability Layer (DAL) \cite{tezos-smart-rollups,tezos-dal}.
 \end{itemize}
 
 \section{Protocol Overview}
@@ -119,7 +119,9 @@ commitment together with encrypted note data. Off chain, the recipient uses the
 viewing path and local address metadata to recover the note plaintext. To spend
 a note, the wallet reveals a \emph{nullifier}: a one-use serial derived from
 the note and the note owner's secret spending material. The rollup rejects any
-nullifier that has already appeared.
+nullifier that has already appeared. This follows the note, commitment, and
+nullifier lineage introduced by Zerocash and refined in the Zcash Sapling and
+Orchard protocols \cite{zerocash,zcash-protocol,zcash-orchard}.
 
 The rollup state therefore contains:
 
@@ -180,11 +182,12 @@ Zero knowledge & Cairo AIR + recursive STARKs & prove validity without exposing 
 
 Where the protocol can be expressed with hash-based machinery, it does so:
 commitments, nullifiers, Merkle nodes, owner binding, transaction sighashes,
-and one-time-signature chains are all built from hashes. That leaves one place
-where hashing alone is not enough. A sender must take a public payment address
-and, without interaction, produce note ciphertext that only the recipient can
-open. That is a public-key delivery problem, so \TzEL{} uses ML-KEM for the
-incoming-note path.
+and one-time-signature chains are all built from BLAKE2s
+\cite{blake2-rfc,blake2}. That leaves one place where hashing alone is not
+enough. A sender must take a public payment address and, without interaction,
+produce note ciphertext that only the recipient can open. That is a public-key
+delivery problem, so \TzEL{} uses ML-KEM for the incoming-note path
+\cite{nist-fips203,kyber}.
 
 This is why the system is not purely hash-based. If there were a practical,
 standardized hash-based KEM with the right ergonomics for per-address note
@@ -202,7 +205,8 @@ whole is meant to survive without elliptic-curve or pairing-based cryptography.
 The private transaction logic is first expressed as Cairo AIR. That first proof
 establishes the arithmetic and Merkle constraints for shield, transfer, or
 unshield. A second proving layer then re-proves that Cairo execution using
-Stwo, yielding the recursive proof object that is posted to the rollup.
+Stwo, yielding the recursive proof object that is posted to the rollup
+\cite{cairo,stark,circle-starks,stwo}.
 
 This two-layer structure serves two purposes. First, it keeps the proving stack
 entirely in STARK territory. Second, it yields a proof that is small and
@@ -233,7 +237,9 @@ Spend & full view plus transaction authorization \\
 Detection, incoming view, full view, and spend form a nested receiver-side
 chain. Outgoing view is orthogonal: it tracks outputs created by the sender but
 does not detect arbitrary incoming notes, compute nullifiers, or authorize
-spends.
+spends. The detection capability is related to fuzzy message detection, but
+\TzEL{} uses an ML-KEM-based clue and short tag rather than directly adopting
+the FMD constructions \cite{fmd}.
 
 That separation is reflected in the wallet derivation tree. From a master
 secret, the wallet derives independent spending, incoming, and outgoing
@@ -298,6 +304,8 @@ as strings to copy by hand.
 
 For note value \(v\), per-note seed \(rseed\), and the recipient's address
 metadata, the protocol derives commitment randomness and the note commitment as
+in a shielded-note design descended from Sapling and Orchard
+\cite{zcash-protocol,zcash-orchard}:
 
 \[
 \rcm = \Hash(\Hash(\mathrm{TAG\_RCM}), rseed),
@@ -340,7 +348,8 @@ public effects of a transaction without handing the prover a reusable spending
 key. \TzEL{} solves that with an XMSS-style authorization tree of one-time
 hash-signature keys. Each spent input consumes one unused leaf. The wallet
 signs the transaction locally; the prover only proves, inside the STARK, that
-the signature is valid under the address's authorization root.
+the signature is valid under the address's authorization root
+\cite{rfc8391,xmss,wotsplus}.
 
 This mechanism is still useful when proving is done locally. It keeps spend
 authorization inside the proof and avoids publishing public keys or signatures
@@ -525,16 +534,16 @@ Each output note carries
 For recipient address \((ek^d_j, ek^v_j)\), the sender creates two ML-KEM
 encapsulations. The viewing path is the strong one: encapsulate to \(ek^v_j\),
 derive a symmetric key from the shared secret, and encrypt
-\((v \parallel rseed \parallel memo)\) with ChaCha20-Poly1305. The detection
-path is weaker on purpose. It gives a watch-only service just enough material
-to flag candidate incoming notes, while leaving note contents encrypted and
-spend authority untouched.
+\((v \parallel rseed \parallel memo)\) with ChaCha20-Poly1305
+\cite{nist-fips203,kyber,chacha-rfc}. The detection path is weaker on purpose.
+It gives a watch-only service just enough material to flag candidate incoming
+notes, while leaving note contents encrypted and spend authority untouched.
 
 This is the operational role of detection. Without it, a wallet or service would
 have to attempt full incoming-note recovery against every output on the chain.
 With detection, a lightweight indexer can scan the chain, report likely
 matches by address index, and leave the wallet to do full note recovery only on
-that narrowed candidate set.
+that narrowed candidate set \cite{fmd}.
 
 Detection leaks very little compared with viewing. A detector can test whether a
 note is a candidate for one of the monitored addresses. It cannot decrypt note
@@ -625,7 +634,8 @@ lets rollups publish large blobs without forcing them into L1 block bandwidth.
 That matters here because recursive proofs are roughly 300 KB and each encrypted
 output note is roughly 3 KB. The intended path is therefore to publish the
 heavy payload through DAL, inject only a small pointer into the rollup inbox,
-and let the kernel resolve that pointer before applying the state transition.
+and let the kernel resolve that pointer before applying the state transition
+\cite{tezos-smart-rollups,tezos-dal}.
 
 \TzEL{}'s post-quantum claims concern the shielded transaction layer. Tezos L1
 consensus, bridge mechanics, and DAL attestation are separate systems with
@@ -753,4 +763,120 @@ The result is a shielded transaction protocol for Tezos smart rollups that aims
 to protect the data most exposed to harvest-now-decrypt-later pressure: durable
 note ciphertexts, spend authorizations, and the proof path that validates
 private state transitions.
+
+\begin{thebibliography}{99}
+
+\bibitem{zerocash}
+Eli Ben-Sasson, Alessandro Chiesa, Christina Garman, Matthew Green, Ian Miers,
+Eran Tromer, and Madars Virza.
+\newblock Zerocash: Decentralized Anonymous Payments from Bitcoin.
+\newblock IEEE Symposium on Security and Privacy, 2014.
+\newblock \url{https://eprint.iacr.org/2014/349}.
+
+\bibitem{zcash-protocol}
+Daira-Emma Hopwood, Sean Bowe, Taylor Hornby, and Nathan Wilcox.
+\newblock Zcash Protocol Specification.
+\newblock Electric Coin Company.
+\newblock \url{https://zcash.readthedocs.io/en/master/rtd_pages/protocol.html}.
+
+\bibitem{zcash-orchard}
+Daira-Emma Hopwood, Jack Grigg, Sean Bowe, Kris Nuttycombe, and Ying Tong Lai.
+\newblock ZIP 224: Orchard Shielded Protocol.
+\newblock \url{https://zips.z.cash/zip-0224}.
+
+\bibitem{fmd}
+Gabrielle Beck, Julia Len, Ian Miers, and Matthew Green.
+\newblock Fuzzy Message Detection.
+\newblock ACM CCS, 2021.
+\newblock \url{https://eprint.iacr.org/2021/089}.
+
+\bibitem{stark}
+Eli Ben-Sasson, Iddo Bentov, Yinon Horesh, and Michael Riabzev.
+\newblock Scalable, transparent, and post-quantum secure computational
+integrity.
+\newblock IACR Cryptology ePrint Archive, Report 2018/046.
+\newblock \url{https://eprint.iacr.org/2018/046}.
+
+\bibitem{circle-starks}
+Ulrich Hab\"ock, David Levit, and Shahar Papini.
+\newblock Circle STARKs.
+\newblock IACR Cryptology ePrint Archive, Report 2024/278.
+\newblock \url{https://eprint.iacr.org/2024/278}.
+
+\bibitem{stwo}
+StarkWare.
+\newblock Stwo: a next-generation Circle STARK prover and verifier.
+\newblock \url{https://github.com/starkware-libs/stwo}.
+
+\bibitem{cairo}
+Lior Goldberg, Shahar Papini, and Michael Riabzev.
+\newblock Cairo -- a Turing-complete STARK-friendly CPU architecture.
+\newblock IACR Cryptology ePrint Archive, Report 2021/1063.
+\newblock \url{https://eprint.iacr.org/2021/1063}.
+
+\bibitem{nist-fips203}
+National Institute of Standards and Technology.
+\newblock FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard.
+\newblock 2024.
+\newblock \url{https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.203.pdf}.
+
+\bibitem{kyber}
+Joppe W. Bos, L\'eo Ducas, Eike Kiltz, Tancr\`ede Lepoint,
+Vadim Lyubashevsky, John M. Schanck, Peter Schwabe, Gregor Seiler,
+and Damien Stehl\'e.
+\newblock CRYSTALS--Kyber: a CCA-secure module-lattice-based KEM.
+\newblock IACR Cryptology ePrint Archive, Report 2017/634.
+\newblock \url{https://eprint.iacr.org/2017/634}.
+
+\bibitem{rfc8391}
+Andreas H\"ulsing, Denis Butin, Stefan-Lukas Gazdag, Joost Rijneveld,
+and Aziz Mohaisen.
+\newblock RFC 8391: XMSS: eXtended Merkle Signature Scheme.
+\newblock Internet Engineering Task Force, 2018.
+\newblock \url{https://datatracker.ietf.org/doc/html/rfc8391}.
+
+\bibitem{xmss}
+Johannes Buchmann, Erik Dahmen, and Andreas H\"ulsing.
+\newblock XMSS -- A Practical Forward Secure Signature Scheme Based on Minimal
+Security Assumptions.
+\newblock PQCrypto, 2011.
+\newblock \url{https://eprint.iacr.org/2011/484}.
+
+\bibitem{wotsplus}
+Andreas H\"ulsing.
+\newblock WOTS+ -- Shorter Signatures for Hash-Based Signature Schemes.
+\newblock IACR Cryptology ePrint Archive, Report 2017/965.
+\newblock \url{https://eprint.iacr.org/2017/965}.
+
+\bibitem{blake2-rfc}
+Markku-Juhani O. Saarinen and Jean-Philippe Aumasson.
+\newblock RFC 7693: The BLAKE2 Cryptographic Hash and Message Authentication
+Code.
+\newblock Internet Engineering Task Force, 2015.
+\newblock \url{https://datatracker.ietf.org/doc/html/rfc7693}.
+
+\bibitem{blake2}
+Jean-Philippe Aumasson, Samuel Neves, Zooko Wilcox-O'Hearn, and
+Christian Winnerlein.
+\newblock BLAKE2: simpler, smaller, fast as MD5.
+\newblock IACR Cryptology ePrint Archive, Report 2013/322.
+\newblock \url{https://eprint.iacr.org/2013/322}.
+
+\bibitem{chacha-rfc}
+Y. Nir and A. Langley.
+\newblock RFC 8439: ChaCha20 and Poly1305 for IETF Protocols.
+\newblock Internet Engineering Task Force, 2018.
+\newblock \url{https://datatracker.ietf.org/doc/html/rfc8439}.
+
+\bibitem{tezos-smart-rollups}
+Tezos documentation.
+\newblock Smart Rollups.
+\newblock \url{https://docs.tezos.com/architecture/smart-rollups}.
+
+\bibitem{tezos-dal}
+Tezos documentation.
+\newblock The Data Availability Layer.
+\newblock \url{https://docs.tezos.com/architecture/data-availability-layer}.
+
+\end{thebibliography}
 \end{document}
