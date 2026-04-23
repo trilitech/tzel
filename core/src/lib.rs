@@ -1466,13 +1466,19 @@ fn transition_public_outputs(
     output_preimage: &[F],
     expected_output_len: usize,
 ) -> Result<&[F], String> {
-    if let Ok(parsed) = parse_single_task_output_preimage(output_preimage) {
-        return parse_cairo_array_public_outputs(parsed.public_outputs);
+    let public_outputs = if let Ok(parsed) = parse_single_task_output_preimage(output_preimage) {
+        parse_cairo_array_public_outputs(parsed.public_outputs)?
+    } else {
+        output_preimage
+    };
+    if public_outputs.len() != expected_output_len {
+        return Err(format!(
+            "public output length mismatch: {} != {}",
+            public_outputs.len(),
+            expected_output_len
+        ));
     }
-    if output_preimage.len() == expected_output_len {
-        return Ok(output_preimage);
-    }
-    Ok(output_preimage)
+    Ok(public_outputs)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1947,12 +1953,6 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
                 );
             }
             let public_outputs = transition_public_outputs(output_preimage, 8)?;
-            if public_outputs.len() != 8 {
-                return Err(format!(
-                    "shield public output length mismatch: {} != 8",
-                    public_outputs.len()
-                ));
-            }
             if public_outputs[0] != u64_to_felt(req.v) {
                 return Err("proof note value mismatch".into());
             }
@@ -2084,13 +2084,6 @@ pub fn apply_transfer<S: LedgerState>(
         } => {
             let expected_output_len = 2 + n + 7;
             let public_outputs = transition_public_outputs(output_preimage, expected_output_len)?;
-            if public_outputs.len() != expected_output_len {
-                return Err(format!(
-                    "transfer public output length mismatch: {} != {}",
-                    public_outputs.len(),
-                    expected_output_len
-                ));
-            }
             let tail = public_outputs;
 
             if tail[0] != state.auth_domain()? {
@@ -2201,13 +2194,6 @@ pub fn apply_unshield<S: LedgerState>(
         } => {
             let expected_output_len = 2 + n + 7;
             let public_outputs = transition_public_outputs(output_preimage, expected_output_len)?;
-            if public_outputs.len() != expected_output_len {
-                return Err(format!(
-                    "unshield public output length mismatch: {} != {}",
-                    public_outputs.len(),
-                    expected_output_len
-                ));
-            }
             let tail = public_outputs;
 
             if tail[0] != state.auth_domain()? {
@@ -2980,7 +2966,7 @@ mod tests {
             14,
             "one-input wrapped transfer/unshield output collides with five-input flat length"
         );
-        let normalized = transition_public_outputs(&output_preimage, 14).unwrap();
+        let normalized = transition_public_outputs(&output_preimage, 10).unwrap();
 
         assert_eq!(normalized, inner_public_outputs.as_slice());
     }
@@ -2999,6 +2985,24 @@ mod tests {
         let err = transition_public_outputs(&output_preimage, 14).unwrap_err();
 
         assert!(err.contains("public output array length mismatch"));
+    }
+
+    #[test]
+    fn test_transition_public_outputs_rejects_flat_length_mismatch() {
+        let output_preimage = vec![u(11), u(22), u(33)];
+
+        let err = transition_public_outputs(&output_preimage, 2).unwrap_err();
+
+        assert!(err.contains("public output length mismatch"));
+    }
+
+    #[test]
+    fn test_transition_public_outputs_rejects_wrapped_length_mismatch() {
+        let output_preimage = bootloader_wrapped_public_outputs(u(12345), vec![u(11), u(22), u(33)]);
+
+        let err = transition_public_outputs(&output_preimage, 2).unwrap_err();
+
+        assert!(err.contains("public output length mismatch"));
     }
 
     fn blake2s_personalized_iv(personal: &[u8; 8]) -> [u32; 8] {
@@ -3591,7 +3595,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("shield public output length mismatch"));
+        assert!(err.contains("public output length mismatch"));
         assert_eq!(
             ledger.balance(&test_deposit_key("alice")).unwrap(),
             125 + producer_fee + fee
@@ -3779,7 +3783,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("transfer public output length mismatch"));
+        assert!(err.contains("public output length mismatch"));
         assert!(!ledger.nullifiers.contains(&nf));
         assert_eq!(ledger.tree.leaves, leaves_before);
         assert_eq!(ledger.memos.len(), memos_before);
@@ -3914,7 +3918,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("unshield public output length mismatch"));
+        assert!(err.contains("public output length mismatch"));
         assert_eq!(ledger.balance("bob").unwrap(), 0);
         assert!(!ledger.nullifiers.contains(&nf));
         assert_eq!(ledger.tree.leaves, leaves_before);
