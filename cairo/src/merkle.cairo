@@ -84,34 +84,9 @@ pub fn verify(leaf: felt252, root: felt252, siblings: Span<felt252>, path_indice
     assert(current == root, 'merkle root mismatch');
 }
 
-/// Verify membership in an auth key tree (depth = AUTH_DEPTH).
-/// Same algorithm as `verify` but for the smaller per-address auth tree.
-pub fn verify_auth(leaf: felt252, root: felt252, siblings: Span<felt252>, path_indices: u64) {
-    assert(siblings.len() == AUTH_DEPTH, 'bad auth path length');
-
-    let mut current = leaf;
-    let mut idx = path_indices;
-    let mut i: u32 = 0;
-
-    while i < AUTH_DEPTH {
-        let sibling = *siblings.at(i);
-        let bit = idx & 1;
-        idx = idx / 2;
-        current = if bit == 1 {
-            hash2(sibling, current)
-        } else {
-            hash2(current, sibling)
-        };
-        i += 1;
-    }
-
-    assert(idx == 0, 'auth_index out of range');
-    assert(current == root, 'auth root mismatch');
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{AUTH_DEPTH, TREE_DEPTH, hash2, verify, verify_auth};
+    use super::{TREE_DEPTH, hash2, verify};
 
     fn zero_siblings(depth: u32) -> Array<felt252> {
         let mut siblings: Array<felt252> = array![];
@@ -193,21 +168,4 @@ mod tests {
         verify(leaf, root, siblings.span(), one_shifted_by(TREE_DEPTH));
     }
 
-    #[test]
-    fn test_verify_auth_valid_path() {
-        let leaf = 0x1357;
-        let siblings = zero_siblings(AUTH_DEPTH);
-        let path_indices = 3_u64;
-        let root = root_from_path(leaf, siblings.span(), path_indices, AUTH_DEPTH);
-        verify_auth(leaf, root, siblings.span(), path_indices);
-    }
-
-    #[test]
-    #[should_panic(expected: ('auth_index out of range',))]
-    fn test_verify_auth_rejects_index_aliasing() {
-        let leaf = 0x2468;
-        let siblings = zero_siblings(AUTH_DEPTH);
-        let root = root_from_path(leaf, siblings.span(), 0, AUTH_DEPTH);
-        verify_auth(leaf, root, siblings.span(), one_shifted_by(AUTH_DEPTH));
-    }
 }

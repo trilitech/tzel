@@ -253,6 +253,23 @@ mod tests {
         current
     }
 
+    fn hash2_root_from_auth_path(leaf: felt252, siblings: Span<felt252>, mut path_indices: u64) -> felt252 {
+        let mut current = leaf;
+        let mut level: u32 = 0;
+        while level < merkle::AUTH_DEPTH {
+            let sibling = *siblings.at(level);
+            current =
+                if path_indices & 1 == 1 {
+                    hash::hash2(sibling, current)
+                } else {
+                    hash::hash2(current, sibling)
+                };
+            path_indices /= 2;
+            level += 1;
+        }
+        current
+    }
+
     fn root_from_signature_inputs(
         sighash: felt252,
         pub_seed: felt252,
@@ -362,6 +379,24 @@ mod tests {
         let root = ref_root_from_auth_path(leaf, pub_seed, key_idx, siblings.span());
 
         xmss_verify_auth(leaf, root, pub_seed, key_idx, siblings.span());
+    }
+
+    #[test]
+    fn test_xmss_auth_root_is_domain_separated_from_commitment_merkle_hash() {
+        let leaf = 0x9876;
+        let pub_seed = 0x1111;
+        let key_idx = 5_u32;
+        let mut siblings: Array<felt252> = array![];
+        let mut level: u32 = 0;
+        while level < merkle::AUTH_DEPTH {
+            siblings.append(hash::hash1(level.into() + 0xCA00));
+            level += 1;
+        }
+
+        let xmss_root = ref_root_from_auth_path(leaf, pub_seed, key_idx, siblings.span());
+        let generic_root = hash2_root_from_auth_path(leaf, siblings.span(), key_idx.into());
+
+        assert(xmss_root != generic_root, 'xmss vs hash2');
     }
 
     #[test]
