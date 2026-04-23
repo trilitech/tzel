@@ -70,6 +70,11 @@ async fn fund_handler(
     State(st): State<AppState>,
     Json(req): Json<FundReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if is_deposit_balance_key(&req.recipient) {
+        return Err(err(
+            "fund endpoint refuses secret-bound deposit key recipients".into(),
+        ));
+    }
     let mut ledger = st.ledger.lock().unwrap();
     ledger.fund(&req.recipient, req.amount).map_err(err)?;
     eprintln!("[fund] {} += {}", req.recipient, req.amount);
@@ -364,6 +369,28 @@ mod tests {
 
         let Json(resp) = balances_handler(State(st)).await;
         assert_eq!(resp.balances.get("alice"), Some(&55));
+    }
+
+    #[tokio::test]
+    async fn test_fund_handler_rejects_secret_bound_deposit_balances() {
+        let st = test_state(default_auth_domain());
+        let deposit_key = deposit_balance_key(&u64_to_felt(0xAB));
+
+        let err = fund_handler(
+            State(st.clone()),
+            Json(FundReq {
+                recipient: deposit_key.clone(),
+                amount: 55,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("secret-bound deposit key"));
+
+        let Json(resp) = balances_handler(State(st)).await;
+        assert!(resp.balances.get(&deposit_key).is_none());
     }
 
     #[tokio::test]
