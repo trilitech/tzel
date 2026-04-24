@@ -6,13 +6,13 @@
 
 > **WARNING: This project is under active development. Neither the cryptographic scheme nor the implementation should be assumed secure. Do not use for real value. See `specs/spec.md` for the protocol definition used by the code in this repository.**
 
-Privacy on blockchains today relies on elliptic curve cryptography that quantum computers will break. TzEL replaces every elliptic curve with post-quantum alternatives — BLAKE2s hashing, ML-KEM-768 lattice-based encryption, Winternitz-style one-time spend authorization verified inside the STARK, and recursive STARK proofs — with reference proofs around 300 KB and verification around 35 ms.
+Privacy on blockchains today relies on elliptic curve cryptography that quantum computers will break. TzEL replaces every elliptic curve with post-quantum alternatives — BLAKE2s hashing, ML-KEM-768 lattice-based encryption, Winternitz-style one-time spend authorization verified inside the STARK, and recursive STARK proofs — with reference proofs around 300 KB and verification around 32--34 ms on an AWS `c8g.16xlarge`.
 
 ### Features
 
 - **Post-quantum end-to-end.** No elliptic curves anywhere. BLAKE2s for commitments and nullifiers, ML-KEM-768 for encrypted memos, Winternitz-style one-time signatures for spend authorization (verified inside the STARK), and recursive STARKs for proofs.
 - **~300 KB recursive zero-knowledge proofs.** Two-level recursive STARKs (Cairo AIR -> Stwo circuit reprover) with ZK blinding.
-- **Delegated proving with spend-bound authorization.** Outsource proof generation to an untrusted server. Each spend uses a fresh one-time hash-signature key from a Merkle tree, and the signature is verified inside the STARK, so the prover cannot redirect funds by changing outputs. On the reference stack, proof generation is measured in tens of seconds rather than milliseconds.
+- **Delegated proving with spend-bound authorization.** Outsource proof generation to an untrusted server. Each spend uses a fresh one-time hash-signature key from a Merkle tree, and the signature is verified inside the STARK, so the prover cannot redirect funds by changing outputs. On an AWS `c8g.16xlarge`, the depth-48 recursive prover measured `4.856s` for shield, `5.235s` for transfer `N=2`, `7.746s` for transfer `N=7`, `5.259s` for unshield `N=2`, and `7.632s` for unshield `N=7`.
 - **Fuzzy message detection.** ML-KEM-based detection keys let a lightweight indexer flag likely-incoming transactions without being able to read them.
 - **Diversified addresses.** Generate unlimited unlinkable addresses from a single master key.
 - **1 KB encrypted memos.** End-to-end encrypted with ML-KEM-768 + ChaCha20-Poly1305.
@@ -171,6 +171,16 @@ ocaml/                  Independent OCaml implementation
 ./apps/prover/bench.sh
 ./apps/prover/bench.sh --depth 16
 ```
+
+Latest reference numbers for the depth-48 recursive prover on an AWS `c8g.16xlarge`:
+
+| Proof | Total prove time | Verify time | Peak RSS | Proof size |
+| --- | ---: | ---: | ---: | ---: |
+| Shield | `4.856s` | `32ms` | `13.19 GiB` | `297.6 KiB` |
+| Transfer `N=2` | `5.235s` | `32ms` | `16.66 GiB` | `289.5 KiB` |
+| Transfer `N=7` | `7.746s` | `32ms` | `24.96 GiB` | `289.2 KiB` |
+| Unshield `N=2` | `5.259s` | `32ms` | `16.59 GiB` | `289.4 KiB` |
+| Unshield `N=7` | `7.632s` | `34ms` | `24.76 GiB` | `301.3 KiB` |
 
 ## Rollup kernel MVP
 
