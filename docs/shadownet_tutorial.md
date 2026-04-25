@@ -3,13 +3,13 @@
 This tutorial covers a Shadownet `deposit -> shield -> send` flow against a
 deployed rollup using the operator box.
 
-> **Status note (intent-bound shield migration):** the protocol now uses
-> intent-bound shield deposit ids. The L1 deposit transaction commits to the
-> entire shield (recipient, value, fees, encrypted-note bytes) by addressing
-> the rollup balance to `deposit:<hex(intent)>`. The wallet's rollup-side
-> `bridge-deposit` and `shield` commands are being rewritten to support this
-> flow — see `new_findings.md`. The localhost demo flow in the top-level
-> `README.md` already runs end-to-end against this design.
+> **Status note:** the protocol uses intent-bound shield deposit ids. The L1
+> deposit transaction commits to the entire shield (recipient, value, fees,
+> encrypted-note bytes) by addressing the rollup balance to
+> `deposit:<hex(intent)>`. The rollup wallet flow below is current:
+> `deposit` creates the pending intent-bound deposit, `shield --deposit-id ...`
+> drains it, `send` stays internal, and `unshield` withdraws directly to an L1
+> tz/KT1 recipient.
 
 The current rollup policy burns at least `100000` mutez (`0.1 tez`) on every
 `shield`, `send`, and `unshield`. The first two accepted private transactions at
@@ -269,22 +269,27 @@ Notes:
 Deposit into the bridge for Alice's next shield. The wallet builds the recipient and producer-fee notes, computes `intent = shield_intent(auth_domain, v, fee, producer_fee, cm_recipient, cm_producer, mh, mh_producer)`, and asks the bridge to credit `deposit:<hex(intent)>` for exactly `v + fee + producer_fee` mutez:
 
 ```bash
+DEPOSIT_OUTPUT="$(
 /usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
   deposit \
   --amount 300000
+)"
+printf '%s\n' "$DEPOSIT_OUTPUT"
+DEPOSIT_ID="$(awk '/Submitted L1 bridge deposit/ {print $NF}' <<<"$DEPOSIT_OUTPUT")"
 ```
 
-The wallet prints an L1 operation hash. Wait for it to land, then poll:
+The wallet prints an L1 operation hash and the intent hex. Wait for it to land,
+then poll:
 
 ```bash
 /usr/local/bin/tzel-wallet --wallet alice.wallet balance
 ```
 
-Do not continue until Alice shows a non-zero pending-deposit line like:
+Do not continue until Alice shows a non-zero deposit-balance line like:
 
 ```text
-Pending intent-bound deposit balance: 300000 across 1 pending deposits
+Secret-bound deposit balance: 400001 across 1 pending deposits
 ```
 
 ## 7. Shield Alice’s Funds
@@ -297,12 +302,12 @@ Shield into a self-address first:
   --reprove-bin /usr/local/bin/reprove \
   --executables-dir /opt/tzel/cairo/target/dev \
   shield \
-  --amount 200000
+  --deposit-id "$DEPOSIT_ID"
 ```
 
 Expected output includes:
 
-- `Submitted shield of ...`
+- `Submitted shield draining deposit ...`
 - `Submission id: sub-...`
 
 Track the submission:

@@ -410,7 +410,8 @@ that includes
   \item the deployment authorization domain \(auth\_domain\);
   \item the input root;
   \item all nullifiers;
-  \item public values such as fees, withdrawal amount, and recipient id;
+  \item public values such as fees, withdrawal amount, and the canonical L1
+        recipient hash;
   \item output commitments and note-data hashes, including the hashes of
         recipient-delivery and outgoing-recovery ciphertexts.
 \end{itemize}
@@ -471,10 +472,12 @@ service without any in-circuit signature.
 
 \paragraph{Ownership binding accounting.} \(v_{pub}\) becomes the user's
 shielded note, \(producer\_fee\) becomes the DAL-producer fee note, and
-\(fee\) is burned. The deposit receipt itself is not directly withdrawable;
-under the intent-bound scheme, \(deposit\_id\) is a hash of a witness only the
-sender knows, so a third party who observes the L1 deposit cannot construct an
-alternative shield against the same \(deposit\_id\).
+\(fee\) is burned. There is no separate direct-withdraw path for the deposit
+receipt; only Shield can consume it. Under the intent-bound scheme,
+\(deposit\_id\) is a hash of off-chain witness data that the wallet persists
+and that is not revealed by the L1 deposit alone, so a third party who merely
+observes the deposit cannot construct an alternative shield against the same
+\(deposit\_id\).
 
 \subsection{Transfer}
 
@@ -629,7 +632,8 @@ state-transition rules that are not handled inside the proof. These include:
         being consumed (the kernel recomputes \(intent\) from the request
         fields and requires \(deposit\_id == intent\); the L1 balance must
         also equal exactly \(v_{pub} + fee + producer\_fee\));
-  \item correct binding of unshield to the intended public recipient encoding;
+  \item correct binding of unshield to the intended canonical L1 recipient
+        string;
   \item enough remaining commitment-tree capacity for every output note before
         any balance, nullifier, or outbox mutation is applied;
   \item satisfaction of the current burned-fee policy.

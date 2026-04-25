@@ -406,7 +406,7 @@ Tests sighash fold with `H_sighash` (`sighSP__`).
 |---|-------|
 | 0 | `[felt_of_int(1), felt_of_int(2), felt_of_int(3)]` |
 | 1 | `[felt_of_int(0x01), H(UTF8("domain")), H(UTF8("root")), H(UTF8("nf0")), felt_of_int(100000), H(UTF8("cm1")), H(UTF8("cm2")), H(UTF8("cm3")), felt_zero, felt_zero, felt_zero]` — simulated transfer sighash |
-| 2 | `[felt_of_int(0x02), H(UTF8("domain")), H(UTF8("root")), H(UTF8("nf0")), felt_of_int(5000), felt_of_int(100000), account_id("bob"), felt_zero, felt_zero, felt_zero, felt_zero]` — simulated unshield sighash |
+| 2 | `[felt_of_int(0x02), H(UTF8("domain")), H(UTF8("root")), H(UTF8("nf0")), felt_of_int(5000), felt_of_int(100000), H(UTF8("tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx")), felt_zero, felt_zero, felt_zero, felt_zero]` — simulated unshield sighash |
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -419,7 +419,7 @@ Fold: `result = items[0]`, then for each remaining item `x`: `result = H_sighash
 
 ## Section: `account_ids`
 
-Tests public account identifier hashing.
+Tests canonical string hashing used by unshield recipient binding.
 
 **Array of 4 objects for strings `["alice", "bob", "", "a]very+long/identifier\x00with\nnulls"]`:**
 

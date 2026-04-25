@@ -23,7 +23,7 @@ Privacy on blockchains today relies on elliptic curve cryptography that quantum 
 A UTXO-based private transaction system where:
 - **Deposits** credit a namespaced *intent-bound* rollup deposit key whose hash commits to the entire shield (recipient note, producer-fee note, fees, auth_domain). `shield` opens the preimage and consumes the deposit. Because every prover-rewritable field is folded into the deposit_id, shield is **safe to delegate to an untrusted prover** — no in-circuit signature is required.
 - **Transfers** spend 1-7 private notes and create recipient, change, and DAL-producer fee notes
-- **Withdrawals** (unshield) destroy private notes, release value publicly, and create a DAL-producer fee note plus optional change
+- **Withdrawals** (unshield) destroy private notes, emit an L1 outbox transfer to a tz/KT1 recipient, and create a DAL-producer fee note plus optional change
 - **Every shield / transfer / unshield burns at least 100000 mutez (0.1 tez)**, with a simple per-level stepped fee under congestion in the current rollup deployment
 - **Every shield / transfer / unshield also creates a separate private DAL-producer fee note**
 - Every spend is proven with a **zero-knowledge STARK** that verifies the **WOTS+ signature inside the circuit** — the proof itself proves spend authorization
@@ -94,7 +94,7 @@ For local testing and fast integration loops, `--trust-me-bro` is useful: `sp-cl
 |                      proof | (public outputs: auth      |
 |                            |  domain/root, nullifiers,  |
 |                            |  fees, commitments, memo   |
-|                            |  hashes, recipient ids)    |
+|                            |  hashes, recipient hashes) |
 |                            v                            |
 +-----------------------+---+-----------------------------+
                         | proof + note_data
@@ -106,7 +106,8 @@ For local testing and fast integration loops, `--trust-me-bro` is useful: `sp-cl
 |  * Check nullifiers not in global NF_set                |
 |  * Check root in historical anchor set                  |
 |  * Append new commitments to Merkle tree T              |
-|  * Credit / debit public balances                       |
+|  * Credit intent-bound deposit balances                 |
+|  * Queue / emit L1 withdrawals                          |
 +---------------------------------------------------------+
 ```
 
@@ -197,7 +198,7 @@ It:
 - reads raw inbox messages from the WASM host
 - persists basic durable state for inbox stats and the last message seen
 - decodes Tezos Data Encoding inbox messages into shared TzEL request types
-- treats `transfer` as the only fully internal rollup transaction, with bridge-`deposit` + `shield` handling rollup ingress and `unshield` (which directly emits an L1-outbox transfer to the depositor's tz/KT1 recipient) handling egress
+- treats `transfer` as the only fully internal rollup transaction, with bridge-`deposit` + `shield` handling rollup ingress and `unshield` (which directly emits an L1-outbox transfer to the requested tz/KT1 recipient) handling egress
 - applies the shared transition logic from `tzel-core`
 - persists path-addressed durable state for notes, bridge balances, roots, nullifiers, and the commitment-tree frontier
 - verifies proofs through the shared verifier path without linking prover code

@@ -291,12 +291,13 @@ XMSS-style WOTS+ signature verification happens inside the STARK. No auth leaves
 
 ### Unshield (N->withdrawal + optional change, where 1 <= N <= 7)
 
-Consumes N private notes, releases `v_pub` to a public address, and creates a
-producer-fee note plus an optional private change note.
+Consumes N private notes, queues an L1 withdrawal of `v_pub` to a canonical
+Tezos recipient, and creates a producer-fee note plus an optional private
+change note.
 
 **Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, v_pub, fee, recipient_id, cm_change, memo_ct_hash_change, cm_fee, memo_ct_hash_fee]`
 
-`recipient_id` is defined in [Public Account Identifier Encoding](#public-account-identifier-encoding).
+`recipient_id` is defined in [L1 Withdrawal Recipient Encoding](#l1-withdrawal-recipient-encoding); semantically it is the hash of the canonical L1 recipient string.
 
 `cm_change` and `memo_ct_hash_change` are 0 if no change output.
 
@@ -310,7 +311,7 @@ producer-fee note plus an optional private change note.
 5. `v_fee > 0`
 6. `sum(v_inputs) = v_pub + v_change + v_fee + fee`
 
-**Contract / ledger checks:** proof valid, `fee >= required_tx_fee`, every public nullifier is unique within the transaction, and no public nullifier has already been spent. Verify recipient binding per [Public Account Identifier Encoding](#public-account-identifier-encoding), credit `v_pub` to that recipient account, append `cm_change` to T (if nonzero), append `cm_fee` to T. No signature verification needed — the STARK proof proves spend authorization.
+**Contract / ledger checks:** proof valid, `fee >= required_tx_fee`, every public nullifier is unique within the transaction, and no public nullifier has already been spent. Verify recipient binding per [L1 Withdrawal Recipient Encoding](#l1-withdrawal-recipient-encoding), queue or emit the L1 withdrawal for `v_pub`, append `cm_change` to T (if nonzero), append `cm_fee` to T. No signature verification needed — the STARK proof proves spend authorization.
 
 ## Contract Consensus Rules
 
@@ -330,7 +331,7 @@ If proofs are produced through a bootloader or recursive verifier wrapper, the v
 
 ### Public nullifier uniqueness (all spending transactions)
 
-The public output list determines `N`, the number of spent inputs, and exposes exactly `nf_0..nf_{N-1}`. Because those nullifiers and their count are public, pairwise distinctness is a consensus rule rather than a private circuit constraint. The contract MUST reject a transfer or unshield if the public nullifier list contains duplicates, and MUST also reject any `nf_i` that already exists in the global on-chain nullifier set. This prevents double-spends both within one transaction and across transactions. After all validation succeeds, the contract inserts all `nf_i` into the global set. The reference rollup kernel enforces this before appending output notes, crediting public balances, or inserting nullifiers.
+The public output list determines `N`, the number of spent inputs, and exposes exactly `nf_0..nf_{N-1}`. Because those nullifiers and their count are public, pairwise distinctness is a consensus rule rather than a private circuit constraint. The contract MUST reject a transfer or unshield if the public nullifier list contains duplicates, and MUST also reject any `nf_i` that already exists in the global on-chain nullifier set. This prevents double-spends both within one transaction and across transactions. After all validation succeeds, the contract inserts all `nf_i` into the global set. The reference rollup kernel enforces this before appending output notes, queueing the withdrawal, or inserting nullifiers.
 
 For proof-verified transactions, the ledger MUST bind `N` to the exact verified public-output vector. The single bootloader task output is a serialized Cairo array, so the ledger first validates and strips the array length prefix. The resulting Transfer vector MUST have exactly `2 + N + 7` public felts, and the resulting Unshield vector MUST have exactly `2 + N + 7` public felts. Accepting a longer vector and interpreting only a suffix is forbidden, because that would make the public input count ambiguous.
 
@@ -479,10 +480,10 @@ outgoing_ct     —   185 bytes   ChaCha20-Poly1305(role:1 || v:8 || rseed:32 ||
 
 ```
 proof             — ~295 KB    circuit proof (ZK, two-level recursive STARK)
-public_outputs    —  256 B     [v_pub, fee, producer_fee, cm_new, cm_producer, deposit_id, memo_ct_hash, producer_memo_ct_hash] (8 x 32 bytes)
+public_outputs    —  288 B     [auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer, deposit_id, memo_ct_hash, producer_memo_ct_hash] (9 x 32 bytes)
 note_data         —  6.8 KB    2 output notes
                   ----------
-                  ~302 KB total (no spend signature — ownership is proved by deposit-secret preimage knowledge)
+                  ~302 KB total (no in-circuit spend signature — ownership is bound by the intent-committing L1 deposit)
 ```
 
 ### Transfer (N->recipient + change + producer fee)
@@ -647,7 +648,7 @@ The reference CLI currently exposes JSON over HTTP. That JSON must map losslessl
 - `index` is serialized as a JSON integer
 - canonical binary `index` is `u64le`; the JSON mapping uses the same integer value
 - shield requests carry `deposit_id` as a `felt252` hex field
-- public recipient account identifiers for unshield and public sender identifiers for withdraw remain JSON strings outside the circuit
+- unshield recipients remain JSON strings outside the circuit and are canonicalized before hashing into `recipient_id`
 
 This JSON mapping is a convenience API, not the normative interoperability format.
 
@@ -675,22 +676,24 @@ The intent commits to *every* prover-rewritable field. As a consequence:
 - The shield proof needs no signature inside the circuit; the L1 deposit transaction's own L1 signature is the spend authorization.
 - Each L1 deposit corresponds to exactly one shield. There is no partial drain and no top-up — both would require updating `intent`, which contradicts the L1 commitment. Wallets MUST size deposits exactly. Sender-side mistakes (over- or under-deposit) are unrecoverable footguns; bridge implementations are encouraged to refuse credits to a non-zero `deposit:<hex>` balance.
 
-A direct withdraw from a `deposit_key` balance is rejected. The L1 deposit binds *one* shield's worth of authority and nothing else.
+A `deposit_key` balance is shield-only. The L1 deposit binds *one* shield's worth of authority and nothing else.
 
-### Public Account Identifier Encoding
+### L1 Withdrawal Recipient Encoding
 
-The current reference ledger represents public recipient accounts as UTF-8 strings outside the circuit and hashes them into felt public outputs:
+The reference clients represent unshield recipients as canonical Tezos L1 account
+or contract strings outside the circuit and hash them into felt public outputs:
 
 ```text
-account_id = H(UTF8(account_string))
+canonical_recipient = trim(recipient_string)
+recipient_id        = H(UTF8(canonical_recipient))
 ```
 
 using unpersonalized BLAKE2s-256 truncated to 251 bits.
 
-- Unshield proves `recipient_id = account_id(recipient_string)`
-- The submitted string is checked by re-hashing it and comparing to the proved felt
+- Unshield proves `recipient_id = H(UTF8(canonical_recipient))`
+- The submitted string is trimmed, validated as a canonical `tz1` / `tz2` / `tz3` / `KT1` Base58Check value, then re-hashed and compared to the proved felt
 
-The reference CLI ledger's string-based public accounts are intentionally a demo-only stand-in for verifier-environment identity. They are suitable for local testing and for illustrating what unshield must bind, but not as a secure networked account model. Deployments that replace this with chain-native addresses MUST specify the exact byte serialization and verifier check. "Address" alone is not a sufficient consensus definition.
+This string serialization is part of the consensus binding. Any deployment that changes accepted recipient types or canonicalization rules MUST version that rule explicitly.
 
 ### Merkle Tree Structure
 

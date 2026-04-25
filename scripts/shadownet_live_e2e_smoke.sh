@@ -15,10 +15,8 @@ TZEL_REPROVE_BIN="${TZEL_REPROVE_BIN:-/usr/local/bin/reprove}"
 TZEL_EXECUTABLES_DIR="${TZEL_EXECUTABLES_DIR:-/opt/tzel/cairo/target/dev}"
 TZEL_SMOKE_WORKDIR="${TZEL_SMOKE_WORKDIR:-$(mktemp -d /tmp/tzel-shadownet-smoke.XXXXXX)}"
 TZEL_SMOKE_DEPOSIT_AMOUNT="${TZEL_SMOKE_DEPOSIT_AMOUNT:-300000}"
-TZEL_SMOKE_SHIELD_AMOUNT="${TZEL_SMOKE_SHIELD_AMOUNT:-200000}"
 TZEL_SMOKE_SEND_AMOUNT="${TZEL_SMOKE_SEND_AMOUNT:-50000}"
 TZEL_SMOKE_UNSHIELD_AMOUNT="${TZEL_SMOKE_UNSHIELD_AMOUNT:-20000}"
-TZEL_SMOKE_WITHDRAW_AMOUNT="${TZEL_SMOKE_WITHDRAW_AMOUNT:-20000}"
 TZEL_SMOKE_POLL_SECS="${TZEL_SMOKE_POLL_SECS:-5}"
 TZEL_SMOKE_MAX_POLLS="${TZEL_SMOKE_MAX_POLLS:-120}"
 
@@ -93,10 +91,6 @@ extract_submission_id() {
   sed -n 's/^Submission id: //p' | tail -n1
 }
 
-extract_public_balance() {
-  sed -n 's/^Public rollup balance (.*): //p' | tail -n1
-}
-
 extract_secret_deposit_balance() {
   sed -n 's/^Secret-bound deposit balance: \([0-9][0-9]*\) across .*$/\1/p' | tail -n1
 }
@@ -122,40 +116,6 @@ wait_for_submission_terminal() {
     sleep "${TZEL_SMOKE_POLL_SECS}"
   done
   echo "timed out waiting for submission ${submission_id}" >&2
-  return 1
-}
-
-wait_for_public_balance_at_least() {
-  local wallet="$1"
-  local expected="$2"
-  local attempt output balance
-  for ((attempt = 1; attempt <= TZEL_SMOKE_MAX_POLLS; attempt++)); do
-    output="$(wallet_cmd "${wallet}" balance)"
-    printf '%s\n' "${output}"
-    balance="$(extract_public_balance <<<"${output}")"
-    if [[ -n "${balance}" && "${balance}" =~ ^[0-9]+$ && "${balance}" -ge "${expected}" ]]; then
-      return 0
-    fi
-    sleep "${TZEL_SMOKE_POLL_SECS}"
-  done
-  echo "timed out waiting for public balance >= ${expected}" >&2
-  return 1
-}
-
-wait_for_public_balance_equals() {
-  local wallet="$1"
-  local expected="$2"
-  local attempt output balance
-  for ((attempt = 1; attempt <= TZEL_SMOKE_MAX_POLLS; attempt++)); do
-    output="$(wallet_cmd "${wallet}" balance)"
-    printf '%s\n' "${output}"
-    balance="$(extract_public_balance <<<"${output}")"
-    if [[ -n "${balance}" && "${balance}" =~ ^[0-9]+$ && "${balance}" -eq "${expected}" ]]; then
-      return 0
-    fi
-    sleep "${TZEL_SMOKE_POLL_SECS}"
-  done
-  echo "timed out waiting for public balance == ${expected}" >&2
   return 1
 }
 
@@ -226,10 +186,16 @@ wallet_cmd "${BOB_WALLET}" receive | tail -n +2 > "${BOB_ADDRESS_JSON}"
 wallet_cmd "${ALICE_WALLET}" check
 wallet_cmd "${BOB_WALLET}" check
 
-wallet_cmd "${ALICE_WALLET}" deposit --amount "${TZEL_SMOKE_DEPOSIT_AMOUNT}"
+deposit_output="$(wallet_cmd "${ALICE_WALLET}" deposit --amount "${TZEL_SMOKE_DEPOSIT_AMOUNT}")"
+printf '%s\n' "${deposit_output}"
+deposit_id="$(awk '/Submitted L1 bridge deposit/ {print $NF}' <<<"${deposit_output}")"
+if [[ -z "${deposit_id}" ]]; then
+  echo "failed to extract deposit id" >&2
+  exit 1
+fi
 wait_for_secret_deposit_balance_at_least "${ALICE_WALLET}" "${TZEL_SMOKE_DEPOSIT_AMOUNT}"
 
-shield_output="$(wallet_prove_cmd "${ALICE_WALLET}" shield --amount "${TZEL_SMOKE_SHIELD_AMOUNT}")"
+shield_output="$(wallet_prove_cmd "${ALICE_WALLET}" shield --deposit-id "${deposit_id}")"
 printf '%s\n' "${shield_output}"
 shield_submission_id="$(extract_submission_id <<<"${shield_output}")"
 if [[ -z "${shield_submission_id}" ]]; then
@@ -237,7 +203,7 @@ if [[ -z "${shield_submission_id}" ]]; then
   exit 1
 fi
 wait_for_submission_terminal "${ALICE_WALLET}" "${shield_submission_id}"
-wait_for_private_available_at_least "${ALICE_WALLET}" "${TZEL_SMOKE_SHIELD_AMOUNT}"
+wait_for_private_available_at_least "${ALICE_WALLET}" "${TZEL_SMOKE_DEPOSIT_AMOUNT}"
 
 send_output="$(wallet_prove_cmd "${ALICE_WALLET}" send --to "${BOB_ADDRESS_JSON}" --amount "${TZEL_SMOKE_SEND_AMOUNT}")"
 printf '%s\n' "${send_output}"
@@ -249,7 +215,7 @@ fi
 wait_for_submission_terminal "${ALICE_WALLET}" "${send_submission_id}"
 wait_for_private_available_at_least "${BOB_WALLET}" "${TZEL_SMOKE_SEND_AMOUNT}"
 
-unshield_output="$(wallet_prove_cmd "${BOB_WALLET}" unshield --amount "${TZEL_SMOKE_UNSHIELD_AMOUNT}" --recipient bob)"
+unshield_output="$(wallet_prove_cmd "${BOB_WALLET}" unshield --amount "${TZEL_SMOKE_UNSHIELD_AMOUNT}" --recipient "${TZEL_SMOKE_L1_RECIPIENT}")"
 printf '%s\n' "${unshield_output}"
 unshield_submission_id="$(extract_submission_id <<<"${unshield_output}")"
 if [[ -z "${unshield_submission_id}" ]]; then
@@ -257,11 +223,6 @@ if [[ -z "${unshield_submission_id}" ]]; then
   exit 1
 fi
 wait_for_submission_terminal "${BOB_WALLET}" "${unshield_submission_id}"
-wait_for_public_balance_at_least "${BOB_WALLET}" "${TZEL_SMOKE_UNSHIELD_AMOUNT}"
-
-withdraw_output="$(wallet_cmd "${BOB_WALLET}" withdraw --amount "${TZEL_SMOKE_WITHDRAW_AMOUNT}" --sender bob --recipient "${TZEL_SMOKE_L1_RECIPIENT}")"
-printf '%s\n' "${withdraw_output}"
-wait_for_public_balance_equals "${BOB_WALLET}" "$((TZEL_SMOKE_UNSHIELD_AMOUNT - TZEL_SMOKE_WITHDRAW_AMOUNT))"
 
 echo "Shadownet smoke completed successfully."
 echo "Workdir: ${TZEL_SMOKE_WORKDIR}"
