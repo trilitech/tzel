@@ -9,7 +9,6 @@ pub enum RollupSubmissionKind {
     Shield,
     Transfer,
     Unshield,
-    Withdraw,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

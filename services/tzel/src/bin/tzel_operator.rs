@@ -17,9 +17,10 @@ use std::sync::{
 use std::time::Duration;
 use tezos_data_encoding_05::enc::BinWriter as _;
 use tezos_smart_rollup_encoding::{inbox::ExternalMessageFrame, smart_rollup::SmartRollupAddress};
+#[cfg(any(test, debug_assertions))]
+use tzel_core::{auth_leaf_hash, derive_auth_pub_seed};
 use tzel_core::{
-    auth_leaf_hash, commit, decrypt_memo, derive_auth_pub_seed, derive_kem_keys, derive_rcm,
-    detect, hash,
+    commit, decrypt_memo, derive_kem_keys, derive_rcm, detect, hash,
     kernel_wire::{
         decode_kernel_inbox_message, encode_kernel_inbox_message, kernel_bridge_config_sighash,
         kernel_verifier_config_sighash, KernelDalChunkPointer, KernelDalPayloadKind,
@@ -380,10 +381,6 @@ fn kernel_message_matches_submission_kind(
                 RollupSubmissionKind::Unshield,
                 KernelInboxMessage::Unshield(_)
             )
-            | (
-                RollupSubmissionKind::Withdraw,
-                KernelInboxMessage::Withdraw(_)
-            )
     )
 }
 
@@ -571,7 +568,6 @@ fn enforce_dal_fee_policy(
         }
         KernelInboxMessage::ConfigureVerifier(_)
         | KernelInboxMessage::ConfigureBridge(_)
-        | KernelInboxMessage::Withdraw(_)
         | KernelInboxMessage::DalPointer(_) => {
             Err("operator only publishes shield, transfer, and unshield payloads to DAL".into())
         }
@@ -739,13 +735,6 @@ fn process_submission(
     config: &OperatorConfig,
     req: SubmitRollupMessageReq,
 ) -> Result<RollupSubmission, String> {
-    if matches!(req.kind, RollupSubmissionKind::Withdraw) {
-        return Err(
-            "withdraw submissions are no longer supported; unshield emits the outbox directly"
-                .into(),
-        );
-    }
-
     let id = next_submission_id(config);
     let targeted_bytes = encode_targeted_rollup_message(&req.rollup_address, &req.payload)?;
     let mut stored = StoredSubmission {
@@ -1293,9 +1282,6 @@ fn dal_pointer_from_submission(
         RollupSubmissionKind::Shield => KernelDalPayloadKind::Shield,
         RollupSubmissionKind::Transfer => KernelDalPayloadKind::Transfer,
         RollupSubmissionKind::Unshield => KernelDalPayloadKind::Unshield,
-        RollupSubmissionKind::Withdraw => {
-            return Err("withdraw submissions do not support DAL pointers".into())
-        }
     };
     let payload_hash_hex = submission
         .payload_hash
@@ -1650,19 +1636,6 @@ mod tests {
         };
         config.signature[0][0] ^= 0xff;
         encode_kernel_inbox_message(&message).unwrap()
-    }
-
-    fn sample_withdraw_payload() -> Vec<u8> {
-        encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(
-            tzel_core::kernel_wire::KernelWithdrawReq {
-                sender: "alice".into(),
-                recipient: "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx".into(),
-                amount: 1,
-                public_key: None,
-                signature: None,
-            },
-        ))
-        .unwrap()
     }
 
     fn sample_small_direct_payload() -> Vec<u8> {
@@ -2120,26 +2093,6 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("configuration signature verification failed"));
-    }
-
-    #[test]
-    fn oversized_withdraw_submission_is_rejected_before_dal_publication() {
-        let script_dir = make_client_script("#!/bin/sh\necho 'should not publish'\n");
-        let mut config = config_with_client(&script_dir.path().join("octez-client"));
-        config.direct_max_message_bytes = 1;
-        config.dal_node_endpoint = Some("http://dal.invalid".into());
-
-        let err = process_submission(
-            &config,
-            SubmitRollupMessageReq {
-                kind: RollupSubmissionKind::Withdraw,
-                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
-                payload: sample_withdraw_payload(),
-            },
-        )
-        .unwrap_err();
-
-        assert!(err.contains("withdraw submissions are no longer supported"));
     }
 
     #[test]

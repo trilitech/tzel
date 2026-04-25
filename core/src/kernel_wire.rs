@@ -4,15 +4,14 @@ use crate::canonical_wire::{
 };
 use crate::{
     hash, wots_sign, EncryptedNote, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp,
-    TransferReq, TransferResp, UnshieldReq, UnshieldResp, WithdrawReq, WithdrawResp,
-    ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES,
-    OUTGOING_RECOVERY_CT_BYTES,
+    TransferReq, TransferResp, UnshieldReq, UnshieldResp, ENCRYPTED_NOTE_BYTES, F,
+    ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES, OUTGOING_RECOVERY_CT_BYTES,
 };
 use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 12;
+pub const KERNEL_WIRE_VERSION: u16 = 13;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
@@ -107,15 +106,6 @@ pub struct KernelUnshieldReq {
     pub proof: KernelStarkProof,
 }
 
-#[derive(Debug, Clone)]
-pub struct KernelWithdrawReq {
-    pub sender: String,
-    pub recipient: String,
-    pub amount: u64,
-    pub public_key: Option<String>,
-    pub signature: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelDalPayloadKind {
     ConfigureVerifier,
@@ -147,7 +137,6 @@ pub enum KernelInboxMessage {
     Shield(KernelShieldReq),
     Transfer(KernelTransferReq),
     Unshield(KernelUnshieldReq),
-    Withdraw(KernelWithdrawReq),
     DalPointer(KernelDalPayloadPointer),
 }
 
@@ -158,7 +147,6 @@ pub enum KernelResult {
     Shield(ShieldResp),
     Transfer(TransferResp),
     Unshield(UnshieldResp),
-    Withdraw(WithdrawResp),
     Error { message: String },
 }
 
@@ -272,17 +260,6 @@ struct WireKernelUnshieldReq {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireKernelWithdrawReq {
-    #[encoding(string = "MAX_ACCOUNT_ID_BYTES")]
-    sender: String,
-    #[encoding(string = "MAX_ACCOUNT_ID_BYTES")]
-    recipient: String,
-    amount: WireU64Le,
-    public_key: WireOptionalAccountId,
-    signature: WireOptionalAccountId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 #[encoding(tags = "u8")]
 enum WireKernelDalPayloadKind {
     #[encoding(tag = 0)]
@@ -325,11 +302,6 @@ struct WireUnshieldResp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireWithdrawResp {
-    withdrawal_index: WireU64Le,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireErrorMessage {
     #[encoding(string = "MAX_ERROR_MESSAGE_BYTES")]
     message: String,
@@ -339,11 +311,6 @@ struct WireErrorMessage {
 struct WireAccountId {
     #[encoding(string = "MAX_ACCOUNT_ID_BYTES")]
     value: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireOptionalAccountId {
-    value: Option<WireAccountId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -364,8 +331,6 @@ enum WireKernelInboxMessage {
     Transfer(WireKernelTransferReq),
     #[encoding(tag = 4)]
     Unshield(WireKernelUnshieldReq),
-    #[encoding(tag = 5)]
-    Withdraw(WireKernelWithdrawReq),
     #[encoding(tag = 6)]
     DalPointer(WireKernelDalPayloadPointer),
 }
@@ -389,8 +354,6 @@ enum WireKernelResult {
     Transfer(WireTransferResp),
     #[encoding(tag = 4)]
     Unshield(WireUnshieldResp),
-    #[encoding(tag = 5)]
-    Withdraw(WireWithdrawResp),
     #[encoding(tag = 255)]
     Error(WireErrorMessage),
 }
@@ -419,9 +382,6 @@ pub fn encode_kernel_inbox_message(message: &KernelInboxMessage) -> Result<Vec<u
             }
             KernelInboxMessage::Unshield(req) => {
                 WireKernelInboxMessage::Unshield(kernel_unshield_req_to_wire(req)?)
-            }
-            KernelInboxMessage::Withdraw(req) => {
-                WireKernelInboxMessage::Withdraw(kernel_withdraw_req_to_wire(req))
             }
             KernelInboxMessage::DalPointer(pointer) => {
                 WireKernelInboxMessage::DalPointer(kernel_dal_payload_pointer_to_wire(pointer)?)
@@ -455,9 +415,6 @@ pub fn decode_kernel_inbox_message(bytes: &[u8]) -> Result<KernelInboxMessage, S
         WireKernelInboxMessage::Unshield(req) => Ok(KernelInboxMessage::Unshield(
             kernel_unshield_req_from_wire(req)?,
         )),
-        WireKernelInboxMessage::Withdraw(req) => Ok(KernelInboxMessage::Withdraw(
-            kernel_withdraw_req_from_wire(req)?,
-        )),
         WireKernelInboxMessage::DalPointer(pointer) => Ok(KernelInboxMessage::DalPointer(
             kernel_dal_payload_pointer_from_wire(pointer)?,
         )),
@@ -476,9 +433,6 @@ pub fn encode_kernel_result(result: &KernelResult) -> Result<Vec<u8>, String> {
             }
             KernelResult::Unshield(resp) => {
                 WireKernelResult::Unshield(unshield_resp_to_wire(resp)?)
-            }
-            KernelResult::Withdraw(resp) => {
-                WireKernelResult::Withdraw(withdraw_resp_to_wire(resp)?)
             }
             KernelResult::Error { message } => WireKernelResult::Error(WireErrorMessage {
                 message: message.clone(),
@@ -505,9 +459,6 @@ pub fn decode_kernel_result(bytes: &[u8]) -> Result<KernelResult, String> {
         }
         WireKernelResult::Unshield(resp) => {
             Ok(KernelResult::Unshield(unshield_resp_from_wire(resp)?))
-        }
-        WireKernelResult::Withdraw(resp) => {
-            Ok(KernelResult::Withdraw(withdraw_resp_from_wire(resp)?))
         }
         WireKernelResult::Error(err) => Ok(KernelResult::Error {
             message: err.message,
@@ -638,14 +589,6 @@ pub fn kernel_unshield_req_to_host(req: &KernelUnshieldReq) -> UnshieldReq {
         cm_fee: req.cm_fee,
         enc_fee: req.enc_fee.clone(),
         proof: kernel_proof_to_host(&req.proof),
-    }
-}
-
-pub fn kernel_withdraw_req_to_host(req: &KernelWithdrawReq) -> WithdrawReq {
-    WithdrawReq {
-        sender: req.sender.clone(),
-        recipient: req.recipient.clone(),
-        amount: req.amount,
     }
 }
 
@@ -1212,56 +1155,6 @@ fn unshield_resp_from_wire(wire: WireUnshieldResp) -> Result<UnshieldResp, Strin
     })
 }
 
-fn kernel_withdraw_req_to_wire(req: &KernelWithdrawReq) -> WireKernelWithdrawReq {
-    WireKernelWithdrawReq {
-        sender: req.sender.clone(),
-        recipient: req.recipient.clone(),
-        amount: u64_to_wire(req.amount),
-        public_key: account_id_option_to_wire(req.public_key.as_deref()),
-        signature: account_id_option_to_wire(req.signature.as_deref()),
-    }
-}
-
-fn kernel_withdraw_req_from_wire(wire: WireKernelWithdrawReq) -> Result<KernelWithdrawReq, String> {
-    Ok(KernelWithdrawReq {
-        sender: wire.sender,
-        recipient: wire.recipient,
-        amount: wire_to_u64(wire.amount)?,
-        public_key: account_id_option_from_wire(wire.public_key),
-        signature: account_id_option_from_wire(wire.signature),
-    })
-}
-
-fn withdraw_resp_to_wire(resp: &WithdrawResp) -> Result<WireWithdrawResp, String> {
-    Ok(WireWithdrawResp {
-        withdrawal_index: u64_to_wire(
-            resp.withdrawal_index
-                .try_into()
-                .map_err(|_| "withdrawal index does not fit in u64".to_string())?,
-        ),
-    })
-}
-
-fn withdraw_resp_from_wire(wire: WireWithdrawResp) -> Result<WithdrawResp, String> {
-    Ok(WithdrawResp {
-        withdrawal_index: wire_to_u64(wire.withdrawal_index)?
-            .try_into()
-            .map_err(|_| "withdrawal index does not fit in usize".to_string())?,
-    })
-}
-
-fn account_id_option_to_wire(value: Option<&str>) -> WireOptionalAccountId {
-    WireOptionalAccountId {
-        value: value.map(|value| WireAccountId {
-            value: value.to_string(),
-        }),
-    }
-}
-
-fn account_id_option_from_wire(wire: WireOptionalAccountId) -> Option<String> {
-    wire.value.map(|value| value.value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1690,29 +1583,6 @@ mod tests {
     }
 
     #[test]
-    fn kernel_inbox_roundtrip_preserves_withdraw_request() {
-        let message = KernelInboxMessage::Withdraw(KernelWithdrawReq {
-            sender: "alice".into(),
-            recipient: "tz1-target".into(),
-            amount: 33,
-            public_key: Some("edpk-test".into()),
-            signature: Some("sig-test".into()),
-        });
-        let encoded = encode_kernel_inbox_message(&message).unwrap();
-        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
-        match decoded {
-            KernelInboxMessage::Withdraw(req) => {
-                assert_eq!(req.sender, "alice");
-                assert_eq!(req.recipient, "tz1-target");
-                assert_eq!(req.amount, 33);
-                assert_eq!(req.public_key.as_deref(), Some("edpk-test"));
-                assert_eq!(req.signature.as_deref(), Some("sig-test"));
-            }
-            other => panic!("unexpected decoded message: {:?}", other),
-        }
-    }
-
-    #[test]
     fn kernel_inbox_roundtrip_preserves_dal_pointer() {
         let message = KernelInboxMessage::DalPointer(KernelDalPayloadPointer {
             kind: KernelDalPayloadKind::ConfigureVerifier,
@@ -1978,9 +1848,6 @@ mod tests {
                     change_index: change_index.map(|x| x as usize),
                     producer_index: producer_note_index as usize,
                 }),
-                KernelResult::Withdraw(WithdrawResp {
-                    withdrawal_index: transfer_index_1 as usize,
-                }),
                 KernelResult::Error { message: message.clone() },
             ];
 
@@ -2004,9 +1871,6 @@ mod tests {
                     (KernelResult::Unshield(actual), KernelResult::Unshield(expected)) => {
                         prop_assert_eq!(actual.change_index, expected.change_index);
                         prop_assert_eq!(actual.producer_index, expected.producer_index);
-                    }
-                    (KernelResult::Withdraw(actual), KernelResult::Withdraw(expected)) => {
-                        prop_assert_eq!(actual.withdrawal_index, expected.withdrawal_index);
                     }
                     (KernelResult::Error { message: actual }, KernelResult::Error { message: expected }) => {
                         prop_assert_eq!(&actual, expected);

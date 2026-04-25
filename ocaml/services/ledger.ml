@@ -4,7 +4,17 @@
    - Global nullifier set
    - Historical root set (anchors)
    - Public balance accounts
-   - Pending withdrawals *)
+   - Pending withdrawals
+
+   NOTE on protocol drift:
+   This OCaml ledger does NOT enforce the canonical DAL-producer fee
+   note that the current Rust circuit publishes for every transfer and
+   unshield. See the comment in protocol/transaction.ml for details.
+   The interop scenario compensates by manually appending the producer-fee
+   commitment to the tree after the call. A future change should add
+   cm_fee / memo_ct_hash_fee to unshield_public and cm_3 / memo_ct_hash_3
+   to transfer_public, fold them into the sighash, and tighten
+   apply_unshield / apply_transfer to verify and append them in-place. *)
 
 let tree_depth = 48
 let max_valid_roots = 4096

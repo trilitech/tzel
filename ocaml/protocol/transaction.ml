@@ -1,3 +1,19 @@
+(* Transaction types for TzEL.
+
+   NOTE on protocol drift vs the canonical Rust circuit / kernel:
+   This module models the *original* TzEL v1 public output shapes
+     - transfer: 2 output notes (cm_1, cm_2)
+     - unshield: optional change note (cm_change) only
+   The current canonical protocol additionally publishes a per-tx
+   DAL-producer fee note in both transfer (cm_3 / memo_ct_hash_3) and
+   unshield (cm_fee / memo_ct_hash_fee). These extra fields are NOT
+   modelled here; the test_interop scenario compensates by appending
+   the producer-fee commitment to the OCaml tree manually after each
+   apply_transfer / apply_unshield call. As a consequence the OCaml
+   sighash defined below differs from the canonical Rust sighash —
+   this implementation cannot verify a Rust-signed sighash without
+   the missing fields. *)
+
 (* Transaction types for TzEL v2:
    - Shield (public -> private)
    - Transfer (N->2 private)

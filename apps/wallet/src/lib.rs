@@ -1750,16 +1750,6 @@ fn withdraw_owner_from_public_balance_key<'a>(value: &'a str) -> Result<&'a str,
     ))
 }
 
-fn validate_l1_withdrawal_recipient(value: &str) -> Result<String, String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err("L1 withdrawal recipient must not be empty".into());
-    }
-    TezosContract::from_b58check(value)
-        .map(|_| value.to_string())
-        .map_err(|_| format!("invalid L1 withdrawal recipient: {}", value))
-}
-
 fn resolve_rollup_unshield_recipient(
     rollup: &RollupRpc,
     recipient: Option<&str>,
@@ -2371,7 +2361,6 @@ fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
         KernelInboxMessage::Shield(_) => RollupSubmissionKind::Shield,
         KernelInboxMessage::Transfer(_) => RollupSubmissionKind::Transfer,
         KernelInboxMessage::Unshield(_) => RollupSubmissionKind::Unshield,
-        KernelInboxMessage::Withdraw(_) => RollupSubmissionKind::Withdraw,
         KernelInboxMessage::ConfigureVerifier(_) => RollupSubmissionKind::ConfigureVerifier,
         KernelInboxMessage::ConfigureBridge(_) => RollupSubmissionKind::ConfigureBridge,
         KernelInboxMessage::DalPointer(_) => {

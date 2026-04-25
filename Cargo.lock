@@ -5259,7 +5259,6 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "tezos-smart-rollup-encoding",
  "tokio",
  "tzel-services",
 ]

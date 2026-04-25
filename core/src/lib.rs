@@ -1694,18 +1694,6 @@ impl PreparedUnshield {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WithdrawReq {
-    pub sender: String,
-    pub recipient: String,
-    pub amount: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WithdrawResp {
-    pub withdrawal_index: usize,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WithdrawalRecord {
     pub recipient: String,
@@ -1789,6 +1777,18 @@ pub struct Ledger {
     pub withdrawals: Vec<WithdrawalRecord>,
 }
 
+/// Generic ledger interface used by `apply_shield`, `apply_transfer`, and
+/// `apply_unshield` to mutate state. The fallible signatures on the write
+/// methods (`set_balance`, `insert_nullifier`, `append_note`, `snapshot_root`,
+/// `enqueue_withdrawal`) exist to accommodate state implementations that
+/// surface durable-store I/O errors. **However, any implementation that
+/// observes externally (e.g., emits an L1 outbox in the same transaction)
+/// MUST treat write methods as infallible after a successful preparation
+/// step**, because the generic `apply_*` paths cannot roll back partial
+/// writes. The kernel-side outbox-emitting unshield path therefore does
+/// NOT route through these methods on the failure-prone branch — see
+/// `prepare_durable_unshield_commit` / `apply_durable_unshield_commit` in
+/// `tezos/rollup-kernel/src/lib.rs`.
 pub trait LedgerState {
     fn auth_domain(&self) -> Result<F, String>;
     fn balance(&self, addr: &str) -> Result<u64, String>;
@@ -1874,9 +1874,6 @@ impl Ledger {
         apply_unshield(self, req)
     }
 
-    pub fn withdraw(&mut self, req: &WithdrawReq) -> Result<WithdrawResp, String> {
-        apply_withdraw(self, req)
-    }
 }
 
 impl LedgerState for Ledger {
@@ -2322,6 +2319,23 @@ pub fn prepare_unshield<S: LedgerState>(
     })
 }
 
+/// Apply the staged writes of a previously prepared unshield to a generic
+/// `LedgerState`. INTENDED CONTRACT: every write method on `LedgerState`
+/// (`enqueue_withdrawal`, `append_note`, `insert_nullifier`, `snapshot_root`)
+/// must be infallible in any state implementation that emits an externally
+/// observable side effect (e.g. an L1 outbox). Otherwise a partial failure
+/// here can leave the ledger in a state where the withdrawal queue, the
+/// commitment tree, and the nullifier set disagree.
+///
+/// The reference in-memory `Ledger` impl satisfies this contract by
+/// construction (Vec/HashSet/HashMap pushes never fail). Outbox-emitting
+/// kernels MUST NOT use this path; the rollup kernel uses its own
+/// `prepare_durable_unshield_commit` / `apply_durable_unshield_commit`
+/// pair, where the post-outbox apply step is explicitly typed infallible.
+///
+/// The write order is: `enqueue_withdrawal` is performed first so that a
+/// failure on the very first call leaves no other state mutated. Beyond
+/// that, the function relies on the infallibility contract above.
 pub fn commit_prepared_unshield<S: LedgerState>(
     state: &mut S,
     prepared: PreparedUnshield,
@@ -2352,22 +2366,6 @@ pub fn apply_unshield<S: LedgerState>(
 ) -> Result<UnshieldResp, String> {
     let prepared = prepare_unshield(state, req)?;
     commit_prepared_unshield(state, prepared)
-}
-
-pub fn apply_withdraw<S: LedgerState>(
-    state: &mut S,
-    req: &WithdrawReq,
-) -> Result<WithdrawResp, String> {
-    if is_deposit_balance_key(&req.sender) {
-        return Err("cannot withdraw from a secret-bound deposit balance; shield it first".into());
-    }
-    let balance = state.balance(&req.sender)?;
-    if balance < req.amount {
-        return Err("insufficient balance".into());
-    }
-    let withdrawal_index = state.enqueue_withdrawal(&req.recipient, req.amount)?;
-    state.set_balance(&req.sender, balance - req.amount)?;
-    Ok(WithdrawResp { withdrawal_index })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4565,73 +4563,6 @@ mod tests {
         assert_eq!(state.inner.tree.leaves, leaves_before);
         assert_eq!(state.inner.memos.len(), memos_before);
         assert_eq!(state.inner.valid_roots.len(), roots_before);
-    }
-
-    #[test]
-    fn test_apply_withdraw_moves_transparent_balance_into_withdrawal_queue() {
-        let mut ledger = Ledger::new();
-        ledger.deposit("bob", 44).unwrap();
-
-        let resp = apply_withdraw(
-            &mut ledger,
-            &WithdrawReq {
-                sender: "bob".into(),
-                recipient: "tz1-target".into(),
-                amount: 33,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(resp.withdrawal_index, 0);
-        assert_eq!(ledger.balance("bob").unwrap(), 11);
-        assert_eq!(
-            ledger.withdrawals,
-            vec![WithdrawalRecord {
-                recipient: "tz1-target".into(),
-                amount: 33,
-            }]
-        );
-    }
-
-    #[test]
-    fn test_apply_withdraw_rejects_insufficient_balance_without_mutation() {
-        let mut ledger = Ledger::new();
-        ledger.deposit("bob", 10).unwrap();
-
-        let err = apply_withdraw(
-            &mut ledger,
-            &WithdrawReq {
-                sender: "bob".into(),
-                recipient: "tz1-target".into(),
-                amount: 11,
-            },
-        )
-        .unwrap_err();
-
-        assert!(err.contains("insufficient balance"));
-        assert_eq!(ledger.balance("bob").unwrap(), 10);
-        assert!(ledger.withdrawals.is_empty());
-    }
-
-    #[test]
-    fn test_apply_withdraw_rejects_secret_bound_deposit_balance() {
-        let mut ledger = Ledger::new();
-        let key = test_deposit_key("alice");
-        ledger.deposit(&key, 10).unwrap();
-
-        let err = apply_withdraw(
-            &mut ledger,
-            &WithdrawReq {
-                sender: key.clone(),
-                recipient: "tz1-target".into(),
-                amount: 1,
-            },
-        )
-        .unwrap_err();
-
-        assert!(err.contains("shield it first"));
-        assert_eq!(ledger.balance(&key).unwrap(), 10);
-        assert!(ledger.withdrawals.is_empty());
     }
 
     #[test]

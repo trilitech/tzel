@@ -1012,9 +1012,6 @@ fn apply_kernel_message<H: Host>(
                 ledger, commit,
             )))
         }
-        KernelInboxMessage::Withdraw(_) => Err(
-            "withdraw messages are no longer supported; unshield emits the outbox directly".into(),
-        ),
         KernelInboxMessage::DalPointer(pointer) => {
             let nested = fetch_kernel_message_from_dal(ledger.host, &pointer)?;
             if matches!(nested, KernelInboxMessage::DalPointer(_)) {
@@ -1054,6 +1051,28 @@ struct PreparedDurableUnshieldCommit {
     response: UnshieldResp,
 }
 
+/// Validate that the in-memory frontier `branches` is consistent with a
+/// commitment tree of size `tree_size`. The append-only frontier MUST hold
+/// `Some(_)` at every level where bit `level` of `tree_size` is set (those
+/// are the levels with a "live" left child waiting for its right child).
+/// Slots above the highest live level are best-effort: they may contain
+/// stale `Some(_)` values from earlier subtree completions and are never
+/// consulted before being overwritten. This function only flags missing
+/// live frontier nodes — it never inspects stale-but-set slots.
+fn assert_frontier_matches_tree_size(branches: &[Option<F>], tree_size: u64) -> Result<(), String> {
+    let mut bits = tree_size;
+    for level in 0..DEPTH {
+        if bits & 1 == 1 && branches[level].is_none() {
+            return Err(format!(
+                "corrupted Merkle frontier: tree_size {} requires live left child at level {} but durable slot is empty",
+                tree_size, level
+            ));
+        }
+        bits >>= 1;
+    }
+    Ok(())
+}
+
 fn simulate_frontier_append(
     zero_hashes: &[F],
     branches: &mut [Option<F>],
@@ -1085,6 +1104,7 @@ fn prepare_durable_unshield_commit<H: Host>(
         .map(|level| ledger.read_felt(&branch_path(level)))
         .collect::<Result<Vec<_>, _>>()?;
     let mut tree_size = ledger.read_u64(PATH_TREE_SIZE)?.unwrap_or(0);
+    assert_frontier_matches_tree_size(&branches, tree_size)?;
     let change_index = if let Some((cm, enc)) = prepared.change_note() {
         let index = tree_size;
         encoded_notes.push((index, encode_published_note(cm, enc)?));
@@ -1145,6 +1165,14 @@ fn prepare_durable_unshield_commit<H: Host>(
     })
 }
 
+/// Apply the staged durable writes for an unshield. SAFETY-CRITICAL: this
+/// function MUST remain infallible — it runs after `host.write_output(...)`
+/// has already emitted the L1 outbox transfer, so any failure here would
+/// reproduce the H1 atomicity bug (outbox observed on L1 without the matching
+/// rollup state mutation, enabling double-withdrawal). Every call site must
+/// either be a `Host::write_store` (declared infallible by the trait) or a
+/// pure-local update. Do NOT introduce any operation that returns `Result` —
+/// route fallible work into `prepare_durable_unshield_commit` instead.
 fn apply_durable_unshield_commit<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
     commit: PreparedDurableUnshieldCommit,
@@ -1713,7 +1741,7 @@ mod tests {
         kernel_wire::{
             encode_kernel_inbox_message, sign_kernel_bridge_config, sign_kernel_verifier_config,
             KernelBridgeConfig, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
-            KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig, KernelWithdrawReq,
+            KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig,
         },
         owner_tag, u64_to_felt, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp,
         TransferResp, UnshieldResp, MIN_TX_FEE, ZERO,
@@ -3085,9 +3113,11 @@ mod tests {
         assert!(read_persisted_note(&host, 1).is_none());
         assert_eq!(host.outputs.len(), 1);
         match read_last_result(&host).unwrap() {
-            KernelResult::Error { message } => {
-                assert!(message.contains("missing Merkle frontier at level 0"))
-            }
+            KernelResult::Error { message } => assert!(
+                message.contains("corrupted Merkle frontier")
+                    && message.contains("level 0"),
+                "unexpected error message: {message}"
+            ),
             other => panic!("unexpected rollup result: {:?}", other),
         }
     }
@@ -3130,34 +3160,6 @@ mod tests {
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("bridge ticketer is not configured"))
-            }
-            other => panic!("unexpected rollup result: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn withdraw_message_is_rejected() {
-        let mut host = MockHost::default();
-        let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
-                sender: "tz1LhXujSfRndomkcC64pCpkkjLWQwsmCUMk".into(),
-                recipient: sample_l1_receiver().into(),
-                amount: 1,
-                public_key: None,
-                signature: None,
-            }))
-            .unwrap();
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 6,
-            payload: message,
-        });
-
-        run_with_host(&mut host);
-
-        match read_last_result(&host).unwrap() {
-            KernelResult::Error { message } => {
-                assert!(message.contains("withdraw messages are no longer supported"))
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }

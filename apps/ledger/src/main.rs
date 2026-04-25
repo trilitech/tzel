@@ -6,7 +6,6 @@ use axum::{
 };
 use clap::Parser;
 use std::sync::{Arc, Mutex};
-use tezos_smart_rollup_encoding::contract::Contract as TezosContract;
 use tokio::net::TcpListener;
 use tzel_services::*;
 
@@ -69,16 +68,6 @@ fn parse_felt_be_hex(s: &str) -> Result<F, String> {
         return Err("auth_domain exceeds 251 bits".into());
     }
     Ok(le)
-}
-
-fn validate_l1_withdrawal_recipient(value: &str) -> Result<String, String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err("L1 withdrawal recipient must not be empty".into());
-    }
-    TezosContract::from_b58check(value)
-        .map(|_| value.to_string())
-        .map_err(|_| format!("invalid L1 withdrawal recipient: {}", value))
 }
 
 async fn fund_handler(
