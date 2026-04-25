@@ -1738,6 +1738,7 @@ const DURABLE_BALANCE_INDEX_PREFIX: &str = "/tzel/v1/state/balances/index/";
 const DURABLE_BALANCE_PREFIX: &str = "/tzel/v1/state/balances/by-key/";
 const DURABLE_DEPOSIT_BY_INTENT_PREFIX: &str = "/tzel/v1/state/deposits/by-intent/";
 const DURABLE_DEPOSIT_SLOT_PREFIX: &str = "/tzel/v1/state/deposits/by-id/";
+const DURABLE_VERIFIER_CONFIG: &str = "/tzel/v1/state/verifier_config.bin";
 
 #[derive(Debug, Clone)]
 struct RollupSubmissionReceipt {
@@ -2293,6 +2294,22 @@ impl<'a> RollupRpc<'a> {
             balances.insert(account, amount);
         }
         Ok(balances)
+    }
+
+    /// Probe the rollup's durable storage for an installed verifier config.
+    /// Returns Ok(()) if the config key exists; Err otherwise. Used by
+    /// `cmd_bridge_deposit` to refuse pre-config L1 tickets — the kernel
+    /// would reject them and the funds would never be slotted.
+    fn ensure_verifier_configured(&self, block_ref: &str) -> Result<(), String> {
+        match self.read_durable_length_at_block(block_ref, DURABLE_VERIFIER_CONFIG)? {
+            Some(_) => Ok(()),
+            None => Err(
+                "rollup verifier is not configured yet — refusing to send a bridge deposit. \
+                 The kernel rejects deposits before verifier configuration. Wait for the \
+                 admin to install the verifier config and retry."
+                    .into(),
+            ),
+        }
     }
 
     fn load_state_snapshot(&self) -> Result<RollupStateSnapshot, String> {
@@ -6418,6 +6435,16 @@ fn cmd_bridge_deposit(
         OutgoingNoteRole::ProducerFee,
     )?;
 
+    // Refuse to send the L1 ticket if the rollup has not yet been
+    // verifier-configured. The kernel's `validate_bridge_deposit` rejects
+    // pre-config tickets (intent commits to auth_domain, which the first
+    // ConfigureVerifier may overwrite), so submitting now would burn real
+    // mutez to a slot that the kernel will never allocate. The
+    // `auth_domain` read above succeeds even on a fresh rollup because of
+    // `ensure_initialized()` defaults — only the explicit verifier-config
+    // probe distinguishes "configured" from "boot defaults".
+    rollup.ensure_verifier_configured(&head_hash)?;
+
     let intent = shield_intent(
         &auth_domain,
         amount,
@@ -6433,10 +6460,13 @@ fn cmd_bridge_deposit(
         .and_then(|v| v.checked_add(profile.dal_fee))
         .ok_or_else(|| "deposit total overflows u64".to_string())?;
 
-    // Submit the L1 deposit FIRST. If it fails, we don't track a phantom
-    // PendingDeposit. On success, the witness is then persisted with the
-    // operation_hash already filled in.
-    let submission = rollup.deposit_to_bridge(&intent, debit)?;
+    // Persist the witness BEFORE the L1 ticket. If save_wallet fails we
+    // haven't sent any mutez, so nothing is stranded. If
+    // `deposit_to_bridge` fails after, the wallet has a phantom pending
+    // deposit (no operation_hash, no kernel slot after sync) which the
+    // user can detect and prune via `tzel-wallet check` — strictly better
+    // than losing the witness for a successful L1 deposit, which would
+    // strand the slot unrecoverably for everyone.
     let pending = PendingDeposit {
         deposit_id: intent,
         auth_domain,
@@ -6462,10 +6492,20 @@ fn cmd_bridge_deposit(
             enc: producer_note.enc.clone(),
         },
         amount: debit,
-        operation_hash: submission.operation_hash.clone(),
+        operation_hash: None,
         slot_id: None,
     };
     wallet.pending_deposits.push(pending);
+    save_wallet(path, &wallet)?;
+
+    let submission = rollup.deposit_to_bridge(&intent, debit)?;
+    if let Some(p) = wallet
+        .pending_deposits
+        .iter_mut()
+        .find(|p| p.deposit_id == intent)
+    {
+        p.operation_hash = submission.operation_hash.clone();
+    }
     save_wallet(path, &wallet)?;
     println!(
         "Submitted L1 bridge deposit of {} mutez (note value {}, fee {}, dal fee {}) for intent {}",
