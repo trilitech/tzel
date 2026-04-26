@@ -3306,6 +3306,13 @@ enum UserCmd {
     },
     /// Derive a new receiving address.
     Receive,
+    /// List every receiving address derived so far, with the total
+    /// private balance bound to each (sum of locally-tracked notes,
+    /// pending spends excluded). Read-only; does not derive a new
+    /// address. Emits structured JSON under `--json`:
+    ///   { addresses: [{ index, address, balance, available, notes }],
+    ///     total, total_available }
+    Addresses,
     /// Sync notes and spent nullifiers directly from the rollup node durable state.
     Sync {
         /// Keep polling until interrupted.
@@ -3588,6 +3595,7 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         | UserCmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
         UserCmd::Profile { .. }
         | UserCmd::Balance
+        | UserCmd::Addresses
         | UserCmd::Check
         | UserCmd::Status { .. }
         | UserCmd::ExportDetect { .. }
@@ -3614,6 +3622,7 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Init => cmd_keygen(&cli.wallet),
         UserCmd::Profile { cmd } => run_user_profile(&cli.wallet, cmd),
         UserCmd::Receive => cmd_address(&cli.wallet),
+        UserCmd::Addresses => cmd_addresses(&cli.wallet),
         UserCmd::Sync {
             watch,
             interval_secs,
@@ -4256,6 +4265,109 @@ fn cmd_address(path: &str) -> Result<(), String> {
     save_wallet(path, &w)?;
     println!("Address #{}", state.index);
     println!("{}", serde_json::to_string_pretty(&addr).unwrap());
+    Ok(())
+}
+
+/// One row of the per-address balance breakdown. `balance` counts
+/// every locally-tracked note bound to this address (including notes
+/// whose spend op is in flight). `available` excludes notes whose
+/// nullifiers appear in `pending_spends` so the UI can render
+/// "spendable now" honestly. `notes` is the raw count of tracked
+/// notes for this address — useful for the "N notes — aggregated
+/// total" hover the UI already shows for the wallet-wide total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AddressEntry {
+    index: u32,
+    address: PaymentAddress,
+    balance: u64,
+    available: u64,
+    notes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AddressBreakdown {
+    addresses: Vec<AddressEntry>,
+    total: u64,
+    total_available: u64,
+    address_count: u32,
+}
+
+/// Pure read-only computation of the per-address balance breakdown.
+/// Pulled out of `cmd_addresses` so unit tests can exercise it
+/// directly without going through `user_out!` / stdout capture.
+fn compute_address_breakdown(w: &WalletFile) -> AddressBreakdown {
+    let pending = w.pending_nullifier_set();
+    let mut totals_balance: std::collections::HashMap<u32, u64> =
+        std::collections::HashMap::new();
+    let mut totals_available: std::collections::HashMap<u32, u64> =
+        std::collections::HashMap::new();
+    let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for note in &w.notes {
+        let bal = totals_balance.entry(note.addr_index).or_default();
+        *bal = bal.saturating_add(note.v);
+        *counts.entry(note.addr_index).or_default() += 1;
+        if !pending.contains(&note_nullifier(note)) {
+            let avail = totals_available.entry(note.addr_index).or_default();
+            *avail = avail.saturating_add(note.v);
+        }
+    }
+
+    let acc = w.account();
+    let mut entries = Vec::with_capacity(w.addresses.len());
+    let mut total: u128 = 0;
+    let mut total_available: u128 = 0;
+    for state in &w.addresses {
+        let (ek_v, _, ek_d, _) = derive_kem_keys(&acc.incoming_seed, state.index);
+        let address = state.payment_address(&ek_v, &ek_d);
+        let bal = *totals_balance.get(&state.index).unwrap_or(&0);
+        let avail = *totals_available.get(&state.index).unwrap_or(&0);
+        let n = *counts.get(&state.index).unwrap_or(&0);
+        total = total.saturating_add(bal as u128);
+        total_available = total_available.saturating_add(avail as u128);
+        entries.push(AddressEntry {
+            index: state.index,
+            address,
+            balance: bal,
+            available: avail,
+            notes: n,
+        });
+    }
+    AddressBreakdown {
+        address_count: w.addresses.len() as u32,
+        addresses: entries,
+        total: total.min(u64::MAX as u128) as u64,
+        total_available: total_available.min(u64::MAX as u128) as u64,
+    }
+}
+
+/// List every address derived so far (i.e. every entry in
+/// `wallet.addresses`) along with the private balance bound to that
+/// address. The balance for address `j` is the sum of `note.v` for all
+/// notes with `note.addr_index == j`; pending spends (notes whose
+/// nullifiers appear in `pending_spends`) are excluded from `available`
+/// but still counted in `balance` so the user can reconcile what's
+/// in-flight.
+///
+/// Read-only; does not mutate the wallet file. Designed to be called
+/// from the daemon's `/api/wallet/addresses` endpoint without taking
+/// the wallet lock — the wallet is loaded, summed, then dropped.
+fn cmd_addresses(path: &str) -> Result<(), String> {
+    let w = load_wallet(path)?;
+    let report = compute_address_breakdown(&w);
+    // The original `user_out!` JSON-envelope wrapping is deferred to the
+    // re-applied `--json` envelope patch (eefe5d0). For now the human
+    // form is always emitted; once `user_out!` lands the JSON arm will
+    // be wired back in here.
+    println!(
+        "{} address(es), total {} (available {})",
+        report.address_count, report.total, report.total_available
+    );
+    for entry in &report.addresses {
+        println!(
+            "  #{}  balance={}  available={}  notes={}",
+            entry.index, entry.balance, entry.available, entry.notes
+        );
+    }
     Ok(())
 }
 
@@ -10421,6 +10533,78 @@ mod network_profile_tests {
             !pending_attested,
             "non-terminal DAL submission must NOT claim attestation"
         );
+    }
+
+    /// Per-address breakdown aggregates `note.v` by `addr_index`, with
+    /// pending-spent notes counted in `balance` but excluded from
+    /// `available`. Empty addresses (no notes bound) still appear in
+    /// the output so the UI can show "address #N — 0 ꜩ" for receiving
+    /// addresses the user has derived but not yet been credited on.
+    #[test]
+    fn address_breakdown_aggregates_per_addr_index_excluding_pending() {
+        let mut w = super::tests::test_wallet(3);
+        let acc = w.account();
+        let push_note = |w: &mut WalletFile,
+                         acc: &Account,
+                         addr_index: u32,
+                         value: u64| {
+            let addr = w.addresses[addr_index as usize].clone();
+            let nk_sp = derive_nk_spend(&acc.nk, &addr.d_j);
+            let nk_tg = derive_nk_tag(&nk_sp);
+            let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tg);
+            // Each note needs a unique nullifier — random_felt is the
+            // existing helper used in adjacent tests for the same job.
+            let rseed = random_felt();
+            let rcm = derive_rcm(&rseed);
+            let cm = commit(&addr.d_j, value, &rcm, &otag);
+            w.notes.push(Note {
+                nk_spend: nk_sp,
+                nk_tag: nk_tg,
+                auth_root: addr.auth_root,
+                d_j: addr.d_j,
+                v: value,
+                rseed,
+                cm,
+                index: w.notes.len(),
+                addr_index,
+            });
+        };
+        push_note(&mut w, &acc, 0, 100);
+        push_note(&mut w, &acc, 0, 200);
+        push_note(&mut w, &acc, 1, 50);
+        // address #2 left empty.
+
+        // Mark the second note on address 0 as pending-spent.
+        let pending_nullifier = note_nullifier(&w.notes[1]);
+        w.pending_spends.push(PendingSpend {
+            nullifiers: vec![pending_nullifier],
+            description: "test pending".into(),
+            operation_hash: None,
+        });
+
+        let report = compute_address_breakdown(&w);
+        assert_eq!(report.address_count, 3);
+        assert_eq!(report.total, 350);
+        assert_eq!(report.total_available, 150); // 100 + 50, the pending 200 excluded
+        assert_eq!(report.addresses.len(), 3);
+
+        let by_index: std::collections::HashMap<u32, &AddressEntry> = report
+            .addresses
+            .iter()
+            .map(|e| (e.index, e))
+            .collect();
+        let a0 = by_index[&0];
+        assert_eq!(a0.balance, 300);
+        assert_eq!(a0.available, 100);
+        assert_eq!(a0.notes, 2);
+        let a1 = by_index[&1];
+        assert_eq!(a1.balance, 50);
+        assert_eq!(a1.available, 50);
+        assert_eq!(a1.notes, 1);
+        let a2 = by_index[&2];
+        assert_eq!(a2.balance, 0);
+        assert_eq!(a2.available, 0);
+        assert_eq!(a2.notes, 0);
     }
 
     #[test]
