@@ -1702,7 +1702,26 @@ struct RollupSubmissionReceipt {
     output: String,
     operation_hash: Option<String>,
     submission_id: Option<String>,
+    /// True when the submission is still progressing through the DAL
+    /// pipeline (PendingDal | CommitmentIncluded | Attested) at the
+    /// moment we read it. False when SubmittedToL1 (final) or when the
+    /// transport bypassed DAL entirely (DirectInbox). The name is
+    /// retained for the printed sync hint; it does NOT mean attested.
     pending_dal: bool,
+    /// Real transport observed on the operator side. Surfaced to phase
+    /// events so the wallet/UI no longer infers DAL vs DirectInbox from
+    /// the presence of a submission_id.
+    transport: Option<RollupSubmissionTransport>,
+    /// Final operator status the wallet observed before returning. This
+    /// is the source of truth for "did the L1 pointer op land": only
+    /// `SubmittedToL1` means the operator successfully injected. The
+    /// wallet polls until this is reached or `Failed`.
+    final_status: Option<RollupSubmissionStatus>,
+    /// DAL pointer fields, populated when transport=Dal. Useful as a
+    /// debugging pointer so the user / next tooling can correlate the
+    /// submission with the L1 op + DAL slot.
+    slot_index: Option<u16>,
+    published_level: Option<i32>,
 }
 
 struct OctezAddressInfo {
@@ -2293,6 +2312,14 @@ impl<'a> RollupRpc<'a> {
             operation_hash: extract_operation_hash(&combined),
             submission_id: None,
             pending_dal: false,
+            // octez-client fallback path bypasses the operator entirely
+            // (the wallet drives `transfer ... --arg ...` directly), so
+            // there is no operator submission to query — we know it
+            // hits the L1 inbox directly with no DAL transport.
+            transport: Some(RollupSubmissionTransport::DirectInbox),
+            final_status: Some(RollupSubmissionStatus::SubmittedToL1),
+            slot_index: None,
+            published_level: None,
         })
     }
 
@@ -2380,6 +2407,41 @@ fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
     }
 }
 
+/// Cap on how long the wallet polls the operator's submission endpoint
+/// before giving up. Shadownet's protocol floor for DAL is
+/// `attestation_lag (8) * block_time (6 s) = 48 s`; we round up to 180 s
+/// so a slow reconciler tick + an extra block of slack still finishes
+/// within the budget. If we time out, we surface what we observed so
+/// the daemon's settlement watcher can still pick up the eventual
+/// rollup-side delta.
+const OPERATOR_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Spacing between operator status polls. The operator's reconciler
+/// runs every 5 s by default; polling at half that gives us ~2 s of
+/// staleness in the worst case without hammering the endpoint.
+const OPERATOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn build_receipt(submission: &RollupSubmission) -> RollupSubmissionReceipt {
+    RollupSubmissionReceipt {
+        output: format_rollup_submission(submission),
+        operation_hash: submission.operation_hash.clone(),
+        submission_id: Some(submission.id.clone()),
+        // Retained for the printed "still in DAL pipeline" sync hint
+        // emitted by `print_rollup_sync_hint`. NOT a confirmation that
+        // the slot is attested — see RollupSubmissionReceipt docs.
+        pending_dal: matches!(
+            submission.status,
+            RollupSubmissionStatus::PendingDal
+                | RollupSubmissionStatus::CommitmentIncluded
+                | RollupSubmissionStatus::Attested
+        ),
+        transport: Some(submission.transport),
+        final_status: Some(submission.status),
+        slot_index: submission.slot_index,
+        published_level: submission.published_level,
+    }
+}
+
 fn submit_kernel_message_via_operator(
     operator_url: &str,
     operator_bearer_token: Option<&str>,
@@ -2397,18 +2459,117 @@ fn submit_kernel_message_via_operator(
         },
         operator_bearer_token,
     )?;
-    let submission = resp.submission;
-    Ok(RollupSubmissionReceipt {
-        output: format_rollup_submission(&submission),
-        operation_hash: submission.operation_hash,
-        submission_id: Some(submission.id),
-        pending_dal: matches!(
-            submission.status,
-            RollupSubmissionStatus::PendingDal
-                | RollupSubmissionStatus::CommitmentIncluded
-                | RollupSubmissionStatus::Attested
-        ),
-    })
+    let mut submission = resp.submission;
+
+    // Synchronous POST returns SubmittedToL1 for the DirectInbox path
+    // (small payloads bypass DAL entirely) and CommitmentIncluded for
+    // the DAL path (chunks published, awaiting attestation). For the
+    // latter the operator's reconciler advances Attested->SubmittedToL1
+    // in a single tick, so the wallet only ever observes
+    // CommitmentIncluded -> SubmittedToL1 from the outside.
+    //
+    // Older code returned right after the POST and lied about
+    // attestation by reusing the `pending_dal` flag in a phase event
+    // labelled `dal_chunks_attested`. We now poll until the operator
+    // reports a terminal status, so the surrounding `operator_done`
+    // event reflects what actually happened on-chain.
+    if matches!(submission.status, RollupSubmissionStatus::CommitmentIncluded) {
+        // Tell the daemon (and the UI) we crossed into the
+        // "DAL chunks published, waiting for committee" phase. The
+        // pointer fields are the breadcrumbs an operator/dev needs to
+        // correlate the submission with an L1 block + DAL slot.
+        // Use the underlying emitter directly: the `phase_event!`
+        // macro is defined further down in the file and Rust's
+        // top-down macro resolution would not see it from here.
+        emit_phase_event("commitment_included", serde_json::json!({
+            "submission_id": submission.id.clone(),
+            "transport": format_transport(submission.transport),
+            "slot_index": submission.slot_index,
+            "published_level": submission.published_level,
+            "operation_hash": submission.operation_hash.clone(),
+            "dal_chunks": submission.dal_chunks.len() as u32,
+        }));
+
+        match wait_for_operator_terminal(
+            base,
+            operator_bearer_token,
+            &submission.id,
+        ) {
+            Ok(final_submission) => submission = final_submission,
+            Err(err) => {
+                // Polling timeout / transient HTTP error: the
+                // submission is still progressing operator-side, but
+                // we don't know its final state. Surface the issue and
+                // fall through with the last-known submission so the
+                // daemon's settlement watcher still gets a chance to
+                // observe the eventual rollup-side delta.
+                eprintln!(
+                    "operator status polling stopped before terminal state: {}",
+                    err
+                );
+            }
+        }
+    }
+
+    Ok(build_receipt(&submission))
+}
+
+fn format_transport(t: RollupSubmissionTransport) -> &'static str {
+    match t {
+        RollupSubmissionTransport::DirectInbox => "direct_inbox",
+        RollupSubmissionTransport::Dal => "dal",
+    }
+}
+
+/// Poll the operator's `/v1/rollup/submissions/{id}` endpoint until the
+/// submission reaches a terminal status (`SubmittedToL1` or `Failed`)
+/// or the wallet's `OPERATOR_POLL_TIMEOUT` elapses.
+///
+/// Emits a `dal_attested` phase event the first time a status of
+/// `Attested` is observed, even though the operator typically advances
+/// `Attested -> SubmittedToL1` atomically inside one reconciler tick
+/// and the wallet may never see it. We still keep the emission so the
+/// schema is forward-compatible if the operator ever splits the two.
+fn wait_for_operator_terminal(
+    base: &str,
+    bearer_token: Option<&str>,
+    submission_id: &str,
+) -> Result<RollupSubmission, String> {
+    let started = std::time::Instant::now();
+    let mut emitted_attested = false;
+    loop {
+        std::thread::sleep(OPERATOR_POLL_INTERVAL);
+        let resp = load_operator_submission(base, bearer_token, submission_id)?;
+        let submission = resp.submission;
+        match submission.status {
+            RollupSubmissionStatus::SubmittedToL1 => return Ok(submission),
+            RollupSubmissionStatus::Failed => {
+                return Err(format!(
+                    "operator marked submission {} as failed: {}",
+                    submission_id,
+                    submission
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| "<no detail>".into())
+                ));
+            }
+            RollupSubmissionStatus::Attested if !emitted_attested => {
+                emitted_attested = true;
+                emit_phase_event("dal_attested", serde_json::json!({
+                    "submission_id": submission.id.clone(),
+                    "slot_index": submission.slot_index,
+                    "published_level": submission.published_level,
+                }));
+            }
+            _ => {}
+        }
+        if started.elapsed() > OPERATOR_POLL_TIMEOUT {
+            return Err(format!(
+                "timed out waiting for operator submission {} to reach SubmittedToL1 (last status: {:?})",
+                submission_id, submission.status
+            ));
+        }
+    }
 }
 
 fn load_operator_submission(
@@ -3081,22 +3242,37 @@ macro_rules! phase_event {
 /// Render an `operator_done` phase event from a `RollupSubmissionReceipt`.
 /// Pulled out of the call sites because each of cmd_shield/cmd_transfer/
 /// cmd_unshield_rollup needs the same shape.
+///
+/// `operator_done` now means the operator has reported `SubmittedToL1`
+/// (or the wallet observed a non-DAL DirectInbox path that returned
+/// terminal synchronously). The previous emission's `dal_chunks_attested`
+/// flag was a misnomer: it reused `pending_dal` which is true for any
+/// non-terminal DAL state, so the flag flipped to `true` ~42 s before
+/// the slot was actually attested. We now expose `attested` as a real
+/// boolean (true iff DAL transport AND we observed the operator reach
+/// terminal status) and rely on the new `commitment_included` /
+/// `dal_attested` events for the intermediate transitions.
 fn emit_operator_done_event(receipt: &RollupSubmissionReceipt) {
-    // The receipt does not carry a structured transport flag (it was
-    // already serialised into `output`). For pedagogy purposes the
-    // distinction we surface is "did the operator route via DAL" — the
-    // operator_url path always uses DAL on shadownet, the local
-    // octez-client fallback uses direct_inbox.
-    let transport = if receipt.submission_id.is_some() {
-        "dal"
-    } else {
-        "direct_inbox"
-    };
+    let transport = receipt
+        .transport
+        .map(format_transport)
+        .unwrap_or("direct_inbox");
+    let reached_terminal = matches!(
+        receipt.final_status,
+        Some(RollupSubmissionStatus::SubmittedToL1)
+    );
+    // Only DAL submissions go through the attestation pipeline; direct
+    // inbox transports never enter it, so reporting `attested: false`
+    // for them is semantically correct (no attestation was needed).
+    let attested = reached_terminal
+        && matches!(receipt.transport, Some(RollupSubmissionTransport::Dal));
     phase_event!("operator_done", {
         "submission_id": receipt.submission_id.clone().unwrap_or_default(),
         "l1_op_hash": receipt.operation_hash.clone(),
         "transport": transport,
-        "dal_chunks_attested": receipt.pending_dal,
+        "attested": attested,
+        "slot_index": receipt.slot_index,
+        "published_level": receipt.published_level,
     });
 }
 
@@ -9915,6 +10091,81 @@ mod network_profile_tests {
         assert_eq!(&ts[10..11], "T");
         assert_eq!(&ts[13..14], ":");
         assert_eq!(&ts[16..17], ":");
+    }
+
+    /// `operator_done` no longer reuses `pending_dal` as a dishonest
+    /// "attested" flag. The new payload exposes (a) the real transport
+    /// the operator picked, (b) an `attested: bool` that is true ONLY
+    /// for DAL submissions that reached `SubmittedToL1`, and (c) the
+    /// DAL slot pointer fields when applicable. Direct-inbox
+    /// submissions explicitly report `attested: false` because they
+    /// never enter the attestation pipeline.
+    #[test]
+    fn operator_done_event_uses_real_transport_and_status() {
+        // DAL transport, terminal: attested=true.
+        let dal_terminal = RollupSubmissionReceipt {
+            output: String::new(),
+            operation_hash: Some("oNetherOp1".into()),
+            submission_id: Some("sub-A".into()),
+            pending_dal: false,
+            transport: Some(RollupSubmissionTransport::Dal),
+            final_status: Some(RollupSubmissionStatus::SubmittedToL1),
+            slot_index: Some(27),
+            published_level: Some(3_077_084),
+        };
+        let attested =
+            matches!(dal_terminal.transport, Some(RollupSubmissionTransport::Dal))
+                && matches!(
+                    dal_terminal.final_status,
+                    Some(RollupSubmissionStatus::SubmittedToL1)
+                );
+        assert!(attested, "DAL+SubmittedToL1 must surface attested=true");
+
+        // DirectInbox, terminal: attested=false (never went through DAL).
+        let direct = RollupSubmissionReceipt {
+            output: String::new(),
+            operation_hash: Some("oNetherOp2".into()),
+            submission_id: Some("sub-B".into()),
+            pending_dal: false,
+            transport: Some(RollupSubmissionTransport::DirectInbox),
+            final_status: Some(RollupSubmissionStatus::SubmittedToL1),
+            slot_index: None,
+            published_level: None,
+        };
+        let direct_attested =
+            matches!(direct.transport, Some(RollupSubmissionTransport::Dal))
+                && matches!(
+                    direct.final_status,
+                    Some(RollupSubmissionStatus::SubmittedToL1)
+                );
+        assert!(
+            !direct_attested,
+            "direct-inbox transport must surface attested=false"
+        );
+
+        // DAL transport, NON-terminal (e.g. polling timeout):
+        // attested=false even though pending_dal would historically
+        // have been true.
+        let dal_pending = RollupSubmissionReceipt {
+            output: String::new(),
+            operation_hash: None,
+            submission_id: Some("sub-C".into()),
+            pending_dal: true,
+            transport: Some(RollupSubmissionTransport::Dal),
+            final_status: Some(RollupSubmissionStatus::CommitmentIncluded),
+            slot_index: Some(31),
+            published_level: Some(3_077_084),
+        };
+        let pending_attested =
+            matches!(dal_pending.transport, Some(RollupSubmissionTransport::Dal))
+                && matches!(
+                    dal_pending.final_status,
+                    Some(RollupSubmissionStatus::SubmittedToL1)
+                );
+        assert!(
+            !pending_attested,
+            "non-terminal DAL submission must NOT claim attestation"
+        );
     }
 
     #[test]
