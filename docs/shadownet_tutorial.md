@@ -421,7 +421,7 @@ For the first successful live run, save:
   - rollup node is stale, wrong `rollup_node_url`, or wrong wallet profile
 - `WARNING: N orphan deposit slot(s) detected` during sync:
   - someone (typically a dust-attacking watcher) has deposited an L1 ticket with the same `(intent, amount)` as one of your settled shields. The kernel allocated extra open slots that your shield did not drain. Each orphan slot still holds real L1 mutez backed by the bridge.
-  - To recover, run `tzel-wallet drain-orphan-slot --slot-id <id>` for each reported slot. The wallet re-shields the original recipient `cm` against the orphan slot using the stored deposit witness. The result is a duplicate `cm` at a new tree position with a distinct nullifier — fully spendable, but the two leaves are publicly correlatable to the same intent.
+  - To recover, re-shield against each orphan slot with `tzel-wallet shield --deposit-id <hex> --slot-id <orphan-id> --correlate`. The wallet reuses the stored deposit witness; the result is a duplicate `cm` at a new tree position with a distinct nullifier — fully spendable, but the two leaves are publicly correlatable to the same intent. The `--correlate` flag is required to make the privacy cost an explicit user choice — without it, shield only consumes the canonical slot.
   - Orphan-drain only works if the wallet still holds the matching settled `PendingDeposit` (it does, because settled deposits are kept around precisely to enable this). A slot that was never witness-tracked by this wallet cannot be drained.
 
 ## 12. Minimal Success Bar

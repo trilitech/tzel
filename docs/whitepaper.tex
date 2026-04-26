@@ -521,10 +521,17 @@ notes.
 an orphan slot that holds real mutez but is not consumed by the victim's
 shield. Because the victim's wallet still holds the full deposit
 witness, it can re-shield the original recipient \(\cm\) against the
-orphan slot, recovering the L1 mutez. The drained slot produces a
-duplicate recipient commitment at a new tree position; the two leaves
-are publicly correlatable to the same intent but each gets a distinct
-nullifier and is independently spendable.
+orphan slot, recovering the L1 mutez. Reference wallets expose this
+through the same shield command with an explicit slot override (so
+"orphan drain" is not a separate operation, just a non-canonical slot
+target requiring the user to acknowledge the privacy cost). The drained
+slot produces a duplicate recipient commitment at a new tree position;
+the two leaves are publicly correlatable to the same intent but each
+gets a distinct nullifier (nullifiers fold in tree position) and is
+independently spendable. Mirror-depositing is therefore an asymmetric
+attack: the attacker burns mutez to a slot only the victim's witness
+can drain, and the only "damage" is the on-chain intent linkage exposed
+when the victim chooses to recover the funds.
 
 \paragraph{Ownership binding accounting.} \(v_{pub}\) becomes the user's
 shielded note, \(producer\_fee\) becomes the DAL-producer fee note, and

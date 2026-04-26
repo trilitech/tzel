@@ -3150,11 +3150,26 @@ enum UserCmd {
     },
     /// Drain a previously-deposited intent-bound balance into its bound
     /// shielded note. The recipient and amount were locked in at `Deposit`
-    /// time; this command only proves and submits.
+    /// time; this command only proves and submits. By default consumes the
+    /// canonical slot the kernel allocated for this deposit. Specify
+    /// `--slot-id` to target a different slot — typically an orphan slot
+    /// left by an attacker's mirror-deposit — in which case `--correlate`
+    /// is required to acknowledge that the duplicate recipient `cm` at a
+    /// new tree position is publicly linkable to the original.
     Shield {
         /// Hex deposit_id of a tracked pending deposit.
         #[arg(long)]
         deposit_id: String,
+        /// Override the slot id to drain. If omitted, uses the canonical
+        /// slot recorded against this deposit during sync.
+        #[arg(long)]
+        slot_id: Option<u64>,
+        /// Acknowledge the privacy cost of draining a non-canonical slot:
+        /// the recipient cm will land at a new tree position, publicly
+        /// correlatable to the original. Required when `--slot-id`
+        /// differs from the wallet's recorded canonical slot.
+        #[arg(long, default_value_t = false)]
+        correlate: bool,
     },
     /// Send shielded funds to another payment address.
     Send {
@@ -3176,17 +3191,6 @@ enum UserCmd {
         /// Override the default L1 recipient. Defaults to the source alias address.
         #[arg(long)]
         recipient: Option<String>,
-    },
-    /// Drain an orphan deposit slot — an open kernel slot for an intent we
-    /// know that some other shield (e.g., an attacker's mirror-debit
-    /// deposit) didn't consume. Reuses the witness from the matching
-    /// settled deposit; produces a duplicate recipient cm in the tree at a
-    /// fresh position. Privacy-cost: two leaves with the same cm are
-    /// publicly correlatable.
-    DrainOrphanSlot {
-        /// Slot id (as reported by `tzel-wallet sync`).
-        #[arg(long)]
-        slot_id: u64,
     },
     /// Query a submission previously accepted by the configured operator.
     Status {
@@ -3385,8 +3389,7 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         | UserCmd::Deposit { .. }
         | UserCmd::Shield { .. }
         | UserCmd::Send { .. }
-        | UserCmd::Unshield { .. }
-        | UserCmd::DrainOrphanSlot { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
+        | UserCmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
         UserCmd::Profile { .. }
         | UserCmd::Balance
         | UserCmd::Check
@@ -3437,9 +3440,13 @@ fn run_user(cli: UserCli) -> Result<(), String> {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_bridge_deposit(&cli.wallet, &profile, amount, fee, to, memo)
         }
-        UserCmd::Shield { deposit_id } => {
+        UserCmd::Shield {
+            deposit_id,
+            slot_id,
+            correlate,
+        } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_shield_rollup(&cli.wallet, &profile, &deposit_id, &pc)
+            cmd_shield_rollup(&cli.wallet, &profile, &deposit_id, slot_id, correlate, &pc)
         }
         UserCmd::Send {
             to,
@@ -3468,10 +3475,6 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Status { submission_id } => {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_operator_status(&profile, &submission_id)
-        }
-        UserCmd::DrainOrphanSlot { slot_id } => {
-            let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_drain_orphan_slot(&cli.wallet, &profile, slot_id, &pc)
         }
         UserCmd::ExportDetect { out } => cmd_export_detect(&cli.wallet, out.as_deref()),
         UserCmd::ExportView { out } => cmd_export_view(&cli.wallet, out.as_deref()),
@@ -3955,7 +3958,8 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
     if summary.orphan_slots > 0 {
         println!(
             "WARNING: {} orphan deposit slot(s) detected for settled deposits. \
-             Run `tzel-wallet drain-orphan-slot --slot-id <id>` to recover the L1 mutez.",
+             Run `tzel-wallet shield --deposit-id <hex> --slot-id <id> --correlate` \
+             to recover the L1 mutez (note: this leaks intent linkage on-chain).",
             summary.orphan_slots
         );
     }
@@ -4044,26 +4048,23 @@ fn apply_scan_feed(
         }
     }
 
-    // Orphan-slot detection: for each settled deposit, count slots in
-    // slots_by_intent that the wallet hasn't claimed via slot_id. Settled
-    // deposits with no orphans don't need user attention; ones with
-    // orphans warrant a `tzel-wallet drain-orphan-slot` call.
-    let claimed_slot_ids: std::collections::HashSet<(F, u64)> = w
-        .pending_deposits
-        .iter()
-        .filter_map(|d| d.slot_id.map(|id| (d.deposit_id, id)))
-        .collect();
+    // Orphan-slot detection: for each *settled* deposit, count every
+    // remaining open slot for that intent. Once a deposit has settled
+    // (its recipient cm is in the tree), the wallet has been paid via
+    // whichever slot the kernel consumed; any other open slot for the
+    // same intent is effectively an orphan from the privacy-cost
+    // perspective — draining it produces a duplicate cm leaf. We do
+    // NOT exclude `pending.slot_id` here, because that field can be
+    // set to a still-open slot when the user drained a different one
+    // first (apply_scan_feed only assigns slot_id when it is None, so
+    // the recorded slot can rotate to whatever remains open).
     let mut orphan_slots = 0usize;
     for d in w.pending_deposits.iter() {
         if !d.settled {
             continue;
         }
         if let Some(open) = slots_by_intent.get(&d.deposit_id) {
-            for slot in open {
-                if !claimed_slot_ids.contains(&(d.deposit_id, slot.id)) {
-                    orphan_slots += 1;
-                }
-            }
+            orphan_slots += open.len();
         }
     }
 
@@ -5844,11 +5845,11 @@ mod tests {
 
     #[test]
     fn test_apply_scan_feed_detects_orphan_slot_after_settlement() {
-        // After the recipient note lands (settled), an UNCLAIMED open slot
-        // for the same intent is reported as an orphan. This is the
-        // mirror-debit attack signature: attacker mirror-deposits, the
-        // wallet's shield consumes one slot (could be either), the
-        // recipient cm appears in the tree, the OTHER slot remains open.
+        // After the recipient note lands (settled), any remaining open
+        // slot for the same intent is reported as an orphan. The shield
+        // that produced the cm necessarily tombstoned its slot in the
+        // same kernel atomic step (and the by-intent index pruned it),
+        // so anything still in `slots_by_intent` is unconsumed mutez.
         let mut w = test_wallet(1);
         let rseed = felt_tag(b"orphan-detect");
         let nm = note_memo_for_wallet_address(&w, 0, 77, rseed, None);
@@ -5880,28 +5881,92 @@ mod tests {
             },
             amount: 78,
             operation_hash: Some("opHash".into()),
-            slot_id: Some(7), // wallet claimed slot 7
+            slot_id: Some(7), // wallet claimed slot 7 (now consumed)
             settled: false,
         });
 
-        // Sync sees: slot 7 (claimed) + slot 9 (orphan, attacker's), plus
-        // recipient note lands → settled flag flips → slot 9 is reported.
+        // Post-shield kernel state: slot 7 was tombstoned and pruned
+        // from the by-intent index; slot 9 (attacker's mirror-deposit)
+        // is still open and counts as an orphan.
         let feed = NotesFeedResp {
             notes: vec![nm],
             next_cursor: 1,
         };
         let mut slots = std::collections::HashMap::new();
-        slots.insert(
-            intent,
-            vec![
-                DepositSlotView { id: 7, amount: 78 },
-                DepositSlotView { id: 9, amount: 78 },
-            ],
-        );
+        slots.insert(intent, vec![DepositSlotView { id: 9, amount: 78 }]);
         let summary = apply_scan_feed(&mut w, &feed, vec![], &slots);
         assert_eq!(summary.settled_deposits, 1);
         assert_eq!(summary.orphan_slots, 1);
         assert!(w.pending_deposits[0].settled);
+    }
+
+    #[test]
+    fn test_apply_scan_feed_counts_orphan_when_slot_id_rotated_to_remaining_open_slot() {
+        // Regression test for the orphan-first drain workflow:
+        //   1. User deposits, two slots S1 and S2 land for the same intent.
+        //   2. User runs `shield --slot-id S2 --correlate` BEFORE sync had a
+        //      chance to record either slot id (pending.slot_id = None).
+        //   3. Sync runs: kernel tombstoned S2 (pruned from index); S1 is
+        //      still open. apply_scan_feed sets pending.slot_id = Some(S1).
+        //      cm landed via S2's shield, so settled flips to true.
+        //   4. Without this test's invariant, orphan-slot detection would
+        //      exclude S1 from the orphan count because the wallet "claimed"
+        //      it via slot_id — but S1 is exactly the duplicate-leaf case
+        //      we want the user warned about. The privacy guard in shield
+        //      relies on this orphan count to surface the issue.
+        let mut w = test_wallet(1);
+        let rseed = felt_tag(b"orphan-rotated");
+        let nm = note_memo_for_wallet_address(&w, 0, 77, rseed, None);
+        let intent = hash(b"orphan-rotated-intent");
+        let addr = &w.addresses[0];
+        w.pending_deposits.push(PendingDeposit {
+            deposit_id: intent,
+            auth_domain: hash(b"auth-domain"),
+            v: 77,
+            fee: 0,
+            producer_fee: 1,
+            recipient: ShieldNoteWitness {
+                d_j: addr.d_j,
+                rseed,
+                auth_root: addr.auth_root,
+                auth_pub_seed: addr.auth_pub_seed,
+                nk_tag: addr.nk_tag,
+                cm: nm.cm,
+                enc: nm.enc.clone(),
+            },
+            producer: ShieldNoteWitness {
+                d_j: addr.d_j,
+                rseed: felt_tag(b"producer-rseed-rotated"),
+                auth_root: addr.auth_root,
+                auth_pub_seed: addr.auth_pub_seed,
+                nk_tag: addr.nk_tag,
+                cm: hash(b"producer-cm-rotated"),
+                enc: nm.enc.clone(),
+            },
+            amount: 78,
+            operation_hash: Some("opHash".into()),
+            slot_id: None, // wallet hadn't recorded a slot id yet
+            settled: false,
+        });
+
+        let feed = NotesFeedResp {
+            notes: vec![nm],
+            next_cursor: 1,
+        };
+        // Slot S1 (id=7) is still open — the user drained S2 first off-band
+        // (kernel pruned S2). apply_scan_feed will assign slot_id = Some(7)
+        // on this run, and the cm appearing in the feed flips settled.
+        let mut slots = std::collections::HashMap::new();
+        slots.insert(intent, vec![DepositSlotView { id: 7, amount: 78 }]);
+        let summary = apply_scan_feed(&mut w, &feed, vec![], &slots);
+
+        assert!(w.pending_deposits[0].settled);
+        assert_eq!(w.pending_deposits[0].slot_id, Some(7));
+        // The remaining open slot must be counted as an orphan even
+        // though pending.slot_id now points at it. Without this, the
+        // shield privacy guard would silently let the second drain
+        // through without --correlate.
+        assert_eq!(summary.orphan_slots, 1);
     }
 
     #[test]
@@ -7377,6 +7442,8 @@ fn cmd_shield_rollup(
     path: &str,
     profile: &WalletNetworkProfile,
     deposit_id_arg: &str,
+    slot_id_override: Option<u64>,
+    correlate: bool,
     pc: &ProveConfig,
 ) -> Result<(), String> {
     let deposit_id = parse_deposit_id_hex(deposit_id_arg)?;
@@ -7405,7 +7472,83 @@ fn cmd_shield_rollup(
         ));
     }
 
-    // Build prover witness for the new intent-bound run_shield circuit.
+    let rollup = RollupRpc::new(profile);
+    let deposit_slot = match slot_id_override {
+        Some(slot_id) => {
+            // Verify the slot exists, is open, binds the same intent, and
+            // has the matching debit. The kernel will recheck all of this
+            // on apply; the wallet check refuses early so we don't waste
+            // prover time on a slot the kernel will reject.
+            let head_hash = rollup.head_hash()?;
+            let (slot_intent, slot_amount, slot_status) = rollup
+                .try_read_deposit_slot(&head_hash, slot_id)?
+                .ok_or_else(|| format!("deposit slot {} does not exist on the rollup", slot_id))?;
+            if slot_status != 0 {
+                return Err(format!(
+                    "deposit slot {} is already consumed (tombstoned)",
+                    slot_id
+                ));
+            }
+            if slot_intent != deposit_id {
+                return Err(format!(
+                    "deposit slot {} binds intent {}, not the requested deposit_id {}",
+                    slot_id,
+                    hex::encode(&slot_intent),
+                    deposit_id_hex(&deposit_id),
+                ));
+            }
+            let expected_debit = pending
+                .v
+                .checked_add(pending.fee)
+                .and_then(|v| v.checked_add(pending.producer_fee))
+                .ok_or_else(|| "pending deposit debit overflow".to_string())?;
+            if slot_amount != expected_debit {
+                return Err(format!(
+                    "deposit slot {} amount {} does not match this deposit's debit {}",
+                    slot_id, slot_amount, expected_debit,
+                ));
+            }
+            slot_id
+        }
+        None => pending.slot_id.ok_or_else(|| {
+            format!(
+                "deposit {} has not been observed by the kernel yet. Run `tzel-wallet sync` to \
+                 discover the slot id, then retry shield.",
+                deposit_id_hex(&deposit_id)
+            )
+        })?,
+    };
+
+    // Privacy guard: a deposit is `settled` once apply_scan_feed has
+    // observed its recipient cm in the commitment tree. Any further
+    // shield against the same deposit drains a remaining open slot and
+    // appends the *same* recipient cm at a new tree position, producing
+    // two on-chain leaves that are publicly correlatable to the same
+    // intent. We key off `settled` rather than slot-id equality because
+    // sync repopulates `pending.slot_id` from whatever open slot remains
+    // when the previous one was set to None — so an orphan-first drain
+    // can rotate the "canonical" slot id, and a slot-id check would let
+    // the second shield through without --correlate. The cm-already-in-
+    // tree fact is the load-bearing invariant.
+    if pending.settled && !correlate {
+        return Err(format!(
+            "deposit {} has already settled (the recipient cm is in the tree from a prior \
+             shield). Shielding it again drains a remaining open slot for the same intent \
+             but produces a duplicate cm leaf at a new tree position; the two leaves are \
+             publicly correlatable. Pass --correlate to acknowledge the privacy cost.",
+            deposit_id_hex(&deposit_id),
+        ));
+    }
+    if pending.settled {
+        eprintln!(
+            "Draining slot {} for already-settled deposit {} — the recipient cm will land \
+             at a new tree position, publicly correlatable to the original.",
+            deposit_slot,
+            deposit_id_hex(&deposit_id),
+        );
+    }
+
+    // Build prover witness for the intent-bound run_shield circuit.
     let args: Vec<String> = vec![
         felt_to_hex(&pending.auth_domain),
         felt_u64_to_hex(pending.v),
@@ -7429,14 +7572,6 @@ fn cmd_shield_rollup(
     ];
     let proof = pc.make_proof("run_shield", &args)?;
 
-    let deposit_slot = pending.slot_id.ok_or_else(|| {
-        format!(
-            "deposit {} has not been observed by the kernel yet. Run `tzel-wallet sync` to \
-             discover the slot id, then retry shield.",
-            deposit_id_hex(&deposit_id)
-        )
-    })?;
-
     let req = ShieldReq {
         deposit_id,
         deposit_slot,
@@ -7450,136 +7585,15 @@ fn cmd_shield_rollup(
         producer_enc: pending.producer.enc.clone(),
     };
     let kernel_req = shield_req_to_kernel(&req)?;
-    let rollup = RollupRpc::new(profile);
     let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
     println!(
-        "Submitted shield draining deposit {} into note {} (v={}, fee={}, dal_fee={})",
+        "Submitted shield draining deposit {} via slot {} into note {} (v={}, fee={}, dal_fee={})",
         deposit_id_hex(&deposit_id),
+        deposit_slot,
         short(&pending.recipient.cm),
         pending.v,
         pending.fee,
         pending.producer_fee
-    );
-    print_rollup_submission(&submission);
-    print_rollup_sync_hint(&submission);
-    Ok(())
-}
-
-/// Drain an orphan deposit slot. Looks up the slot's intent on the rollup,
-/// finds the matching settled PendingDeposit (which must still hold the
-/// witness), and submits a fresh shield consuming that slot. The result is
-/// a duplicate recipient cm in the tree at a new tree position with a
-/// distinct nullifier — fully spendable, but publicly correlatable with
-/// the original recipient note.
-fn cmd_drain_orphan_slot(
-    path: &str,
-    profile: &WalletNetworkProfile,
-    slot_id: u64,
-    pc: &ProveConfig,
-) -> Result<(), String> {
-    let wallet = load_wallet(path)?;
-    let rollup = RollupRpc::new(profile);
-    let head_hash = rollup.head_hash()?;
-    // Read the slot's intent and amount directly from durable storage.
-    let (slot_intent, slot_amount, slot_status) = rollup
-        .try_read_deposit_slot(&head_hash, slot_id)?
-        .ok_or_else(|| format!("deposit slot {} does not exist on the rollup", slot_id))?;
-    if slot_status != 0 {
-        return Err(format!(
-            "deposit slot {} is already consumed (tombstoned)",
-            slot_id
-        ));
-    }
-    // Find the wallet's settled deposit whose intent AND amount match the
-    // slot. Matching only on amount would let a deposit-with-different-intent
-    // pass through (the kernel would reject, but at the cost of wasted
-    // proving). The slot.intent is the canonical key.
-    let pending = wallet
-        .pending_deposits
-        .iter()
-        .find(|d| {
-            d.settled
-                && d.deposit_id == slot_intent
-                && d.amount == slot_amount
-                && d.slot_id != Some(slot_id)
-        })
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "no settled deposit witness in wallet matches slot {} (intent {}, amount {} mutez). \
-                 Run `tzel-wallet sync` first; if the slot was never witness-tracked by \
-                 this wallet, it cannot be drained.",
-                slot_id,
-                hex::encode(&slot_intent),
-                slot_amount,
-            )
-        })?;
-
-    // Sanity: recompute the intent and confirm slot.intent == that.
-    let recomputed = shield_intent(
-        &pending.auth_domain,
-        pending.v,
-        pending.fee,
-        pending.producer_fee,
-        &pending.recipient.cm,
-        &pending.producer.cm,
-        &memo_ct_hash(&pending.recipient.enc),
-        &memo_ct_hash(&pending.producer.enc),
-    );
-    if recomputed != pending.deposit_id {
-        return Err(
-            "wallet's settled-deposit witness no longer reproduces deposit_id; refusing to drain.".into(),
-        );
-    }
-
-    eprintln!(
-        "Draining orphan slot {} (intent {}, amount {} mutez). Note: this re-shields the \
-         original recipient cm at a new tree position. The two leaves are publicly correlatable.",
-        slot_id,
-        deposit_id_hex(&pending.deposit_id),
-        slot_amount
-    );
-
-    let args: Vec<String> = vec![
-        felt_to_hex(&pending.auth_domain),
-        felt_u64_to_hex(pending.v),
-        felt_u64_to_hex(pending.fee),
-        felt_u64_to_hex(pending.producer_fee),
-        felt_to_hex(&pending.recipient.cm),
-        felt_to_hex(&pending.producer.cm),
-        felt_to_hex(&pending.deposit_id),
-        felt_to_hex(&memo_ct_hash(&pending.recipient.enc)),
-        felt_to_hex(&memo_ct_hash(&pending.producer.enc)),
-        felt_to_hex(&pending.recipient.auth_root),
-        felt_to_hex(&pending.recipient.auth_pub_seed),
-        felt_to_hex(&pending.recipient.nk_tag),
-        felt_to_hex(&pending.recipient.d_j),
-        felt_to_hex(&pending.recipient.rseed),
-        felt_to_hex(&pending.producer.auth_root),
-        felt_to_hex(&pending.producer.auth_pub_seed),
-        felt_to_hex(&pending.producer.nk_tag),
-        felt_to_hex(&pending.producer.d_j),
-        felt_to_hex(&pending.producer.rseed),
-    ];
-    let proof = pc.make_proof("run_shield", &args)?;
-    let req = ShieldReq {
-        deposit_id: pending.deposit_id,
-        deposit_slot: slot_id,
-        v: pending.v,
-        fee: pending.fee,
-        producer_fee: pending.producer_fee,
-        proof,
-        client_cm: pending.recipient.cm,
-        client_enc: pending.recipient.enc.clone(),
-        producer_cm: pending.producer.cm,
-        producer_enc: pending.producer.enc.clone(),
-    };
-    let kernel_req = shield_req_to_kernel(&req)?;
-    let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
-    println!(
-        "Submitted orphan-slot drain (slot {}, intent {})",
-        slot_id,
-        deposit_id_hex(&pending.deposit_id),
     );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
