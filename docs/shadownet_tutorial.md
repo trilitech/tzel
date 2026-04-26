@@ -262,13 +262,21 @@ Notes:
 
 - `dal_fee_address` is the shielded address that receives the DAL inclusion fee note
 - each `deposit` builds the entire shield (recipient note + producer-fee note) up front, computes the *intent-bound* deposit id (`shield_intent` over every shield public output), and addresses the L1 ticket to the canonical recipient string `deposit:<hex(intent)>`. Each L1 ticket allocates its own kernel-side **slot** keyed by a fresh kernel-controlled `slot_id` (depositors don't control the id), with content `(intent, amount)`. The L1 deposit transaction is itself the shield authorization — there is no `deposit_secret`, and any modification of the witness (recipient, value, fees) yields a different deposit id whose slots either don't exist or bind a different intent.
-- `public_account` in the profile is only used for non-shielded balance reporting; under the new design, unshield emits an L1 outbox directly to a tz/KT1 recipient.
+- `public_account` in the profile is vestigial wallet metadata — unshield now emits an L1 outbox transfer directly to a tz/KT1 recipient supplied at unshield time, and the per-account "transparent rollup balance" scheme has been removed.
 - keep Alice and Bob distinct
 - **Shield deposits are single-shot and exact-amount:** the wallet computes `v + fee + producer_fee` and instructs the bridge to deposit precisely that amount. There is no partial drain and no top-up — both would require updating `intent`, which contradicts the L1 commitment. An over- or under-deposit leaves an orphan slot but does not affect any other slot. **Dust-resistance:** an attacker observing the public `deposit:<hex(intent)>` recipient string cannot brick a victim's shield by sending 1 mutez to the same recipient — that just allocates an unrelated orphan slot.
 
 ## 6. Fund Alice On L1 And Wait For The Kernel To Allocate A Deposit Slot
 
 Deposit into the bridge for Alice's next shield. The wallet builds the recipient and producer-fee notes, computes `intent = shield_intent(auth_domain, v, fee, producer_fee, cm_recipient, cm_producer, mh, mh_producer)`, and asks the bridge to send an L1 ticket to `deposit:<hex(intent)>` for exactly `v + fee + producer_fee` mutez. The kernel allocates a fresh slot for the ticket — keyed by a kernel-controlled monotonic `slot_id`, with content `(intent, amount)`. The wallet picks up the slot id during sync.
+
+Before submitting the L1 ticket, the wallet runs three preflight checks against the rollup's durable state and refuses if any disagrees:
+
+1. The kernel verifier config (`/tzel/v1/state/verifier_config.bin`) is installed. Deposits before configuration are rejected by the kernel; the L1 ticket would burn for nothing.
+2. The kernel's configured bridge ticketer (`/tzel/v1/state/bridge/ticketer`) equals `profile.bridge_ticketer`. A mismatch means the kernel won't accept tickets from this bridge contract.
+3. The kernel's published `operator_producer_owner_tag` equals the `owner_tag` derived from `profile.dal_fee_address`. Without this check a misconfigured profile silently routes the producer-fee note to a non-operator receiver — there is no in-circuit binding from `cm_producer`'s recipient back to the operator's address. (If the rollup published a zero owner_tag the wallet warns and proceeds, trusting the profile.)
+
+The same `operator_producer_owner_tag` gate also runs for `transfer` and `unshield` since those also emit a producer-fee note.
 
 ```bash
 DEPOSIT_OUTPUT="$(
@@ -411,6 +419,10 @@ For the first successful live run, save:
   - bridge config is wrong, the kernel did not parse the ticket, or the rollup node is not following the right rollup
 - `sync` finds nothing after a successful operator state:
   - rollup node is stale, wrong `rollup_node_url`, or wrong wallet profile
+- `WARNING: N orphan deposit slot(s) detected` during sync:
+  - someone (typically a dust-attacking watcher) has deposited an L1 ticket with the same `(intent, amount)` as one of your settled shields. The kernel allocated extra open slots that your shield did not drain. Each orphan slot still holds real L1 mutez backed by the bridge.
+  - To recover, run `tzel-wallet drain-orphan-slot --slot-id <id>` for each reported slot. The wallet re-shields the original recipient `cm` against the orphan slot using the stored deposit witness. The result is a duplicate `cm` at a new tree position with a distinct nullifier — fully spendable, but the two leaves are publicly correlatable to the same intent.
+  - Orphan-drain only works if the wallet still holds the matching settled `PendingDeposit` (it does, because settled deposits are kept around precisely to enable this). A slot that was never witness-tracked by this wallet cannot be drained.
 
 ## 12. Minimal Success Bar
 

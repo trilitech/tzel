@@ -332,6 +332,30 @@ The contract maintains an append-only set of historical Merkle roots (anchors). 
 
 The contract or verifier environment MUST verify that `auth_domain` (from the proof's public outputs) equals the deployment's configured spend-authorization domain. Rejection of mismatched domains prevents replay of a valid spend authorization onto a mirrored deployment, fork, or verifier migration that shares the same Merkle root history.
 
+`auth_domain` is **frozen on first verifier configuration** and is single-set for the lifetime of the deployment. The contract MUST reject any subsequent `configure_verifier` whose `auth_domain` differs from the installed one, *even on a still-pristine ledger*. Other verifier-config fields (program hashes, operator producer-fee `owner_tag`) MAY change while the ledger is pristine. Allowing `auth_domain` to change in the in-flight window would silently strand any L1 bridge deposit whose intent was computed against the previous value: intent commits to `auth_domain`, so post-rotation the kernel's slot lookup would either return no slot or a slot with a now-different intent.
+
+### Verifier configuration
+
+The kernel persists a signed `KernelVerifierConfig` containing:
+
+- `auth_domain` (frozen on first install, see above)
+- `verified_program_hashes` for `run_shield`, `run_transfer`, `run_unshield`
+- `operator_producer_owner_tag = H_owner(auth_root, pub_seed, nk_tag)` of the operator's canonical producer-fee receiver
+
+The signature covers all fields. Rotating the operator's producer-fee receiver requires a fresh signed config; an attacker cannot redirect producer fees by tampering with a single field in transit.
+
+The producer-fee receiver is **not enforced in-circuit** — the shield / transfer / unshield circuits prove only that `cm_producer = H_commit(producer_d_j, producer_fee, producer_rcm, producer_otag)` and that the witness is internally consistent. Nothing in the proof binds `producer_otag` to the operator's published value. Wallets MUST therefore preflight against `operator_producer_owner_tag` before submitting a transaction that emits a producer-fee note (see [Wallet preflight gates](#wallet-preflight-gates)). A wallet whose profile-supplied `dal_fee_address` derives a different `owner_tag` than the rollup published silently routes producer fees to a non-operator receiver, with no protocol-level enforcement.
+
+### Wallet preflight gates
+
+Bridge deposits and unshield/transfer submissions are irreversible at the L1 / inbox layer. The reference wallet refuses to submit until it has read durable storage and confirmed:
+
+1. **Verifier configured** — `verifier_config.bin` exists. Deposits before configuration would land in a kernel that rejects them.
+2. **Bridge ticketer matches** — `bridge/ticketer` equals the wallet profile's `bridge_ticketer`. The kernel rejects deposits whose `transfer.sender` doesn't match its configured ticketer; an L1 ticket against the wrong ticketer burns mutez to a slot that never appears.
+3. **Operator producer-fee owner_tag matches** — the `owner_tag` derived from `profile.dal_fee_address` equals `KernelVerifierConfig.operator_producer_owner_tag`. If the rollup-published value is zero (uninitialized), the wallet warns and proceeds; if it is non-zero and disagrees, the wallet refuses.
+
+These checks bind the wallet to the deployment it thinks it is talking to. They are reference behavior, not a consensus rule — a custom wallet that skips them merely loses funds privately.
+
 ### Executable binding (all proof-verified transactions)
 
 If proofs are produced through a bootloader or recursive verifier wrapper, the verifier environment MUST also authenticate which circuit executable was actually proved. In the reference implementation this means checking the bootloader-reported task program hash against the deployment's expected `run_shield`, `run_transfer`, or `run_unshield` executable hash before interpreting the public outputs. Verifying "some valid Cairo task" is not sufficient.
@@ -687,6 +711,10 @@ Each accepted L1 ticket allocates its own kernel-side **deposit slot**. The *key
 Slots are NOT a single mutable bucket per intent, and two L1 tickets with identical `(intent, amount)` content still get distinct ids. If an attacker observes a victim's `deposit:<hex(intent)>` recipient string on L1 and dust-deposits the same recipient string, the kernel allocates a fresh slot for the dust ticket — the victim's slot's `(intent, amount)` is unchanged, and the wallet's shield can still drain it by referring to its `slot_id`. Without the per-deposit slot scheme, summing all credits into one balance bucket would let a 1-mutez dust deposit permanently brick a victim's shield (the bucket would hold `debit + 1`, which is not the exact debit, so shield would always reject).
 
 The wallet observes its slot id by polling the rollup state for the by-intent index after the L1 deposit settles, then matches the slot whose amount equals the bound debit.
+
+The kernel prunes the by-intent index on slot consumption: the consumed `slot_id` is removed by **swap-with-last** (overwriting its index entry with the last entry's value, then decrementing the count); when the count reaches zero, the count key remains at `0` rather than being deleted. The slot's `by-id` record is overwritten with a tombstone rather than deleted, so a re-run shield against a consumed slot fails with "already consumed" rather than "not found." This bounds the index size to the live open-slot count per intent — a dust attacker cannot inflate per-intent enumeration cost beyond the open frontier.
+
+If a wallet's settled deposit has additional open slots in the by-intent index (typically because an attacker mirror-deposited the same `(intent, amount)` after observing the victim's L1 ticket), the wallet can re-shield against an orphan slot using the same recipient witness via `tzel-wallet drain-orphan-slot --slot-id N`. The drained slot produces a duplicate recipient `cm` at a new tree position; the two leaves are publicly correlatable to the same intent, but each gets a distinct nullifier and is independently spendable.
 
 The intent commits to *every* prover-rewritable field. As a consequence:
 

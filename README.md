@@ -200,7 +200,7 @@ It:
 - decodes Tezos Data Encoding inbox messages into shared TzEL request types
 - treats `transfer` as the only fully internal rollup transaction, with bridge-`deposit` + `shield` handling rollup ingress and `unshield` (which directly emits an L1-outbox transfer to the requested tz/KT1 recipient) handling egress
 - applies the shared transition logic from `tzel-core`
-- persists path-addressed durable state for notes, bridge balances, roots, nullifiers, and the commitment-tree frontier
+- persists path-addressed durable state for notes, per-deposit slots, roots, nullifiers, withdrawal queue, bridge ticketer, verifier config, and the commitment-tree frontier
 - verifies proofs through the shared verifier path without linking prover code
 
 Build it with:
@@ -214,7 +214,7 @@ Build it with:
 See `specs/security.md` for the full security notes and operational caveats. Key items:
 
 - **Active development** -- protocol and implementation are not audited for production use
-- **Reference ledger is localhost-only** -- `sp-ledger` is a demo/reference verifier for the protocol checks, not a real authenticated public-balance server
+- **Reference ledger is localhost-only** -- `sp-ledger` is a demo/reference verifier for the protocol checks, not a real authenticated server
 - **`sp-client` is a developer/test harness** -- it is useful for local testing and fixtures, not as a hardened end-user wallet
 - **WOTS+ key reuse compromises funds** -- unlike multi-use signature schemes, reusing a WOTS+ key lets an attacker forge signatures and steal funds
 - **One-time key exhaustion** -- each address has 65536 signing keys; rotate addresses before exhaustion

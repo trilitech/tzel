@@ -16,11 +16,19 @@ The kernel consumes Tezos Data Encoding inbox messages and records:
 - last inbox payload
 
 Supported message kinds:
-- `deposit` (bridge-balance credit after an L1 deposit is observed)
-- `shield` (convert credited bridge balance into a user note plus a DAL-producer fee note, and burn the protocol fee)
-- `transfer` (shielded transfer inside the rollup, creating recipient, change, and DAL-producer fee notes while burning the protocol fee)
-- `unshield` (consume a shielded note, burn the protocol fee, credit transparent rollup balance, and append the DAL-producer fee note plus optional change)
-- `withdraw` (debit transparent rollup balance and emit an L1 outbox withdrawal payload)
+- L1 internal `Transfer` carrying a bridge ticket (allocates a fresh
+  deposit slot keyed by a kernel-controlled `slot_id`, with content
+  `(intent, amount)` parsed from the ticket's recipient string)
+- `shield` (drain a specified deposit slot and append the recipient
+  note plus a DAL-producer fee note; burns the protocol fee)
+- `transfer` (shielded transfer inside the rollup, creating recipient,
+  change, and DAL-producer fee notes while burning the protocol fee)
+- `unshield` (consume one or more shielded notes, append optional change
+  and a DAL-producer fee note, queue a withdrawal record, and emit an
+  L1 outbox withdrawal payload directly — there is no separate
+  transparent-balance step)
+- `configure_verifier` / `configure_bridge` (signed administrative
+  messages installing the verifier config and bridge ticketer)
 
 These messages are applied through the shared Rust transition logic in `core/`.
 
@@ -29,8 +37,15 @@ The kernel does not keep the full ledger as one serialized blob. It stores:
 - the commitment-tree append frontier and current root
 - valid-root membership markers
 - nullifier membership markers
-- per-account bridge balances used for deposit/withdrawal accounting
+- per-deposit slots (each L1 ticket allocates a fresh `slot_id` keyed
+  to `(intent, amount)`; consumed slots are tombstoned, not deleted)
+- a per-intent index over open slots, so wallets can enumerate every
+  slot funded for a given intent without scanning all slots
 - queued withdrawals under append-only per-index paths
+- the configured bridge ticketer (the L1 contract whose ticket transfers
+  the kernel will accept)
+- the verifier config (`auth_domain`, program hashes, the operator's
+  expected producer-fee `owner_tag`)
 
 The current POC kernel uses a simple congestion fee policy for private
 transactions:
@@ -55,8 +70,13 @@ Durable storage paths:
 - `/tzel/v1/state/notes/*`
 - `/tzel/v1/state/roots/*`
 - `/tzel/v1/state/nullifiers/*`
-- `/tzel/v1/state/balances/*`
+- `/tzel/v1/state/deposits/count` — monotonic slot-id counter
+- `/tzel/v1/state/deposits/by-id/<slot_id>` — `(status, intent, amount)`
+  for an open slot, or just `status=consumed` after tombstoning
+- `/tzel/v1/state/deposits/by-intent/<intent>/{count,index/<i>}` —
+  enumeration of open slots for an intent (swap-with-last on consume)
 - `/tzel/v1/state/withdrawals/*`
+- `/tzel/v1/state/bridge/ticketer`
 - `/tzel/v1/state/verifier_config.bin`
 - `/tzel/v1/state/last_result.bin`
 

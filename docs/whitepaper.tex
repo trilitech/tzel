@@ -490,6 +490,42 @@ modification by an untrusted prover yields a different \(deposit\_id\) whose
 L1 balance is empty. This makes shield safe to delegate to an external proving
 service without any in-circuit signature.
 
+\paragraph{auth\_domain freeze.} Because \(intent\) commits to
+\(auth\_domain\), any reconfiguration of the deployment's
+\(auth\_domain\) between the wallet computing \(intent\) and the L1
+ticket landing would silently strand the deposit. The kernel therefore
+freezes \(auth\_domain\) on first verifier configuration: subsequent
+\texttt{configure\_verifier} messages may rotate program hashes or the
+operator's producer-fee receiver, but any attempt to change
+\(auth\_domain\) is rejected, even on a still-pristine ledger. Other
+verifier-config fields remain rotatable while pristine.
+
+\paragraph{Producer-fee receiver binding.} The producer-fee note
+recipient is a private input; the circuit only proves that
+\(\cm_{producer}\) commits to some
+\(producer\_otag = \Hash_{owner}(auth\_root, pub\_seed, nk\_tag)\), not
+that \(producer\_otag\) equals the operator's address. To prevent a
+misconfigured wallet profile from silently routing fees to a
+non-operator receiver, the kernel's verifier config carries an
+\(operator\_producer\_owner\_tag\) field, signed alongside
+\(auth\_domain\) and the program hashes. Reference wallets refuse to
+submit shield, transfer, or unshield unless the \(owner\_tag\) derived
+from the profile-supplied DAL-fee receiver equals the published
+\(operator\_producer\_owner\_tag\). This is reference behavior, not a
+consensus rule — a custom wallet that skips it merely loses its own fee
+notes.
+
+\paragraph{Orphan-slot drain.} If an attacker mirror-deposits a victim's
+\texttt{deposit:<hex(intent)>} recipient string with the same
+\(amount\) as the victim's settled shield, the extra L1 ticket allocates
+an orphan slot that holds real mutez but is not consumed by the victim's
+shield. Because the victim's wallet still holds the full deposit
+witness, it can re-shield the original recipient \(\cm\) against the
+orphan slot, recovering the L1 mutez. The drained slot produces a
+duplicate recipient commitment at a new tree position; the two leaves
+are publicly correlatable to the same intent but each gets a distinct
+nullifier and is independently spendable.
+
 \paragraph{Ownership binding accounting.} \(v_{pub}\) becomes the user's
 shielded note, \(producer\_fee\) becomes the DAL-producer fee note, and
 \(fee\) is burned. There is no separate direct-withdraw path for the deposit
