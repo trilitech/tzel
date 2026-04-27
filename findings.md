@@ -137,50 +137,60 @@ sync)".
 
 **Commit:** `a7c7c2c`.
 
-### F-W-3 [LOW, OPEN] — Multi-stage drain of the same pool can pin `PendingDeposit` forever
+### F-W-3 [LOW, FIXED] — Multi-stage drain of the same pool pinned `PendingDeposit` forever
 
 Two compounding mistakes in the F-W-2 fix:
 
-1. **`cmd_shield_rollup` only sets `shielded_cm` when it's currently
-   `None`.** The filter at `apps/wallet/src/lib.rs:7214` is
-   `p.pubkey_hash == pubkey_hash && p.shielded_cm.is_none()`. So a
-   second shield against the same pool (legitimate — core supports
-   distinct-cm draws against one pool, see
-   `test_apply_shield_two_distinct_shields_can_share_one_pool`) does
-   not update `shielded_cm`; the entry stays pinned to the *first*
+1. **`cmd_shield_rollup` only set `shielded_cm` when it was currently
+   `None`.** The filter `p.shielded_cm.is_none()` meant a second shield
+   against the same pool (legitimate — core supports distinct-cm
+   draws, see `test_apply_shield_two_distinct_shields_can_share_one_pool`)
+   never updated `shielded_cm`; the entry stayed pinned to the *first*
    shield's `cm1`.
 
-2. **`apply_scan_feed` builds `known_cms` from `feed.notes` only**, the
+2. **`apply_scan_feed` built `known_cms` from `feed.notes` only**, the
    incremental feed since the last sync cursor. So `cm1` (observed in
-   an earlier sync) is not in the current set even though it is in
+   an earlier sync) was not in the current set even though it was in
    `w.notes`.
 
-Reachable sequence:
+Reachable sequence (now a regression test):
 
    1. Pool funded with X.
    2. Shield 1 drains v1 < X, mints cm1; wallet sets
       `shielded_cm = Some(cm1)`.
-   3. Sync 1: cm1 in feed, pool balance > 0 → don't prune (correct).
-   4. Shield 2 drains the residue, mints cm2; the `is_none()` filter
-      excludes the entry, so `shielded_cm` stays `Some(cm1)`.
-   5. Sync 2: cm2 in feed (not cm1), pool balance == 0 → predicate is
+   3. Sync 1: cm1 in feed, pool balance > 0 → keep (correct).
+   4. Shield 2 drains the residue, mints cm2; the old `is_none()`
+      filter left `shielded_cm` pinned to `Some(cm1)`.
+   5. Sync 2: cm2 in feed (not cm1), pool balance == 0 → predicate
       `drained && (cm1 ∈ {cm2})` = `drained && false` → don't prune.
 
-The entry is stuck forever. Reporting permanently shows "drained but
-not yet pruned" or, if the user does a fresh sync run with `cm2`
-present from the start, an even more confusing state where a fully
-consumed pool stays counted.
+The entry was stuck forever. Reporting permanently showed "drained
+but not yet pruned" — stale local deposit metadata, misleading
+operational output. Not a consensus or custody break.
 
-Impact: stale local deposit metadata and misleading operational
-output after legitimate multi-step drains. Not a consensus or custody
-break.
+**Fix:**
 
-**Suggested shape of fix (not applied):** drop the `is_none()` filter
-so `cmd_shield_rollup` always overwrites `shielded_cm` with the latest
-cm; and have `apply_scan_feed` evaluate `cm_observed` against
-`w.notes` (cumulative) plus the new feed leaves, instead of just the
-incremental feed. Add a regression test that mirrors the five-step
-sequence above.
+1. `cmd_shield_rollup` now always overwrites `shielded_cm` with the
+   latest shield's recipient cm. Older cms are still observable
+   cumulatively via `w.notes`, so the prune predicate accepts an
+   observation of any prior cm too.
+2. `apply_scan_feed` builds `known_cms` from `w.notes` (after this
+   round's recovery, before nullifier pruning) ∪ `feed.notes`
+   (defensive coverage for cms the wallet didn't itself recover).
+   This is cumulative across syncs and survives both multi-stage
+   drains and the "user runs sync twice, only the first contained
+   the cm" scenario.
+
+**Regressions:**
+- `test_apply_scan_feed_prunes_multi_stage_drain_after_residue_shield`
+  walks the exact five-step sequence and asserts pruning fires on
+  sync 2.
+- `test_apply_scan_feed_prunes_drained_pool_via_cumulative_state`
+  is the cumulative twin: cm absorbed in sync 1 (pool still funded,
+  no prune), pool drained between syncs, sync 2 has empty feed —
+  prune still fires because `w.notes` still contains the cm.
+
+**Commit:** `<this commit>`.
 
 ---
 
@@ -391,7 +401,7 @@ These were verified during the audit and stand as positive results:
 | F-K-2  | HIGH     | FIXED    |
 | F-W-1  | MED      | FIXED    |
 | F-W-2  | LOW      | FIXED    |
-| F-W-3  | LOW      | OPEN     |
+| F-W-3  | LOW      | FIXED    |
 | F-C-1  | LOW      | OPEN     |
 | F-C-2  | LOW      | OPEN     |
 | F-C-3  | LOW      | OPEN     |

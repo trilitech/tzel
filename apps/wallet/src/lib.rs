@@ -3888,6 +3888,24 @@ fn apply_scan_feed(
         }
     }
 
+    // Build the cumulative known-cm set BEFORE the nullifier-driven
+    // note prune. We merge two sources:
+    //   * `w.notes` (after this round's recovery, before nullifier
+    //     pruning) — every shield/transfer/unshield output cm the
+    //     wallet has ever recovered. Cumulative across syncs, which
+    //     handles "user runs sync twice and only the first contained
+    //     the cm" and "user multi-stage drains a pool, sync 2 only
+    //     contains cm2 but cm1 was absorbed in sync 1".
+    //   * `feed.notes` — defensively covers cms in this round's feed
+    //     that the wallet didn't recover (e.g., wallet restored
+    //     without the kem keys for the recipient address).
+    // Building before nullifier pruning matters because a shielded cm
+    // that has since been spent would otherwise drop out of `w.notes`
+    // and leave the `PendingDeposit` pinned forever.
+    let mut known_cms: std::collections::HashSet<F> =
+        w.notes.iter().map(|n| n.cm).collect();
+    known_cms.extend(feed.notes.iter().map(|nm| nm.cm));
+
     let nf_set: std::collections::HashSet<F> = nullifiers.into_iter().collect();
     let before = w.notes.len();
     w.notes.retain(|n| !nf_set.contains(&note_nullifier(n)));
@@ -3896,12 +3914,12 @@ fn apply_scan_feed(
     w.pending_spends
         .retain(|pending| !pending.nullifiers.iter().all(|nf| nf_set.contains(nf)));
 
-    // Prune `PendingDeposit` entries whose recipient note has now
-    // been seen on chain (cm matches a leaf in the rollup tree
-    // alongside a zero kernel-side pool balance). Until we observe
-    // the cm, the entry stays around so a wallet that ran shield
-    // but never re-synced still has the metadata it needs.
-    let known_cms: std::collections::HashSet<F> = feed.notes.iter().map(|nm| nm.cm).collect();
+    // Prune `PendingDeposit` entries whose recipient note has been
+    // seen on chain (any of the wallet's shielded cms appears in the
+    // cumulative known-cm set above) AND whose pool now reads zero
+    // balance. Until both signals align, the entry stays around so a
+    // wallet that ran shield but never re-synced still has the
+    // metadata it needs.
     let before_pools = w.pending_deposits.len();
     w.pending_deposits.retain(|p| {
         let drained_on_chain = pool_balances.get(&p.pubkey_hash).copied().unwrap_or(0) == 0;
@@ -5728,6 +5746,171 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_scan_feed_prunes_multi_stage_drain_after_residue_shield() {
+        // Multi-stage drain: a pool with two distinct shields against
+        // it (legitimate — `core` explicitly supports it via
+        // `test_apply_shield_two_distinct_shields_can_share_one_pool`).
+        // The wallet records `shielded_cm = Some(cm1)` after the first
+        // shield, then overwrites it to `Some(cm2)` after the second.
+        // Across two sync runs (one each between the shields, one
+        // after the residue is drained), apply_scan_feed must:
+        //   sync 1: see cm1, but pool still has balance → keep entry.
+        //   sync 2: see cm2, pool drained → prune entry.
+        //
+        // This pinned forever in the prior implementation because
+        // (a) the wallet only updated `shielded_cm` when it was
+        // `None` and (b) sync 2's known-cm set was the incremental
+        // feed only, so cm1 (last seen in sync 1) never appeared
+        // alongside the drained signal.
+        let mut w = test_wallet(1);
+        let pubkey_hash = felt_tag(b"multi-stage-pkh");
+
+        // First shield: set shielded_cm to cm1.
+        let cm1 = felt_tag(b"multi-stage-cm-1");
+        w.pending_deposits.push(PendingDeposit {
+            pubkey_hash,
+            blind: felt_tag(b"multi-stage-blind"),
+            address_index: 0,
+            auth_domain: felt_tag(b"multi-stage-domain"),
+            amount: 200_000,
+            operation_hash: Some("opShield1".into()),
+            shielded_cm: Some(cm1),
+        });
+
+        // Sync 1: cm1 in feed, pool balance > 0 → keep.
+        let mut pool_balances = std::collections::HashMap::new();
+        pool_balances.insert(pubkey_hash, 80_000u64);
+        let nm1 = NoteMemo {
+            index: 0,
+            cm: cm1,
+            enc: encrypt_note(
+                100_000,
+                &felt_tag(b"multi-stage-rseed1"),
+                None,
+                &kem_keygen_from_seed(&[0xAA; 64]).0,
+                &kem_keygen_from_seed(&[0xBB; 64]).0,
+            ),
+        };
+        let summary = apply_scan_feed(
+            &mut w,
+            &NotesFeedResp {
+                notes: vec![nm1],
+                next_cursor: 1,
+            },
+            Vec::<F>::new(),
+            &pool_balances,
+        );
+        assert_eq!(
+            summary.pruned_drained_pools, 0,
+            "must not prune while pool still has balance"
+        );
+        assert_eq!(w.pending_deposits.len(), 1);
+
+        // Second shield: overwrite shielded_cm to cm2.
+        let cm2 = felt_tag(b"multi-stage-cm-2");
+        for p in w
+            .pending_deposits
+            .iter_mut()
+            .filter(|p| p.pubkey_hash == pubkey_hash)
+        {
+            p.shielded_cm = Some(cm2);
+        }
+
+        // Sync 2: cm2 in feed (cm1 is in past sync's notes only),
+        // pool balance == 0 → must prune.
+        let pool_balances_drained: std::collections::HashMap<F, u64> =
+            std::collections::HashMap::new();
+        let nm2 = NoteMemo {
+            index: 1,
+            cm: cm2,
+            enc: encrypt_note(
+                80_000,
+                &felt_tag(b"multi-stage-rseed2"),
+                None,
+                &kem_keygen_from_seed(&[0xCC; 64]).0,
+                &kem_keygen_from_seed(&[0xDD; 64]).0,
+            ),
+        };
+        let summary = apply_scan_feed(
+            &mut w,
+            &NotesFeedResp {
+                notes: vec![nm2],
+                next_cursor: 2,
+            },
+            Vec::<F>::new(),
+            &pool_balances_drained,
+        );
+        assert_eq!(
+            summary.pruned_drained_pools, 1,
+            "drained pool with cm2 in feed must prune even though cm1 was the original cm"
+        );
+        assert!(w.pending_deposits.is_empty());
+    }
+
+    #[test]
+    fn test_apply_scan_feed_prunes_drained_pool_via_cumulative_state() {
+        // Bulletproof against the scenario where a user runs sync
+        // twice: the first run absorbs the recipient cm into
+        // `w.notes` while the pool was still funded; the second run
+        // has an empty feed (cursor advanced past cm) but observes
+        // that the pool has now been drained on chain. Pruning must
+        // still fire on the second run because `w.notes` is the
+        // cumulative source-of-truth for observed cms.
+        let mut w = test_wallet(1);
+        let pubkey_hash = felt_tag(b"two-syncs-pkh");
+        let recipient_rseed = felt_tag(b"two-syncs-rseed");
+        // Build a recoverable recipient note for address 0.
+        let new_nm = note_memo_for_wallet_address(&w, 0, 100_000, recipient_rseed, None);
+        let cm = new_nm.cm;
+        w.pending_deposits.push(PendingDeposit {
+            pubkey_hash,
+            blind: felt_tag(b"two-syncs-blind"),
+            address_index: 0,
+            auth_domain: felt_tag(b"two-syncs-domain"),
+            amount: 100_000,
+            operation_hash: Some("opShield".into()),
+            shielded_cm: Some(cm),
+        });
+
+        // Sync 1: cm in feed, pool still funded (residual or stale
+        // read) → don't prune; cm gets absorbed into w.notes.
+        let mut pool_balances_funded = std::collections::HashMap::new();
+        pool_balances_funded.insert(pubkey_hash, 50u64);
+        let summary = apply_scan_feed(
+            &mut w,
+            &NotesFeedResp {
+                notes: vec![new_nm],
+                next_cursor: 1,
+            },
+            Vec::<F>::new(),
+            &pool_balances_funded,
+        );
+        assert_eq!(summary.pruned_drained_pools, 0);
+        assert_eq!(w.pending_deposits.len(), 1);
+        assert!(w.notes.iter().any(|n| n.cm == cm));
+
+        // Sync 2: empty feed, pool drained. Without cumulative cm
+        // tracking the entry would stay pinned. With it, w.notes
+        // still contains cm → prune.
+        let pool_balances_drained: std::collections::HashMap<F, u64> =
+            std::collections::HashMap::new();
+        let summary = apply_scan_feed(
+            &mut w,
+            &NotesFeedResp {
+                notes: vec![],
+                next_cursor: 2,
+            },
+            Vec::<F>::new(),
+            &pool_balances_drained,
+        );
+        assert_eq!(
+            summary.pruned_drained_pools, 1,
+            "second sync with empty feed must still prune via cumulative w.notes"
+        );
+        assert!(w.pending_deposits.is_empty());
+    }
+
+    #[test]
     fn test_apply_scan_feed_drops_newly_recovered_note_if_already_nullified() {
         let mut w = test_wallet(1);
         let new_rseed = felt_tag(b"wallet-scan-new-spent");
@@ -7203,15 +7386,18 @@ fn cmd_shield_rollup(
     };
     let kernel_req = shield_req_to_kernel(&req)?;
     let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
-    // Mark every local PendingDeposit for this pool as consumed by this
-    // shield's recipient cm. Sync's `apply_scan_feed` later observes
-    // the cm in the rollup tree and prunes the entries entirely; until
-    // then, balance/check reporting can distinguish "drained by us"
-    // from "never credited".
+    // Mark every local PendingDeposit for this pool as consumed by
+    // *this* shield's recipient cm — overwriting any previous cm
+    // recorded against the same pool. Multi-stage drains are
+    // legitimate (the core ledger explicitly supports two distinct
+    // shields draining one pool), so the latest cm is the one sync
+    // most likely sees in the next feed; older cms are still tracked
+    // cumulatively in `w.notes`, so the prune predicate in
+    // `apply_scan_feed` accepts an observation of any prior cm too.
     for p in w
         .pending_deposits
         .iter_mut()
-        .filter(|p| p.pubkey_hash == pubkey_hash && p.shielded_cm.is_none())
+        .filter(|p| p.pubkey_hash == pubkey_hash)
     {
         p.shielded_cm = Some(note_recipient.cm);
     }
