@@ -274,7 +274,6 @@ fn validate_stark_circuit(
 mod tests {
     use super::*;
     use ml_kem::KeyExport;
-    use tzel_core::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES;
 
     const TEST_FEE: u64 = MIN_TX_FEE;
     const TEST_L1_RECIPIENT: &str = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
@@ -288,26 +287,15 @@ mod tests {
         value
     }
 
-    /// Test-only helper: deterministic deposit_id derived from a label.
-    /// Standalone services tests do not need to round-trip via the canonical
-    /// intent fold.
-    fn test_deposit_id(label: &str) -> F {
+    /// Test-only helper: deterministic pubkey_hash derived from a label.
+    /// Standalone services tests do not need to compute the real
+    /// `H(0x04, auth_domain, auth_root, auth_pub_seed, blind)`.
+    fn test_pubkey_hash(label: &str) -> F {
         hash(label.as_bytes())
     }
 
     fn test_deposit_key(label: &str) -> String {
-        deposit_recipient_string(&test_deposit_id(label))
-    }
-
-    fn random_payment_address() -> PaymentAddress {
-        PaymentAddress {
-            d_j: random_felt(),
-            auth_root: random_felt(),
-            auth_pub_seed: random_felt(),
-            nk_tag: random_felt(),
-            ek_v: vec![0; ML_KEM768_ENCAPSULATION_KEY_BYTES],
-            ek_d: vec![0; ML_KEM768_ENCAPSULATION_KEY_BYTES],
-        }
+        deposit_recipient_string(&test_pubkey_hash(label))
     }
 
     fn test_auth_root(d_j: &F, auth_pub_seed: &F) -> F {
@@ -546,24 +534,16 @@ mod tests {
             &[0xBB; 32],
         );
         let (producer_cm, producer_enc, _producer_mh) = test_output_note(0x04);
-        let intent = shield_intent(
-            &ledger.auth_domain,
-            v,
-            TEST_FEE,
-            1,
-            &cm_recipient,
-            &producer_cm,
-            &memo_ct_hash(&enc_recipient),
-            &memo_ct_hash(&producer_enc),
-        );
+        let blind = u(0xBEEF);
+        let pubkey_hash =
+            deposit_pubkey_hash(&ledger.auth_domain, &auth_root, &auth_pub_seed, &blind);
         let debit = v + TEST_FEE + 1;
-        let slot_id = ledger
-            .deposit(&deposit_recipient_string(&intent), debit)
+        ledger
+            .deposit(&deposit_recipient_string(&pubkey_hash), debit)
             .unwrap();
         ledger
             .shield(&ShieldReq {
-                deposit_id: intent,
-                deposit_slot: slot_id,
+                pubkey_hash,
                 v,
                 fee: TEST_FEE,
                 producer_fee: 1,
@@ -571,7 +551,7 @@ mod tests {
                 client_cm: cm_recipient,
                 client_enc: enc_recipient,
                 producer_cm,
-                producer_enc: producer_enc,
+                producer_enc,
             })
             .unwrap();
 
@@ -1680,29 +1660,6 @@ mod tests {
         let mut ledger = Ledger::new();
         let _ = ledger.deposit(&test_deposit_key("alice"), 200_000);
 
-        let mut master_sk = ZERO;
-        master_sk[0] = 0x44;
-        let acc = derive_account(&master_sk);
-        let d_j = derive_address(&acc.incoming_seed, 0);
-        let ask_j = derive_ask(&acc.ask_base, 0);
-        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
-        let auth_root = test_auth_root(&d_j, &auth_pub_seed);
-        let nk_sp = derive_nk_spend(&acc.nk, &d_j);
-        let nk_tg = derive_nk_tag(&nk_sp);
-        let seed: [u8; 64] = [0x77; 64];
-        let (ek_v, _, ek_d, _) = {
-            let (ekv, dkv) = kem_keygen_from_seed(&seed);
-            let (ekd, dkd) = kem_keygen_from_seed(&seed);
-            (ekv, dkv, ekd, dkd)
-        };
-        let addr = PaymentAddress {
-            d_j,
-            auth_root,
-            auth_pub_seed,
-            nk_tag: nk_tg,
-            ek_v: ek_v.to_bytes().to_vec(),
-            ek_d: ek_d.to_bytes().to_vec(),
-        };
         let bad_enc = EncryptedNote {
             ct_d: vec![0; 10],
             tag: 0,
@@ -1716,8 +1673,7 @@ mod tests {
 
         let err = ledger
             .shield(&ShieldReq {
-                deposit_id: test_deposit_id("alice"),
-                deposit_slot: 0,
+                pubkey_hash: test_pubkey_hash("alice"),
                 v: 100,
                 fee: TEST_FEE,
                 producer_fee: 1,

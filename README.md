@@ -21,7 +21,7 @@ Privacy on blockchains today relies on elliptic curve cryptography that quantum 
 ### How it works
 
 A UTXO-based private transaction system where:
-- **Deposits** credit a namespaced *intent-bound* rollup deposit key whose hash commits to the entire shield (recipient note, producer-fee note, fees, auth_domain). `shield` opens the preimage and consumes the deposit. Because every prover-rewritable field is folded into the deposit_id, shield is **safe to delegate to an untrusted prover** — no in-circuit signature is required.
+- **Deposits** credit an aggregated rollup pool keyed by `pubkey_hash = H(auth_domain, auth_root, auth_pub_seed, blind)`. Multiple L1 tickets to `deposit:<hex(pubkey_hash)>` add to the same balance. `shield` debits the pool by `v + fee + producer_fee` and mints recipient + producer-fee notes; the proof's in-circuit WOTS+ signature, verified under the recipient's auth tree, binds the entire request payload so a delegated prover cannot redirect funds.
 - **Transfers** spend 1-7 private notes and create recipient, change, and DAL-producer fee notes
 - **Withdrawals** (unshield) destroy private notes, emit an L1 outbox transfer to a tz/KT1 recipient, and create a DAL-producer fee note plus optional change
 - **Every shield / transfer / unshield burns at least 100000 mutez (0.1 tez)**, with a simple per-level stepped fee under congestion in the current rollup deployment
@@ -40,14 +40,13 @@ cd cairo && scarb build && cd ..
 # If you launch it from elsewhere, also pass --executables-dir /abs/path/to/cairo/target/dev
 target/release/sp-ledger --port 8080 --reprove-bin apps/prover/target/release/reprove &
 
-# Run the developer/test wallet harness. The `shield` command builds the
-# recipient + producer-fee notes, computes the intent-bound deposit_id, calls
-# the local ledger's `/deposit` endpoint to allocate a slot for the exact
-# debit, then proves and submits with that slot id.
+# Run the developer/test wallet harness. The shield path is rollup-only
+# (see `tzel-wallet shield --pubkey-hash <hex> --amount <v>` against a
+# configured rollup profile); the demo `sp-client` exposes scan, balance,
+# transfer, and unshield against the standalone `sp-ledger`.
 target/release/sp-client -w alice.json keygen
 target/release/sp-client -w producer.json keygen
 target/release/sp-client -w producer.json address | sed -n '2,$p' > producer-address.json
-target/release/sp-client -w alice.json shield -l http://localhost:8080 --sender alice --amount 200001 --dal-fee 1 --dal-fee-address producer-address.json
 target/release/sp-client -w alice.json scan -l http://localhost:8080
 target/release/sp-client -w alice.json balance
 
@@ -66,7 +65,7 @@ For deployment-oriented installs with standard paths instead of a workspace chec
 
 > **WARNING:** The ledger refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
 >
-> **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, intent-binding, slot allocation, and memo-hash checks. For local shield testing, `sp-client shield` builds both the recipient and producer-fee notes client-side, computes the shield intent over them, and POSTs `/deposit` to allocate a slot for the exact `(intent, debit)` before submitting `/shield`. `/deposit` is demo-only and unauthenticated; it should not be exposed as a real public endpoint.
+> **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, pubkey_hash binding, deposit-pool, and memo-hash checks. Its `/deposit` endpoint credits an aggregated pool keyed by `pubkey_hash` and `/shield` debits one — both demo-only and unauthenticated, not appropriate for a real public endpoint. The wallet's primary shield path is `tzel-wallet shield --pubkey-hash <hex> --amount <v>` against a configured rollup profile.
 >
 > **DEVELOPER WALLET NOTE:** `sp-client` is a developer/reference CLI used for local testing, demos, and integration flows. It persists plaintext secrets and wallet state in local JSON files and is not intended to be a hardened end-user wallet.
 

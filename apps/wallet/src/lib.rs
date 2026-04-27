@@ -476,6 +476,11 @@ struct WalletFile {
     pending_spends: Vec<PendingSpend>,
     #[serde(default)]
     pending_deposits: Vec<PendingDeposit>,
+    /// Monotonic counter feeding `derive_deposit_blind`. Each new bridge
+    /// deposit increments it so distinct pools have distinct blinds even
+    /// when they share an address index.
+    #[serde(default)]
+    deposit_nonce: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -496,62 +501,39 @@ struct PendingSpend {
     operation_hash: Option<String>,
 }
 
-/// Per-note witness needed to drive `apply_shield` at shield time. The
-/// recipient (or change-receiver) chose all of these values at deposit time;
-/// the sender (L1 depositor) builds a `cm = H_commit(d_j, v, derive_rcm(rseed),
-/// owner_tag(auth_root, auth_pub_seed, nk_tag))` from them and folds the
-/// result into the shield intent. Persist alongside the encrypted ciphertext
-/// so a later re-encryption (with fresh ML-KEM ephemerals) doesn't change the
-/// memo_ct_hash and break intent binding.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ShieldNoteWitness {
-    #[serde(with = "hex_f")]
-    d_j: F,
-    #[serde(with = "hex_f")]
-    rseed: F,
-    #[serde(with = "hex_f")]
-    auth_root: F,
-    #[serde(with = "hex_f")]
-    auth_pub_seed: F,
-    #[serde(with = "hex_f")]
-    nk_tag: F,
-    #[serde(with = "hex_f")]
-    cm: F,
-    /// Encrypted note bytes, persisted at deposit time so the resulting
-    /// memo_ct_hash exactly matches what was folded into the deposit intent.
-    enc: EncryptedNote,
-}
-
-/// A pending L1 bridge deposit awaiting shield. Each L1 ticket allocates its
-/// own kernel-side slot; the wallet records the slot id once the kernel has
-/// observed the deposit. Shielding consumes a specific slot, so dust deposits
-/// to the same intent (which would just allocate orphan slots elsewhere)
-/// cannot brick a legitimate deposit.
+/// A pending L1 bridge deposit pool. Each pool is keyed by
+/// `pubkey_hash = H(auth_domain, auth_root, auth_pub_seed, blind)` and
+/// the kernel maintains a per-pool aggregated balance. Multiple L1 tickets
+/// to the same `deposit:<hex(pubkey_hash)>` recipient just add to that
+/// balance (top-up). Shield decrements the balance by `v + fee +
+/// producer_fee`; the user picks `v, fee, producer_fee` at shield time and
+/// signs the request with one of the recipient's auth-tree WOTS+ keys.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingDeposit {
+    /// Deposit pool key. The L1 recipient string is
+    /// `deposit:<hex(pubkey_hash)>`.
     #[serde(with = "hex_f")]
-    deposit_id: F,
+    pubkey_hash: F,
+    /// Per-deposit blind — the entropy that distinguishes this pool from
+    /// other pools the same auth tree might own. Persisted so the wallet
+    /// can re-derive `pubkey_hash` and prove ownership at shield time.
+    #[serde(with = "hex_f")]
+    blind: F,
+    /// Wallet's address index whose auth tree owns this pool. Used to look
+    /// up auth_root/auth_pub_seed/nk_spend at shield time.
+    address_index: u32,
+    /// auth_domain at deposit time. Persisted so we can reproduce the
+    /// pubkey_hash exactly even if the kernel's auth_domain were ever
+    /// inspected post-rotation. (auth_domain is frozen, so this is
+    /// belt-and-braces.)
     #[serde(with = "hex_f")]
     auth_domain: F,
-    v: u64,
-    fee: u64,
-    producer_fee: u64,
-    recipient: ShieldNoteWitness,
-    producer: ShieldNoteWitness,
-    /// Total mutez deposited on L1; equals `v + fee + producer_fee`.
+    /// Total mutez sent in this wallet's L1 ticket(s) to the pool. The
+    /// kernel's actual balance can exceed this if other parties (e.g.,
+    /// dust-attackers, or the user issuing top-ups) deposited to the same
+    /// pool; sync reads the kernel-side authoritative balance.
     amount: u64,
     operation_hash: Option<String>,
-    /// Kernel-side slot id, populated the first time the wallet's sync
-    /// observes a slot for `deposit_id` whose amount equals `amount`. Until
-    /// then, shield is blocked because the kernel needs the slot id.
-    slot_id: Option<u64>,
-    /// True once the wallet has observed the recipient note in the
-    /// commitment tree (the shield landed). The deposit is kept in
-    /// `pending_deposits` so the wallet can detect orphan slots — open
-    /// kernel-side slots for the same intent that the wallet's own shield
-    /// did not consume (e.g., because an attacker's mirror-debit deposit
-    /// landed first). The witness is still needed to drain such orphans.
-    settled: bool,
 }
 
 const WATCH_WALLET_VERSION: u16 = 1;
@@ -1740,8 +1722,7 @@ const DURABLE_NOTE_CHUNK_BYTES: usize = 1024;
 const MAX_PUBLISHED_NOTE_BYTES: usize = 4 * 1024 * 1024;
 const DURABLE_NULLIFIER_COUNT: &str = "/tzel/v1/state/nullifiers/count";
 const DURABLE_NULLIFIER_INDEX_PREFIX: &str = "/tzel/v1/state/nullifiers/index/";
-const DURABLE_DEPOSIT_BY_INTENT_PREFIX: &str = "/tzel/v1/state/deposits/by-intent/";
-const DURABLE_DEPOSIT_SLOT_PREFIX: &str = "/tzel/v1/state/deposits/by-id/";
+const DURABLE_DEPOSIT_BALANCE_PREFIX: &str = "/tzel/v1/state/deposits/balance/";
 const DURABLE_VERIFIER_CONFIG: &str = "/tzel/v1/state/verifier_config.bin";
 const DURABLE_BRIDGE_TICKETER: &str = "/tzel/v1/state/bridge/ticketer";
 
@@ -2173,85 +2154,53 @@ impl<'a> RollupRpc<'a> {
         Ok(nullifiers)
     }
 
-    /// For each pending deposit's intent, fetch the kernel-side list of open
-    /// slots and their amounts. The wallet uses this to assign `slot_id` on
-    /// pending deposits during sync.
-    fn load_slot_map(
+    /// For each pending deposit pool, fetch the kernel-side current balance.
+    /// `None` (absent from the map) means the pool has never been credited
+    /// (or has been fully drained — implementations may garbage-collect).
+    fn load_pool_balances(
         &self,
         pending: &[PendingDeposit],
-    ) -> Result<std::collections::HashMap<F, Vec<DepositSlotView>>, String> {
+    ) -> Result<std::collections::HashMap<F, u64>, String> {
         let head = self.head_hash()?;
-        let mut map: std::collections::HashMap<F, Vec<DepositSlotView>> =
-            std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<F, u64> = std::collections::HashMap::new();
         let mut seen: std::collections::HashSet<F> = std::collections::HashSet::new();
         for p in pending {
-            if !seen.insert(p.deposit_id) {
+            if !seen.insert(p.pubkey_hash) {
                 continue;
             }
-            let by_intent_count_key =
-                format!("{}{}/count", DURABLE_DEPOSIT_BY_INTENT_PREFIX, hex::encode(p.deposit_id));
-            // Missing key means no slots for this intent yet.
-            let count = self
-                .read_optional_u64_at_block(&head, &by_intent_count_key)?
-                .unwrap_or(0);
-            let mut slots = Vec::with_capacity(count as usize);
-            for position in 0..count {
-                let id_key = format!(
-                    "{}{}/index/{:016x}",
-                    DURABLE_DEPOSIT_BY_INTENT_PREFIX,
-                    hex::encode(p.deposit_id),
-                    position
-                );
-                let id = self.read_u64_at_block(&head, &id_key)?;
-                if let Some((_intent, amount, status)) = self.try_read_deposit_slot(&head, id)? {
-                    if status == 0 {
-                        slots.push(DepositSlotView { id, amount });
-                    }
-                }
-            }
-            if !slots.is_empty() {
-                map.insert(p.deposit_id, slots);
+            if let Some(balance) = self.try_read_deposit_balance(&head, &p.pubkey_hash)? {
+                map.insert(p.pubkey_hash, balance);
             }
         }
         Ok(map)
     }
 
-    /// Return `(intent, amount, status)` for an existing slot record, or
-    /// `None` if the slot id has never been written. Status: 0 = open,
-    /// 1 = consumed (tombstone). For tombstones the intent and amount
-    /// fields are not present in storage and are returned as `ZERO`/`0`.
-    fn try_read_deposit_slot(
+    /// Read a deposit pool's current balance from durable storage, returning
+    /// `None` when the pool has never been credited or has been fully drained
+    /// (kernel writes an empty value to bound storage).
+    fn try_read_deposit_balance(
         &self,
         block_ref: &str,
-        slot_id: u64,
-    ) -> Result<Option<(F, u64, u8)>, String> {
-        let key = format!("{}{:016x}", DURABLE_DEPOSIT_SLOT_PREFIX, slot_id);
-        if self.read_durable_length_at_block(block_ref, &key)?.is_none() {
-            return Ok(None);
-        }
-        let bytes = self.read_durable_bytes_at_block(block_ref, &key)?;
-        if bytes.is_empty() {
-            return Err(format!("deposit slot {} is empty", slot_id));
-        }
-        match bytes[0] {
-            0 => {
-                if bytes.len() != 1 + 32 + 8 {
+        pubkey_hash: &F,
+    ) -> Result<Option<u64>, String> {
+        let key = format!("{}{}", DURABLE_DEPOSIT_BALANCE_PREFIX, hex::encode(pubkey_hash));
+        match self.read_durable_length_at_block(block_ref, &key)? {
+            None => Ok(None),
+            Some(0) => Ok(None),
+            Some(_) => {
+                let bytes = self.read_durable_bytes_at_block(block_ref, &key)?;
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                if bytes.len() != 8 {
                     return Err(format!(
-                        "deposit slot {} has unexpected length {}",
-                        slot_id,
+                        "deposit balance for pool {} has unexpected length {}",
+                        hex::encode(pubkey_hash),
                         bytes.len()
                     ));
                 }
-                let mut intent: F = ZERO;
-                intent.copy_from_slice(&bytes[1..33]);
-                let amount = u64::from_le_bytes(bytes[33..].try_into().unwrap());
-                Ok(Some((intent, amount, 0)))
+                Ok(Some(u64::from_le_bytes(bytes.try_into().unwrap())))
             }
-            1 => Ok(Some((ZERO, 0, 1))),
-            other => Err(format!(
-                "deposit slot {} has unknown status byte 0x{:02x}",
-                slot_id, other
-            )),
         }
     }
 
@@ -2418,11 +2367,11 @@ impl<'a> RollupRpc<'a> {
 
     fn deposit_to_bridge(
         &self,
-        deposit_id: &F,
+        pubkey_hash: &F,
         amount_mutez: u64,
     ) -> Result<RollupSubmissionReceipt, String> {
         let tez_amount = mutez_to_tez_string(amount_mutez);
-        let recipient = deposit_recipient_string(deposit_id);
+        let recipient = deposit_recipient_string(pubkey_hash);
         let mint_arg = format!(
             "Pair 0x{} \"{}\"",
             hex::encode(recipient.as_bytes()),
@@ -2814,8 +2763,7 @@ fn host_stark_proof_to_kernel(proof: &Proof) -> Result<KernelStarkProof, String>
 
 fn shield_req_to_kernel(req: &ShieldReq) -> Result<KernelShieldReq, String> {
     Ok(KernelShieldReq {
-        deposit_id: req.deposit_id,
-        deposit_slot: req.deposit_slot,
+        pubkey_hash: req.pubkey_hash,
         fee: req.fee,
         producer_fee: req.producer_fee,
         v: req.v,
@@ -2913,26 +2861,6 @@ enum Cmd {
     },
     /// Show wallet balance
     Balance,
-    /// Shield: deposit public tokens into a private note
-    Shield {
-        #[arg(short, long, default_value = "http://localhost:8080")]
-        ledger: String,
-        #[arg(long)]
-        sender: String,
-        #[arg(long)]
-        amount: u64,
-        #[arg(long)]
-        fee: Option<u64>,
-        #[arg(long)]
-        dal_fee: u64,
-        #[arg(long)]
-        dal_fee_address: String,
-        /// Path to recipient address JSON (default: generate new self-address)
-        #[arg(long)]
-        to: Option<String>,
-        #[arg(long)]
-        memo: Option<String>,
-    },
     /// Transfer private notes to a recipient
     Transfer {
         #[arg(short, long, default_value = "http://localhost:8080")]
@@ -3000,7 +2928,6 @@ fn run(cli: Cli) -> Result<(), String> {
         Cmd::Keygen
         | Cmd::Address
         | Cmd::Scan { .. }
-        | Cmd::Shield { .. }
         | Cmd::Transfer { .. }
         | Cmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
         Cmd::ExportDetect { .. }
@@ -3021,27 +2948,6 @@ fn run(cli: Cli) -> Result<(), String> {
         Cmd::ExportOutgoing { out } => cmd_export_outgoing(&cli.wallet, out.as_deref()),
         Cmd::Scan { ledger } => cmd_scan(&cli.wallet, &ledger),
         Cmd::Balance => cmd_balance(&cli.wallet),
-        Cmd::Shield {
-            ledger,
-            sender,
-            amount,
-            fee,
-            dal_fee,
-            dal_fee_address,
-            to,
-            memo,
-        } => cmd_shield(
-            &cli.wallet,
-            &ledger,
-            &sender,
-            amount,
-            fee,
-            dal_fee,
-            &dal_fee_address,
-            to,
-            memo,
-            &pc,
-        ),
         Cmd::Transfer {
             ledger,
             to,
@@ -3148,28 +3054,19 @@ enum UserCmd {
         #[arg(long)]
         memo: Option<String>,
     },
-    /// Drain a previously-deposited intent-bound balance into its bound
-    /// shielded note. The recipient and amount were locked in at `Deposit`
-    /// time; this command only proves and submits. By default consumes the
-    /// canonical slot the kernel allocated for this deposit. Specify
-    /// `--slot-id` to target a different slot — typically an orphan slot
-    /// left by an attacker's mirror-deposit — in which case `--correlate`
-    /// is required to acknowledge that the duplicate recipient `cm` at a
-    /// new tree position is publicly linkable to the original.
+    /// Drain a deposit pool into a shielded note owned by the pool's own
+    /// auth tree. The shield circuit verifies an in-circuit WOTS+ signature
+    /// under the recipient's auth tree, so only the wallet that owns the
+    /// pool's `(auth_root, auth_pub_seed, blind)` can shield against it.
     Shield {
-        /// Hex deposit_id of a tracked pending deposit.
+        /// Hex pubkey_hash identifying the deposit pool to drain.
         #[arg(long)]
-        deposit_id: String,
-        /// Override the slot id to drain. If omitted, uses the canonical
-        /// slot recorded against this deposit during sync.
+        pubkey_hash: String,
+        /// Recipient note value. Defaults to the pool balance minus
+        /// `required_tx_fee + producer_fee`. Pool balance must be at least
+        /// `amount + required_tx_fee + producer_fee`.
         #[arg(long)]
-        slot_id: Option<u64>,
-        /// Acknowledge the privacy cost of draining a non-canonical slot:
-        /// the recipient cm will land at a new tree position, publicly
-        /// correlatable to the original. Required when `--slot-id`
-        /// differs from the wallet's recorded canonical slot.
-        #[arg(long, default_value_t = false)]
-        correlate: bool,
+        amount: Option<u64>,
     },
     /// Send shielded funds to another payment address.
     Send {
@@ -3441,12 +3338,11 @@ fn run_user(cli: UserCli) -> Result<(), String> {
             cmd_bridge_deposit(&cli.wallet, &profile, amount, fee, to, memo)
         }
         UserCmd::Shield {
-            deposit_id,
-            slot_id,
-            correlate,
+            pubkey_hash,
+            amount,
         } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_shield_rollup(&cli.wallet, &profile, &deposit_id, slot_id, correlate, &pc)
+            cmd_shield_rollup(&cli.wallet, &profile, &pubkey_hash, amount, &pc)
         }
         UserCmd::Send {
             to,
@@ -3594,15 +3490,16 @@ fn felt_u64_to_hex(v: u64) -> String {
     format!("0x{:x}", v)
 }
 
-fn parse_deposit_id_hex(value: &str) -> Result<F, String> {
+fn parse_pubkey_hash_hex(value: &str) -> Result<F, String> {
     let value = value.strip_prefix("0x").unwrap_or(value);
     let value = value
         .strip_prefix(DEPOSIT_RECIPIENT_PREFIX)
         .unwrap_or(value);
-    let bytes = hex::decode(value).map_err(|e| format!("invalid deposit id hex: {}", e))?;
+    let bytes =
+        hex::decode(value).map_err(|e| format!("invalid pubkey_hash hex: {}", e))?;
     if bytes.len() != 32 {
         return Err(format!(
-            "invalid deposit id: expected 32 bytes, got {}",
+            "invalid pubkey_hash: expected 32 bytes, got {}",
             bytes.len()
         ));
     }
@@ -3611,8 +3508,8 @@ fn parse_deposit_id_hex(value: &str) -> Result<F, String> {
     Ok(out)
 }
 
-fn deposit_id_hex(deposit_id: &F) -> String {
-    hex::encode(deposit_id)
+fn pubkey_hash_hex(pubkey_hash: &F) -> String {
+    hex::encode(pubkey_hash)
 }
 
 /// Call the reprover to generate a ZK proof.
@@ -3700,6 +3597,7 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
         wots_key_indices: std::collections::HashMap::new(),
         pending_spends: vec![],
         pending_deposits: vec![],
+        deposit_nonce: 0,
     };
     save_wallet(path, &w)?;
     println!("Wallet created: {}", path);
@@ -3902,38 +3800,34 @@ pub fn validate_detection_service_wallet(path: &str) -> Result<(), String> {
 /// wallet's pending intents. Slots are keyed by intent and may have multiple
 /// entries per intent if attackers dust-deposit; the wallet picks the slot
 /// whose amount matches the bound debit (see `apply_scan_feed`).
-fn fetch_slot_map_http(
+/// Fetch each tracked deposit pool's current balance from the demo HTTP
+/// ledger. Returns a sparse map (pools with no recorded balance are absent).
+fn fetch_pool_balances_http(
     ledger: &str,
     pending: &[PendingDeposit],
-) -> Result<std::collections::HashMap<F, Vec<DepositSlotView>>, String> {
-    let mut map: std::collections::HashMap<F, Vec<DepositSlotView>> =
-        std::collections::HashMap::new();
+) -> Result<std::collections::HashMap<F, u64>, String> {
+    let mut map: std::collections::HashMap<F, u64> = std::collections::HashMap::new();
     let mut seen: std::collections::HashSet<F> = std::collections::HashSet::new();
     for p in pending {
-        if !seen.insert(p.deposit_id) {
+        if !seen.insert(p.pubkey_hash) {
             continue;
         }
         let url = format!(
-            "{}/deposits/by-intent?intent={}",
+            "{}/deposits/balance?pubkey_hash={}",
             ledger,
-            hex::encode(p.deposit_id)
+            hex::encode(p.pubkey_hash)
         );
         #[derive(serde::Deserialize)]
-        struct SlotRow {
-            id: u64,
-            amount: u64,
+        struct BalanceBody {
+            balance: u64,
         }
-        #[derive(serde::Deserialize)]
-        struct SlotsBody {
-            slots: Vec<SlotRow>,
-        }
-        let body: SlotsBody = get_json(&url)?;
-        let entry = map.entry(p.deposit_id).or_default();
-        for s in body.slots {
-            entry.push(DepositSlotView {
-                id: s.id,
-                amount: s.amount,
-            });
+        // Treat 404 / missing keys as "no pool yet"; surface other errors.
+        match get_json::<BalanceBody>(&url) {
+            Ok(body) => {
+                map.insert(p.pubkey_hash, body.balance);
+            }
+            Err(e) if e.contains("404") => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(map)
@@ -3945,23 +3839,20 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
     let url = format!("{}/notes?cursor={}", ledger, w.scanned);
     let feed: NotesFeedResp = get_json(&url)?;
     let nf_resp: NullifiersResp = get_json(&format!("{}/nullifiers", ledger))?;
-    let slots_by_intent = fetch_slot_map_http(ledger, &w.pending_deposits)?;
-    let summary = apply_scan_feed(&mut w, &feed, nf_resp.nullifiers, &slots_by_intent);
+    let pool_balances = fetch_pool_balances_http(ledger, &w.pending_deposits)?;
+    let summary = apply_scan_feed(&mut w, &feed, nf_resp.nullifiers, &pool_balances);
     save_wallet(path, &w)?;
     println!(
-        "Scanned: {} new notes found, {} spent removed, {} deposits assigned slots, balance={}",
+        "Scanned: {} new notes found, {} spent removed, balance={}",
         summary.found,
         summary.spent,
-        summary.slot_assignments,
         w.available_balance()
     );
-    if summary.orphan_slots > 0 {
-        println!(
-            "WARNING: {} orphan deposit slot(s) detected for settled deposits. \
-             Run `tzel-wallet shield --deposit-id <hex> --slot-id <id> --correlate` \
-             to recover the L1 mutez (note: this leaks intent linkage on-chain).",
-            summary.orphan_slots
-        );
+    if !summary.pool_balances.is_empty() {
+        println!("Deposit pools:");
+        for (pubkey_hash, balance) in &summary.pool_balances {
+            println!("  pool {} = {} mutez", pubkey_hash_hex(pubkey_hash), balance);
+        }
     }
     Ok(())
 }
@@ -3970,27 +3861,15 @@ struct ScanSummary {
     found: usize,
     spent: usize,
     confirmed_pending: usize,
-    settled_deposits: usize,
-    slot_assignments: usize,
-    /// Open kernel slots for an intent we know (settled deposit) that we
-    /// did NOT consume — typically created when an attacker mirror-deposits
-    /// to the same recipient string with the same debit. They hold real L1
-    /// mutez backed by the bridge.
-    orphan_slots: usize,
-}
-
-/// One open kernel-side deposit slot, keyed by intent.
-#[derive(Clone, Copy, Debug)]
-struct DepositSlotView {
-    id: u64,
-    amount: u64,
+    /// Snapshot of each known pool's current kernel-side balance.
+    pool_balances: std::collections::HashMap<F, u64>,
 }
 
 fn apply_scan_feed(
     w: &mut WalletFile,
     feed: &NotesFeedResp,
     nullifiers: impl IntoIterator<Item = F>,
-    slots_by_intent: &std::collections::HashMap<F, Vec<DepositSlotView>>,
+    pool_balances: &std::collections::HashMap<F, u64>,
 ) -> ScanSummary {
     let mut found = 0usize;
     let mut known_notes: std::collections::HashSet<(usize, F)> =
@@ -4018,64 +3897,12 @@ fn apply_scan_feed(
     w.pending_spends
         .retain(|pending| !pending.nullifiers.iter().all(|nf| nf_set.contains(nf)));
 
-    // Populate slot_id on pending deposits whose intent now has an open slot
-    // matching the bound debit. Multiple slots can share an intent (dust
-    // attack); we pick the one whose amount equals our debit.
-    let mut slot_assignments = 0usize;
-    for pending in w.pending_deposits.iter_mut() {
-        if pending.slot_id.is_some() {
-            continue;
-        }
-        if let Some(open) = slots_by_intent.get(&pending.deposit_id) {
-            if let Some(slot) = open.iter().find(|s| s.amount == pending.amount) {
-                pending.slot_id = Some(slot.id);
-                slot_assignments += 1;
-            }
-        }
-    }
-
-    // Mark pending_deposits whose recipient commitment now exists in the
-    // visible tree as settled (shield landed). The deposit stays in the
-    // wallet so we can detect orphan slots for the same intent — open
-    // kernel slots that some other shield (e.g., an attacker's
-    // mirror-debit) didn't consume but that still hold L1 mutez.
-    let live_cms: std::collections::HashSet<F> = w.notes.iter().map(|n| n.cm).collect();
-    let mut settled_deposits = 0usize;
-    for d in w.pending_deposits.iter_mut() {
-        if !d.settled && live_cms.contains(&d.recipient.cm) {
-            d.settled = true;
-            settled_deposits += 1;
-        }
-    }
-
-    // Orphan-slot detection: for each *settled* deposit, count every
-    // remaining open slot for that intent. Once a deposit has settled
-    // (its recipient cm is in the tree), the wallet has been paid via
-    // whichever slot the kernel consumed; any other open slot for the
-    // same intent is effectively an orphan from the privacy-cost
-    // perspective — draining it produces a duplicate cm leaf. We do
-    // NOT exclude `pending.slot_id` here, because that field can be
-    // set to a still-open slot when the user drained a different one
-    // first (apply_scan_feed only assigns slot_id when it is None, so
-    // the recorded slot can rotate to whatever remains open).
-    let mut orphan_slots = 0usize;
-    for d in w.pending_deposits.iter() {
-        if !d.settled {
-            continue;
-        }
-        if let Some(open) = slots_by_intent.get(&d.deposit_id) {
-            orphan_slots += open.len();
-        }
-    }
-
     w.scanned = feed.next_cursor;
     ScanSummary {
         found,
         spent,
         confirmed_pending: before_pending - w.pending_spends.len(),
-        settled_deposits,
-        slot_assignments,
-        orphan_slots,
+        pool_balances: pool_balances.clone(),
     }
 }
 
@@ -4267,6 +4094,7 @@ mod tests {
             wots_key_indices: std::collections::HashMap::new(),
             pending_spends: vec![],
             pending_deposits: vec![],
+            deposit_nonce: 0,
         };
         if addr_counter as usize > cached {
             wallet
@@ -5370,6 +5198,7 @@ mod tests {
             wots_key_indices: std::collections::HashMap::new(),
             pending_spends: vec![],
             pending_deposits: vec![],
+            deposit_nonce: 0,
         };
 
         let (state0, addr0) = wallet.next_address().expect("first fixture address");
@@ -5395,6 +5224,7 @@ mod tests {
             wots_key_indices: std::collections::HashMap::new(),
             pending_spends: vec![],
             pending_deposits: vec![],
+            deposit_nonce: 0,
         };
 
         wallet
@@ -5742,233 +5572,6 @@ mod tests {
         assert_eq!(w.notes[0].v, 25);
         assert_eq!(w.notes[0].cm, new_nm.cm);
     }
-
-    #[test]
-    fn test_apply_scan_feed_retires_pending_deposit_when_recipient_note_lands() {
-        let mut w = test_wallet(1);
-        let rseed = felt_tag(b"wallet-scan-pending-deposit");
-        let nm = note_memo_for_wallet_address(&w, 0, 77, rseed, None);
-        let addr = &w.addresses[0];
-        let producer_addr = addr.clone();
-        let intent = hash(b"unique-intent-stand-in");
-        w.pending_deposits.push(PendingDeposit {
-            deposit_id: intent,
-            auth_domain: hash(b"auth-domain"),
-            v: 77,
-            fee: 0,
-            producer_fee: 1,
-            recipient: ShieldNoteWitness {
-                d_j: addr.d_j,
-                rseed,
-                auth_root: addr.auth_root,
-                auth_pub_seed: addr.auth_pub_seed,
-                nk_tag: addr.nk_tag,
-                cm: nm.cm,
-                enc: nm.enc.clone(),
-            },
-            producer: ShieldNoteWitness {
-                d_j: producer_addr.d_j,
-                rseed: felt_tag(b"producer-rseed"),
-                auth_root: producer_addr.auth_root,
-                auth_pub_seed: producer_addr.auth_pub_seed,
-                nk_tag: producer_addr.nk_tag,
-                cm: hash(b"producer-cm"),
-                enc: nm.enc.clone(),
-            },
-            amount: 78,
-            operation_hash: Some("opHash".into()),
-            slot_id: None,
-            settled: false,
-        });
-
-        let feed = NotesFeedResp {
-            notes: vec![nm],
-            next_cursor: 7,
-        };
-        let summary = apply_scan_feed(&mut w, &feed, vec![], &Default::default());
-        assert_eq!(summary.found, 1);
-        assert_eq!(summary.settled_deposits, 1);
-        // The deposit stays in the wallet (not removed) so we can detect
-        // orphan slots later. It's now flagged settled.
-        assert_eq!(w.pending_deposits.len(), 1);
-        assert!(w.pending_deposits[0].settled);
-        assert_eq!(w.notes.len(), 1);
-    }
-
-    #[test]
-    fn test_apply_scan_feed_keeps_pending_deposit_until_recipient_note_lands() {
-        let mut w = test_wallet(1);
-        let rseed = felt_tag(b"wallet-scan-deposit-not-yet");
-        let intent = hash(b"unique-intent-stand-in-2");
-        let addr = &w.addresses[0];
-        let producer_addr = addr.clone();
-        let nm = note_memo_for_wallet_address(&w, 0, 77, rseed, None);
-        w.pending_deposits.push(PendingDeposit {
-            deposit_id: intent,
-            auth_domain: hash(b"auth-domain"),
-            v: 77,
-            fee: 0,
-            producer_fee: 1,
-            recipient: ShieldNoteWitness {
-                d_j: addr.d_j,
-                rseed,
-                auth_root: addr.auth_root,
-                auth_pub_seed: addr.auth_pub_seed,
-                nk_tag: addr.nk_tag,
-                cm: nm.cm,
-                enc: nm.enc.clone(),
-            },
-            producer: ShieldNoteWitness {
-                d_j: producer_addr.d_j,
-                rseed: felt_tag(b"producer-rseed-2"),
-                auth_root: producer_addr.auth_root,
-                auth_pub_seed: producer_addr.auth_pub_seed,
-                nk_tag: producer_addr.nk_tag,
-                cm: hash(b"producer-cm-2"),
-                enc: nm.enc.clone(),
-            },
-            amount: 78,
-            operation_hash: Some("opHash".into()),
-            slot_id: None,
-            settled: false,
-        });
-
-        // Empty feed: shield has not landed yet.
-        let feed = NotesFeedResp {
-            notes: vec![],
-            next_cursor: 1,
-        };
-        let summary = apply_scan_feed(&mut w, &feed, vec![], &Default::default());
-        assert_eq!(summary.settled_deposits, 0);
-        assert_eq!(w.pending_deposits.len(), 1);
-    }
-
-    #[test]
-    fn test_apply_scan_feed_detects_orphan_slot_after_settlement() {
-        // After the recipient note lands (settled), any remaining open
-        // slot for the same intent is reported as an orphan. The shield
-        // that produced the cm necessarily tombstoned its slot in the
-        // same kernel atomic step (and the by-intent index pruned it),
-        // so anything still in `slots_by_intent` is unconsumed mutez.
-        let mut w = test_wallet(1);
-        let rseed = felt_tag(b"orphan-detect");
-        let nm = note_memo_for_wallet_address(&w, 0, 77, rseed, None);
-        let intent = hash(b"orphan-detect-intent");
-        let addr = &w.addresses[0];
-        w.pending_deposits.push(PendingDeposit {
-            deposit_id: intent,
-            auth_domain: hash(b"auth-domain"),
-            v: 77,
-            fee: 0,
-            producer_fee: 1,
-            recipient: ShieldNoteWitness {
-                d_j: addr.d_j,
-                rseed,
-                auth_root: addr.auth_root,
-                auth_pub_seed: addr.auth_pub_seed,
-                nk_tag: addr.nk_tag,
-                cm: nm.cm,
-                enc: nm.enc.clone(),
-            },
-            producer: ShieldNoteWitness {
-                d_j: addr.d_j,
-                rseed: felt_tag(b"producer-rseed-orphan"),
-                auth_root: addr.auth_root,
-                auth_pub_seed: addr.auth_pub_seed,
-                nk_tag: addr.nk_tag,
-                cm: hash(b"producer-cm-orphan"),
-                enc: nm.enc.clone(),
-            },
-            amount: 78,
-            operation_hash: Some("opHash".into()),
-            slot_id: Some(7), // wallet claimed slot 7 (now consumed)
-            settled: false,
-        });
-
-        // Post-shield kernel state: slot 7 was tombstoned and pruned
-        // from the by-intent index; slot 9 (attacker's mirror-deposit)
-        // is still open and counts as an orphan.
-        let feed = NotesFeedResp {
-            notes: vec![nm],
-            next_cursor: 1,
-        };
-        let mut slots = std::collections::HashMap::new();
-        slots.insert(intent, vec![DepositSlotView { id: 9, amount: 78 }]);
-        let summary = apply_scan_feed(&mut w, &feed, vec![], &slots);
-        assert_eq!(summary.settled_deposits, 1);
-        assert_eq!(summary.orphan_slots, 1);
-        assert!(w.pending_deposits[0].settled);
-    }
-
-    #[test]
-    fn test_apply_scan_feed_counts_orphan_when_slot_id_rotated_to_remaining_open_slot() {
-        // Regression test for the orphan-first drain workflow:
-        //   1. User deposits, two slots S1 and S2 land for the same intent.
-        //   2. User runs `shield --slot-id S2 --correlate` BEFORE sync had a
-        //      chance to record either slot id (pending.slot_id = None).
-        //   3. Sync runs: kernel tombstoned S2 (pruned from index); S1 is
-        //      still open. apply_scan_feed sets pending.slot_id = Some(S1).
-        //      cm landed via S2's shield, so settled flips to true.
-        //   4. Without this test's invariant, orphan-slot detection would
-        //      exclude S1 from the orphan count because the wallet "claimed"
-        //      it via slot_id — but S1 is exactly the duplicate-leaf case
-        //      we want the user warned about. The privacy guard in shield
-        //      relies on this orphan count to surface the issue.
-        let mut w = test_wallet(1);
-        let rseed = felt_tag(b"orphan-rotated");
-        let nm = note_memo_for_wallet_address(&w, 0, 77, rseed, None);
-        let intent = hash(b"orphan-rotated-intent");
-        let addr = &w.addresses[0];
-        w.pending_deposits.push(PendingDeposit {
-            deposit_id: intent,
-            auth_domain: hash(b"auth-domain"),
-            v: 77,
-            fee: 0,
-            producer_fee: 1,
-            recipient: ShieldNoteWitness {
-                d_j: addr.d_j,
-                rseed,
-                auth_root: addr.auth_root,
-                auth_pub_seed: addr.auth_pub_seed,
-                nk_tag: addr.nk_tag,
-                cm: nm.cm,
-                enc: nm.enc.clone(),
-            },
-            producer: ShieldNoteWitness {
-                d_j: addr.d_j,
-                rseed: felt_tag(b"producer-rseed-rotated"),
-                auth_root: addr.auth_root,
-                auth_pub_seed: addr.auth_pub_seed,
-                nk_tag: addr.nk_tag,
-                cm: hash(b"producer-cm-rotated"),
-                enc: nm.enc.clone(),
-            },
-            amount: 78,
-            operation_hash: Some("opHash".into()),
-            slot_id: None, // wallet hadn't recorded a slot id yet
-            settled: false,
-        });
-
-        let feed = NotesFeedResp {
-            notes: vec![nm],
-            next_cursor: 1,
-        };
-        // Slot S1 (id=7) is still open — the user drained S2 first off-band
-        // (kernel pruned S2). apply_scan_feed will assign slot_id = Some(7)
-        // on this run, and the cm appearing in the feed flips settled.
-        let mut slots = std::collections::HashMap::new();
-        slots.insert(intent, vec![DepositSlotView { id: 7, amount: 78 }]);
-        let summary = apply_scan_feed(&mut w, &feed, vec![], &slots);
-
-        assert!(w.pending_deposits[0].settled);
-        assert_eq!(w.pending_deposits[0].slot_id, Some(7));
-        // The remaining open slot must be counted as an orphan even
-        // though pending.slot_id now points at it. Without this, the
-        // shield privacy guard would silently let the second drain
-        // through without --correlate.
-        assert_eq!(summary.orphan_slots, 1);
-    }
-
     #[test]
     fn test_apply_scan_feed_clears_confirmed_pending_spends() {
         let mut w = test_wallet(1);
@@ -6431,34 +6034,22 @@ fn cmd_user_balance(path: &str) -> Result<(), String> {
     if profile_path.exists() {
         let profile = load_network_profile(&profile_path)?;
         let rollup = RollupRpc::new(&profile);
-        // Pending-deposit reporting is slot-based: for each tracked
-        // PendingDeposit, sum the amount IF the kernel has assigned a slot
-        // (slot_id is Some). Unassigned pending deposits are reported
-        // separately as "awaiting slot assignment" — they contribute
-        // nothing yet because the kernel hasn't observed the L1 ticket.
-        let assigned_total: u64 = w
-            .pending_deposits
-            .iter()
-            .filter(|d| d.slot_id.is_some())
-            .map(|d| d.amount)
-            .sum();
-        let unassigned_count = w
-            .pending_deposits
-            .iter()
-            .filter(|d| d.slot_id.is_none())
-            .count();
-        let assigned_count = w.pending_deposits.len() - unassigned_count;
+        // Deposit-pool reporting: query the kernel for each tracked pool's
+        // current balance (None == pool drained or never credited).
+        let balances = rollup.load_pool_balances(&w.pending_deposits)?;
+        let funded_count = balances.len();
+        let total_funded: u64 = balances.values().sum();
         println!(
-            "Pending shield deposits assigned: {} mutez across {} deposit(s)",
-            assigned_total, assigned_count
+            "Deposit pools: {} funded, total balance {} mutez",
+            funded_count, total_funded
         );
-        if unassigned_count > 0 {
+        let unfunded = w.pending_deposits.len() - funded_count;
+        if unfunded > 0 {
             println!(
-                "Pending shield deposits awaiting slot assignment: {}",
-                unassigned_count
+                "Deposit pools awaiting on-chain credit: {}",
+                unfunded
             );
         }
-        let _ = rollup;
     }
     Ok(())
 }
@@ -6471,18 +6062,10 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     let auth_domain = snapshot.auth_domain;
     let tree_size = snapshot.tree.leaves.len();
     let required_tx_fee = snapshot.required_tx_fee;
-    let assigned_total: u64 = wallet
-        .pending_deposits
-        .iter()
-        .filter(|d| d.slot_id.is_some())
-        .map(|d| d.amount)
-        .sum();
-    let unassigned_count = wallet
-        .pending_deposits
-        .iter()
-        .filter(|d| d.slot_id.is_none())
-        .count();
-    let assigned_count = wallet.pending_deposits.len() - unassigned_count;
+    let balances = rollup.load_pool_balances(&wallet.pending_deposits)?;
+    let funded_count = balances.len();
+    let total_funded: u64 = balances.values().sum();
+    let unfunded = wallet.pending_deposits.len() - funded_count;
 
     println!("Wallet file: {}", path);
     println!("Network: {}", profile.network);
@@ -6501,14 +6084,11 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
         wallet.scanned
     );
     println!(
-        "Pending shield deposits assigned: {} mutez across {} deposit(s)",
-        assigned_total, assigned_count
+        "Deposit pools: {} funded, total balance {} mutez",
+        funded_count, total_funded
     );
-    if unassigned_count > 0 {
-        println!(
-            "Pending shield deposits awaiting slot assignment: {}",
-            unassigned_count
-        );
+    if unfunded > 0 {
+        println!("Deposit pools awaiting on-chain credit: {}", unfunded);
     }
 
     if let Some(operator_url) = &profile.operator_url {
@@ -6533,30 +6113,20 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
         )
     })?;
     let nullifiers = rollup.load_nullifiers()?;
-    let slots_by_intent = rollup.load_slot_map(&w.pending_deposits)?;
-    let summary = apply_scan_feed(&mut w, &feed, nullifiers, &slots_by_intent);
+    let pool_balances = rollup.load_pool_balances(&w.pending_deposits)?;
+    let summary = apply_scan_feed(&mut w, &feed, nullifiers, &pool_balances);
     save_wallet(path, &w)?;
-    let pending_assigned_total: u64 = w
-        .pending_deposits
-        .iter()
-        .filter(|d| d.slot_id.is_some())
-        .map(|d| d.amount)
-        .sum();
-    let pending_unassigned_count = w
-        .pending_deposits
-        .iter()
-        .filter(|d| d.slot_id.is_none())
-        .count();
+    let funded_count = summary.pool_balances.len();
+    let total_funded: u64 = summary.pool_balances.values().sum();
+    let pending_unfunded = w.pending_deposits.len() - funded_count;
     println!(
-        "Synced: {} new notes, {} spent removed, {} pending confirmed, {} deposits settled, {} slots assigned, private_available={}, pending_assigned_total={}, pending_awaiting_slot={}",
+        "Synced: {} new notes, {} spent removed, {} pending confirmed, private_available={}, pool_funded_total={}, pools_awaiting_credit={}",
         summary.found,
         summary.spent,
         summary.confirmed_pending,
-        summary.settled_deposits,
-        summary.slot_assignments,
         w.available_balance(),
-        pending_assigned_total,
-        pending_unassigned_count,
+        total_funded,
+        pending_unfunded,
     );
     Ok(())
 }
@@ -6577,152 +6147,116 @@ fn cmd_rollup_sync_watch(
     }
 }
 
-fn select_pending_deposit_by_id<'a>(
+fn select_pending_deposit_by_pubkey_hash<'a>(
     wallet: &'a WalletFile,
-    deposit_id: &F,
+    pubkey_hash: &F,
 ) -> Result<&'a PendingDeposit, String> {
     wallet
         .pending_deposits
         .iter()
-        .find(|p| &p.deposit_id == deposit_id)
-        .ok_or_else(|| format!("deposit {} is not tracked by this wallet", hex::encode(deposit_id)))
+        .find(|p| &p.pubkey_hash == pubkey_hash)
+        .ok_or_else(|| {
+            format!(
+                "deposit pool {} is not tracked by this wallet",
+                hex::encode(pubkey_hash)
+            )
+        })
 }
 
-/// Bridge deposit: builds the recipient + producer-fee notes up front,
-/// computes the shield intent, and L1-deposits exactly the bound amount to
-/// `deposit:<intent>`. Persists the full witness (including the encrypted
-/// notes) so the later shield can re-prove without storing a long-lived
-/// secret.
+/// Derive a deterministic blinding factor for a fresh deposit pool. The
+/// blind is hashed from `(master_sk, address_index, deposit_nonce)` so a
+/// wallet recovered from seed alone can reproduce every pool's
+/// `pubkey_hash` and prove ownership.
+fn derive_deposit_blind(master_sk: &F, address_index: u32, deposit_nonce: u64) -> F {
+    let mut payload = b"tzel-deposit-blind".to_vec();
+    payload.extend_from_slice(master_sk);
+    payload.extend_from_slice(&address_index.to_le_bytes());
+    payload.extend_from_slice(&deposit_nonce.to_le_bytes());
+    hash(&payload)
+}
+
+/// Bridge deposit: derives a fresh deposit-pool `pubkey_hash` from the
+/// wallet's auth tree and a deterministic blind, then L1-tickets `amount`
+/// mutez to `deposit:<hex(pubkey_hash)>`. Multiple deposits to the same
+/// pool aggregate as top-ups. The actual `(v, fee, producer_fee, recipient)`
+/// is chosen at shield time, not deposit time, so this command is
+/// meta-information only — it just funds a balance the wallet later signs
+/// against.
 fn cmd_bridge_deposit(
     path: &str,
     profile: &WalletNetworkProfile,
     amount: u64,
-    fee_arg: Option<u64>,
-    to: Option<String>,
-    memo: Option<String>,
+    _fee_arg: Option<u64>,
+    _to: Option<String>,
+    _memo: Option<String>,
 ) -> Result<(), String> {
-    ensure_positive_dal_fee(profile.dal_fee)?;
     let rollup = RollupRpc::new(profile);
     let head_hash = rollup.head_hash()?;
     let auth_domain = rollup.read_felt_at_block(&head_hash, DURABLE_AUTH_DOMAIN)?;
-    let required_fee = rollup.current_required_tx_fee_at_block(&head_hash)?;
-    let fee = resolve_requested_tx_fee(fee_arg, required_fee)?;
 
     let mut wallet = load_wallet(path)?;
-    let outgoing_seed = wallet.account().outgoing_seed;
+    let master_sk = wallet.master_sk;
 
-    let (recipient_address, generated_self_address) = if let Some(addr_path) = to {
-        (load_address(&addr_path)?, false)
-    } else {
-        let (_state, addr) = wallet.next_address()?;
-        (addr, true)
-    };
-    if generated_self_address {
-        // Persist the new self-address before we commit to a deposit_id that
-        // depends on it.
-        save_wallet(path, &wallet)?;
-    }
+    // Pick the auth tree that owns this new pool. Default to allocating a
+    // fresh address so each deposit has its own pubkey_hash and pools
+    // don't aggregate by accident.
+    let (address_state, recipient_address) = wallet.next_address()?;
+    let address_index = address_state.index;
+    save_wallet(path, &wallet)?;
 
-    let recipient_note = build_output_note_with_outgoing(
-        &recipient_address,
-        amount,
-        memo.as_deref().map(str::as_bytes),
-        &outgoing_seed,
-        OutgoingNoteRole::ShieldOutput,
-    )?;
-    let producer_note = build_output_note_with_outgoing(
-        &profile.dal_fee_address,
-        profile.dal_fee,
-        Some(b"dal"),
-        &outgoing_seed,
-        OutgoingNoteRole::ProducerFee,
-    )?;
-
-    // Refuse to send the L1 ticket unless the rollup is fully configured,
-    // its bridge ticketer matches our profile, AND the producer-fee
-    // receiver our profile claims matches what the operator published in
-    // the rollup's verifier config. The kernel does not enforce
-    // producer-fee routing in-circuit; the wallet-side gate keeps a
-    // misconfigured profile from silently routing fees to an attacker.
+    // Refuse to send the L1 ticket unless the rollup is fully configured
+    // and its bridge ticketer matches our profile. Producer-fee owner_tag
+    // matching no longer applies at deposit time (the producer-fee
+    // recipient is chosen at shield time), but bridge ticketer mismatch
+    // would burn mutez to a slot that never appears in our pool.
     rollup.ensure_verifier_configured(&head_hash)?;
     rollup.ensure_bridge_ticketer_matches(&head_hash, &profile.bridge_ticketer)?;
-    let wallet_dal_owner_tag = owner_tag(
-        &profile.dal_fee_address.auth_root,
-        &profile.dal_fee_address.auth_pub_seed,
-        &profile.dal_fee_address.nk_tag,
-    );
-    rollup.ensure_operator_producer_owner_tag_matches(&head_hash, &wallet_dal_owner_tag)?;
 
-    let intent = shield_intent(
+    // Deterministic blind: address index plus the wallet's running deposit
+    // nonce. Stored locally so we can re-derive pubkey_hash on demand.
+    let deposit_nonce = wallet.deposit_nonce;
+    wallet.deposit_nonce = deposit_nonce
+        .checked_add(1)
+        .ok_or_else(|| "deposit nonce overflow".to_string())?;
+    let blind = derive_deposit_blind(&master_sk, address_index, deposit_nonce);
+    let pubkey_hash = deposit_pubkey_hash(
         &auth_domain,
-        amount,
-        fee,
-        profile.dal_fee,
-        &recipient_note.cm,
-        &producer_note.cm,
-        &recipient_note.mh,
-        &producer_note.mh,
+        &recipient_address.auth_root,
+        &recipient_address.auth_pub_seed,
+        &blind,
     );
-    let debit = amount
-        .checked_add(fee)
-        .and_then(|v| v.checked_add(profile.dal_fee))
-        .ok_or_else(|| "deposit total overflows u64".to_string())?;
 
-    // Persist the witness BEFORE the L1 ticket. If save_wallet fails we
+    // Persist the pool entry BEFORE the L1 ticket. If save_wallet fails we
     // haven't sent any mutez, so nothing is stranded. If
     // `deposit_to_bridge` fails after, the wallet has a phantom pending
-    // deposit (no operation_hash, no kernel slot after sync) which the
-    // user can detect and prune via `tzel-wallet check` — strictly better
-    // than losing the witness for a successful L1 deposit, which would
-    // strand the slot unrecoverably for everyone.
+    // pool (no operation_hash) which the user can detect and prune via
+    // `tzel-wallet check` — strictly better than losing the blind for a
+    // successful L1 deposit (which would strand the pool, since only the
+    // wallet that knows the blind can recompute pubkey_hash and shield).
     let pending = PendingDeposit {
-        deposit_id: intent,
+        pubkey_hash,
+        blind,
+        address_index,
         auth_domain,
-        v: amount,
-        fee,
-        producer_fee: profile.dal_fee,
-        recipient: ShieldNoteWitness {
-            d_j: recipient_address.d_j,
-            rseed: recipient_note.rseed,
-            auth_root: recipient_address.auth_root,
-            auth_pub_seed: recipient_address.auth_pub_seed,
-            nk_tag: recipient_address.nk_tag,
-            cm: recipient_note.cm,
-            enc: recipient_note.enc.clone(),
-        },
-        producer: ShieldNoteWitness {
-            d_j: profile.dal_fee_address.d_j,
-            rseed: producer_note.rseed,
-            auth_root: profile.dal_fee_address.auth_root,
-            auth_pub_seed: profile.dal_fee_address.auth_pub_seed,
-            nk_tag: profile.dal_fee_address.nk_tag,
-            cm: producer_note.cm,
-            enc: producer_note.enc.clone(),
-        },
-        amount: debit,
+        amount,
         operation_hash: None,
-        slot_id: None,
-        settled: false,
     };
     wallet.pending_deposits.push(pending);
     save_wallet(path, &wallet)?;
 
-    let submission = rollup.deposit_to_bridge(&intent, debit)?;
+    let submission = rollup.deposit_to_bridge(&pubkey_hash, amount)?;
     if let Some(p) = wallet
         .pending_deposits
         .iter_mut()
-        .find(|p| p.deposit_id == intent)
+        .find(|p| p.pubkey_hash == pubkey_hash)
     {
         p.operation_hash = submission.operation_hash.clone();
     }
     save_wallet(path, &wallet)?;
     println!(
-        "Submitted L1 bridge deposit of {} mutez (note value {}, fee {}, dal fee {}) for intent {}",
-        debit,
+        "Submitted L1 bridge deposit of {} mutez to pool {}",
         amount,
-        fee,
-        profile.dal_fee,
-        deposit_id_hex(&intent)
+        pubkey_hash_hex(&pubkey_hash)
     );
     if let Some(op_hash) = submission.operation_hash {
         println!("Operation hash: {}", op_hash);
@@ -6731,8 +6265,9 @@ fn cmd_bridge_deposit(
         println!("{}", submission.output);
     }
     println!(
-        "Run `tzel-wallet shield --deposit-id {}` once the deposit settles on the rollup.",
-        deposit_id_hex(&intent)
+        "Run `tzel-wallet shield --pubkey-hash {} --amount <v> --to <addr>` once the \
+         deposit settles on the rollup.",
+        pubkey_hash_hex(&pubkey_hash)
     );
     Ok(())
 }
@@ -6771,140 +6306,6 @@ fn print_rollup_sync_hint(submission: &RollupSubmissionReceipt) {
     } else {
         println!("Run `tzel-wallet sync` after the rollup processes the message.");
     }
-}
-
-/// Demo HTTP shield path. Builds the recipient + producer notes, computes
-/// the intent, funds the local ledger's deposit balance keyed by intent for
-/// exactly the bound amount, then submits an intent-bound shield. The
-/// `sender` label is no longer cryptographically meaningful — under the
-/// intent-bound scheme, the L1 transaction commits to the *full* shield by
-/// virtue of being addressed to `deposit:<intent>`.
-fn cmd_shield(
-    path: &str,
-    ledger: &str,
-    _sender: &str,
-    amount: u64,
-    fee: Option<u64>,
-    dal_fee: u64,
-    dal_fee_address_path: &str,
-    to: Option<String>,
-    memo: Option<String>,
-    pc: &ProveConfig,
-) -> Result<(), String> {
-    let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
-    let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
-    ensure_positive_dal_fee(dal_fee)?;
-    let auth_domain = cfg.auth_domain;
-    let mut w = load_wallet(path)?;
-    let outgoing_seed = w.account().outgoing_seed;
-    let producer_address = load_address(dal_fee_address_path)?;
-
-    let (address, generated_self_address) = if let Some(addr_path) = to {
-        (load_address(&addr_path)?, false)
-    } else {
-        let (_state, addr) = w.next_address()?;
-        (addr, true)
-    };
-
-    let client_note = build_output_note_with_outgoing(
-        &address,
-        amount,
-        memo.as_deref().map(str::as_bytes),
-        &outgoing_seed,
-        OutgoingNoteRole::ShieldOutput,
-    )?;
-    let producer_note = build_output_note_with_outgoing(
-        &producer_address,
-        dal_fee,
-        Some(b"dal"),
-        &outgoing_seed,
-        OutgoingNoteRole::ProducerFee,
-    )?;
-
-    // Intent: H_intent over every prover-rewritable shield field.
-    let intent = shield_intent(
-        &auth_domain,
-        amount,
-        fee,
-        dal_fee,
-        &client_note.cm,
-        &producer_note.cm,
-        &client_note.mh,
-        &producer_note.mh,
-    );
-    let debit = amount
-        .checked_add(fee)
-        .and_then(|v| v.checked_add(dal_fee))
-        .ok_or_else(|| "shield debit overflow".to_string())?;
-
-    let proof = if !pc.skip_proof {
-        let args: Vec<String> = vec![
-            felt_u64_to_hex(19),
-            felt_to_hex(&auth_domain),
-            felt_u64_to_hex(amount),
-            felt_u64_to_hex(fee),
-            felt_u64_to_hex(dal_fee),
-            felt_to_hex(&client_note.cm),
-            felt_to_hex(&producer_note.cm),
-            felt_to_hex(&intent),
-            felt_to_hex(&client_note.mh),
-            felt_to_hex(&producer_note.mh),
-            felt_to_hex(&address.auth_root),
-            felt_to_hex(&address.auth_pub_seed),
-            felt_to_hex(&address.nk_tag),
-            felt_to_hex(&address.d_j),
-            felt_to_hex(&client_note.rseed),
-            felt_to_hex(&producer_address.auth_root),
-            felt_to_hex(&producer_address.auth_pub_seed),
-            felt_to_hex(&producer_address.nk_tag),
-            felt_to_hex(&producer_address.d_j),
-            felt_to_hex(&producer_note.rseed),
-        ];
-        pc.make_proof("run_shield", &args)?
-    } else {
-        Proof::TrustMeBro
-    };
-
-    if generated_self_address {
-        // Persist generated self-addresses before submission so a crash after a
-        // successful shield does not hide the note from future scans.
-        save_wallet(path, &w)?;
-    }
-    // Demo flow: simulate an L1 ticket. The local ledger's /deposit endpoint
-    // allocates a fresh slot for (intent, debit) and returns its id, which is
-    // what shield consumes.
-    let DepositResp { slot_id } = post_json(
-        &format!("{}/deposit", ledger),
-        &DepositReq {
-            recipient: deposit_recipient_string(&intent),
-            amount: debit,
-        },
-    )?;
-    let req = ShieldReq {
-        deposit_id: intent,
-        deposit_slot: slot_id,
-        fee,
-        producer_fee: dal_fee,
-        v: amount,
-        proof,
-        client_cm: client_note.cm,
-        client_enc: client_note.enc,
-        producer_cm: producer_note.cm,
-        producer_enc: producer_note.enc,
-    };
-    let resp: ShieldResp = post_json(&format!("{}/shield", ledger), &req)?;
-    save_wallet(path, &w)?;
-    println!(
-        "Shielded {} (fee {}, dal fee {}) -> cm={} index={} intent={}",
-        amount,
-        fee,
-        dal_fee,
-        short(&resp.cm),
-        resp.index,
-        hex::encode(&intent[..4])
-    );
-    println!("Run 'scan' to pick up the note.");
-    Ok(())
 }
 
 fn cmd_transfer(
@@ -7433,167 +6834,221 @@ fn cmd_unshield(
     Ok(())
 }
 
-/// Drain an intent-bound pending deposit. Loads the witness persisted at
-/// `Deposit` time, reconstructs the prover args (the recipient and producer
-/// notes are NOT re-encrypted — the persisted ciphertext bytes are reused
-/// verbatim, otherwise the freshly-randomized memo_ct_hash would diverge
-/// from the intent), proves, and submits.
+/// Drain a deposit pool into a freshly-minted shielded note owned by the
+/// pool's auth tree. The shield circuit verifies an in-circuit WOTS+
+/// signature under that same auth tree, binding the request payload (v,
+/// fee, producer_fee, output commitments) so a delegated prover holding
+/// the witness still cannot redirect funds. Each shield consumes one
+/// WOTS+ key from the pool-owning address's auth tree (mirroring transfer
+/// / unshield).
 fn cmd_shield_rollup(
     path: &str,
     profile: &WalletNetworkProfile,
-    deposit_id_arg: &str,
-    slot_id_override: Option<u64>,
-    correlate: bool,
+    pubkey_hash_arg: &str,
+    amount_arg: Option<u64>,
     pc: &ProveConfig,
 ) -> Result<(), String> {
-    let deposit_id = parse_deposit_id_hex(deposit_id_arg)?;
-    let wallet = load_wallet(path)?;
-    let pending = select_pending_deposit_by_id(&wallet, &deposit_id)?.clone();
+    let rollup = RollupRpc::new(profile);
+    let pubkey_hash = parse_pubkey_hash_hex(pubkey_hash_arg)?;
 
-    // Sanity-recompute the intent locally; refuse to submit if the persisted
-    // witness no longer matches deposit_id (e.g. wallet file corruption).
-    let recomputed = shield_intent(
-        &pending.auth_domain,
-        pending.v,
-        pending.fee,
-        pending.producer_fee,
-        &pending.recipient.cm,
-        &pending.producer.cm,
-        &memo_ct_hash(&pending.recipient.enc),
-        &memo_ct_hash(&pending.producer.enc),
+    let head_hash = rollup.head_hash()?;
+    let snapshot = rollup.load_state_snapshot_at_block(&head_hash)?;
+    let fee = snapshot.required_tx_fee;
+    ensure_positive_dal_fee(profile.dal_fee)?;
+    let producer_fee = profile.dal_fee;
+
+    // Verify the producer-fee receiver matches what the operator published.
+    let producer_address = profile.dal_fee_address.clone();
+    let wallet_dal_owner_tag = owner_tag(
+        &producer_address.auth_root,
+        &producer_address.auth_pub_seed,
+        &producer_address.nk_tag,
     );
-    if recomputed != deposit_id {
+    rollup.ensure_operator_producer_owner_tag_matches(&head_hash, &wallet_dal_owner_tag)?;
+
+    // Pool must currently hold at least the fixed fees; otherwise even a
+    // zero-value shield can't settle.
+    let pool_balance = rollup
+        .try_read_deposit_balance(&head_hash, &pubkey_hash)?
+        .ok_or_else(|| {
+            format!(
+                "deposit pool {} not found or already drained",
+                pubkey_hash_hex(&pubkey_hash)
+            )
+        })?;
+    let min_fees = fee
+        .checked_add(producer_fee)
+        .ok_or_else(|| "fee + producer_fee overflow".to_string())?;
+    if pool_balance < min_fees {
         return Err(format!(
-            "wallet's pending-deposit witness for {} no longer reproduces the deposit_id; \
-             refusing to submit a stale shield. Recomputed intent {} does not match {}.",
-            deposit_id_hex(&deposit_id),
-            deposit_id_hex(&recomputed),
-            deposit_id_hex(&deposit_id),
+            "deposit pool {} balance {} < required fees {} (tx_fee {} + producer_fee {})",
+            pubkey_hash_hex(&pubkey_hash),
+            pool_balance,
+            min_fees,
+            fee,
+            producer_fee,
+        ));
+    }
+    let amount = match amount_arg {
+        Some(a) => a,
+        None => pool_balance - min_fees,
+    };
+    let total_drain = amount
+        .checked_add(min_fees)
+        .ok_or_else(|| "shield total draw overflow".to_string())?;
+    if pool_balance < total_drain {
+        return Err(format!(
+            "deposit pool {} balance {} < requested draw {} (amount {} + tx_fee {} + producer_fee {})",
+            pubkey_hash_hex(&pubkey_hash),
+            pool_balance,
+            total_drain,
+            amount,
+            fee,
+            producer_fee,
         ));
     }
 
-    let rollup = RollupRpc::new(profile);
-    let deposit_slot = match slot_id_override {
-        Some(slot_id) => {
-            // Verify the slot exists, is open, binds the same intent, and
-            // has the matching debit. The kernel will recheck all of this
-            // on apply; the wallet check refuses early so we don't waste
-            // prover time on a slot the kernel will reject.
-            let head_hash = rollup.head_hash()?;
-            let (slot_intent, slot_amount, slot_status) = rollup
-                .try_read_deposit_slot(&head_hash, slot_id)?
-                .ok_or_else(|| format!("deposit slot {} does not exist on the rollup", slot_id))?;
-            if slot_status != 0 {
-                return Err(format!(
-                    "deposit slot {} is already consumed (tombstoned)",
-                    slot_id
-                ));
-            }
-            if slot_intent != deposit_id {
-                return Err(format!(
-                    "deposit slot {} binds intent {}, not the requested deposit_id {}",
-                    slot_id,
-                    hex::encode(&slot_intent),
-                    deposit_id_hex(&deposit_id),
-                ));
-            }
-            let expected_debit = pending
-                .v
-                .checked_add(pending.fee)
-                .and_then(|v| v.checked_add(pending.producer_fee))
-                .ok_or_else(|| "pending deposit debit overflow".to_string())?;
-            if slot_amount != expected_debit {
-                return Err(format!(
-                    "deposit slot {} amount {} does not match this deposit's debit {}",
-                    slot_id, slot_amount, expected_debit,
-                ));
-            }
-            slot_id
+    let mut w = load_wallet(path)?;
+    let pending_match = select_pending_deposit_by_pubkey_hash(&w, &pubkey_hash)?;
+    let blind = pending_match.blind;
+    let address_index = pending_match.address_index;
+    let stored_auth_domain = pending_match.auth_domain;
+
+    let auth_domain = snapshot.auth_domain;
+    if auth_domain != stored_auth_domain {
+        return Err(format!(
+            "auth_domain mismatch: kernel {} != local PendingDeposit {} for pool {}",
+            short(&auth_domain),
+            short(&stored_auth_domain),
+            pubkey_hash_hex(&pubkey_hash),
+        ));
+    }
+
+    // Recipient note is owned by the pool's auth tree (same auth_root /
+    // auth_pub_seed). Build a `PaymentAddress` from the wallet's address
+    // record so we can re-use the standard note builder.
+    let (ek_v_recipient, _, ek_d_recipient, _) = w.kem_keys(address_index);
+    let recipient_state = w
+        .addresses
+        .get(address_index as usize)
+        .cloned()
+        .ok_or_else(|| format!("missing wallet address record {}", address_index))?;
+    let recipient = recipient_state.payment_address(&ek_v_recipient, &ek_d_recipient);
+
+    let outgoing_seed = w.account().outgoing_seed;
+    let note_recipient = build_output_note_with_outgoing(
+        &recipient,
+        amount,
+        None,
+        &outgoing_seed,
+        OutgoingNoteRole::ShieldOutput,
+    )?;
+    let note_producer = build_output_note_with_outgoing(
+        &producer_address,
+        producer_fee,
+        Some(b"dal"),
+        &outgoing_seed,
+        OutgoingNoteRole::ProducerFee,
+    )?;
+
+    let sighash = shield_sighash(
+        &auth_domain,
+        &pubkey_hash,
+        amount,
+        fee,
+        producer_fee,
+        &note_recipient.cm,
+        &note_producer.cm,
+        &note_recipient.mh,
+        &note_producer.mh,
+    );
+
+    let ask_j = derive_ask(&w.account().ask_base, address_index);
+    let (key_idx, auth_root, auth_pub_seed, auth_path) = w.reserve_next_auth(address_index)?;
+    if auth_root != recipient.auth_root || auth_pub_seed != recipient.auth_pub_seed {
+        return Err(format!(
+            "auth tree mismatch for address {}: reserved ({}, {}) but recipient state has ({}, {})",
+            address_index,
+            short(&auth_root),
+            short(&auth_pub_seed),
+            short(&recipient.auth_root),
+            short(&recipient.auth_pub_seed),
+        ));
+    }
+    let recomputed_pkh = deposit_pubkey_hash(&auth_domain, &auth_root, &auth_pub_seed, &blind);
+    if recomputed_pkh != pubkey_hash {
+        return Err(format!(
+            "pubkey_hash mismatch: recomputed {} != requested {}",
+            pubkey_hash_hex(&recomputed_pkh),
+            pubkey_hash_hex(&pubkey_hash),
+        ));
+    }
+    let (sig, _pk, _digits) = wots_sign(&ask_j, key_idx, &sighash);
+
+    let proof = {
+        let total_fields: usize = 16 + WOTS_CHAINS + AUTH_DEPTH + 5;
+        let mut args: Vec<String> = Vec::with_capacity(1 + total_fields);
+        args.push(felt_u64_to_hex(total_fields as u64));
+
+        // Fixed prefix (16): public outputs first, then recipient witness, then auth_idx.
+        args.push(felt_to_hex(&auth_domain));
+        args.push(felt_to_hex(&pubkey_hash));
+        args.push(felt_u64_to_hex(amount));
+        args.push(felt_u64_to_hex(fee));
+        args.push(felt_u64_to_hex(producer_fee));
+        args.push(felt_to_hex(&note_recipient.cm));
+        args.push(felt_to_hex(&note_producer.cm));
+        args.push(felt_to_hex(&note_recipient.mh));
+        args.push(felt_to_hex(&note_producer.mh));
+        args.push(felt_to_hex(&auth_root));
+        args.push(felt_to_hex(&auth_pub_seed));
+        args.push(felt_to_hex(&recipient.nk_tag));
+        args.push(felt_to_hex(&recipient.d_j));
+        args.push(felt_to_hex(&note_recipient.rseed));
+        args.push(felt_to_hex(&blind));
+        args.push(felt_u64_to_hex(key_idx as u64));
+
+        // WOTS+ signature chains (WOTS_CHAINS).
+        for s in &sig {
+            args.push(felt_to_hex(s));
         }
-        None => pending.slot_id.ok_or_else(|| {
-            format!(
-                "deposit {} has not been observed by the kernel yet. Run `tzel-wallet sync` to \
-                 discover the slot id, then retry shield.",
-                deposit_id_hex(&deposit_id)
-            )
-        })?,
+        // Auth-tree siblings for `auth_idx = key_idx` (AUTH_DEPTH).
+        for sib in &auth_path {
+            args.push(felt_to_hex(sib));
+        }
+
+        // Producer-fee witness (5).
+        args.push(felt_to_hex(&producer_address.auth_root));
+        args.push(felt_to_hex(&producer_address.auth_pub_seed));
+        args.push(felt_to_hex(&producer_address.nk_tag));
+        args.push(felt_to_hex(&producer_address.d_j));
+        args.push(felt_to_hex(&note_producer.rseed));
+
+        persist_wallet_and_make_proof(path, &w, pc, "run_shield", &args)?
     };
 
-    // Privacy guard: a deposit is `settled` once apply_scan_feed has
-    // observed its recipient cm in the commitment tree. Any further
-    // shield against the same deposit drains a remaining open slot and
-    // appends the *same* recipient cm at a new tree position, producing
-    // two on-chain leaves that are publicly correlatable to the same
-    // intent. We key off `settled` rather than slot-id equality because
-    // sync repopulates `pending.slot_id` from whatever open slot remains
-    // when the previous one was set to None — so an orphan-first drain
-    // can rotate the "canonical" slot id, and a slot-id check would let
-    // the second shield through without --correlate. The cm-already-in-
-    // tree fact is the load-bearing invariant.
-    if pending.settled && !correlate {
-        return Err(format!(
-            "deposit {} has already settled (the recipient cm is in the tree from a prior \
-             shield). Shielding it again drains a remaining open slot for the same intent \
-             but produces a duplicate cm leaf at a new tree position; the two leaves are \
-             publicly correlatable. Pass --correlate to acknowledge the privacy cost.",
-            deposit_id_hex(&deposit_id),
-        ));
-    }
-    if pending.settled {
-        eprintln!(
-            "Draining slot {} for already-settled deposit {} — the recipient cm will land \
-             at a new tree position, publicly correlatable to the original.",
-            deposit_slot,
-            deposit_id_hex(&deposit_id),
-        );
-    }
-
-    // Build prover witness for the intent-bound run_shield circuit.
-    let args: Vec<String> = vec![
-        felt_to_hex(&pending.auth_domain),
-        felt_u64_to_hex(pending.v),
-        felt_u64_to_hex(pending.fee),
-        felt_u64_to_hex(pending.producer_fee),
-        felt_to_hex(&pending.recipient.cm),
-        felt_to_hex(&pending.producer.cm),
-        felt_to_hex(&deposit_id),
-        felt_to_hex(&memo_ct_hash(&pending.recipient.enc)),
-        felt_to_hex(&memo_ct_hash(&pending.producer.enc)),
-        felt_to_hex(&pending.recipient.auth_root),
-        felt_to_hex(&pending.recipient.auth_pub_seed),
-        felt_to_hex(&pending.recipient.nk_tag),
-        felt_to_hex(&pending.recipient.d_j),
-        felt_to_hex(&pending.recipient.rseed),
-        felt_to_hex(&pending.producer.auth_root),
-        felt_to_hex(&pending.producer.auth_pub_seed),
-        felt_to_hex(&pending.producer.nk_tag),
-        felt_to_hex(&pending.producer.d_j),
-        felt_to_hex(&pending.producer.rseed),
-    ];
-    let proof = pc.make_proof("run_shield", &args)?;
-
+    save_wallet(path, &w)?;
     let req = ShieldReq {
-        deposit_id,
-        deposit_slot,
-        v: pending.v,
-        fee: pending.fee,
-        producer_fee: pending.producer_fee,
+        pubkey_hash,
+        fee,
+        v: amount,
+        producer_fee,
         proof,
-        client_cm: pending.recipient.cm,
-        client_enc: pending.recipient.enc.clone(),
-        producer_cm: pending.producer.cm,
-        producer_enc: pending.producer.enc.clone(),
+        client_cm: note_recipient.cm,
+        client_enc: note_recipient.enc,
+        producer_cm: note_producer.cm,
+        producer_enc: note_producer.enc,
     };
     let kernel_req = shield_req_to_kernel(&req)?;
     let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
+    save_wallet(path, &w)?;
+
     println!(
-        "Submitted shield draining deposit {} via slot {} into note {} (v={}, fee={}, dal_fee={})",
-        deposit_id_hex(&deposit_id),
-        deposit_slot,
-        short(&pending.recipient.cm),
-        pending.v,
-        pending.fee,
-        pending.producer_fee
+        "Submitted shield of {} from pool {} (fee {} + producer_fee {})",
+        amount,
+        pubkey_hash_hex(&pubkey_hash),
+        fee,
+        producer_fee
     );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
@@ -8341,12 +7796,6 @@ mod network_profile_tests {
         let err = load_required_network_profile(wallet_path_str).unwrap_err();
         assert!(err.contains("operator_url requires operator_bearer_token"));
     }
-
-    // bridge_deposit_persists_secret_before_l1_submission was removed when the
-    // legacy `deposit_secret` field was excised. The intent-bound flow requires
-    // a fully mocked rollup HTTP backend (for auth_domain + required_tx_fee
-    // reads) plus a recipient-address fixture and is best covered by a
-    // dedicated integration harness rather than an inline unit test.
 
     #[cfg(unix)]
     #[test]
@@ -9398,5 +8847,59 @@ mod network_profile_tests {
         assert_eq!(mutez_to_tez_string(1), "0.000001");
         assert_eq!(mutez_to_tez_string(1_500_000), "1.5");
         assert_eq!(mutez_to_tez_string(2_000_000), "2");
+    }
+
+    #[test]
+    fn derive_deposit_blind_distinguishes_master_sk_address_index_and_nonce() {
+        // The blind feeds `pubkey_hash = H(0x04, auth_domain,
+        // auth_root, auth_pub_seed, blind)`. If two distinct deposits
+        // ever derive the same blind, the wallet would aggregate
+        // them silently (and on wallet recovery from seed without
+        // local nonce state, the user might be surprised). Ensure
+        // each of the three inputs is folded into the blind.
+        let master_a = ZERO;
+        let mut master_b = ZERO;
+        master_b[0] = 0x42;
+
+        let blind_a0_n0 = derive_deposit_blind(&master_a, 0, 0);
+        let blind_b0_n0 = derive_deposit_blind(&master_b, 0, 0);
+        let blind_a1_n0 = derive_deposit_blind(&master_a, 1, 0);
+        let blind_a0_n1 = derive_deposit_blind(&master_a, 0, 1);
+
+        assert_ne!(blind_a0_n0, blind_b0_n0, "master_sk");
+        assert_ne!(blind_a0_n0, blind_a1_n0, "address_index");
+        assert_ne!(blind_a0_n0, blind_a0_n1, "deposit_nonce");
+        assert_ne!(blind_a1_n0, blind_a0_n1);
+
+        // Determinism: same inputs → same output (idempotent over
+        // wallet restore for the same nonce).
+        assert_eq!(blind_a0_n0, derive_deposit_blind(&master_a, 0, 0));
+    }
+
+    #[test]
+    fn pubkey_hash_hex_round_trips_through_parse_pubkey_hash_hex() {
+        // The wallet exposes both forms (`<32-byte hex>` and
+        // `deposit:<hex>`); both must round-trip. Reject the obvious
+        // malformed cases for completeness.
+        let mut sample = ZERO;
+        for (i, b) in sample.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let hex = pubkey_hash_hex(&sample);
+        assert_eq!(parse_pubkey_hash_hex(&hex).unwrap(), sample);
+        assert_eq!(
+            parse_pubkey_hash_hex(&format!("0x{}", hex)).unwrap(),
+            sample
+        );
+        assert_eq!(
+            parse_pubkey_hash_hex(&format!("deposit:{}", hex)).unwrap(),
+            sample
+        );
+
+        assert!(parse_pubkey_hash_hex("nope").is_err());
+        assert!(parse_pubkey_hash_hex("0x00").is_err());
+        // 64 hex chars but with an embedded non-hex glyph.
+        let bad = format!("{}g", &hex[..63]);
+        assert!(parse_pubkey_hash_hex(&bad).is_err());
     }
 }

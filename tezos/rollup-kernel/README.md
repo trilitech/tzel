@@ -16,11 +16,15 @@ The kernel consumes Tezos Data Encoding inbox messages and records:
 - last inbox payload
 
 Supported message kinds:
-- L1 internal `Transfer` carrying a bridge ticket (allocates a fresh
-  deposit slot keyed by a kernel-controlled `slot_id`, with content
-  `(intent, amount)` parsed from the ticket's recipient string)
-- `shield` (drain a specified deposit slot and append the recipient
-  note plus a DAL-producer fee note; burns the protocol fee)
+- L1 internal `Transfer` carrying a bridge ticket (credits the
+  per-pool aggregated balance keyed by `pubkey_hash =
+  H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)` parsed from
+  the ticket's `deposit:<hex(pubkey_hash)>` recipient string;
+  multiple tickets to the same pool aggregate)
+- `shield` (debit the named pool by `v + fee + producer_fee` and
+  append the recipient note plus a DAL-producer fee note; the proof
+  verifies an in-circuit WOTS+ signature under the recipient's auth
+  tree, binding the entire shield request)
 - `transfer` (shielded transfer inside the rollup, creating recipient,
   change, and DAL-producer fee notes while burning the protocol fee)
 - `unshield` (consume one or more shielded notes, append optional change
@@ -37,10 +41,11 @@ The kernel does not keep the full ledger as one serialized blob. It stores:
 - the commitment-tree append frontier and current root
 - valid-root membership markers
 - nullifier membership markers
-- per-deposit slots (each L1 ticket allocates a fresh `slot_id` keyed
-  to `(intent, amount)`; consumed slots are tombstoned, not deleted)
-- a per-intent index over open slots, so wallets can enumerate every
-  slot funded for a given intent without scanning all slots
+- per-pool aggregated deposit balances keyed by `pubkey_hash`. A pool
+  whose balance reaches zero is removed (best-effort delete via empty
+  value).
+- a single-byte "ever received" marker (set on the first deposit;
+  never cleared) used by `is_pristine` for the verifier-config freeze
 - queued withdrawals under append-only per-index paths
 - the configured bridge ticketer (the L1 contract whose ticket transfers
   the kernel will accept)
@@ -70,11 +75,10 @@ Durable storage paths:
 - `/tzel/v1/state/notes/*`
 - `/tzel/v1/state/roots/*`
 - `/tzel/v1/state/nullifiers/*`
-- `/tzel/v1/state/deposits/count` — monotonic slot-id counter
-- `/tzel/v1/state/deposits/by-id/<slot_id>` — `(status, intent, amount)`
-  for an open slot, or just `status=consumed` after tombstoning
-- `/tzel/v1/state/deposits/by-intent/<intent>/{count,index/<i>}` —
-  enumeration of open slots for an intent (swap-with-last on consume)
+- `/tzel/v1/state/deposits/balance/<hex(pubkey_hash)>` — u64 balance
+  for the named pool. Empty value or absent key means "no funds".
+- `/tzel/v1/state/deposits/ever_received` — single-byte presence
+  marker, used by is_pristine for the freeze rule
 - `/tzel/v1/state/withdrawals/*`
 - `/tzel/v1/state/bridge/ticketer`
 - `/tzel/v1/state/verifier_config.bin`

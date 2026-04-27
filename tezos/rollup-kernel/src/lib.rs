@@ -42,7 +42,7 @@ use tzel_core::{
         KERNEL_VERIFIER_CONFIG_KEY_INDEX,
     },
     prepare_shield, prepare_unshield, required_tx_fee_for_private_tx_count,
-    verify_wots_signature_against_leaf, DepositSlot, EncryptedNote, Ledger, LedgerState,
+    verify_wots_signature_against_leaf, EncryptedNote, Ledger, LedgerState,
     ShieldResp, UnshieldResp, WithdrawalRecord, DEPTH, F, ZERO,
 };
 #[cfg(any(test, debug_assertions))]
@@ -100,13 +100,25 @@ const PATH_NULLIFIER_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/nullifiers/index/";
 const PATH_VALID_ROOT_PREFIX: &[u8] = b"/tzel/v1/state/roots/by-key/";
 const PATH_VALID_ROOT_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/roots/index/";
 const PATH_WITHDRAWAL_PREFIX: &[u8] = b"/tzel/v1/state/withdrawals/index/";
-/// Bridge-deposit slots. Each successful `apply_deposit` allocates one,
-/// indexed by a monotonic counter. A slot stores `(intent, amount)` and
-/// disappears the moment shield consumes it. Dust deposits to the same intent
-/// simply allocate their own slots.
-const PATH_DEPOSIT_SLOT_COUNT: &[u8] = b"/tzel/v1/state/deposits/count";
-const PATH_DEPOSIT_SLOT_PREFIX: &[u8] = b"/tzel/v1/state/deposits/by-id/";
-const PATH_DEPOSIT_BY_INTENT_PREFIX: &[u8] = b"/tzel/v1/state/deposits/by-intent/";
+/// Per-pool deposit balance keyed by `deposit_pubkey_hash`. Each L1 ticket
+/// addressed to `deposit:<hex(pubkey_hash)>` credits the pool (creating it
+/// if absent); each shield debits it. Multiple deposits to the same
+/// pubkey_hash aggregate. A pool whose balance reaches zero is removed from
+/// storage to bound durable footprint.
+const PATH_DEPOSIT_BALANCE_PREFIX: &[u8] = b"/tzel/v1/state/deposits/balance/";
+/// Single-byte marker set by `apply_deposit` on the very first L1 ticket.
+/// Never cleared; used by `is_pristine` to refuse verifier reconfigurations
+/// once any deposit has been observed (the freeze rule).
+const PATH_DEPOSIT_EVER_RECEIVED: &[u8] = b"/tzel/v1/state/deposits/ever_received";
+/// Replay-protection set for shield commitments. Each successful shield
+/// records `client_cm` here; a subsequent shield carrying the same
+/// `client_cm` is rejected before any state mutation. Without this,
+/// anyone could top up a drained pool and replay a victim's shield
+/// proof — the kernel would mint a duplicate of the recipient's note
+/// at a fresh tree position (independently spendable, since nullifiers
+/// are per-position) at the dust-attacker's expense. Value at the path
+/// is a single-byte marker.
+const PATH_APPLIED_SHIELD_PREFIX: &[u8] = b"/tzel/v1/state/shields/applied_cm/";
 const MAX_STORE_STRING_BYTES: usize = 256;
 const MAX_STORE_BINARY_BYTES: usize = 1024;
 const MAX_STORED_INPUT_PAYLOAD_BYTES: usize = 2048;
@@ -203,9 +215,6 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
         if self.host.read_store(PATH_WITHDRAWAL_COUNT, 8).is_none() {
             self.write_u64(PATH_WITHDRAWAL_COUNT, 0);
         }
-        if self.host.read_store(PATH_DEPOSIT_SLOT_COUNT, 8).is_none() {
-            self.write_u64(PATH_DEPOSIT_SLOT_COUNT, 0);
-        }
         if self.host.read_store(PATH_VALID_ROOT_COUNT, 8).is_none() {
             let root = self
                 .read_felt(PATH_TREE_ROOT)?
@@ -220,7 +229,10 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
     fn is_pristine(&self) -> Result<bool, String> {
         Ok(self.read_u64(PATH_TREE_SIZE)?.unwrap_or(0) == 0
             && self.read_u64(PATH_NULLIFIER_COUNT)?.unwrap_or(0) == 0
-            && self.read_u64(PATH_DEPOSIT_SLOT_COUNT)?.unwrap_or(0) == 0)
+            && self
+                .host
+                .read_store(PATH_DEPOSIT_EVER_RECEIVED, 1)
+                .is_none())
     }
 
     fn read_u64(&self, path: &[u8]) -> Result<Option<u64>, String> {
@@ -418,131 +430,112 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
             .write_store(PATH_PRIVATE_TX_COUNT_IN_LEVEL, &next.to_le_bytes());
     }
 
-    fn record_deposit_slot(&mut self, intent: F, amount: u64) -> Result<u64, String> {
-        let id = self.read_u64(PATH_DEPOSIT_SLOT_COUNT)?.unwrap_or(0);
-        let next_id = id
-            .checked_add(1)
-            .ok_or_else(|| "deposit slot counter overflow".to_string())?;
-        self.host
-            .write_store(&deposit_slot_path(id), &encode_deposit_slot_open(&intent, amount));
-        // Append to the by-intent index. Each intent has its own (count,
-        // index/i -> slot_id) pair so wallets can enumerate every slot funded
-        // for a given intent and pick the one whose amount matches.
-        let by_intent_count_path = deposits_by_intent_count_path(&intent);
-        let position = match self.host.read_store(&by_intent_count_path, 8) {
-            None => 0u64,
+    fn deposit_balance(&self, pubkey_hash: &F) -> Result<Option<u64>, String> {
+        let path = deposit_balance_path(pubkey_hash);
+        match self.host.read_store(&path, 8) {
+            None => Ok(None),
+            // Empty bytes = best-effort-deleted (pool was drained).
+            Some(bytes) if bytes.is_empty() => Ok(None),
             Some(bytes) => {
                 if bytes.len() != 8 {
                     return Err(format!(
                         "bad u64 at {}",
-                        String::from_utf8_lossy(&by_intent_count_path)
+                        String::from_utf8_lossy(&path)
                     ));
                 }
-                u64::from_le_bytes(bytes.try_into().unwrap())
+                Ok(Some(u64::from_le_bytes(bytes.try_into().unwrap())))
             }
-        };
-        self.host.write_store(
-            &deposits_by_intent_index_path(&intent, position),
-            &id.to_le_bytes(),
-        );
-        let next_position = position
-            .checked_add(1)
-            .ok_or_else(|| "by-intent deposit counter overflow".to_string())?;
-        self.host
-            .write_store(&by_intent_count_path, &next_position.to_le_bytes());
-        self.write_u64(PATH_DEPOSIT_SLOT_COUNT, next_id);
-        Ok(id)
+        }
     }
 
-    fn consume_deposit_slot(
-        &mut self,
-        slot_id: u64,
-        intent: &F,
-        debit: u64,
-    ) -> Result<(), String> {
-        let path = deposit_slot_path(slot_id);
-        let bytes = self
-            .host
-            .read_store(&path, MAX_STORE_BINARY_BYTES)
-            .ok_or_else(|| format!("deposit slot {} does not exist", slot_id))?;
-        let slot = decode_deposit_slot_open(&bytes)?
-            .ok_or_else(|| format!("deposit slot {} already consumed", slot_id))?;
-        if slot.intent != *intent {
-            return Err(format!(
-                "deposit slot {} intent mismatch: slot binds a different deposit",
-                slot_id
-            ));
-        }
-        if slot.amount != debit {
-            return Err(format!(
-                "deposit slot {} amount mismatch: have {}, expected exactly {}",
-                slot_id, slot.amount, debit
-            ));
-        }
-        // Tombstone the slot. Intentionally a single-byte rewrite so the
-        // by-id path remains readable (returns Some([0x01])).
-        self.host.write_store(&path, &encode_deposit_slot_consumed());
-
-        // Prune the by-intent index entry: swap-with-last and decrement
-        // count. Without pruning, the index grows monotonically per intent
-        // and a dust-spamming attacker can inflate the wallet's sync cost
-        // by a factor of N for the targeted intent.
-        let by_intent_count_path = deposits_by_intent_count_path(intent);
-        let count = match self.host.read_store(&by_intent_count_path, 8) {
+    fn credit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
+        let path = deposit_balance_path(pubkey_hash);
+        // Empty bytes indicate a previously fully-drained pool (the WASM
+        // PVM has no native delete; `apply_durable_shield_commit` writes
+        // an empty value as the closest analogue). Treat that the same
+        // as "absent" so the pool can be redeposited; only complain if
+        // the entry has a non-empty, non-u64 length, which would be
+        // genuine durable-store corruption.
+        let current = match self.host.read_store(&path, 8) {
             None => 0u64,
+            Some(bytes) if bytes.is_empty() => 0u64,
             Some(bytes) => {
                 if bytes.len() != 8 {
                     return Err(format!(
                         "bad u64 at {}",
-                        String::from_utf8_lossy(&by_intent_count_path)
+                        String::from_utf8_lossy(&path)
                     ));
                 }
                 u64::from_le_bytes(bytes.try_into().unwrap())
             }
         };
-        // Linear scan to find this slot_id's position. Bounded by per-intent
-        // slot count; an attacker who inflates the index pays for each scan.
-        let mut found_position: Option<u64> = None;
-        for position in 0..count {
-            let entry_path = deposits_by_intent_index_path(intent, position);
-            let entry = self
-                .host
-                .read_store(&entry_path, 8)
-                .ok_or_else(|| format!("missing by-intent entry at position {}", position))?;
-            if entry.len() != 8 {
-                return Err(format!(
-                    "bad u64 at {}",
-                    String::from_utf8_lossy(&entry_path)
-                ));
-            }
-            let id_at_pos = u64::from_le_bytes(entry.try_into().unwrap());
-            if id_at_pos == slot_id {
-                found_position = Some(position);
-                break;
-            }
+        let next = current
+            .checked_add(amount)
+            .ok_or_else(|| "deposit balance overflow".to_string())?;
+        self.host.write_store(&path, &next.to_le_bytes());
+        // First-deposit-ever marker (used by is_pristine for the freeze rule).
+        if self
+            .host
+            .read_store(PATH_DEPOSIT_EVER_RECEIVED, 1)
+            .is_none()
+        {
+            self.host.write_store(PATH_DEPOSIT_EVER_RECEIVED, &[1]);
         }
-        let position = found_position.ok_or_else(|| {
+        Ok(())
+    }
+
+    fn debit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
+        let path = deposit_balance_path(pubkey_hash);
+        let raw = self.host.read_store(&path, 8).ok_or_else(|| {
             format!(
-                "deposit slot {} not present in by-intent index — index inconsistency",
-                slot_id
+                "deposit pool {} does not exist",
+                hex::encode(pubkey_hash)
             )
         })?;
-        let last_position = count.saturating_sub(1);
-        if position != last_position {
-            // Move the last entry into the consumed slot's position.
-            let last_path = deposits_by_intent_index_path(intent, last_position);
-            let last_bytes = self
-                .host
-                .read_store(&last_path, 8)
-                .ok_or_else(|| "missing last by-intent entry".to_string())?;
-            self.host
-                .write_store(&deposits_by_intent_index_path(intent, position), &last_bytes);
+        if raw.is_empty() {
+            // Pool was previously drained (best-effort delete via empty
+            // write). Treat as if the entry were absent.
+            return Err(format!(
+                "deposit pool {} does not exist",
+                hex::encode(pubkey_hash)
+            ));
         }
-        // Decrement count. The entry at the old `last_position` is no longer
-        // enumerated; its bytes remain readable at that path but are
-        // unreachable through the count-bounded iteration.
-        self.host
-            .write_store(&by_intent_count_path, &last_position.to_le_bytes());
+        if raw.len() != 8 {
+            return Err(format!("bad u64 at {}", String::from_utf8_lossy(&path)));
+        }
+        let current = u64::from_le_bytes(raw.try_into().unwrap());
+        if current < amount {
+            return Err(format!(
+                "deposit pool {} balance {} too small to debit {}",
+                hex::encode(pubkey_hash),
+                current,
+                amount
+            ));
+        }
+        let next = current - amount;
+        if next == 0 {
+            // Best-effort delete: WASM PVM does not expose a delete; writing
+            // an empty value is the closest thing. Wallets reading this key
+            // see an empty (non-u64-shaped) read, which they treat as None.
+            // Production durable-store sweeps periodically reclaim such keys.
+            self.host.write_store(&path, &[]);
+        } else {
+            self.host.write_store(&path, &next.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    fn has_applied_shield(&self, client_cm: &F) -> Result<bool, String> {
+        Ok(self.has_marker(&applied_shield_path(client_cm)))
+    }
+
+    fn mark_applied_shield(&mut self, client_cm: F) -> Result<(), String> {
+        // Note: the kernel-side outbox-emitting shield path
+        // (`apply_durable_shield_commit`) writes this marker directly so
+        // the apply step stays infallible. This trait method is wired
+        // for symmetry / tests that exercise the generic
+        // `commit_prepared_shield`.
+        self.write_marker(&applied_shield_path(&client_cm));
         Ok(())
     }
 }
@@ -607,71 +600,23 @@ fn nullifier_path(nf: &F) -> Vec<u8> {
     path
 }
 
-fn deposit_slot_path(id: u64) -> Vec<u8> {
-    indexed_path(PATH_DEPOSIT_SLOT_PREFIX, id)
-}
-
-fn deposits_by_intent_count_path(intent: &F) -> Vec<u8> {
-    let mut path = Vec::with_capacity(PATH_DEPOSIT_BY_INTENT_PREFIX.len() + 64 + 6);
-    path.extend_from_slice(PATH_DEPOSIT_BY_INTENT_PREFIX);
-    path.extend_from_slice(hex::encode(intent).as_bytes());
-    path.extend_from_slice(b"/count");
+/// Path for the per-pool deposit balance keyed by `pubkey_hash`. Encoded as
+/// the prefix followed by the lowercase hex of the pubkey_hash; the value at
+/// this path is a u64 little-endian. An empty value (zero-length read) is
+/// treated as "pool fully drained, key unreachable" — consumers should
+/// behave as if the key were absent.
+pub fn deposit_balance_path(pubkey_hash: &F) -> Vec<u8> {
+    let mut path = Vec::with_capacity(PATH_DEPOSIT_BALANCE_PREFIX.len() + 64);
+    path.extend_from_slice(PATH_DEPOSIT_BALANCE_PREFIX);
+    path.extend_from_slice(hex::encode(pubkey_hash).as_bytes());
     path
 }
 
-fn deposits_by_intent_index_path(intent: &F, position: u64) -> Vec<u8> {
-    let mut path = Vec::with_capacity(PATH_DEPOSIT_BY_INTENT_PREFIX.len() + 64 + 32);
-    path.extend_from_slice(PATH_DEPOSIT_BY_INTENT_PREFIX);
-    path.extend_from_slice(hex::encode(intent).as_bytes());
-    path.extend_from_slice(b"/index/");
-    path.extend_from_slice(format!("{:016x}", position).as_bytes());
+fn applied_shield_path(client_cm: &F) -> Vec<u8> {
+    let mut path = Vec::with_capacity(PATH_APPLIED_SHIELD_PREFIX.len() + 64);
+    path.extend_from_slice(PATH_APPLIED_SHIELD_PREFIX);
+    path.extend_from_slice(hex::encode(client_cm).as_bytes());
     path
-}
-
-/// Deposit slot encoding. The first byte is a status tag:
-///   0x00 — OPEN: followed by 32 intent bytes and 8 amount LE bytes (41 total).
-///   0x01 — CONSUMED: a single-byte tombstone indicating shield drained the
-///          slot. The tombstone is what makes consumption-once enforceable
-///          without a `store_delete` host call.
-const DEPOSIT_SLOT_STATUS_OPEN: u8 = 0x00;
-const DEPOSIT_SLOT_STATUS_CONSUMED: u8 = 0x01;
-
-fn encode_deposit_slot_open(intent: &F, amount: u64) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(1 + 32 + 8);
-    bytes.push(DEPOSIT_SLOT_STATUS_OPEN);
-    bytes.extend_from_slice(intent);
-    bytes.extend_from_slice(&amount.to_le_bytes());
-    bytes
-}
-
-fn encode_deposit_slot_consumed() -> Vec<u8> {
-    vec![DEPOSIT_SLOT_STATUS_CONSUMED]
-}
-
-/// Decode an OPEN slot. Returns `None` for tombstones (CONSUMED) and `Err` for
-/// malformed bytes — this distinction matters in `read_ledger` which silently
-/// skips consumed slots but errors on corruption.
-fn decode_deposit_slot_open(bytes: &[u8]) -> Result<Option<DepositSlot>, String> {
-    let Some((status, body)) = bytes.split_first() else {
-        return Err("deposit slot is empty".into());
-    };
-    match *status {
-        DEPOSIT_SLOT_STATUS_OPEN => {
-            if body.len() != 32 + 8 {
-                return Err(format!(
-                    "deposit slot body length {} != {}",
-                    body.len(),
-                    32 + 8
-                ));
-            }
-            let mut intent = ZERO;
-            intent.copy_from_slice(&body[..32]);
-            let amount = u64::from_le_bytes(body[32..].try_into().unwrap());
-            Ok(Some(DepositSlot { intent, amount }))
-        }
-        DEPOSIT_SLOT_STATUS_CONSUMED => Ok(None),
-        other => Err(format!("unknown deposit slot status byte: 0x{:02x}", other)),
-    }
 }
 
 
@@ -907,7 +852,6 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     let nullifier_count = read_u64(host, PATH_NULLIFIER_COUNT).unwrap_or(0);
     let valid_root_count = read_u64(host, PATH_VALID_ROOT_COUNT).unwrap_or(0);
     let withdrawal_count = read_u64(host, PATH_WITHDRAWAL_COUNT).unwrap_or(0);
-    let deposit_slot_count = read_u64(host, PATH_DEPOSIT_SLOT_COUNT).unwrap_or(0);
 
     let mut ledger = Ledger::with_auth_domain(auth_domain);
     ledger.tree.leaves.clear();
@@ -915,9 +859,11 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     ledger.valid_roots.clear();
     ledger.memos.clear();
     ledger.withdrawals.clear();
-    ledger.deposit_slots.clear();
-    ledger.deposits_by_intent.clear();
-    ledger.next_deposit_slot_id = deposit_slot_count;
+    ledger.deposit_balances.clear();
+    // Deposit balances are NOT enumerated here: the durable layout has no
+    // balance index (intentionally — bounded storage), so callers that want
+    // to see a specific pool must probe `deposit_balance_path(pubkey_hash)`
+    // via `host.read_store(...)` directly.
 
     for i in 0..tree_size {
         let note_bytes =
@@ -959,23 +905,6 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
             .read_store(&path, MAX_STORE_BINARY_BYTES)
             .ok_or_else(|| format!("missing persisted withdrawal {}", i))?;
         ledger.withdrawals.push(decode_withdrawal_record(&bytes)?);
-    }
-
-    for id in 0..deposit_slot_count {
-        let path = deposit_slot_path(id);
-        let Some(bytes) = host.read_store(&path, MAX_STORE_BINARY_BYTES) else {
-            return Err(format!("missing persisted deposit slot {}", id));
-        };
-        let Some(slot) = decode_deposit_slot_open(&bytes)? else {
-            // Consumed (tombstone). Skip — slot is no longer drainable.
-            continue;
-        };
-        ledger
-            .deposits_by_intent
-            .entry(slot.intent)
-            .or_default()
-            .push(id);
-        ledger.deposit_slots.insert(id, slot);
     }
 
     Ok(ledger)
@@ -1406,103 +1335,76 @@ struct PreparedDurableShieldCommit {
     branch_values: Vec<(usize, F)>,
     new_tree_root: F,
     new_tree_size: u64,
-    /// Slot tombstone path. The slot's by-id record is overwritten with the
-    /// consumed-status byte. The current intent + amount were verified equal
-    /// to the request's deposit_id and debit during prepare.
-    slot_path: Vec<u8>,
-    /// Pending swap-with-last for the by-intent index. `None` if the
-    /// consumed slot was already at the last position (no swap needed).
-    by_intent_swap: Option<(Vec<u8>, Vec<u8>)>, // (target_path, source_bytes)
-    by_intent_count_path: Vec<u8>,
-    by_intent_count_after: u64,
+    /// Path of the deposit-pool balance entry for `pubkey_hash`.
+    balance_path: Vec<u8>,
+    /// New balance value to write. If zero, the apply step writes empty
+    /// bytes (best-effort delete) so the entry doesn't accumulate.
+    new_balance: u64,
     /// Optional new valid-root marker (only if the resulting root is fresh).
     root_marker: Option<(u64, F)>,
+    /// Path of the replay-protection marker for this shield's
+    /// `client_cm`. The apply step records a single-byte value here so a
+    /// replay submitting the same proof is rejected by the prepare step.
+    applied_shield_path: Vec<u8>,
     response: ShieldResp,
 }
 
-/// Validate the slot record (must exist, be open, match intent + debit) and
-/// precompute every durable write the shield will perform. Read-only on the
-/// store. The returned struct is then consumed by the infallible apply.
+/// Validate the deposit-pool balance (must exist and be at least `debit`)
+/// and precompute every durable write the shield will perform. Read-only on
+/// the store. The returned struct is then consumed by the infallible apply.
 fn prepare_durable_shield_commit<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
     prepared: &tzel_core::PreparedShield,
 ) -> Result<PreparedDurableShieldCommit, String> {
-    // 1. Validate the slot record without mutating.
-    let slot_path = deposit_slot_path(prepared.deposit_slot());
-    let slot_bytes = ledger
-        .host
-        .read_store(&slot_path, MAX_STORE_BINARY_BYTES)
-        .ok_or_else(|| format!("deposit slot {} does not exist", prepared.deposit_slot()))?;
-    let slot = decode_deposit_slot_open(&slot_bytes)?
-        .ok_or_else(|| format!("deposit slot {} already consumed", prepared.deposit_slot()))?;
-    if slot.intent != *prepared.deposit_id() {
+    // 1. Validate the pool balance without mutating.
+    let balance_path = deposit_balance_path(prepared.pubkey_hash());
+    let balance_bytes = ledger.host.read_store(&balance_path, 8).ok_or_else(|| {
+        format!(
+            "no deposit pool for pubkey_hash {}; submit an L1 bridge deposit first",
+            hex::encode(prepared.pubkey_hash())
+        )
+    })?;
+    if balance_bytes.is_empty() {
+        // Best-effort-deleted pool — treat as missing.
         return Err(format!(
-            "deposit slot {} intent mismatch: slot binds a different deposit",
-            prepared.deposit_slot()
+            "no deposit pool for pubkey_hash {}; submit an L1 bridge deposit first",
+            hex::encode(prepared.pubkey_hash())
         ));
     }
-    if slot.amount != prepared.debit() {
+    if balance_bytes.len() != 8 {
         return Err(format!(
-            "deposit slot {} amount mismatch: have {}, expected exactly {}",
-            prepared.deposit_slot(),
-            slot.amount,
+            "bad u64 at {}",
+            String::from_utf8_lossy(&balance_path)
+        ));
+    }
+    let balance = u64::from_le_bytes(balance_bytes.try_into().unwrap());
+    if balance < prepared.debit() {
+        return Err(format!(
+            "deposit pool {} balance {} too small for v + fee + producer_fee = {}",
+            hex::encode(prepared.pubkey_hash()),
+            balance,
             prepared.debit()
         ));
     }
+    let new_balance = balance - prepared.debit();
 
-    // 2. Plan the by-intent index swap-with-last.
-    let by_intent_count_path = deposits_by_intent_count_path(prepared.deposit_id());
-    let by_intent_count = match ledger.host.read_store(&by_intent_count_path, 8) {
-        None => 0u64,
-        Some(bytes) => {
-            if bytes.len() != 8 {
-                return Err(format!(
-                    "bad u64 at {}",
-                    String::from_utf8_lossy(&by_intent_count_path)
-                ));
-            }
-            u64::from_le_bytes(bytes.try_into().unwrap())
-        }
-    };
-    let mut found_position: Option<u64> = None;
-    for position in 0..by_intent_count {
-        let entry_path = deposits_by_intent_index_path(prepared.deposit_id(), position);
-        let entry = ledger
-            .host
-            .read_store(&entry_path, 8)
-            .ok_or_else(|| format!("missing by-intent entry at position {}", position))?;
-        if entry.len() != 8 {
-            return Err(format!(
-                "bad u64 at {}",
-                String::from_utf8_lossy(&entry_path)
-            ));
-        }
-        let id_at_pos = u64::from_le_bytes(entry.try_into().unwrap());
-        if id_at_pos == prepared.deposit_slot() {
-            found_position = Some(position);
-            break;
-        }
+    // 2. Reject shield replays. The kernel records each successfully
+    // applied shield's `client_cm`; if the same `client_cm` arrives
+    // again, the request is the replay of an earlier proof. Without
+    // this, an attacker could top up a drained pool (or mirror the
+    // original deposit into any aggregating top-up) and resubmit the
+    // victim's old proof, minting a duplicate of their note at a
+    // fresh tree position — independently spendable since nullifiers
+    // are per-position, doubling the recipient's shielded balance at
+    // the dust-attacker's expense.
+    let (client_cm_marker_check, _) = prepared.client_note();
+    let applied_shield_path = applied_shield_path(client_cm_marker_check);
+    if ledger.has_marker(&applied_shield_path) {
+        return Err(format!(
+            "shield replay: cm {} already applied",
+            hex::encode(client_cm_marker_check)
+        ));
     }
-    let position = found_position.ok_or_else(|| {
-        format!(
-            "deposit slot {} not present in by-intent index — index inconsistency",
-            prepared.deposit_slot()
-        )
-    })?;
-    let last_position = by_intent_count.saturating_sub(1);
-    let by_intent_swap = if position != last_position {
-        let last_path = deposits_by_intent_index_path(prepared.deposit_id(), last_position);
-        let last_bytes = ledger
-            .host
-            .read_store(&last_path, 8)
-            .ok_or_else(|| "missing last by-intent entry".to_string())?;
-        Some((
-            deposits_by_intent_index_path(prepared.deposit_id(), position),
-            last_bytes,
-        ))
-    } else {
-        None
-    };
 
     // 3. Plan the tree appends. Read frontier, simulate two appends.
     let mut branches = (0..DEPTH)
@@ -1560,11 +1462,10 @@ fn prepare_durable_shield_commit<H: Host>(
             .collect(),
         new_tree_root: next_root,
         new_tree_size: tree_size,
-        slot_path,
-        by_intent_swap,
-        by_intent_count_path,
-        by_intent_count_after: last_position,
+        balance_path,
+        new_balance,
         root_marker,
+        applied_shield_path,
         response: ShieldResp {
             cm: *client_cm,
             index: client_index,
@@ -1575,27 +1476,30 @@ fn prepare_durable_shield_commit<H: Host>(
 }
 
 /// Apply the staged durable writes for a shield. SAFETY-CRITICAL: this
-/// function MUST remain infallible — once it starts mutating, the slot
-/// tombstone makes the operation irreversible. Every call here is either a
-/// `Host::write_store` (declared infallible by the trait) or a pure-local
-/// update. Do NOT introduce fallible operations; route fallible work into
+/// function MUST remain infallible — once it starts mutating, the balance
+/// debit makes the operation effectively irreversible (the user's claim is
+/// taken). Every call here is either a `Host::write_store` (declared
+/// infallible by the trait) or a pure-local update. Do NOT introduce
+/// fallible operations; route fallible work into
 /// `prepare_durable_shield_commit` instead.
 fn apply_durable_shield_commit<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
     commit: PreparedDurableShieldCommit,
 ) -> ShieldResp {
-    // Tombstone the slot (irreversible).
-    ledger
-        .host
-        .write_store(&commit.slot_path, &encode_deposit_slot_consumed());
-    // Prune the by-intent index entry: swap-with-last, decrement count.
-    if let Some((target_path, source_bytes)) = &commit.by_intent_swap {
-        ledger.host.write_store(target_path, source_bytes);
+    // Debit the deposit pool. Zero balance triggers a best-effort delete
+    // (empty value) to bound durable footprint.
+    if commit.new_balance == 0 {
+        ledger.host.write_store(&commit.balance_path, &[]);
+    } else {
+        ledger
+            .host
+            .write_store(&commit.balance_path, &commit.new_balance.to_le_bytes());
     }
-    ledger.host.write_store(
-        &commit.by_intent_count_path,
-        &commit.by_intent_count_after.to_le_bytes(),
-    );
+
+    // Record the replay-protection marker for this shield's `client_cm`.
+    // Set BEFORE the tree appends so a future prepare step that probes
+    // the marker observes the post-apply state.
+    ledger.write_marker(&commit.applied_shield_path);
 
     // Append the two notes and update frontier / tree size / tree root.
     for (index, encoded) in &commit.encoded_notes {
@@ -2172,16 +2076,16 @@ mod tests {
             KernelBridgeConfig, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
             KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig,
         },
-        owner_tag, u64_to_felt, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp,
+        owner_tag, PaymentAddress, ProgramHashes, ShieldResp,
         TransferResp, UnshieldResp, MIN_TX_FEE, ZERO,
     };
 
-    /// Test-only deterministic deposit_id derived from a label. The legacy
-    /// `deposit_id_from_label` is gone; under the intent-bound shield, the
-    /// real `deposit_id` comes from `shield_intent(...)` which folds in the
-    /// recipient note. These tests do not exercise the intent recompute and
-    /// instead use this opaque label-bound id as a stand-in balance key.
-    fn deposit_id_from_label(label: &str) -> tzel_core::F {
+    /// Test-only deterministic pubkey_hash derived from a label. The
+    /// real `pubkey_hash = H(0x04, auth_domain, auth_root,
+    /// auth_pub_seed, blind)`; these tests don't exercise the wallet-
+    /// side derivation, so an opaque label-derived F suffices as the
+    /// pool key.
+    fn pubkey_hash_from_label(label: &str) -> tzel_core::F {
         tzel_core::hash(label.as_bytes())
     }
 
@@ -2433,7 +2337,7 @@ mod tests {
             level: 1,
             id: 0,
             payload: encode_ticket_deposit_message(
-                &deposit_recipient_string(&deposit_id_from_label("alice")),
+                &deposit_recipient_string(&pubkey_hash_from_label("alice")),
                 75,
             ),
         });
@@ -2442,10 +2346,13 @@ mod tests {
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.auth_domain, default_auth_domain());
-        assert_eq!(
-            ledger.deposit_slots.values().filter(|s| s.amount == 75).count(),
-            1
-        );
+        // Probe the durable balance entry directly: read_ledger does not
+        // enumerate deposit balances (no index by design — bounded
+        // storage), so callers verify specific pools by path.
+        let balance_path = deposit_balance_path(&pubkey_hash_from_label("alice"));
+        let bytes = host.read_store(&balance_path, 8).expect("balance entry");
+        let balance = u64::from_le_bytes(bytes.try_into().unwrap());
+        assert_eq!(balance, 75);
         match read_last_result(&host).unwrap() {
             KernelResult::Deposit => {}
             other => panic!("unexpected rollup result: {:?}", other),
@@ -2475,36 +2382,32 @@ mod tests {
         let client_rseed = sample_felt(0x32);
         let client_enc = sample_encrypted_note(&address, v, client_rseed, b"shield");
         let client_cm = sample_commitment(&address, v, client_rseed);
-        let intent = tzel_core::shield_intent(
+        let blind = sample_felt(0x33);
+        let pubkey_hash = tzel_core::deposit_pubkey_hash(
             &config.auth_domain,
-            v,
-            MIN_TX_FEE,
-            producer_fee,
-            &client_cm,
-            &producer_cm,
-            &tzel_core::memo_ct_hash(&client_enc),
-            &tzel_core::memo_ct_hash(&producer_enc),
+            &address.auth_root,
+            &address.auth_pub_seed,
+            &blind,
         );
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
             apply_deposit(
                 &mut state,
-                &deposit_recipient_string(&intent),
+                &deposit_recipient_string(&pubkey_hash),
                 v + producer_fee + MIN_TX_FEE,
             )
             .unwrap();
         }
         let shield_req = KernelShieldReq {
-            deposit_id: intent,
-            deposit_slot: 0,
+            pubkey_hash,
             fee: MIN_TX_FEE,
             producer_fee,
             v,
             proof: sample_kernel_test_proof(),
             client_cm,
-            client_enc: client_enc,
+            client_enc,
             producer_cm,
-            producer_enc: producer_enc,
+            producer_enc,
         };
         let message = encode_external_kernel_message(&KernelInboxMessage::Shield(shield_req));
         host.inputs.push_back(InputMessage {
@@ -2515,9 +2418,12 @@ mod tests {
 
         run_with_host(&mut host);
 
+        // Pool was fully drained by the shield — durable balance entry is
+        // either absent or empty (kernel writes empty bytes to bound storage).
+        let balance_path = deposit_balance_path(&pubkey_hash);
+        let after_shield = host.read_store(&balance_path, 8);
+        assert!(after_shield.as_ref().map(|b| b.is_empty()).unwrap_or(true));
         let ledger = read_ledger(&host).unwrap();
-        // Slot 0 was consumed by shield (now a tombstone, not in deposit_slots).
-        assert!(ledger.deposit_slots.is_empty());
         assert_eq!(ledger.tree.leaves.len(), 2);
         match read_last_result(&host).unwrap() {
             KernelResult::Shield(ShieldResp {
@@ -2634,8 +2540,7 @@ mod tests {
         let client_enc = sample_encrypted_note(&address, 50, client_rseed, b"shield");
         let client_cm = sample_commitment(&address, 50, client_rseed);
         let payload = encode_external_kernel_message(&KernelInboxMessage::Shield(KernelShieldReq {
-            deposit_id: deposit_id_from_label("alice"),
-            deposit_slot: 0,
+            pubkey_hash: pubkey_hash_from_label("alice"),
             fee: MIN_TX_FEE,
             producer_fee,
             v: 50,
@@ -2664,11 +2569,11 @@ mod tests {
         run_with_host(&mut host);
 
         let _ = producer_fee;
+        // DAL hash mismatch: kernel rejects, no balance entry mutated.
+        let balance_path =
+            deposit_balance_path(&pubkey_hash_from_label("alice"));
+        assert!(host.read_store(&balance_path, 8).is_none());
         let ledger = read_ledger(&host).unwrap();
-        assert!(
-            ledger.deposit_slots.is_empty(),
-            "DAL hash mismatch must not allocate any deposit slot"
-        );
         assert!(ledger.tree.leaves.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
@@ -3388,7 +3293,7 @@ mod tests {
         run_with_host(&mut host);
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, &deposit_recipient_string(&deposit_id_from_label("alice")), 1).unwrap();
+            apply_deposit(&mut state, &deposit_recipient_string(&pubkey_hash_from_label("alice")), 1).unwrap();
         }
 
         let new_domain = sample_felt(0x44);
@@ -3518,7 +3423,7 @@ mod tests {
     fn rejects_bridge_deposit_before_verifier_configuration() {
         let mut host = MockHost::default();
         install_test_bridge(&mut host);
-        let deposit_key = deposit_recipient_string(&deposit_id_from_label("alice"));
+        let deposit_key = deposit_recipient_string(&pubkey_hash_from_label("alice"));
 
         host.inputs.push_back(InputMessage {
             level: 8,
@@ -3528,7 +3433,6 @@ mod tests {
 
         run_with_host(&mut host);
 
-        let ledger = read_ledger(&host).unwrap();
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => assert!(
                 message.contains("bridge deposits not accepted before verifier configuration"),
@@ -3543,7 +3447,7 @@ mod tests {
     fn accepts_bridge_deposit_after_verifier_configuration() {
         let mut host = MockHost::default();
         install_test_bridge(&mut host);
-        let deposit_key = deposit_recipient_string(&deposit_id_from_label("alice"));
+        let deposit_key = deposit_recipient_string(&pubkey_hash_from_label("alice"));
         let config = KernelVerifierConfig {
             auth_domain: sample_felt(0x57),
             verified_program_hashes: sample_program_hashes(),
@@ -3565,10 +3469,10 @@ mod tests {
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.auth_domain, config.auth_domain);
-        assert_eq!(
-            ledger.deposit_slots.values().filter(|s| s.amount == 12).count(),
-            1
-        );
+        let balance_path =
+            deposit_balance_path(&pubkey_hash_from_label("alice"));
+        let bytes = host.read_store(&balance_path, 8).expect("balance entry");
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 12);
         assert!(matches!(
             read_last_result(&host).unwrap(),
             KernelResult::Deposit
@@ -3622,7 +3526,7 @@ mod tests {
         run_with_host(&mut host);
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, &deposit_recipient_string(&deposit_id_from_label("alice")), 1).unwrap();
+            apply_deposit(&mut state, &deposit_recipient_string(&pubkey_hash_from_label("alice")), 1).unwrap();
         }
         let mut changed_hashes = original.verified_program_hashes;
         changed_hashes.transfer = sample_felt(0x99);
@@ -3640,8 +3544,11 @@ mod tests {
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.auth_domain, original.auth_domain);
-        // Pre-existing slot remains; reconfiguration was rejected.
-        assert_eq!(ledger.deposit_slots.len(), 1);
+        // Pre-existing balance remains; reconfiguration was rejected.
+        let balance_path =
+            deposit_balance_path(&pubkey_hash_from_label("alice"));
+        let bytes = host.read_store(&balance_path, 8).expect("balance entry");
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 1);
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("cannot change verifier configuration"))
@@ -3691,8 +3598,7 @@ mod tests {
         let client_enc = sample_encrypted_note(&address, 50, client_rseed, b"shield");
         let client_cm = sample_commitment(&address, 50, client_rseed);
         let shield_req = KernelShieldReq {
-            deposit_id: deposit_id_from_label("alice"),
-            deposit_slot: 0,
+            pubkey_hash: pubkey_hash_from_label("alice"),
             fee: MIN_TX_FEE,
             producer_fee,
             v: 50,
@@ -3731,7 +3637,6 @@ mod tests {
 
         run_with_host(&mut host);
 
-        let ledger = read_ledger(&host).unwrap();
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("invalid inbox message"))
@@ -3759,18 +3664,25 @@ mod tests {
                 id: 2,
                 payload: encode_external_kernel_message(&KernelInboxMessage::Shield(
                     KernelShieldReq {
-                        deposit_id: deposit_id_from_label("alice"),
-            deposit_slot: 0,
+                        pubkey_hash: pubkey_hash_from_label("alice"),
                         v: 50,
                         fee: MIN_TX_FEE,
                         producer_fee: 1,
-                        address: sample_payment_address(),
-                        memo: None,
                         proof: sample_verified_kernel_proof(),
-                        client_cm: ZERO,
-                        client_enc: None,
-                        producer_cm: ZERO,
-                        producer_enc: None,
+                        client_cm: sample_felt(0x71),
+                        client_enc: sample_encrypted_note(
+                            &sample_payment_address(),
+                            50,
+                            sample_felt(0x72),
+                            b"alice-recipient",
+                        ),
+                        producer_cm: sample_felt(0x73),
+                        producer_enc: sample_encrypted_note(
+                            &sample_payment_address(),
+                            1,
+                            sample_felt(0x74),
+                            b"alice-producer",
+                        ),
                     },
                 )),
             },
@@ -3836,7 +3748,6 @@ mod tests {
 
         run_with_host(&mut host);
 
-        let ledger = read_ledger(&host).unwrap();
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("unexpected ticketer"))
@@ -3855,7 +3766,6 @@ mod tests {
 
         run_with_host(&mut host);
 
-        let ledger = read_ledger(&host).unwrap();
         assert!(host
             .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
             .is_none());
@@ -3885,7 +3795,6 @@ mod tests {
 
         run_with_host(&mut host);
 
-        let ledger = read_ledger(&host).unwrap();
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("token_id must be 0"))
@@ -3912,7 +3821,6 @@ mod tests {
 
         run_with_host(&mut host);
 
-        let ledger = read_ledger(&host).unwrap();
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("creator does not match transfer sender"))
@@ -3939,7 +3847,6 @@ mod tests {
 
         run_with_host(&mut host);
 
-        let ledger = read_ledger(&host).unwrap();
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("metadata must be None"))
@@ -3966,7 +3873,6 @@ mod tests {
 
         run_with_host(&mut host);
 
-        let ledger = read_ledger(&host).unwrap();
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("receiver is not UTF-8"))
@@ -4006,7 +3912,7 @@ mod tests {
         install_test_bridge(&mut host);
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, &deposit_recipient_string(&deposit_id_from_label("alice")), 3).unwrap();
+            apply_deposit(&mut state, &deposit_recipient_string(&pubkey_hash_from_label("alice")), 3).unwrap();
         }
 
         let message = encode_external_kernel_message(&signed_bridge_message(KernelBridgeConfig {
@@ -4038,7 +3944,7 @@ mod tests {
         install_test_bridge(&mut host);
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, &deposit_recipient_string(&deposit_id_from_label("alice")), 3).unwrap();
+            apply_deposit(&mut state, &deposit_recipient_string(&pubkey_hash_from_label("alice")), 3).unwrap();
         }
 
         let message = encode_external_kernel_message(&signed_bridge_message(KernelBridgeConfig {
@@ -4056,8 +3962,10 @@ mod tests {
             .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
             .expect("bridge ticketer persists");
         assert_eq!(String::from_utf8(persisted).unwrap(), sample_ticketer());
-        // Pre-existing slot remained through the bridge reconfiguration.
-        assert_eq!(read_ledger(&host).unwrap().deposit_slots.len(), 1);
+        // Pre-existing pool balance remained through bridge reconfiguration.
+        let balance_path =
+            deposit_balance_path(&pubkey_hash_from_label("alice"));
+        assert!(host.read_store(&balance_path, 8).is_some());
         assert!(matches!(
             read_last_result(&host).unwrap(),
             KernelResult::Configured
@@ -4065,15 +3973,17 @@ mod tests {
     }
 
     #[test]
-    fn dust_deposit_to_same_intent_does_not_brick_legitimate_one() {
-        // Two L1 ticket deposits arrive for the same `deposit:<intent>` recipient
-        // (legit + 1-mutez attacker dust). Each must allocate its own slot so the
-        // legit shield can later drain its slot independently.
+    fn dust_deposit_to_same_pubkey_hash_aggregates_balance() {
+        // Two L1 ticket deposits to the same `deposit:<pubkey_hash>`
+        // recipient aggregate into one balance pool. Under the deposit-pool
+        // design, dust no longer creates a separate "slot" — it just adds
+        // to the user's pool balance, which the user (sole holder of the
+        // auth tree) can drain in a single shield.
         let mut host = MockHost::default();
         install_test_bridge(&mut host);
         install_test_verifier(&mut host);
-        let intent = deposit_id_from_label("alice");
-        let recipient = deposit_recipient_string(&intent);
+        let pubkey_hash = pubkey_hash_from_label("alice");
+        let recipient = deposit_recipient_string(&pubkey_hash);
         host.inputs.push_back(InputMessage {
             level: 13,
             id: 0,
@@ -4087,17 +3997,47 @@ mod tests {
 
         run_with_host(&mut host);
 
-        let ledger = read_ledger(&host).unwrap();
-        // Two distinct slots, neither bricks the other.
-        assert_eq!(ledger.deposit_slots.len(), 2);
-        let amounts: std::collections::HashSet<u64> =
-            ledger.deposit_slots.values().map(|s| s.amount).collect();
-        assert!(amounts.contains(&100_000));
-        assert!(amounts.contains(&1));
-        assert_eq!(
-            ledger.deposits_by_intent.get(&intent).map(|v| v.len()),
-            Some(2)
-        );
+        // Single aggregated balance: 100_000 + 1.
+        let balance_path = deposit_balance_path(&pubkey_hash);
+        let bytes = host.read_store(&balance_path, 8).expect("balance entry");
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 100_001);
+    }
+
+    #[test]
+    fn pool_can_be_redeposited_after_full_drain() {
+        // Regression: when a pool is drained to 0, the kernel writes an
+        // empty value at the balance path as a best-effort delete on the
+        // WASM PVM (which has no native delete primitive). A subsequent
+        // L1 deposit to that pool must treat the empty read as absence
+        // and credit a fresh balance, not error out with `bad u64 at ...`.
+        let mut host = MockHost::default();
+        install_test_bridge(&mut host);
+        install_test_verifier(&mut host);
+        let pubkey_hash = pubkey_hash_from_label("alice");
+        let balance_path = deposit_balance_path(&pubkey_hash);
+
+        // Simulate the post-drain state: the apply step writes empty bytes.
+        host.write_store(&balance_path, &[]);
+        // Same shape `read_ledger` and the wallet treat as None.
+        assert_eq!(host.read_store(&balance_path, 8).map(|b| b.len()), Some(0));
+
+        // A fresh L1 ticket deposit to the drained pool must succeed.
+        let recipient = deposit_recipient_string(&pubkey_hash);
+        host.inputs.push_back(InputMessage {
+            level: 14,
+            id: 0,
+            payload: encode_ticket_deposit_message(&recipient, 7_777),
+        });
+        run_with_host(&mut host);
+
+        match read_last_result(&host).unwrap() {
+            KernelResult::Deposit => {}
+            other => panic!("redeposit after drain should succeed: {:?}", other),
+        }
+        let bytes = host
+            .read_store(&balance_path, 8)
+            .expect("balance entry after redeposit");
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 7_777);
     }
 
     #[test]

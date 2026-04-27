@@ -8,6 +8,7 @@ use clap::Parser;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tzel_services::*;
+use tzel_services::LedgerState as _;
 
 struct LedgerState {
     ledger: Mutex<Ledger>,
@@ -76,53 +77,51 @@ async fn deposit_handler(
     Json(req): Json<DepositReq>,
 ) -> Result<Json<DepositResp>, (StatusCode, String)> {
     let mut ledger = st.ledger.lock().unwrap();
-    let slot_id = ledger.deposit(&req.recipient, req.amount).map_err(err)?;
+    ledger.deposit(&req.recipient, req.amount).map_err(err)?;
+    let pubkey_hash = parse_deposit_recipient_pubkey_hash(&req.recipient).map_err(err)?;
+    let balance = ledger
+        .deposit_balance(&pubkey_hash)
+        .map_err(err)?
+        .unwrap_or(0);
     eprintln!(
-        "[deposit] {} += {} (slot {})",
-        req.recipient, req.amount, slot_id
+        "[deposit] {} += {} (pool balance now {})",
+        req.recipient, req.amount, balance
     );
-    Ok(Json(DepositResp { slot_id }))
+    Ok(Json(DepositResp { balance }))
 }
 
-async fn slots_handler(
+async fn balance_handler(
     State(st): State<AppState>,
-    Query(params): Query<SlotsByIntentParam>,
-) -> Result<Json<DepositSlotsResp>, (StatusCode, String)> {
-    let intent = parse_intent_hex(&params.intent).map_err(err)?;
+    Query(params): Query<BalanceByPubkeyHashParam>,
+) -> Result<Json<DepositBalanceResp>, (StatusCode, String)> {
+    let pubkey_hash = parse_pubkey_hash_hex(&params.pubkey_hash).map_err(err)?;
     let ledger = st.ledger.lock().unwrap();
-    let slots = ledger
-        .open_deposit_slots_for_intent(&intent)
-        .into_iter()
-        .map(|(id, amount)| DepositSlotInfo { id, amount })
-        .collect();
-    Ok(Json(DepositSlotsResp { slots }))
+    let balance = ledger
+        .deposit_balance(&pubkey_hash)
+        .map_err(err)?
+        .unwrap_or(0);
+    Ok(Json(DepositBalanceResp { balance }))
 }
 
 #[derive(serde::Deserialize)]
-struct SlotsByIntentParam {
-    intent: String,
+struct BalanceByPubkeyHashParam {
+    pubkey_hash: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-pub struct DepositSlotInfo {
-    pub id: u64,
-    pub amount: u64,
+pub struct DepositBalanceResp {
+    pub balance: u64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct DepositSlotsResp {
-    pub slots: Vec<DepositSlotInfo>,
-}
-
-fn parse_intent_hex(s: &str) -> Result<F, String> {
+fn parse_pubkey_hash_hex(s: &str) -> Result<F, String> {
     let hex = s.strip_prefix("0x").unwrap_or(s);
     if hex.len() != 64 {
-        return Err("intent must be 32-byte hex".into());
+        return Err("pubkey_hash must be 32-byte hex".into());
     }
-    let raw = hex::decode(hex).map_err(|_| "intent must be hex".to_string())?;
-    let mut intent = ZERO;
-    intent.copy_from_slice(&raw);
-    Ok(intent)
+    let raw = hex::decode(hex).map_err(|_| "pubkey_hash must be hex".to_string())?;
+    let mut pubkey_hash = ZERO;
+    pubkey_hash.copy_from_slice(&raw);
+    Ok(pubkey_hash)
 }
 
 async fn shield_handler(
@@ -135,8 +134,8 @@ async fn shield_handler(
     let mut ledger = st.ledger.lock().unwrap();
     let resp = ledger.shield(&req).map_err(err)?;
     eprintln!(
-        "[shield] deposit {} shielded {} -> cm={} idx={}",
-        deposit_recipient_string(&req.deposit_id),
+        "[shield] pool {} shielded {} -> cm={} idx={}",
+        deposit_recipient_string(&req.pubkey_hash),
         req.v,
         short(&resp.cm),
         resp.index
@@ -303,7 +302,7 @@ async fn main() {
     let app = Router::new()
         .route("/config", get(config_handler))
         .route("/deposit", post(deposit_handler))
-        .route("/deposits/by-intent", get(slots_handler))
+        .route("/deposits/balance", get(balance_handler))
         .route("/shield", post(shield_handler))
         .route("/transfer", post(transfer_handler))
         .route("/unshield", post(unshield_handler))
@@ -403,24 +402,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deposit_handler_allocates_slots_and_dust_does_not_brick() {
+    async fn test_deposit_handler_aggregates_balance_across_multiple_l1_tickets() {
         let st = test_state(default_auth_domain());
-        let intent = u64_to_felt(0xAB);
-        let recipient = deposit_recipient_string(&intent);
-        let debit = 5101u64;
+        let pubkey_hash = u64_to_felt(0xAB);
+        let recipient = deposit_recipient_string(&pubkey_hash);
 
-        let Json(legit) = deposit_handler(
+        let Json(first) = deposit_handler(
             State(st.clone()),
             Json(DepositReq {
                 recipient: recipient.clone(),
-                amount: debit,
+                amount: 5101,
             }),
         )
         .await
-        .expect("legit deposit allocates a slot");
+        .expect("first deposit credits the pool");
+        assert_eq!(first.balance, 5101);
 
-        // Attacker dusts the same intent.
-        let Json(dust) = deposit_handler(
+        // Second deposit (same recipient → top-up; balance aggregates).
+        let Json(second) = deposit_handler(
             State(st.clone()),
             Json(DepositReq {
                 recipient: recipient.clone(),
@@ -428,22 +427,19 @@ mod tests {
             }),
         )
         .await
-        .expect("dust deposit allocates its own (orphan) slot");
+        .expect("top-up deposit");
+        assert_eq!(second.balance, 5102);
 
-        assert_ne!(legit.slot_id, dust.slot_id);
-
-        let Json(slots) = slots_handler(
+        // Balance query returns the same total.
+        let Json(balance) = balance_handler(
             State(st.clone()),
-            Query(SlotsByIntentParam {
-                intent: hex::encode(intent),
+            Query(BalanceByPubkeyHashParam {
+                pubkey_hash: hex::encode(pubkey_hash),
             }),
         )
         .await
-        .expect("slots query");
-        // Both visible; the wallet picks the slot with the right amount.
-        assert_eq!(slots.slots.len(), 2);
-        assert!(slots.slots.iter().any(|s| s.amount == debit));
-        assert!(slots.slots.iter().any(|s| s.amount == 1));
+        .expect("balance query");
+        assert_eq!(balance.balance, 5102);
     }
 
     #[tokio::test]
@@ -587,8 +583,7 @@ mod tests {
         let err = shield_handler(
             State(st),
             Json(ShieldReq {
-                deposit_id: hash(b"alice"),
-                deposit_slot: 0,
+                pubkey_hash: hash(b"alice"),
                 v: 5,
                 fee: MIN_TX_FEE,
                 producer_fee: 1,

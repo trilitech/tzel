@@ -43,10 +43,13 @@ type shield_note_witness = {
   snw_nk_tag : Felt.t;
 }
 
-(* Witness for shield circuit. The shield is intent-bound: the deposit_id
-   public output is recomputed inside the circuit as the sighash_fold over
-   every other public output, so the witness exposes everything needed to
-   rebuild both the recipient and producer commitments. *)
+(* Witness for the shield circuit. The shield is pool-keyed: the
+   `pubkey_hash` public output is recomputed inside the circuit from
+   the recipient's `(auth_domain, auth_root, auth_pub_seed, blind)`
+   tuple, and the entire request payload is signed with an in-circuit
+   WOTS+ signature under the recipient's auth tree. The witness exposes
+   everything needed to rebuild both the recipient and producer
+   commitments. *)
 type shield_witness = {
   sw_auth_domain : Felt.t;
   sw_v : int64;

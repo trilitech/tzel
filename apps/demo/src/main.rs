@@ -504,11 +504,7 @@ fn verify_merkle(leaf: &F, root: &F, siblings: &[F], mut index: usize) {
 #[derive(Clone)]
 struct Note {
     nk_spend: F,  // per-address secret nullifier key (given to prover)
-    nk_tag: F,    // per-address public binding tag (in payment address)
-    ak: F,        // authorization verifying key
-    d_j: F,       // diversified address
     v: u64,       // amount
-    rseed: F,     // per-note randomness
     cm: F,        // commitment
     index: usize, // Merkle tree leaf index
 }
@@ -588,11 +584,7 @@ impl Wallet {
                     let index = chain.tree.leaves.iter().position(|l| l == cm).unwrap();
                     self.notes.push(Note {
                         nk_spend: nk_sp,
-                        nk_tag: nk_tg,
-                        ak,
-                        d_j,
                         v,
-                        rseed,
                         cm: *cm,
                         index,
                     });

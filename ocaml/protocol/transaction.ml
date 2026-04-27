@@ -1,29 +1,31 @@
-(* Transaction types for TzEL — canonical (post intent-bound shield).
+(* Transaction types for TzEL — canonical (post pubkey_hash redesign).
 
    Public-output shapes match the Rust circuit exactly:
-   - Shield: [auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer,
-             deposit_id, memo_ct_hash, producer_memo_ct_hash]
+   - Shield: [auth_domain, pubkey_hash, v_pub, fee, producer_fee,
+             cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash]
    - Transfer: [auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3,
                memo_ct_hash_1, memo_ct_hash_2, memo_ct_hash_3]
    - Unshield: [auth_domain, root, nf_0..nf_{N-1}, v_pub, fee, recipient_id,
                cm_change, memo_ct_hash_change, cm_fee, memo_ct_hash_fee]
 
-   Sighashes (transfer/unshield) and shield-intent (shield) all use the
-   sighash_fold primitive (BLAKE2s with personalization "sighSP__"). The
-   leading type tag is 0x01 / 0x02 / 0x03 respectively, providing
-   cross-construction domain separation. *)
+   Sighashes use the sighash_fold primitive (BLAKE2s with personalization
+   "sighSP__"). The leading type tag is 0x01 / 0x02 / 0x03 respectively
+   for transfer / unshield / shield, providing cross-construction domain
+   separation. The shield circuit additionally verifies an in-circuit
+   WOTS+ signature under the recipient's auth tree (matching pubkey_hash
+   = H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)). *)
 
 (* Shield public outputs:
-   [auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer,
-    deposit_id, memo_ct_hash, producer_memo_ct_hash] *)
+   [auth_domain, pubkey_hash, v_pub, fee, producer_fee, cm_new, cm_producer,
+    memo_ct_hash, producer_memo_ct_hash] *)
 type shield_public = {
   auth_domain : Felt.t;
+  pubkey_hash : Felt.t;
   v_pub : int64;
   fee : int64;
   producer_fee : int64;
   cm_new : Felt.t;
   cm_producer : Felt.t;
-  deposit_id : Felt.t;          (* = shield_intent over the rest *)
   memo_ct_hash : Felt.t;
   producer_memo_ct_hash : Felt.t;
 }
@@ -83,15 +85,31 @@ type output_desc = {
   memo_ct_hash : Felt.t;
 }
 
-(* Compute the shield intent / deposit_id.
-   intent = fold(0x03, auth_domain, v_pub, fee, producer_fee,
-                 cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash) *)
-let shield_intent ~auth_domain ~(v_pub : int64) ~(fee : int64) ~(producer_fee : int64)
-    ~cm_new ~cm_producer ~memo_ct_hash ~producer_memo_ct_hash =
+(* Compute the deposit-pool pubkey_hash.
+   pubkey_hash = fold(0x04, auth_domain, auth_root, auth_pub_seed, blind) *)
+let deposit_pubkey_hash ~auth_domain ~auth_root ~auth_pub_seed ~blind =
+  let items =
+    [
+      Felt.of_int 0x04;
+      auth_domain;
+      auth_root;
+      auth_pub_seed;
+      blind;
+    ]
+  in
+  Hash.sighash_fold items
+
+(* Compute the in-circuit shield sighash bound by the WOTS+ signature.
+   sighash = fold(0x03, auth_domain, pubkey_hash, v_pub, fee, producer_fee,
+                  cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash) *)
+let shield_sighash ~auth_domain ~pubkey_hash ~(v_pub : int64) ~(fee : int64)
+    ~(producer_fee : int64) ~cm_new ~cm_producer ~memo_ct_hash
+    ~producer_memo_ct_hash =
   let items =
     [
       Felt.of_int 0x03;
       auth_domain;
+      pubkey_hash;
       Felt.of_u64 (Int64.to_int v_pub);
       Felt.of_u64 (Int64.to_int fee);
       Felt.of_u64 (Int64.to_int producer_fee);
@@ -135,27 +153,22 @@ let unshield_sighash (pub : unshield_public) =
   in
   Hash.sighash_fold items
 
-(* Build a shield transaction. The deposit_id is the intent computed over the
-   recipient + producer-fee notes; under intent-bound shield, this is the L1
-   deposit balance key. *)
-let build_shield ~auth_domain ~(recipient : Keys.address)
+(* Build a shield transaction. The pubkey_hash names the deposit-balance
+   pool the shield drains; the recipient and producer notes are picked at
+   shield time and bound by the in-circuit WOTS+ signature (not modeled in
+   this OCaml mirror — it trusts that the corresponding STARK has already
+   validated). *)
+let build_shield ~auth_domain ~pubkey_hash ~(recipient : Keys.address)
     ~(v_pub : int64) ~(fee : int64) ~(producer_fee : int64)
     ~(rseed : Felt.t) ~memo_ct_hash
     ~(producer : Keys.address) ~(producer_rseed : Felt.t) ~producer_memo_ct_hash =
   let note = Note.create recipient v_pub rseed in
   let producer_note = Note.create producer producer_fee producer_rseed in
-  let deposit_id =
-    shield_intent
-      ~auth_domain
-      ~v_pub ~fee ~producer_fee
-      ~cm_new:note.cm ~cm_producer:producer_note.cm
-      ~memo_ct_hash ~producer_memo_ct_hash
-  in
   let pub = {
     auth_domain;
+    pubkey_hash;
     v_pub; fee; producer_fee;
     cm_new = note.cm; cm_producer = producer_note.cm;
-    deposit_id;
     memo_ct_hash; producer_memo_ct_hash;
   } in
   (pub, note, producer_note)

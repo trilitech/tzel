@@ -210,10 +210,37 @@ pub fn derive_rcm(rseed: &F) -> F {
 ///   intent = fold(0x03, auth_domain, v, fee, producer_fee,
 ///                 cm_recipient, cm_producer, mh, mh_producer)
 /// using `sighash_fold` (BLAKE2s personalized "sighSP__"). The leading
-/// type tag 0x03 distinguishes shield intents from transfer (0x01) and
-/// unshield (0x02) sighashes.
-pub fn shield_intent(
+/// Hash binding a wallet's spending key tree (`auth_root`, `auth_pub_seed`)
+/// plus a per-deposit `blind` scalar plus the deployment's `auth_domain`.
+/// The L1 deposit recipient string is `deposit:<hex(deposit_pubkey_hash)>`.
+/// Multiple L1 tickets to the same recipient string aggregate into the same
+/// kernel-side balance — this is how top-ups work. Including `auth_domain`
+/// makes the pool deployment-scoped: the same wallet deriving the same blind
+/// on two deployments produces two distinct pool ids, so neither can claim
+/// the other's L1 mutez.
+pub fn deposit_pubkey_hash(
     auth_domain: &F,
+    auth_root: &F,
+    auth_pub_seed: &F,
+    blind: &F,
+) -> F {
+    let mut type_tag = ZERO;
+    type_tag[0] = 0x04;
+    let mut h = sighash_fold(&type_tag, auth_domain);
+    h = sighash_fold(&h, auth_root);
+    h = sighash_fold(&h, auth_pub_seed);
+    h = sighash_fold(&h, blind);
+    h
+}
+
+/// Sighash bound by the in-circuit WOTS+ signature for shield requests. The
+/// signature authorizes a specific draw `(v, fee, producer_fee, cm_recipient,
+/// cm_producer, mh_recipient, mh_producer)` against the deposit pool keyed by
+/// `pubkey_hash`. Type tag 0x03 distinguishes from transfer (0x01) and
+/// unshield (0x02).
+pub fn shield_sighash(
+    auth_domain: &F,
+    pubkey_hash: &F,
     v: u64,
     fee: u64,
     producer_fee: u64,
@@ -225,6 +252,7 @@ pub fn shield_intent(
     let mut type_tag = ZERO;
     type_tag[0] = 0x03;
     let mut h = sighash_fold(&type_tag, auth_domain);
+    h = sighash_fold(&h, pubkey_hash);
     h = sighash_fold(&h, &u64_to_felt(v));
     h = sighash_fold(&h, &u64_to_felt(fee));
     h = sighash_fold(&h, &u64_to_felt(producer_fee));
@@ -238,20 +266,19 @@ pub fn shield_intent(
 pub const DEPOSIT_RECIPIENT_PREFIX: &str = "deposit:";
 pub const PUBLIC_BALANCE_KEY_PREFIX: &str = "public:";
 
-/// Build the canonical L1-bridge recipient string for an intent-bound deposit.
-/// The bridge contract emits an L1 Transfer with this string; the kernel parses
-/// the intent back out and records a fresh deposit slot. The string itself is
-/// NOT a ledger entry under the slot scheme — `record_deposit_slot` allocates a
-/// per-deposit id so dust deposits to the same intent cannot brick a legit one.
-pub fn deposit_recipient_string(deposit_id: &F) -> String {
-    format!("{}{}", DEPOSIT_RECIPIENT_PREFIX, hex::encode(deposit_id))
+/// Build the canonical L1-bridge recipient string for a deposit-pool pubkey
+/// hash. The bridge contract emits an L1 Transfer with this string; the
+/// kernel parses the pubkey_hash back out and credits the corresponding
+/// balance entry. Multiple L1 tickets to the same string aggregate.
+pub fn deposit_recipient_string(pubkey_hash: &F) -> String {
+    format!("{}{}", DEPOSIT_RECIPIENT_PREFIX, hex::encode(pubkey_hash))
 }
 
 pub fn is_deposit_recipient_string(value: &str) -> bool {
-    parse_deposit_recipient_intent(value).is_ok()
+    parse_deposit_recipient_pubkey_hash(value).is_ok()
 }
 
-pub fn parse_deposit_recipient_intent(value: &str) -> Result<F, String> {
+pub fn parse_deposit_recipient_pubkey_hash(value: &str) -> Result<F, String> {
     let hex_id = value
         .strip_prefix(DEPOSIT_RECIPIENT_PREFIX)
         .ok_or_else(|| "deposit recipient must start with 'deposit:'".to_string())?;
@@ -262,9 +289,9 @@ pub fn parse_deposit_recipient_intent(value: &str) -> Result<F, String> {
     if bytes.len() != 32 || hex::encode(&bytes) != hex_id {
         return Err("deposit recipient hex must be canonical lowercase".into());
     }
-    let mut intent: F = ZERO;
-    intent.copy_from_slice(&bytes);
-    Ok(intent)
+    let mut pubkey_hash: F = ZERO;
+    pubkey_hash.copy_from_slice(&bytes);
+    Ok(pubkey_hash)
 }
 
 pub fn public_balance_key(owner: &str, label: &str) -> Result<String, String> {
@@ -1594,8 +1621,9 @@ impl CircuitKind {
 }
 
 /// Demo HTTP ledger / operator deposit request: a `deposit:<hex>` recipient
-/// string and the exact debit. The demo ledger allocates a fresh slot, just
-/// like the rollup kernel does on a real L1 ticket.
+/// string and the deposit amount. The recipient string encodes the
+/// deposit-pool `pubkey_hash`; multiple deposits to the same string
+/// aggregate.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DepositReq {
     pub recipient: String,
@@ -1604,7 +1632,8 @@ pub struct DepositReq {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DepositResp {
-    pub slot_id: u64,
+    /// The pool's balance after this deposit lands.
+    pub balance: u64,
 }
 
 /// Payment address — everything a sender needs to create a note for the recipient.
@@ -1626,22 +1655,19 @@ pub struct PaymentAddress {
 
 /// Shield request.
 ///
-/// `deposit_id == shield_intent(auth_domain, v, fee, producer_fee, client_cm,
-/// producer_cm, memo_ct_hash(client_enc), memo_ct_hash(producer_enc))` — the
-/// kernel recomputes that hash from the other request fields and rejects the
-/// request if it disagrees. Because every rewritable field is folded into
-/// `deposit_id`, a relayer or untrusted prover cannot redirect funds.
-///
-/// `deposit_slot` identifies the specific L1 bridge deposit being drained.
-/// Each successful bridge deposit allocates its own slot so that dust deposits
-/// to the same intent cannot brick a legitimate one. The kernel verifies that
-/// the slot exists, has not already been consumed, has the matching intent,
-/// and has the exact debit (`v + fee + producer_fee`).
+/// `pubkey_hash` identifies the deposit-balance pool to drain, computed as
+/// `H(auth_domain, auth_root, auth_pub_seed, blind)` (type tag 0x04). The
+/// kernel debits `v + fee + producer_fee` from that pool. The proof's
+/// in-circuit WOTS+ signature, verified under the recipient's auth tree,
+/// binds the entire request payload (pubkey_hash, v, fee, producer_fee,
+/// output commitments, memo hashes) so a delegated prover cannot redirect
+/// funds, change values, or swap recipients without the wallet's signing
+/// key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShieldReq {
+    /// Identifies the deposit-balance pool this shield is draining.
     #[serde(with = "hex_f")]
-    pub deposit_id: F,
-    pub deposit_slot: u64,
+    pub pubkey_hash: F,
     pub fee: u64,
     pub v: u64,
     pub producer_fee: u64,
@@ -1811,18 +1837,6 @@ pub fn required_tx_fee_for_private_tx_count(accepted_private_txs_in_level: u64) 
 // Ledger state
 // ═══════════════════════════════════════════════════════════════════════
 
-/// One pending L1-bridge deposit awaiting shield. Each successful
-/// `apply_deposit` allocates its own slot, keyed by a monotonic id, so dust
-/// deposits to the same intent cannot brick a legitimate one. Shield consumes
-/// a slot by id, verifying that `intent == req.deposit_id` and
-/// `amount == v + fee + producer_fee` exactly.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DepositSlot {
-    #[serde(with = "hex_f")]
-    pub intent: F,
-    pub amount: u64,
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Ledger {
     pub auth_domain: F,
@@ -1833,19 +1847,18 @@ pub struct Ledger {
     pub root_history: VecDeque<F>,
     pub memos: Vec<(F, EncryptedNote)>,
     pub withdrawals: Vec<WithdrawalRecord>,
-    /// Open deposit slots awaiting shield consumption. A slot disappears
-    /// (`HashMap::remove`) the moment shield drains it. Dust deposits to the
-    /// same intent simply create their own slots and are ignored.
+    /// Per-pool deposit balance keyed by `deposit_pubkey_hash`. Each L1
+    /// bridge deposit credits the pool (creating it if absent); each shield
+    /// debits it. Multiple L1 deposits to the same `pubkey_hash` aggregate.
     #[serde(default)]
-    pub deposit_slots: HashMap<u64, DepositSlot>,
-    /// Monotonic counter assigning the next slot id.
+    pub deposit_balances: HashMap<F, u64>,
+    /// Replay-protection set for shield commitments. Each successful
+    /// shield records its `client_cm` here; a subsequent shield carrying
+    /// the same `client_cm` is rejected. Without this, anyone could top
+    /// up a drained pool and resubmit a victim's shield proof, minting
+    /// a duplicate of the recipient's note at a fresh tree position.
     #[serde(default)]
-    pub next_deposit_slot_id: u64,
-    /// Per-intent index of slot ids (for wallet enumeration). Slots remain
-    /// listed here even after consumption; consumers must verify membership
-    /// in `deposit_slots` to determine if a slot is still drainable.
-    #[serde(default)]
-    pub deposits_by_intent: HashMap<F, Vec<u64>>,
+    pub applied_shield_cms: HashSet<F>,
 }
 
 /// Generic ledger interface used by `apply_shield`, `apply_transfer`, and
@@ -1871,19 +1884,30 @@ pub trait LedgerState {
     fn snapshot_root(&mut self) -> Result<(), String>;
     fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String>;
     fn note_private_tx_applied(&mut self);
-    /// Allocate a fresh per-deposit slot recording (intent, amount). Returns
-    /// the slot id, which the wallet later passes back in `ShieldReq`.
-    fn record_deposit_slot(&mut self, intent: F, amount: u64) -> Result<u64, String>;
-    /// Look up a slot by id and consume it if (slot.intent == intent) and
-    /// (slot.amount == debit). On success the slot is removed and the call
-    /// returns Ok(()). On any mismatch / missing / already-consumed slot, the
-    /// state is left unchanged.
-    fn consume_deposit_slot(
-        &mut self,
-        slot_id: u64,
-        intent: &F,
-        debit: u64,
-    ) -> Result<(), String>;
+    /// Look up a deposit pool's current balance. `None` if the pool key has
+    /// never been credited (or has been fully drained — implementations may
+    /// either return Some(0) or None here; both have the same semantics for
+    /// downstream code).
+    fn deposit_balance(&self, pubkey_hash: &F) -> Result<Option<u64>, String>;
+    /// Credit `amount` to the pool keyed by `pubkey_hash`. Creates the pool
+    /// if absent. Used by `apply_deposit` on every L1 bridge deposit.
+    fn credit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String>;
+    /// Debit `amount` from the pool keyed by `pubkey_hash`. The caller
+    /// (`commit_prepared_shield`) has already confirmed the pool has at
+    /// least `amount`; implementations may panic / error if invariants are
+    /// violated. When the balance reaches zero the entry should be removed
+    /// to bound storage.
+    fn debit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String>;
+    /// True iff a shield with this `client_cm` has already been applied.
+    /// Used by `prepare_shield` to reject replays of an old shield proof
+    /// after a pool top-up; without this, the kernel would mint a
+    /// duplicate of the recipient's note at a fresh tree position
+    /// (independently spendable, since nullifiers are per-position).
+    fn has_applied_shield(&self, client_cm: &F) -> Result<bool, String>;
+    /// Record that a shield with this `client_cm` has now been applied.
+    /// Called by `commit_prepared_shield` so subsequent replays observe
+    /// the marker.
+    fn mark_applied_shield(&mut self, client_cm: F) -> Result<(), String>;
 }
 
 impl Ledger {
@@ -1906,21 +1930,8 @@ impl Ledger {
             root_history,
             memos: vec![],
             withdrawals: vec![],
-            deposit_slots: HashMap::new(),
-            next_deposit_slot_id: 0,
-            deposits_by_intent: HashMap::new(),
-        }
-    }
-
-    /// Convenience: list all slots currently open for an intent. The wallet's
-    /// shield path picks the slot whose amount matches the bound debit.
-    pub fn open_deposit_slots_for_intent(&self, intent: &F) -> Vec<(u64, u64)> {
-        match self.deposits_by_intent.get(intent) {
-            None => vec![],
-            Some(ids) => ids
-                .iter()
-                .filter_map(|id| self.deposit_slots.get(id).map(|slot| (*id, slot.amount)))
-                .collect(),
+            deposit_balances: HashMap::new(),
+            applied_shield_cms: HashSet::new(),
         }
     }
 
@@ -1951,8 +1962,8 @@ impl Ledger {
     }
 
     /// Apply a bridge deposit (recipient must be a `deposit:<hex>` string).
-    /// Returns the new slot id.
-    pub fn deposit(&mut self, recipient: &str, amount: u64) -> Result<u64, String> {
+    /// Credits the deposit pool keyed by the parsed pubkey_hash.
+    pub fn deposit(&mut self, recipient: &str, amount: u64) -> Result<(), String> {
         apply_deposit(self, recipient, amount)
     }
 
@@ -2030,75 +2041,72 @@ impl LedgerState for Ledger {
 
     fn note_private_tx_applied(&mut self) {}
 
-    fn record_deposit_slot(&mut self, intent: F, amount: u64) -> Result<u64, String> {
-        let id = self.next_deposit_slot_id;
-        let next = id
-            .checked_add(1)
-            .ok_or_else(|| "deposit slot counter overflow".to_string())?;
-        self.deposit_slots.insert(id, DepositSlot { intent, amount });
-        self.deposits_by_intent.entry(intent).or_default().push(id);
-        self.next_deposit_slot_id = next;
-        Ok(id)
+    fn deposit_balance(&self, pubkey_hash: &F) -> Result<Option<u64>, String> {
+        Ok(self.deposit_balances.get(pubkey_hash).copied())
     }
 
-    fn consume_deposit_slot(
-        &mut self,
-        slot_id: u64,
-        intent: &F,
-        debit: u64,
-    ) -> Result<(), String> {
-        let slot = self
-            .deposit_slots
-            .get(&slot_id)
-            .ok_or_else(|| format!("deposit slot {} not found or already consumed", slot_id))?;
-        if &slot.intent != intent {
+    fn credit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
+        let entry = self.deposit_balances.entry(*pubkey_hash).or_insert(0);
+        *entry = entry
+            .checked_add(amount)
+            .ok_or_else(|| "deposit balance overflow".to_string())?;
+        Ok(())
+    }
+
+    fn debit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
+        let balance = self
+            .deposit_balances
+            .get_mut(pubkey_hash)
+            .ok_or_else(|| {
+                format!(
+                    "deposit pool {} does not exist",
+                    hex::encode(pubkey_hash)
+                )
+            })?;
+        if *balance < amount {
             return Err(format!(
-                "deposit slot {} intent mismatch: slot binds a different deposit",
-                slot_id
+                "deposit pool {} balance {} too small to debit {}",
+                hex::encode(pubkey_hash),
+                *balance,
+                amount
             ));
         }
-        if slot.amount != debit {
-            return Err(format!(
-                "deposit slot {} amount mismatch: have {}, expected exactly {}",
-                slot_id, slot.amount, debit
-            ));
+        *balance -= amount;
+        if *balance == 0 {
+            self.deposit_balances.remove(pubkey_hash);
         }
-        self.deposit_slots.remove(&slot_id);
-        // Prune the by-intent index entry too, mirroring the kernel's
-        // swap-with-last behavior. Bounds index size to open-slot count
-        // per intent.
-        if let Some(ids) = self.deposits_by_intent.get_mut(intent) {
-            if let Some(pos) = ids.iter().position(|id| *id == slot_id) {
-                ids.swap_remove(pos);
-            }
-            if ids.is_empty() {
-                self.deposits_by_intent.remove(intent);
-            }
-        }
+        Ok(())
+    }
+
+    fn has_applied_shield(&self, client_cm: &F) -> Result<bool, String> {
+        Ok(self.applied_shield_cms.contains(client_cm))
+    }
+
+    fn mark_applied_shield(&mut self, client_cm: F) -> Result<(), String> {
+        self.applied_shield_cms.insert(client_cm);
         Ok(())
     }
 }
 
-/// Apply an L1 bridge deposit. The recipient is parsed as `deposit:<hex>` and a
-/// fresh per-deposit slot is allocated for `(intent, amount)`. Returns the new
-/// slot id so the wallet can correlate its L1 op with the kernel-side record.
+/// Apply an L1 bridge deposit. The recipient is parsed as `deposit:<hex>` to
+/// extract the deposit-pool `pubkey_hash`, and `amount` is credited to that
+/// pool's balance. Multiple deposits to the same `pubkey_hash` aggregate.
 pub fn apply_deposit<S: LedgerState>(
     state: &mut S,
     recipient: &str,
     amount: u64,
-) -> Result<u64, String> {
-    let intent = parse_deposit_recipient_intent(recipient)?;
-    state.record_deposit_slot(intent, amount)
+) -> Result<(), String> {
+    let pubkey_hash = parse_deposit_recipient_pubkey_hash(recipient)?;
+    state.credit_deposit(&pubkey_hash, amount)
 }
 
 /// All inputs needed to commit a shield. Built by `prepare_shield` from
 /// validated request fields; consumed by `commit_prepared_shield`. Holds the
-/// slot id + intent so the commit step can drain the right slot without
-/// re-checking anything that was already validated.
+/// pool's pubkey_hash and the debit so the commit step can decrement balance
+/// without re-checking anything that was already validated.
 #[derive(Clone, Debug)]
 pub struct PreparedShield {
-    pub deposit_slot: u64,
-    pub deposit_id: F,
+    pub pubkey_hash: F,
     pub debit: u64,
     pub client_cm: F,
     pub client_enc: EncryptedNote,
@@ -2107,11 +2115,8 @@ pub struct PreparedShield {
 }
 
 impl PreparedShield {
-    pub fn deposit_slot(&self) -> u64 {
-        self.deposit_slot
-    }
-    pub fn deposit_id(&self) -> &F {
-        &self.deposit_id
+    pub fn pubkey_hash(&self) -> &F {
+        &self.pubkey_hash
     }
     pub fn debit(&self) -> u64 {
         self.debit
@@ -2143,6 +2148,12 @@ pub fn prepare_shield<S: LedgerState>(
     if req.producer_cm == ZERO {
         return Err("shield requires non-zero producer_cm".into());
     }
+    if state.has_applied_shield(&req.client_cm)? {
+        return Err(format!(
+            "shield replay: cm {} already applied",
+            hex::encode(&req.client_cm)
+        ));
+    }
     req.client_enc
         .validate()
         .map_err(|e| format!("invalid client encrypted note: {}", e))?;
@@ -2153,25 +2164,27 @@ pub fn prepare_shield<S: LedgerState>(
     let auth_domain = state.auth_domain()?;
     let mh_recipient = memo_ct_hash(&req.client_enc);
     let mh_producer = memo_ct_hash(&req.producer_enc);
-    let expected_intent = shield_intent(
-        &auth_domain,
-        req.v,
-        req.fee,
-        req.producer_fee,
-        &req.client_cm,
-        &req.producer_cm,
-        &mh_recipient,
-        &mh_producer,
-    );
-    if req.deposit_id != expected_intent {
-        return Err("shield intent mismatch — deposit_id does not match request fields".into());
-    }
 
     let debit = req
         .v
         .checked_add(req.fee)
         .and_then(|value| value.checked_add(req.producer_fee))
         .ok_or_else(|| "shield debit overflow".to_string())?;
+
+    let pool_balance = state
+        .deposit_balance(&req.pubkey_hash)?
+        .ok_or_else(|| {
+            format!(
+                "no deposit pool for pubkey_hash {}; submit an L1 bridge deposit first",
+                hex::encode(&req.pubkey_hash)
+            )
+        })?;
+    if pool_balance < debit {
+        return Err(format!(
+            "deposit pool balance ({}) too small for v + fee + producer_fee ({})",
+            pool_balance, debit
+        ));
+    }
 
     if let Proof::Stark {
         proof_bytes: _,
@@ -2188,23 +2201,23 @@ pub fn prepare_shield<S: LedgerState>(
         if public_outputs[0] != auth_domain {
             return Err("proof auth_domain mismatch".into());
         }
-        if public_outputs[1] != u64_to_felt(req.v) {
+        if public_outputs[1] != req.pubkey_hash {
+            return Err("proof pubkey_hash mismatch".into());
+        }
+        if public_outputs[2] != u64_to_felt(req.v) {
             return Err("proof note value mismatch".into());
         }
-        if public_outputs[2] != u64_to_felt(req.fee) {
+        if public_outputs[3] != u64_to_felt(req.fee) {
             return Err("proof fee mismatch".into());
         }
-        if public_outputs[3] != u64_to_felt(req.producer_fee) {
+        if public_outputs[4] != u64_to_felt(req.producer_fee) {
             return Err("proof producer_fee mismatch".into());
         }
-        if public_outputs[4] != req.client_cm {
+        if public_outputs[5] != req.client_cm {
             return Err("proof cm mismatch".into());
         }
-        if public_outputs[5] != req.producer_cm {
+        if public_outputs[6] != req.producer_cm {
             return Err("proof producer_cm mismatch".into());
-        }
-        if public_outputs[6] != req.deposit_id {
-            return Err("proof deposit_id mismatch".into());
         }
         if public_outputs[7] != mh_recipient {
             return Err("proof memo_ct_hash mismatch".into());
@@ -2217,8 +2230,7 @@ pub fn prepare_shield<S: LedgerState>(
     state.ensure_note_capacity(2)?;
 
     Ok(PreparedShield {
-        deposit_slot: req.deposit_slot,
-        deposit_id: req.deposit_id,
+        pubkey_hash: req.pubkey_hash,
         debit,
         client_cm: req.client_cm,
         client_enc: req.client_enc.clone(),
@@ -2227,22 +2239,23 @@ pub fn prepare_shield<S: LedgerState>(
     })
 }
 
-/// Commit a `PreparedShield`. The order is: (1) consume slot — single-shot
-/// authorization, (2) append both notes, (3) snapshot root, (4) bump
-/// private-tx counter. INTENDED CONTRACT (mirrors `commit_prepared_unshield`):
-/// every `LedgerState` write here must be infallible in any state
-/// implementation that observes externally; otherwise a partial failure can
-/// leave the slot tombstoned but the notes unappended, stranding the L1
-/// deposit. The reference in-memory `Ledger` impl satisfies this trivially.
-/// Outbox-emitting / durable-store kernels MUST NOT use this path — they use
-/// the kernel-specific `prepare_durable_shield_commit` /
-/// `apply_durable_shield_commit` pair where the post-validation apply is
-/// explicitly typed infallible.
+/// Commit a `PreparedShield`. The order is: (1) debit balance — single-shot
+/// for the requested debit, (2) append both notes, (3) snapshot root,
+/// (4) bump private-tx counter. INTENDED CONTRACT (mirrors
+/// `commit_prepared_unshield`): every `LedgerState` write here must be
+/// infallible in any state implementation that observes externally;
+/// otherwise a partial failure can leave the balance debited but the notes
+/// unappended, stranding the user's claim. The reference in-memory `Ledger`
+/// impl satisfies this trivially. Outbox-emitting / durable-store kernels
+/// MUST NOT use this path — they use the kernel-specific
+/// `prepare_durable_shield_commit` / `apply_durable_shield_commit` pair
+/// where the post-validation apply is explicitly typed infallible.
 pub fn commit_prepared_shield<S: LedgerState>(
     state: &mut S,
     prepared: PreparedShield,
 ) -> Result<ShieldResp, String> {
-    state.consume_deposit_slot(prepared.deposit_slot, &prepared.deposit_id, prepared.debit)?;
+    state.debit_deposit(&prepared.pubkey_hash, prepared.debit)?;
+    state.mark_applied_shield(prepared.client_cm)?;
     let index = state.append_note(prepared.client_cm, prepared.client_enc)?;
     let producer_index = state.append_note(prepared.producer_cm, prepared.producer_enc)?;
     state.snapshot_root()?;
@@ -2553,26 +2566,8 @@ mod tests {
         u64_to_felt(v)
     }
 
-    fn test_intent_for_shield(
-        auth_domain: &F,
-        v: u64,
-        fee: u64,
-        producer_fee: u64,
-        cm_recipient: &F,
-        cm_producer: &F,
-        enc_recipient: &EncryptedNote,
-        enc_producer: &EncryptedNote,
-    ) -> F {
-        shield_intent(
-            auth_domain,
-            v,
-            fee,
-            producer_fee,
-            cm_recipient,
-            cm_producer,
-            &memo_ct_hash(enc_recipient),
-            &memo_ct_hash(enc_producer),
-        )
+    fn test_pubkey_hash_for_address(auth_domain: &F, addr: &PaymentAddress, blind: &F) -> F {
+        deposit_pubkey_hash(auth_domain, &addr.auth_root, &addr.auth_pub_seed, blind)
     }
 
     fn recompute_root_from_path(leaf: F, index: usize, siblings: &[F]) -> F {
@@ -2824,17 +2819,24 @@ mod tests {
 
         fn note_private_tx_applied(&mut self) {}
 
-        fn record_deposit_slot(&mut self, intent: F, amount: u64) -> Result<u64, String> {
-            self.inner.record_deposit_slot(intent, amount)
+        fn deposit_balance(&self, pubkey_hash: &F) -> Result<Option<u64>, String> {
+            self.inner.deposit_balance(pubkey_hash)
         }
 
-        fn consume_deposit_slot(
-            &mut self,
-            slot_id: u64,
-            intent: &F,
-            debit: u64,
-        ) -> Result<(), String> {
-            self.inner.consume_deposit_slot(slot_id, intent, debit)
+        fn credit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
+            self.inner.credit_deposit(pubkey_hash, amount)
+        }
+
+        fn debit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
+            self.inner.debit_deposit(pubkey_hash, amount)
+        }
+
+        fn has_applied_shield(&self, client_cm: &F) -> Result<bool, String> {
+            self.inner.has_applied_shield(client_cm)
+        }
+
+        fn mark_applied_shield(&mut self, client_cm: F) -> Result<(), String> {
+            self.inner.mark_applied_shield(client_cm)
         }
     }
 
@@ -2887,17 +2889,24 @@ mod tests {
 
         fn note_private_tx_applied(&mut self) {}
 
-        fn record_deposit_slot(&mut self, intent: F, amount: u64) -> Result<u64, String> {
-            self.inner.record_deposit_slot(intent, amount)
+        fn deposit_balance(&self, pubkey_hash: &F) -> Result<Option<u64>, String> {
+            self.inner.deposit_balance(pubkey_hash)
         }
 
-        fn consume_deposit_slot(
-            &mut self,
-            slot_id: u64,
-            intent: &F,
-            debit: u64,
-        ) -> Result<(), String> {
-            self.inner.consume_deposit_slot(slot_id, intent, debit)
+        fn credit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
+            self.inner.credit_deposit(pubkey_hash, amount)
+        }
+
+        fn debit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
+            self.inner.debit_deposit(pubkey_hash, amount)
+        }
+
+        fn has_applied_shield(&self, client_cm: &F) -> Result<bool, String> {
+            self.inner.has_applied_shield(client_cm)
+        }
+
+        fn mark_applied_shield(&mut self, client_cm: F) -> Result<(), String> {
+            self.inner.mark_applied_shield(client_cm)
         }
     }
 
@@ -2939,32 +2948,23 @@ mod tests {
             Some(b"shield"),
         );
         let mut ledger = Ledger::new();
-        let intent = test_intent_for_shield(
-            &ledger.auth_domain,
-            amount,
-            MIN_TX_FEE,
-            producer_fee,
-            &client_cm,
-            &producer_cm,
-            &client_enc,
-            &producer_enc,
-        );
+        let blind = felt_tag(b"shielded-note-setup-blind");
+        let pubkey_hash = test_pubkey_hash_for_address(&ledger.auth_domain, &addr, &blind);
         let debit = amount + MIN_TX_FEE + producer_fee;
         ledger
-            .deposit(&deposit_recipient_string(&intent), debit)
+            .deposit(&deposit_recipient_string(&pubkey_hash), debit)
             .unwrap();
         let resp = ledger
             .shield(&ShieldReq {
-                deposit_id: intent,
-                deposit_slot: 0,
+                pubkey_hash,
                 fee: MIN_TX_FEE,
                 v: amount,
                 producer_fee,
                 proof: Proof::TrustMeBro,
                 client_cm,
-                client_enc: client_enc,
+                client_enc,
                 producer_cm,
-                producer_enc: producer_enc,
+                producer_enc,
             })
             .unwrap();
         (ledger, addr, nk_spend, resp)
@@ -3450,6 +3450,276 @@ mod tests {
     }
 
     #[test]
+    fn test_shield_sighash_binds_every_public_field() {
+        // Mirror of `test_transfer_and_unshield_sighash_are_bound_to
+        // _public_fields`: verifies that `shield_sighash` fans out
+        // every one of its 9 inputs into the digest, so a delegated
+        // prover with a leaked witness cannot redirect funds, change
+        // values, or swap recipients without invalidating the WOTS+
+        // signature.
+        let auth_domain = u(1);
+        let pubkey_hash = u(2);
+        let v: u64 = 100;
+        let fee: u64 = 7;
+        let producer_fee: u64 = 1;
+        let cm_recipient = u(3);
+        let cm_producer = u(4);
+        let mh_recipient = u(5);
+        let mh_producer = u(6);
+
+        let base = shield_sighash(
+            &auth_domain,
+            &pubkey_hash,
+            v,
+            fee,
+            producer_fee,
+            &cm_recipient,
+            &cm_producer,
+            &mh_recipient,
+            &mh_producer,
+        );
+
+        let perturbations: Vec<F> = vec![
+            shield_sighash(
+                &u(99),
+                &pubkey_hash,
+                v,
+                fee,
+                producer_fee,
+                &cm_recipient,
+                &cm_producer,
+                &mh_recipient,
+                &mh_producer,
+            ),
+            shield_sighash(
+                &auth_domain,
+                &u(99),
+                v,
+                fee,
+                producer_fee,
+                &cm_recipient,
+                &cm_producer,
+                &mh_recipient,
+                &mh_producer,
+            ),
+            shield_sighash(
+                &auth_domain,
+                &pubkey_hash,
+                v + 1,
+                fee,
+                producer_fee,
+                &cm_recipient,
+                &cm_producer,
+                &mh_recipient,
+                &mh_producer,
+            ),
+            shield_sighash(
+                &auth_domain,
+                &pubkey_hash,
+                v,
+                fee + 1,
+                producer_fee,
+                &cm_recipient,
+                &cm_producer,
+                &mh_recipient,
+                &mh_producer,
+            ),
+            shield_sighash(
+                &auth_domain,
+                &pubkey_hash,
+                v,
+                fee,
+                producer_fee + 1,
+                &cm_recipient,
+                &cm_producer,
+                &mh_recipient,
+                &mh_producer,
+            ),
+            shield_sighash(
+                &auth_domain,
+                &pubkey_hash,
+                v,
+                fee,
+                producer_fee,
+                &u(99),
+                &cm_producer,
+                &mh_recipient,
+                &mh_producer,
+            ),
+            shield_sighash(
+                &auth_domain,
+                &pubkey_hash,
+                v,
+                fee,
+                producer_fee,
+                &cm_recipient,
+                &u(99),
+                &mh_recipient,
+                &mh_producer,
+            ),
+            shield_sighash(
+                &auth_domain,
+                &pubkey_hash,
+                v,
+                fee,
+                producer_fee,
+                &cm_recipient,
+                &cm_producer,
+                &u(99),
+                &mh_producer,
+            ),
+            shield_sighash(
+                &auth_domain,
+                &pubkey_hash,
+                v,
+                fee,
+                producer_fee,
+                &cm_recipient,
+                &cm_producer,
+                &mh_recipient,
+                &u(99),
+            ),
+        ];
+        for (idx, perturbed) in perturbations.iter().enumerate() {
+            assert_ne!(*perturbed, base, "field {} did not affect sighash", idx);
+        }
+
+        // Domain-separated from transfer (0x01) and unshield (0x02): a
+        // shield's sighash must never collide with a transfer's or
+        // unshield's even when their public outputs nominally match.
+        // (We pick small synthetic inputs so the type-tag is the only
+        // difference; transfer and unshield take different shapes, so
+        // the fold sequences diverge structurally as well.)
+        assert_ne!(
+            base,
+            transfer_sighash(
+                &auth_domain,
+                &pubkey_hash,
+                &[],
+                fee,
+                &cm_recipient,
+                &cm_producer,
+                &mh_recipient,
+                &mh_recipient,
+                &mh_producer,
+                &mh_producer,
+            )
+        );
+    }
+
+    #[test]
+    fn test_deposit_pubkey_hash_binds_every_input() {
+        // The pool key is `H(0x04, auth_domain, auth_root,
+        // auth_pub_seed, blind)`. Any of the four inputs flipping must
+        // produce a distinct pool key — otherwise the pool wouldn't be
+        // deployment-scoped (auth_domain), wouldn't be wallet-scoped
+        // (auth_root, auth_pub_seed), or wouldn't resist deterministic
+        // collision across different blinds derived from the same
+        // wallet (the `derive_deposit_blind` advance).
+        let auth_domain = u(0xA1);
+        let auth_root = u(0xA2);
+        let auth_pub_seed = u(0xA3);
+        let blind = u(0xA4);
+        let base = deposit_pubkey_hash(&auth_domain, &auth_root, &auth_pub_seed, &blind);
+        assert_ne!(
+            base,
+            deposit_pubkey_hash(&u(0xFF), &auth_root, &auth_pub_seed, &blind),
+            "auth_domain"
+        );
+        assert_ne!(
+            base,
+            deposit_pubkey_hash(&auth_domain, &u(0xFF), &auth_pub_seed, &blind),
+            "auth_root"
+        );
+        assert_ne!(
+            base,
+            deposit_pubkey_hash(&auth_domain, &auth_root, &u(0xFF), &blind),
+            "auth_pub_seed"
+        );
+        assert_ne!(
+            base,
+            deposit_pubkey_hash(&auth_domain, &auth_root, &auth_pub_seed, &u(0xFF)),
+            "blind"
+        );
+    }
+
+    #[test]
+    fn test_parse_deposit_recipient_pubkey_hash_rejects_malformed_inputs() {
+        // Empty / wrong prefix.
+        assert!(parse_deposit_recipient_pubkey_hash("").is_err());
+        assert!(parse_deposit_recipient_pubkey_hash("alice").is_err());
+        assert!(parse_deposit_recipient_pubkey_hash("DEPOSIT:1234").is_err());
+
+        // Wrong length (not 64 hex chars).
+        assert!(parse_deposit_recipient_pubkey_hash("deposit:00").is_err());
+        assert!(parse_deposit_recipient_pubkey_hash(&format!(
+            "deposit:{}",
+            "00".repeat(31)
+        ))
+        .is_err());
+        assert!(parse_deposit_recipient_pubkey_hash(&format!(
+            "deposit:{}",
+            "00".repeat(33)
+        ))
+        .is_err());
+
+        // 64 chars but non-hex (g..z).
+        assert!(parse_deposit_recipient_pubkey_hash(&format!("deposit:{}", "g".repeat(64)))
+            .is_err());
+
+        // 64 chars but non-canonical (uppercase hex).
+        let upper = format!("deposit:{}", "AB".repeat(32));
+        let upper_err = parse_deposit_recipient_pubkey_hash(&upper).unwrap_err();
+        assert!(upper_err.contains("canonical"), "{}", upper_err);
+
+        // Round-trip on a canonical input.
+        let key = deposit_recipient_string(&u(42));
+        let parsed = parse_deposit_recipient_pubkey_hash(&key).unwrap();
+        assert_eq!(parsed, u(42));
+        assert!(is_deposit_recipient_string(&key));
+        assert!(!is_deposit_recipient_string(&format!(
+            "{}{}",
+            DEPOSIT_RECIPIENT_PREFIX,
+            "00".repeat(31)
+        )));
+    }
+
+    #[test]
+    fn test_credit_deposit_overflow_is_caught() {
+        // The reference Ledger keeps balances as u64; an L1 ticket that
+        // would push a pool past u64::MAX must error rather than wrap.
+        let mut ledger = Ledger::new();
+        let pubkey_hash = u(0xC0);
+        ledger.credit_deposit(&pubkey_hash, u64::MAX).unwrap();
+        let err = ledger.credit_deposit(&pubkey_hash, 1).unwrap_err();
+        assert!(err.contains("overflow"), "{}", err);
+        assert_eq!(
+            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn test_debit_deposit_zero_amount_keeps_pool_intact() {
+        // A degenerate but valid debit of zero shouldn't remove the
+        // pool entry (only debits to exactly the remaining balance do).
+        let mut ledger = Ledger::new();
+        let pubkey_hash = u(0xD0);
+        ledger.credit_deposit(&pubkey_hash, 100).unwrap();
+        ledger.debit_deposit(&pubkey_hash, 0).unwrap();
+        assert_eq!(
+            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            Some(100)
+        );
+        // Full drain removes the entry.
+        ledger.debit_deposit(&pubkey_hash, 100).unwrap();
+        assert!(!ledger.deposit_balances.contains_key(&pubkey_hash));
+        // Debiting an absent pool errors.
+        let err = ledger.debit_deposit(&pubkey_hash, 1).unwrap_err();
+        assert!(err.contains("does not exist"), "{}", err);
+    }
+
+    #[test]
     fn test_transfer_and_unshield_sighash_are_bound_to_public_fields() {
         let auth_domain = u(1);
         let root = u(2);
@@ -3793,7 +4063,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_shield_stark_path_drains_intent_balance_and_appends_notes() {
+    fn test_apply_shield_stark_path_drains_pool_balance_and_appends_notes() {
         let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x71, 0);
         let mut ledger = Ledger::new();
         let fee = MIN_TX_FEE;
@@ -3801,48 +4071,41 @@ mod tests {
         let v = 125u64;
         let debit = v + fee + producer_fee;
         let auth_domain = ledger.auth_domain;
+        let blind = felt_tag(b"shield-test-blind-1");
+        let pubkey_hash = test_pubkey_hash_for_address(&auth_domain, &addr, &blind);
 
         let (enc, cm) = deterministic_note(&addr, v, u(15), Some(b"shield"));
         let (producer_enc, producer_cm) =
             deterministic_note(&addr, producer_fee, u(16), Some(b"dal"));
         let memo_hash = memo_ct_hash(&enc);
         let producer_memo_hash = memo_ct_hash(&producer_enc);
-        let intent = test_intent_for_shield(
-            &auth_domain,
-            v,
-            fee,
-            producer_fee,
-            &cm,
-            &producer_cm,
-            &enc,
-            &producer_enc,
-        );
-        ledger.deposit(&deposit_recipient_string(&intent), debit).unwrap();
+        ledger
+            .deposit(&deposit_recipient_string(&pubkey_hash), debit)
+            .unwrap();
         let root_before = ledger.tree.root();
 
         let resp = apply_shield(
             &mut ledger,
             &ShieldReq {
-                deposit_id: intent,
-                deposit_slot: 0,
+                pubkey_hash,
                 fee,
                 v,
                 producer_fee,
                 proof: fake_stark(vec![
                     auth_domain,
+                    pubkey_hash,
                     u(v),
                     u(fee),
                     u(producer_fee),
                     cm,
                     producer_cm,
-                    intent,
                     memo_hash,
                     producer_memo_hash,
                 ]),
                 client_cm: cm,
                 client_enc: enc,
                 producer_cm,
-                producer_enc: producer_enc,
+                producer_enc,
             },
         )
         .unwrap();
@@ -3851,15 +4114,244 @@ mod tests {
         assert_eq!(resp.index, 0);
         assert_eq!(resp.producer_cm, producer_cm);
         assert_eq!(resp.producer_index, 1);
-        // Intent-bound deposits: slot consumed on shield.
-        assert!(ledger.deposit_slots.is_empty());
+        // Pool was fully drained → balance entry removed.
+        assert!(ledger.deposit_balances.is_empty());
         assert_eq!(ledger.memos.len(), 2);
         assert_ne!(ledger.tree.root(), root_before);
         assert!(ledger.valid_roots.contains(&ledger.tree.root()));
     }
 
     #[test]
-    fn test_apply_shield_rejects_request_with_intent_mismatch() {
+    fn test_apply_shield_two_distinct_shields_can_share_one_pool() {
+        // Replay protection MUST NOT block the legitimate scenario of
+        // a wallet draining the same pool twice with different
+        // recipient commitments (e.g., two partial drains using
+        // distinct rseeds, or top up then drain the residue). Each
+        // shield mints a fresh `client_cm` because the wallet picks a
+        // random rseed per shield, so the applied-cm set is distinct
+        // and both succeed.
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x71, 0);
+        let mut ledger = Ledger::new();
+        let fee = MIN_TX_FEE;
+        let producer_fee = 7;
+        let v = 50u64;
+        let debit = v + fee + producer_fee;
+        let auth_domain = ledger.auth_domain;
+        let blind = felt_tag(b"shield-share-pool-blind");
+        let pubkey_hash = test_pubkey_hash_for_address(&auth_domain, &addr, &blind);
+
+        // Two shields, distinct rseeds → distinct cms.
+        let (enc_a, cm_a) = deterministic_note(&addr, v, u(0x21), Some(b"shield-a"));
+        let (producer_enc_a, producer_cm_a) =
+            deterministic_note(&addr, producer_fee, u(0x22), Some(b"dal-a"));
+        let (enc_b, cm_b) = deterministic_note(&addr, v, u(0x31), Some(b"shield-b"));
+        let (producer_enc_b, producer_cm_b) =
+            deterministic_note(&addr, producer_fee, u(0x32), Some(b"dal-b"));
+        assert_ne!(cm_a, cm_b);
+        let mh_a = memo_ct_hash(&enc_a);
+        let producer_mh_a = memo_ct_hash(&producer_enc_a);
+        let mh_b = memo_ct_hash(&enc_b);
+        let producer_mh_b = memo_ct_hash(&producer_enc_b);
+
+        // Pre-fund the pool to cover both shields.
+        ledger
+            .deposit(&deposit_recipient_string(&pubkey_hash), 2 * debit)
+            .unwrap();
+
+        let req_a = ShieldReq {
+            pubkey_hash,
+            fee,
+            v,
+            producer_fee,
+            proof: fake_stark(vec![
+                auth_domain,
+                pubkey_hash,
+                u(v),
+                u(fee),
+                u(producer_fee),
+                cm_a,
+                producer_cm_a,
+                mh_a,
+                producer_mh_a,
+            ]),
+            client_cm: cm_a,
+            client_enc: enc_a,
+            producer_cm: producer_cm_a,
+            producer_enc: producer_enc_a,
+        };
+        ledger.shield(&req_a).expect("first shield");
+
+        let req_b = ShieldReq {
+            pubkey_hash,
+            fee,
+            v,
+            producer_fee,
+            proof: fake_stark(vec![
+                auth_domain,
+                pubkey_hash,
+                u(v),
+                u(fee),
+                u(producer_fee),
+                cm_b,
+                producer_cm_b,
+                mh_b,
+                producer_mh_b,
+            ]),
+            client_cm: cm_b,
+            client_enc: enc_b,
+            producer_cm: producer_cm_b,
+            producer_enc: producer_enc_b,
+        };
+        ledger.shield(&req_b).expect("second distinct shield");
+
+        // Both client cms are recorded, both notes are in the tree,
+        // pool is drained.
+        assert!(ledger.applied_shield_cms.contains(&cm_a));
+        assert!(ledger.applied_shield_cms.contains(&cm_b));
+        assert_eq!(ledger.tree.leaves.len(), 4);
+        assert!(ledger.deposit_balances.is_empty());
+    }
+
+    #[test]
+    fn test_apply_shield_rejects_replay_of_same_client_cm() {
+        // After a successful shield, replaying the SAME `ShieldReq` (same
+        // proof, same client_cm) must be rejected by `prepare_shield`,
+        // even when the pool has been topped up to cover the second
+        // debit. Without this check, the recipient would receive a
+        // duplicate of their original note at a fresh tree position
+        // (independently spendable), siphoning the topup.
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x71, 0);
+        let mut ledger = Ledger::new();
+        let fee = MIN_TX_FEE;
+        let producer_fee = 7;
+        let v = 125u64;
+        let debit = v + fee + producer_fee;
+        let auth_domain = ledger.auth_domain;
+        let blind = felt_tag(b"shield-replay-blind");
+        let pubkey_hash = test_pubkey_hash_for_address(&auth_domain, &addr, &blind);
+
+        let (enc, cm) = deterministic_note(&addr, v, u(15), Some(b"shield"));
+        let (producer_enc, producer_cm) =
+            deterministic_note(&addr, producer_fee, u(16), Some(b"dal"));
+        let memo_hash = memo_ct_hash(&enc);
+        let producer_memo_hash = memo_ct_hash(&producer_enc);
+
+        let req = ShieldReq {
+            pubkey_hash,
+            fee,
+            v,
+            producer_fee,
+            proof: fake_stark(vec![
+                auth_domain,
+                pubkey_hash,
+                u(v),
+                u(fee),
+                u(producer_fee),
+                cm,
+                producer_cm,
+                memo_hash,
+                producer_memo_hash,
+            ]),
+            client_cm: cm,
+            client_enc: enc,
+            producer_cm,
+            producer_enc,
+        };
+
+        ledger
+            .deposit(&deposit_recipient_string(&pubkey_hash), debit)
+            .unwrap();
+        ledger.shield(&req).expect("first shield must succeed");
+        let memos_after_first = ledger.memos.len();
+        let tree_size_after_first = ledger.tree.leaves.len();
+
+        // Top up the pool by exactly the same debit (mirror deposit /
+        // any aggregating top-up). Replay must still be rejected.
+        ledger
+            .deposit(&deposit_recipient_string(&pubkey_hash), debit)
+            .unwrap();
+        let err = ledger
+            .shield(&req)
+            .expect_err("replay must be rejected");
+        assert!(
+            err.contains("shield replay") || err.contains("already applied"),
+            "expected replay error, got: {}",
+            err
+        );
+
+        // Tree must not have grown; memos must not have grown.
+        assert_eq!(ledger.memos.len(), memos_after_first);
+        assert_eq!(ledger.tree.leaves.len(), tree_size_after_first);
+        // Topup is still in the pool (rejected request must not have
+        // partially debited).
+        assert_eq!(
+            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            Some(debit)
+        );
+        // The applied-shield set has exactly the one cm.
+        assert!(ledger.applied_shield_cms.contains(&cm));
+    }
+
+    #[test]
+    fn test_apply_shield_aggregates_multiple_l1_deposits_to_same_pubkey() {
+        // Top-up: two L1 tickets to the same deposit:<hex(pubkey_hash)>
+        // recipient sum into one balance pool. A single shield drains
+        // exactly v + fee + producer_fee; the rest stays as residual
+        // balance available for a second shield.
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x72, 0);
+        let mut ledger = Ledger::new();
+        let fee = MIN_TX_FEE;
+        let producer_fee = 7;
+        let v = 100u64;
+        let debit = v + fee + producer_fee;
+        let auth_domain = ledger.auth_domain;
+        let blind = felt_tag(b"shield-test-blind-aggregate");
+        let pubkey_hash = test_pubkey_hash_for_address(&auth_domain, &addr, &blind);
+
+        let recipient = deposit_recipient_string(&pubkey_hash);
+        // Two L1 deposits aggregating to debit + slack.
+        ledger.deposit(&recipient, debit / 2).unwrap();
+        ledger.deposit(&recipient, debit - debit / 2 + 50).unwrap();
+        assert_eq!(ledger.deposit_balances.get(&pubkey_hash).copied(), Some(debit + 50));
+
+        let (enc, cm) = deterministic_note(&addr, v, u(31), Some(b"shield"));
+        let (producer_enc, producer_cm) =
+            deterministic_note(&addr, producer_fee, u(32), Some(b"dal"));
+        let memo_hash = memo_ct_hash(&enc);
+        let producer_memo_hash = memo_ct_hash(&producer_enc);
+
+        apply_shield(
+            &mut ledger,
+            &ShieldReq {
+                pubkey_hash,
+                fee,
+                v,
+                producer_fee,
+                proof: fake_stark(vec![
+                    auth_domain,
+                    pubkey_hash,
+                    u(v),
+                    u(fee),
+                    u(producer_fee),
+                    cm,
+                    producer_cm,
+                    memo_hash,
+                    producer_memo_hash,
+                ]),
+                client_cm: cm,
+                client_enc: enc,
+                producer_cm,
+                producer_enc,
+            },
+        )
+        .unwrap();
+
+        // 50 mutez left in the pool after the first shield.
+        assert_eq!(ledger.deposit_balances.get(&pubkey_hash).copied(), Some(50));
+    }
+
+    #[test]
+    fn test_apply_shield_rejects_request_against_unknown_pubkey_hash() {
         let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x91, 0);
         let mut ledger = Ledger::new();
         let fee = MIN_TX_FEE;
@@ -3867,32 +4359,19 @@ mod tests {
         let v = 125u64;
         let debit = v + fee + producer_fee;
         let auth_domain = ledger.auth_domain;
+        let blind = felt_tag(b"unknown-pubkey-test");
+        let pubkey_hash = test_pubkey_hash_for_address(&auth_domain, &addr, &blind);
 
         let (enc, cm) = deterministic_note(&addr, v, u(17), Some(b"shield"));
         let (producer_enc, producer_cm) =
             deterministic_note(&addr, producer_fee, u(18), Some(b"dal"));
-        let intent = test_intent_for_shield(
-            &auth_domain,
-            v,
-            fee,
-            producer_fee,
-            &cm,
-            &producer_cm,
-            &enc,
-            &producer_enc,
-        );
-        ledger.deposit(&deposit_recipient_string(&intent), debit).unwrap();
-
-        // Lie about the deposit_id (caller-controlled). Must be rejected before
-        // anything mutates state.
-        let mut bogus_intent = intent;
-        bogus_intent[0] ^= 0x01;
+        // Note: NO deposit was performed, so the pool does not exist.
+        let _ = debit;
 
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
-                deposit_id: bogus_intent,
-                deposit_slot: 0,
+                pubkey_hash,
                 fee,
                 v,
                 producer_fee,
@@ -3900,19 +4379,18 @@ mod tests {
                 client_cm: cm,
                 client_enc: enc,
                 producer_cm,
-                producer_enc: producer_enc,
+                producer_enc,
             },
         )
         .unwrap_err();
 
-        assert!(err.contains("shield intent mismatch"), "err = {}", err);
-        // Original slot is intact.
-        assert_eq!(ledger.deposit_slots.get(&0).map(|s| s.amount), Some(debit));
+        assert!(err.contains("no deposit pool"), "err = {}", err);
+        assert!(ledger.deposit_balances.is_empty());
         assert!(ledger.memos.is_empty());
     }
 
     #[test]
-    fn test_apply_shield_rejects_inexact_l1_amount() {
+    fn test_apply_shield_rejects_request_when_pool_balance_too_small() {
         let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x93, 0);
         let mut ledger = Ledger::new();
         let fee = MIN_TX_FEE;
@@ -3920,30 +4398,21 @@ mod tests {
         let v = 125u64;
         let debit = v + fee + producer_fee;
         let auth_domain = ledger.auth_domain;
+        let blind = felt_tag(b"insufficient-balance-test");
+        let pubkey_hash = test_pubkey_hash_for_address(&auth_domain, &addr, &blind);
 
         let (enc, cm) = deterministic_note(&addr, v, u(31), Some(b"shield"));
         let (producer_enc, producer_cm) =
             deterministic_note(&addr, producer_fee, u(32), Some(b"dal"));
-        let intent = test_intent_for_shield(
-            &auth_domain,
-            v,
-            fee,
-            producer_fee,
-            &cm,
-            &producer_cm,
-            &enc,
-            &producer_enc,
-        );
-        // Over-fund the deposit by 1; exact-amount rule must reject.
+        // Underfund the pool by 1.
         ledger
-            .deposit(&deposit_recipient_string(&intent), debit + 1)
+            .deposit(&deposit_recipient_string(&pubkey_hash), debit - 1)
             .unwrap();
 
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
-                deposit_id: intent,
-                deposit_slot: 0,
+                pubkey_hash,
                 fee,
                 v,
                 producer_fee,
@@ -3951,14 +4420,17 @@ mod tests {
                 client_cm: cm,
                 client_enc: enc,
                 producer_cm,
-                producer_enc: producer_enc,
+                producer_enc,
             },
         )
         .unwrap_err();
 
-        assert!(err.contains("amount mismatch"), "err = {}", err);
-        // Slot still open (rejection left state untouched).
-        assert_eq!(ledger.deposit_slots.get(&0).map(|s| s.amount), Some(debit + 1));
+        assert!(err.contains("balance"), "err = {}", err);
+        // Pool still has its underfunded balance (rejection left state untouched).
+        assert_eq!(
+            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            Some(debit - 1)
+        );
         assert!(ledger.memos.is_empty());
     }
 
@@ -3971,139 +4443,115 @@ mod tests {
         let v = 125u64;
         let debit = v + fee + producer_fee;
         let auth_domain = ledger.auth_domain;
+        let blind = felt_tag(b"extra-public-outputs-test");
+        let pubkey_hash = test_pubkey_hash_for_address(&auth_domain, &addr, &blind);
 
         let (enc, cm) = deterministic_note(&addr, v, u(19), Some(b"shield"));
         let (producer_enc, producer_cm) =
             deterministic_note(&addr, producer_fee, u(20), Some(b"dal"));
-        let intent = test_intent_for_shield(
-            &auth_domain,
-            v,
-            fee,
-            producer_fee,
-            &cm,
-            &producer_cm,
-            &enc,
-            &producer_enc,
-        );
-        ledger.deposit(&deposit_recipient_string(&intent), debit).unwrap();
+        ledger
+            .deposit(&deposit_recipient_string(&pubkey_hash), debit)
+            .unwrap();
 
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
-                deposit_id: intent,
-                deposit_slot: 0,
+                pubkey_hash,
                 fee,
                 v,
                 producer_fee,
                 proof: fake_stark(vec![
                     u(999),
                     auth_domain,
+                    pubkey_hash,
                     u(v),
                     u(fee),
                     u(producer_fee),
                     cm,
                     producer_cm,
-                    intent,
                     memo_ct_hash(&enc),
                     memo_ct_hash(&producer_enc),
                 ]),
                 client_cm: cm,
                 client_enc: enc,
                 producer_cm,
-                producer_enc: producer_enc,
+                producer_enc,
             },
         )
         .unwrap_err();
 
         assert!(err.contains("public output length mismatch"), "err = {}", err);
-        // Slot still open (rejection left state untouched).
-        assert_eq!(ledger.deposit_slots.get(&0).map(|s| s.amount), Some(debit));
+        // Pool balance untouched.
+        assert_eq!(
+            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            Some(debit)
+        );
         assert!(ledger.memos.is_empty());
     }
 
     #[test]
-    fn test_apply_shield_rejects_swapped_recipient_to_other_intent() {
-        // A malicious prover that received the witness for "honest" cannot
-        // redirect funds: they would need to substitute a different
-        // client_cm, which changes shield_intent(...), so the kernel's
-        // recompute would no longer match req.deposit_id, and the L1 balance
-        // for the fake intent is empty.
-        let (_acc, addr_honest, _, _, _) = sample_address_bundle(0x71, 0);
-        let (_acc2, addr_attacker, _, _, _) = sample_address_bundle(0x72, 0);
+    fn test_apply_shield_rejects_proof_pubkey_hash_mismatch() {
+        // The kernel pins the proof's public output #1 to req.pubkey_hash.
+        // A malicious prover that swaps in a different pubkey_hash inside
+        // the proof would fail this consensus check before any state change.
+        let (_acc, addr, _, _, _) = sample_address_bundle(0x73, 0);
         let mut ledger = Ledger::new();
         let fee = MIN_TX_FEE;
         let producer_fee = 7;
         let v = 100u64;
         let debit = v + fee + producer_fee;
         let auth_domain = ledger.auth_domain;
+        let blind = felt_tag(b"pubkey-hash-mismatch-test");
+        let pubkey_hash = test_pubkey_hash_for_address(&auth_domain, &addr, &blind);
 
-        let (enc_honest, cm_honest) = deterministic_note(&addr_honest, v, u(50), Some(b"shield"));
-        let (enc_attacker, cm_attacker) =
-            deterministic_note(&addr_attacker, v, u(51), Some(b"shield"));
+        let (enc, cm) = deterministic_note(&addr, v, u(60), Some(b"shield"));
         let (producer_enc, producer_cm) =
-            deterministic_note(&addr_honest, producer_fee, u(52), Some(b"dal"));
-
-        // Honest user funds for the honest recipient.
-        let honest_intent = test_intent_for_shield(
-            &auth_domain,
-            v,
-            fee,
-            producer_fee,
-            &cm_honest,
-            &producer_cm,
-            &enc_honest,
-            &producer_enc,
-        );
+            deterministic_note(&addr, producer_fee, u(61), Some(b"dal"));
         ledger
-            .deposit(&deposit_recipient_string(&honest_intent), debit)
+            .deposit(&deposit_recipient_string(&pubkey_hash), debit)
             .unwrap();
 
-        // Attacker tries to drain by claiming an attacker-crafted intent.
-        let attacker_intent = test_intent_for_shield(
-            &auth_domain,
-            v,
-            fee,
-            producer_fee,
-            &cm_attacker,
-            &producer_cm,
-            &enc_attacker,
-            &producer_enc,
-        );
-        let err = apply_shield(
-            &mut ledger,
-            &ShieldReq {
-                deposit_id: attacker_intent,
-                deposit_slot: 0,
+        let mut bogus_pubkey_hash = pubkey_hash;
+        bogus_pubkey_hash[0] ^= 0x01;
+
+        let err = ledger
+            .shield(&ShieldReq {
+                pubkey_hash,
                 fee,
                 v,
                 producer_fee,
-                proof: Proof::TrustMeBro,
-                client_cm: cm_attacker,
-                client_enc: enc_attacker,
+                proof: fake_stark(vec![
+                    auth_domain,
+                    bogus_pubkey_hash,
+                    u(v),
+                    u(fee),
+                    u(producer_fee),
+                    cm,
+                    producer_cm,
+                    memo_ct_hash(&enc),
+                    memo_ct_hash(&producer_enc),
+                ]),
+                client_cm: cm,
+                client_enc: enc,
                 producer_cm,
-                producer_enc: producer_enc,
-            },
-        )
-        .unwrap_err();
+                producer_enc,
+            })
+            .unwrap_err();
 
-        // The slot's intent is bound to honest, not attacker.
-        assert!(
-            err.contains("intent mismatch") || err.contains("amount mismatch"),
-            "err = {}", err
-        );
-        // Honest slot is intact.
+        assert!(err.contains("pubkey_hash mismatch"), "err = {}", err);
+        // Pool balance untouched.
         assert_eq!(
-            ledger.deposit_slots.get(&0),
-            Some(&DepositSlot { intent: honest_intent, amount: debit })
+            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            Some(debit)
         );
-        assert!(ledger.memos.is_empty());
     }
 
     #[test]
     fn test_apply_shield_rejects_swapped_auth_domain_replay() {
         // A shield proof crafted for deployment A must not drain funds in
-        // deployment B even if all other fields match — auth_domain is
-        // folded into intent.
+        // deployment B even if all other fields match — auth_domain is in
+        // the proof's public outputs and the kernel pins it to its
+        // configured value.
         let (_acc, addr, _, _, _) = sample_address_bundle(0x73, 0);
         let mut ledger_a = Ledger::with_auth_domain(u(0xA));
         let mut ledger_b = Ledger::with_auth_domain(u(0xB));
@@ -4111,33 +4559,29 @@ mod tests {
         let producer_fee = 7;
         let v = 100u64;
         let debit = v + fee + producer_fee;
+        let blind = felt_tag(b"auth-domain-replay-test");
+        // Note: pubkey_hash already binds auth_domain, so the same blind
+        // produces *different* pubkey_hashes on the two deployments.
+        let pubkey_hash_a =
+            test_pubkey_hash_for_address(&ledger_a.auth_domain, &addr, &blind);
+        let pubkey_hash_b =
+            test_pubkey_hash_for_address(&ledger_b.auth_domain, &addr, &blind);
+        assert_ne!(pubkey_hash_a, pubkey_hash_b);
 
         let (enc, cm) = deterministic_note(&addr, v, u(60), Some(b"shield"));
         let (producer_enc, producer_cm) =
             deterministic_note(&addr, producer_fee, u(61), Some(b"dal"));
-        let intent_a = test_intent_for_shield(
-            &ledger_a.auth_domain,
-            v,
-            fee,
-            producer_fee,
-            &cm,
-            &producer_cm,
-            &enc,
-            &producer_enc,
-        );
-        // Fund both deployments at the *same* deposit key (intent_a).
         ledger_a
-            .deposit(&deposit_recipient_string(&intent_a), debit)
+            .deposit(&deposit_recipient_string(&pubkey_hash_a), debit)
             .unwrap();
         ledger_b
-            .deposit(&deposit_recipient_string(&intent_a), debit)
+            .deposit(&deposit_recipient_string(&pubkey_hash_b), debit)
             .unwrap();
 
-        // Drain ledger A succeeds.
+        // Drain ledger A succeeds (TrustMeBro skips proof public-output check).
         ledger_a
             .shield(&ShieldReq {
-                deposit_id: intent_a,
-                deposit_slot: 0,
+                pubkey_hash: pubkey_hash_a,
                 fee,
                 v,
                 producer_fee,
@@ -4149,26 +4593,38 @@ mod tests {
             })
             .unwrap();
 
-        // Same request against ledger B fails — different auth_domain means
-        // the kernel-recomputed intent disagrees with req.deposit_id.
+        // A proof that bound deployment A's auth_domain is rejected on
+        // deployment B because output[0] disagrees.
         let err = ledger_b
             .shield(&ShieldReq {
-                deposit_id: intent_a,
-                deposit_slot: 0,
+                pubkey_hash: pubkey_hash_b,
                 fee,
                 v,
                 producer_fee,
-                proof: Proof::TrustMeBro,
+                proof: fake_stark(vec![
+                    ledger_a.auth_domain, // wrong domain in the proof
+                    pubkey_hash_b,
+                    u(v),
+                    u(fee),
+                    u(producer_fee),
+                    cm,
+                    producer_cm,
+                    memo_ct_hash(&enc),
+                    memo_ct_hash(&producer_enc),
+                ]),
                 client_cm: cm,
                 client_enc: enc,
                 producer_cm,
-                producer_enc: producer_enc,
+                producer_enc,
             })
             .unwrap_err();
 
-        assert!(err.contains("shield intent mismatch"), "err = {}", err);
-        // Slot in ledger B is still open.
-        assert_eq!(ledger_b.deposit_slots.get(&0).map(|s| s.amount), Some(debit));
+        assert!(err.contains("auth_domain mismatch"), "err = {}", err);
+        // Ledger B's pool is intact.
+        assert_eq!(
+            ledger_b.deposit_balances.get(&pubkey_hash_b).copied(),
+            Some(debit)
+        );
     }
 
     #[test]
@@ -4618,35 +5074,27 @@ mod tests {
         let mut ledger = Ledger::new();
         let (client_enc, client_cm) = deterministic_note(&addr, 125, u(60), Some(b"shield"));
         let (producer_enc, producer_cm) = deterministic_note(&addr, 1, u(61), Some(b"dal"));
-        // Intent is computed for the *requested* (illegal) fee. The fee guard
-        // fires before the intent recomputation, so funding is incidental.
-        let intent = test_intent_for_shield(
-            &ledger.auth_domain,
-            125,
-            MIN_TX_FEE - 1,
-            1,
-            &client_cm,
-            &producer_cm,
-            &client_enc,
-            &producer_enc,
-        );
+        let blind = felt_tag(b"fee-below-min-test");
+        let pubkey_hash = test_pubkey_hash_for_address(&ledger.auth_domain, &addr, &blind);
         ledger
-            .deposit(&deposit_recipient_string(&intent), 125 + (MIN_TX_FEE - 1) + 1)
+            .deposit(
+                &deposit_recipient_string(&pubkey_hash),
+                125 + (MIN_TX_FEE - 1) + 1,
+            )
             .unwrap();
 
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
-                deposit_id: intent,
-                deposit_slot: 0,
+                pubkey_hash,
                 fee: MIN_TX_FEE - 1,
                 v: 125,
                 producer_fee: 1,
                 proof: Proof::TrustMeBro,
                 client_cm,
-                client_enc: client_enc,
+                client_enc,
                 producer_cm,
-                producer_enc: producer_enc,
+                producer_enc,
             },
         )
         .unwrap_err();
@@ -4674,34 +5122,25 @@ mod tests {
             LimitedAppendLedgerState::new(Ledger::new(), 4).with_required_tx_fee(MIN_TX_FEE * 2);
         let (client_enc, client_cm) = deterministic_note(&addr, 125, u(62), Some(b"shield"));
         let (producer_enc, producer_cm) = deterministic_note(&addr, 1, u(63), Some(b"dal"));
-        let intent = test_intent_for_shield(
-            &state.inner.auth_domain,
-            125,
-            MIN_TX_FEE,
-            1,
-            &client_cm,
-            &producer_cm,
-            &client_enc,
-            &producer_enc,
-        );
+        let blind = felt_tag(b"required-fee-state-test");
+        let pubkey_hash = test_pubkey_hash_for_address(&state.inner.auth_domain, &addr, &blind);
         state
             .inner
-            .deposit(&deposit_recipient_string(&intent), 125 + MIN_TX_FEE + 1)
+            .deposit(&deposit_recipient_string(&pubkey_hash), 125 + MIN_TX_FEE + 1)
             .unwrap();
 
         let err = apply_shield(
             &mut state,
             &ShieldReq {
-                deposit_id: intent,
-                deposit_slot: 0,
+                pubkey_hash,
                 fee: MIN_TX_FEE,
                 v: 125,
                 producer_fee: 1,
                 proof: Proof::TrustMeBro,
                 client_cm,
-                client_enc: client_enc,
+                client_enc,
                 producer_cm,
-                producer_enc: producer_enc,
+                producer_enc,
             },
         )
         .unwrap_err();
@@ -4716,46 +5155,37 @@ mod tests {
         let mut state = LimitedAppendLedgerState::new(Ledger::new(), 1);
         let (client_enc, client_cm) = deterministic_note(&addr, 125, u(91), Some(b"shield"));
         let (producer_enc, producer_cm) = deterministic_note(&addr, 1, u(92), Some(b"dal"));
-        let intent = test_intent_for_shield(
-            &state.inner.auth_domain,
-            125,
-            MIN_TX_FEE,
-            1,
-            &client_cm,
-            &producer_cm,
-            &client_enc,
-            &producer_enc,
-        );
+        let blind = felt_tag(b"capacity-preflight-test");
+        let pubkey_hash = test_pubkey_hash_for_address(&state.inner.auth_domain, &addr, &blind);
         let debit = 125 + MIN_TX_FEE + 1;
         state
             .inner
-            .deposit(&deposit_recipient_string(&intent), debit)
+            .deposit(&deposit_recipient_string(&pubkey_hash), debit)
             .unwrap();
 
         let leaves_before = state.inner.tree.leaves.clone();
         let memos_before = state.inner.memos.len();
-        let slots_before = state.inner.deposit_slots.clone();
+        let balances_before = state.inner.deposit_balances.clone();
 
         let err = apply_shield(
             &mut state,
             &ShieldReq {
-                deposit_id: intent,
-                deposit_slot: 0,
+                pubkey_hash,
                 fee: MIN_TX_FEE,
                 v: 125,
                 producer_fee: 1,
                 proof: Proof::TrustMeBro,
                 client_cm,
-                client_enc: client_enc,
+                client_enc,
                 producer_cm,
-                producer_enc: producer_enc,
+                producer_enc,
             },
         )
         .unwrap_err();
 
         assert!(err.contains("Merkle tree full"));
-        // Slot must be untouched when shield is rejected pre-commit.
-        assert_eq!(state.inner.deposit_slots, slots_before);
+        // Pool balance must be untouched when shield is rejected pre-commit.
+        assert_eq!(state.inner.deposit_balances, balances_before);
         assert_eq!(state.inner.tree.leaves, leaves_before);
         assert_eq!(state.inner.memos.len(), memos_before);
     }
@@ -5014,13 +5444,13 @@ mod tests {
 
     #[test]
     fn test_deposit_balance_key_is_namespaced_and_canonical() {
-        let mut deposit_id = ZERO;
-        deposit_id[..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
-        let key = deposit_recipient_string(&deposit_id);
+        let mut pubkey_hash = ZERO;
+        pubkey_hash[..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let key = deposit_recipient_string(&pubkey_hash);
 
         assert!(key.starts_with(DEPOSIT_RECIPIENT_PREFIX));
         assert!(is_deposit_recipient_string(&key));
-        assert!(!is_deposit_recipient_string(&hex::encode(deposit_id)));
+        assert!(!is_deposit_recipient_string(&hex::encode(pubkey_hash)));
         assert!(!is_deposit_recipient_string(&key.to_uppercase()));
     }
 

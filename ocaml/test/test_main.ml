@@ -1036,8 +1036,15 @@ let test_build_shield () =
   let mch = Tzel.Hash.hash_tag "mh" in
   let prod_mch = Tzel.Hash.hash_tag "prod-mh" in
   let auth_domain = Tzel.Hash.hash_tag "domain" in
+  let blind = Tzel.Hash.hash_tag "test-blind" in
+  let pubkey_hash =
+    Tzel.Transaction.deposit_pubkey_hash
+      ~auth_domain ~auth_root:alice.auth_root
+      ~auth_pub_seed:alice.auth_pub_seed ~blind
+  in
   let (pub, note, prod_note) = Tzel.Transaction.build_shield
-    ~auth_domain ~recipient:alice ~v_pub:5000L ~fee:100L ~producer_fee:1L
+    ~auth_domain ~pubkey_hash
+    ~recipient:alice ~v_pub:5000L ~fee:100L ~producer_fee:1L
     ~rseed ~memo_ct_hash:mch
     ~producer ~producer_rseed ~producer_memo_ct_hash:prod_mch in
   Alcotest.(check bool) "cm_new matches" true (Tzel.Felt.equal pub.cm_new note.cm);
@@ -1046,15 +1053,8 @@ let test_build_shield () =
   Alcotest.(check int64) "v_pub" 5000L pub.v_pub;
   Alcotest.(check int64) "fee" 100L pub.fee;
   Alcotest.(check int64) "producer_fee" 1L pub.producer_fee;
-  let expected_intent =
-    Tzel.Transaction.shield_intent
-      ~auth_domain
-      ~v_pub:5000L ~fee:100L ~producer_fee:1L
-      ~cm_new:note.cm ~cm_producer:prod_note.cm
-      ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
-  in
-  Alcotest.(check bool) "deposit_id binds intent" true
-    (Tzel.Felt.equal expected_intent pub.deposit_id)
+  Alcotest.(check bool) "pubkey_hash threaded through" true
+    (Tzel.Felt.equal pubkey_hash pub.pubkey_hash)
 
 let test_build_output () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 200) in
@@ -1512,13 +1512,20 @@ let test_encoding_hex_helpers () =
    Ledger
    ══════════════════════════════════════════════════════════════════════ *)
 
-(* Build a self-consistent intent-bound shield: returns (pub, mch, prod_mch)
-   such that pub.deposit_id is the intent over the rest. *)
+(* Build a self-consistent shield against a fresh pool: returns
+   (pub, mch, prod_mch) plus the pubkey_hash of the deposit pool. *)
 let build_test_shield ~auth_domain ~recipient ~producer ~v_pub ~fee ~producer_fee =
   let mch = Tzel.Hash.hash_tag "shield-mch" in
   let prod_mch = Tzel.Hash.hash_tag "shield-prod-mch" in
+  let blind = Tzel.Hash.hash_tag "shield-test-blind" in
+  let pubkey_hash =
+    Tzel.Transaction.deposit_pubkey_hash
+      ~auth_domain ~auth_root:(recipient : Tzel.Keys.address).auth_root
+      ~auth_pub_seed:recipient.auth_pub_seed ~blind
+  in
   let (pub, _, _) = Tzel.Transaction.build_shield
-    ~auth_domain ~recipient ~v_pub ~fee ~producer_fee
+    ~auth_domain ~pubkey_hash
+    ~recipient ~v_pub ~fee ~producer_fee
     ~rseed:(Tzel.Felt.of_u64 555) ~memo_ct_hash:mch
     ~producer ~producer_rseed:(Tzel.Felt.of_u64 999)
     ~producer_memo_ct_hash:prod_mch
@@ -1536,17 +1543,17 @@ let test_shield_flow () =
     build_test_shield ~auth_domain ~recipient:bob ~producer
       ~v_pub:5000L ~fee:100L ~producer_fee:1L
   in
-  let slot_id =
-    Tzel.Ledger.record_deposit ledger
-      ~intent:pub.deposit_id ~amount:5101L
-  in
+  Tzel.Ledger.credit_deposit ledger
+    ~pubkey_hash:pub.pubkey_hash ~amount:5101L;
   let result =
-    Tzel.Ledger.apply_shield ledger ~pub ~deposit_slot:slot_id
+    Tzel.Ledger.apply_shield ledger ~pub
       ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
   in
   Alcotest.(check bool) "shield ok" true (Result.is_ok result);
-  Alcotest.(check bool) "slot consumed" true
-    (Option.is_none (Hashtbl.find_opt ledger.deposit_slots slot_id));
+  Alcotest.(check bool) "pool drained" true
+    (Option.is_none
+       (Hashtbl.find_opt ledger.deposit_balances
+          (Tzel.Felt.to_hex pub.pubkey_hash)));
   Alcotest.(check int) "tree size (recipient + producer)" 2
     (Tzel.Ledger.tree_size ledger);
   let root = Tzel.Ledger.current_root ledger in
@@ -1563,17 +1570,17 @@ let test_shield_balance_underfund () =
     build_test_shield ~auth_domain ~recipient ~producer
       ~v_pub:500L ~fee:50L ~producer_fee:1L
   in
-  let slot_id =
-    Tzel.Ledger.record_deposit ledger
-      ~intent:pub.deposit_id ~amount:100L
-  in
+  Tzel.Ledger.credit_deposit ledger
+    ~pubkey_hash:pub.pubkey_hash ~amount:100L;
   let result =
-    Tzel.Ledger.apply_shield ledger ~pub ~deposit_slot:slot_id
+    Tzel.Ledger.apply_shield ledger ~pub
       ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
   in
   Alcotest.(check bool) "underfund rejected" true (Result.is_error result)
 
-let test_shield_balance_overfund () =
+let test_shield_balance_overfund_keeps_residual () =
+  (* Under the deposit-pool design, overfunding is fine: the surplus stays
+     in the pool for future shields. *)
   let auth_domain = Tzel.Hash.hash_tag "test-domain" in
   let ledger = Tzel.Ledger.create ~auth_domain in
   let recipient_keys = Tzel.Keys.derive (Tzel.Felt.of_u64 1) in
@@ -1584,40 +1591,16 @@ let test_shield_balance_overfund () =
     build_test_shield ~auth_domain ~recipient ~producer
       ~v_pub:500L ~fee:50L ~producer_fee:1L
   in
-  (* Exact debit is 551; overfund the slot to 552. Exact-match rule rejects. *)
-  let slot_id =
-    Tzel.Ledger.record_deposit ledger ~intent:pub.deposit_id ~amount:552L
-  in
+  (* Exact debit is 551; overfund the pool to 552. Shield drains 551, leaves 1. *)
+  Tzel.Ledger.credit_deposit ledger ~pubkey_hash:pub.pubkey_hash ~amount:552L;
   let result =
-    Tzel.Ledger.apply_shield ledger ~pub ~deposit_slot:slot_id
+    Tzel.Ledger.apply_shield ledger ~pub
       ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
   in
-  Alcotest.(check bool) "overfund rejected" true (Result.is_error result)
-
-let test_shield_intent_mismatch () =
-  let auth_domain = Tzel.Hash.hash_tag "test-domain" in
-  let ledger = Tzel.Ledger.create ~auth_domain in
-  let recipient_keys = Tzel.Keys.derive (Tzel.Felt.of_u64 1) in
-  let recipient = derive_test_address recipient_keys 0 in
-  let producer_keys = Tzel.Keys.derive (Tzel.Felt.of_u64 700) in
-  let producer = derive_test_address producer_keys 0 in
-  let (pub, mch, prod_mch) =
-    build_test_shield ~auth_domain ~recipient ~producer
-      ~v_pub:500L ~fee:50L ~producer_fee:1L
-  in
-  (* Mutate one detail (memo_ct_hash) so deposit_id no longer binds. *)
-  let pub = { pub with memo_ct_hash = Tzel.Hash.hash_tag "different-mch" } in
-  let slot_id =
-    Tzel.Ledger.record_deposit ledger
-      ~intent:pub.deposit_id ~amount:551L
-  in
-  let result =
-    Tzel.Ledger.apply_shield ledger ~pub ~deposit_slot:slot_id
-      ~memo_ct_hash:(Tzel.Hash.hash_tag "different-mch")
-      ~producer_memo_ct_hash:prod_mch
-  in
-  Alcotest.(check bool) "intent mismatch rejected" true (Result.is_error result);
-  ignore mch
+  Alcotest.(check bool) "shield ok" true (Result.is_ok result);
+  Alcotest.(check bool) "1 mutez residual in pool" true
+    (Hashtbl.find_opt ledger.deposit_balances
+       (Tzel.Felt.to_hex pub.pubkey_hash) = Some 1L)
 
 let test_shield_memo_mismatch () =
   let auth_domain = Tzel.Hash.hash_tag "test-domain" in
@@ -1630,13 +1613,11 @@ let test_shield_memo_mismatch () =
     build_test_shield ~auth_domain ~recipient ~producer
       ~v_pub:500L ~fee:50L ~producer_fee:1L
   in
-  let slot_id =
-    Tzel.Ledger.record_deposit ledger
-      ~intent:pub.deposit_id ~amount:551L
-  in
+  Tzel.Ledger.credit_deposit ledger
+    ~pubkey_hash:pub.pubkey_hash ~amount:551L;
   let wrong_mch = Tzel.Felt.of_u64 999 in
   let result =
-    Tzel.Ledger.apply_shield ledger ~pub ~deposit_slot:slot_id
+    Tzel.Ledger.apply_shield ledger ~pub
       ~memo_ct_hash:wrong_mch ~producer_memo_ct_hash:prod_mch
   in
   Alcotest.(check bool) "memo mismatch" true (Result.is_error result)
@@ -2164,32 +2145,37 @@ let test_multi_shield_transfer_unshield () =
   let producer_keys = Tzel.Keys.derive (Tzel.Felt.of_u64 700) in
   let producer = derive_test_address producer_keys 0 in
   let mch = Tzel.Felt.zero in
-  (* Shield 1: intent-bound. Fund the deposit balance with the exact debit. *)
+  (* Shield 1: pool-bound. Fund the deposit balance with the exact debit. *)
   let prep_shield ~v_pub ~fee ~producer_fee ~rseed_offset =
     let mch_r = Tzel.Hash.hash_tag (Printf.sprintf "shield-mch-%d" rseed_offset) in
     let mch_p = Tzel.Hash.hash_tag (Printf.sprintf "shield-prod-%d" rseed_offset) in
+    let blind = Tzel.Hash.hash_tag (Printf.sprintf "blind-%d" rseed_offset) in
+    let pubkey_hash =
+      Tzel.Transaction.deposit_pubkey_hash
+        ~auth_domain ~auth_root:recipient.auth_root
+        ~auth_pub_seed:recipient.auth_pub_seed ~blind
+    in
     let (pub, _, _) = Tzel.Transaction.build_shield
-      ~auth_domain ~recipient ~v_pub ~fee ~producer_fee
+      ~auth_domain ~pubkey_hash
+      ~recipient ~v_pub ~fee ~producer_fee
       ~rseed:(Tzel.Felt.of_u64 (1000 + rseed_offset))
       ~memo_ct_hash:mch_r ~producer
       ~producer_rseed:(Tzel.Felt.of_u64 (2000 + rseed_offset))
       ~producer_memo_ct_hash:mch_p
     in
     let amount = Int64.add v_pub (Int64.add fee producer_fee) in
-    let slot_id =
-      Tzel.Ledger.record_deposit ledger ~intent:pub.deposit_id ~amount
-    in
-    (pub, mch_r, mch_p, slot_id)
+    Tzel.Ledger.credit_deposit ledger ~pubkey_hash ~amount;
+    (pub, mch_r, mch_p)
   in
-  let (pub1, mch1, prod_mch1, slot1) =
+  let (pub1, mch1, prod_mch1) =
     prep_shield ~v_pub:3000L ~fee:100L ~producer_fee:1L ~rseed_offset:1
   in
-  ignore (Tzel.Ledger.apply_shield ledger ~pub:pub1 ~deposit_slot:slot1
+  ignore (Tzel.Ledger.apply_shield ledger ~pub:pub1
             ~memo_ct_hash:mch1 ~producer_memo_ct_hash:prod_mch1);
-  let (pub2, mch2, prod_mch2, slot2) =
+  let (pub2, mch2, prod_mch2) =
     prep_shield ~v_pub:2000L ~fee:100L ~producer_fee:1L ~rseed_offset:2
   in
-  ignore (Tzel.Ledger.apply_shield ledger ~pub:pub2 ~deposit_slot:slot2
+  ignore (Tzel.Ledger.apply_shield ledger ~pub:pub2
             ~memo_ct_hash:mch2 ~producer_memo_ct_hash:prod_mch2);
   Alcotest.(check int) "tree after shields (2 recipient + 2 producer)" 4
     (Tzel.Ledger.tree_size ledger);
@@ -2381,8 +2367,7 @@ let () =
     "ledger", [
       Alcotest.test_case "shield flow" `Quick test_shield_flow;
       Alcotest.test_case "shield underfund" `Quick test_shield_balance_underfund;
-      Alcotest.test_case "shield overfund" `Quick test_shield_balance_overfund;
-      Alcotest.test_case "shield intent mismatch" `Quick test_shield_intent_mismatch;
+      Alcotest.test_case "shield overfund residual" `Quick test_shield_balance_overfund_keeps_residual;
       Alcotest.test_case "shield memo mismatch" `Quick test_shield_memo_mismatch;
       Alcotest.test_case "transfer" `Quick test_ledger_transfer;
       Alcotest.test_case "transfer wrong domain" `Quick test_ledger_transfer_wrong_domain;

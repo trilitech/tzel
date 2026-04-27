@@ -60,9 +60,11 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
   let initial_alice_balance = Int64.of_int (json_int (json_field "initial_alice_balance" json)) in
   let ledger = Tzel.Ledger.create ~auth_domain in
 
-  (* Shield: intent-bound. The Rust scenario carries the recipient + producer
-     notes; we recompute the intent (deposit_id) over them and seed the
-     ledger's deposit balance with the exact debit. *)
+  (* Shield: pool-keyed. The Rust scenario carries the recipient +
+     producer notes only (no `(blind, auth_root)`); for cross-impl
+     equivalence we just need a deterministic pubkey_hash to seed the
+     pool with — synthesize it from the scenario's public fields and
+     credit that pool with the exact debit. *)
   let shield = json_field "shield" json in
   let shield_v = Int64.of_int (json_int (json_field "v" shield)) in
   let shield_fee = Int64.of_int (json_int (json_field "fee" shield)) in
@@ -71,28 +73,24 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
   let shield_producer_cm = felt_of_hex (json_string (json_field "producer_cm" shield)) in
   let shield_mch = felt_of_hex (json_string (json_field "memo_ct_hash" shield)) in
   let shield_prod_mch = felt_of_hex (json_string (json_field "producer_memo_ct_hash" shield)) in
-  let shield_intent =
-    Tzel.Transaction.shield_intent
-      ~auth_domain
-      ~v_pub:shield_v ~fee:shield_fee ~producer_fee:shield_producer_fee
-      ~cm_new:shield_cm ~cm_producer:shield_producer_cm
-      ~memo_ct_hash:shield_mch ~producer_memo_ct_hash:shield_prod_mch
+  let shield_pubkey_hash =
+    Tzel.Hash.sighash_fold [
+      auth_domain; shield_cm; shield_producer_cm;
+    ]
   in
   let shield_pub : Tzel.Transaction.shield_public = {
     auth_domain;
+    pubkey_hash = shield_pubkey_hash;
     v_pub = shield_v; fee = shield_fee; producer_fee = shield_producer_fee;
     cm_new = shield_cm; cm_producer = shield_producer_cm;
-    deposit_id = shield_intent;
     memo_ct_hash = shield_mch; producer_memo_ct_hash = shield_prod_mch;
   } in
   let exact_debit =
     Int64.add shield_v (Int64.add shield_fee shield_producer_fee)
   in
-  let slot_id =
-    Tzel.Ledger.record_deposit ledger ~intent:shield_intent ~amount:exact_debit
-  in
+  Tzel.Ledger.credit_deposit ledger
+    ~pubkey_hash:shield_pubkey_hash ~amount:exact_debit;
   begin match Tzel.Ledger.apply_shield ledger ~pub:shield_pub
-                ~deposit_slot:slot_id
                 ~memo_ct_hash:shield_mch
                 ~producer_memo_ct_hash:shield_prod_mch with
   | Ok () -> ()

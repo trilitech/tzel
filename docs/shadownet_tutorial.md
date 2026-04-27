@@ -3,15 +3,18 @@
 This tutorial covers a Shadownet `deposit -> shield -> send` flow against a
 deployed rollup using the operator box.
 
-> **Status note:** the protocol uses intent-bound shield deposit ids with
-> per-deposit slots. The L1 deposit transaction commits to the entire shield
-> (recipient, value, fees, encrypted-note bytes) by addressing the L1 ticket
-> to `deposit:<hex(intent)>`, and the kernel allocates a fresh slot per
-> ticket so dust deposits to the same intent cannot brick a legitimate one.
-> The rollup wallet flow below is current: `deposit` creates the pending
-> intent-bound deposit, `shield --deposit-id ...` drains the slot,
-> `send` stays internal, and `unshield` withdraws directly to an L1 tz/KT1
-> recipient.
+> **Status note:** the protocol uses **deposit pools** keyed by a wallet-
+> derived pubkey hash. The L1 deposit transaction credits the pool keyed
+> by `deposit:<hex(pubkey_hash)>`, where `pubkey_hash` commits to the
+> deployment's auth_domain plus the recipient's auth tree plus a
+> per-deposit blind. Multiple L1 tickets to the same pool aggregate
+> (top-ups). The shield circuit verifies an in-circuit WOTS+ signature
+> from the recipient's auth tree, binding the entire shield request, so
+> only the wallet that holds the auth tree's signing material can drain
+> the pool. The rollup wallet flow below: `deposit` allocates a fresh
+> pool and L1-tickets to it; `shield --pubkey-hash ... --amount ...`
+> drains a chosen amount; `send` stays internal; `unshield` withdraws
+> to an L1 tz/KT1 recipient.
 
 The current rollup policy burns at least `100000` mutez (`0.1 tez`) on every
 `shield`, `send`, and `unshield`. The first two accepted private transactions at
@@ -261,48 +264,47 @@ Create Shadownet profiles:
 Notes:
 
 - `dal_fee_address` is the shielded address that receives the DAL inclusion fee note
-- each `deposit` builds the entire shield (recipient note + producer-fee note) up front, computes the *intent-bound* deposit id (`shield_intent` over every shield public output), and addresses the L1 ticket to the canonical recipient string `deposit:<hex(intent)>`. Each L1 ticket allocates its own kernel-side **slot** keyed by a fresh kernel-controlled `slot_id` (depositors don't control the id), with content `(intent, amount)`. The L1 deposit transaction is itself the shield authorization — there is no `deposit_secret`, and any modification of the witness (recipient, value, fees) yields a different deposit id whose slots either don't exist or bind a different intent.
-- `public_account` in the profile is vestigial wallet metadata — unshield now emits an L1 outbox transfer directly to a tz/KT1 recipient supplied at unshield time, and the per-account "transparent rollup balance" scheme has been removed.
+- each `deposit` derives a fresh `pubkey_hash = H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)` for a wallet-controlled auth tree, then L1-tickets the deposit amount to `deposit:<hex(pubkey_hash)>`. Multiple deposits to the same `pubkey_hash` aggregate (top-ups). The shield circuit verifies an in-circuit WOTS+ signature under the recipient's auth tree, binding the entire shield request — only the wallet that holds the auth tree's signing material can drain the pool.
+- `public_account` in the profile is vestigial wallet metadata — unshield now emits an L1 outbox transfer directly to a tz/KT1 recipient supplied at unshield time.
 - keep Alice and Bob distinct
-- **Shield deposits are single-shot and exact-amount:** the wallet computes `v + fee + producer_fee` and instructs the bridge to deposit precisely that amount. There is no partial drain and no top-up — both would require updating `intent`, which contradicts the L1 commitment. An over- or under-deposit leaves an orphan slot but does not affect any other slot. **Dust-resistance:** an attacker observing the public `deposit:<hex(intent)>` recipient string cannot brick a victim's shield by sending 1 mutez to the same recipient — that just allocates an unrelated orphan slot.
+- **Pool-bound shields are flexible:** the wallet picks `(v, fee, producer_fee)` at shield time, not deposit time. Pool overfunding is fine — the surplus stays available for future shields. Dust attackers depositing to a victim's `pubkey_hash` just add to the victim's pool balance (they're donating mutez they can't drain themselves).
 
-## 6. Fund Alice On L1 And Wait For The Kernel To Allocate A Deposit Slot
+## 6. Fund Alice On L1 And Wait For The Kernel Pool To See The Credit
 
-Deposit into the bridge for Alice's next shield. The wallet builds the recipient and producer-fee notes, computes `intent = shield_intent(auth_domain, v, fee, producer_fee, cm_recipient, cm_producer, mh, mh_producer)`, and asks the bridge to send an L1 ticket to `deposit:<hex(intent)>` for exactly `v + fee + producer_fee` mutez. The kernel allocates a fresh slot for the ticket — keyed by a kernel-controlled monotonic `slot_id`, with content `(intent, amount)`. The wallet picks up the slot id during sync.
+Deposit into the bridge for Alice's next shield. The wallet derives a fresh `pubkey_hash` from her auth tree plus a per-deposit blind, then asks the bridge to send an L1 ticket to `deposit:<hex(pubkey_hash)>` for the chosen amount. The kernel credits the per-pool aggregated balance.
 
-Before submitting the L1 ticket, the wallet runs three preflight checks against the rollup's durable state and refuses if any disagrees:
+Before submitting the L1 ticket, the wallet runs preflight checks against the rollup's durable state and refuses if any disagrees:
 
 1. The kernel verifier config (`/tzel/v1/state/verifier_config.bin`) is installed. Deposits before configuration are rejected by the kernel; the L1 ticket would burn for nothing.
 2. The kernel's configured bridge ticketer (`/tzel/v1/state/bridge/ticketer`) equals `profile.bridge_ticketer`. A mismatch means the kernel won't accept tickets from this bridge contract.
-3. The kernel's published `operator_producer_owner_tag` equals the `owner_tag` derived from `profile.dal_fee_address`. Without this check a misconfigured profile silently routes the producer-fee note to a non-operator receiver — there is no in-circuit binding from `cm_producer`'s recipient back to the operator's address. (If the rollup published a zero owner_tag the wallet warns and proceeds, trusting the profile.)
 
-The same `operator_producer_owner_tag` gate also runs for `transfer` and `unshield` since those also emit a producer-fee note.
+(The producer-fee `operator_producer_owner_tag` gate runs at shield/transfer/unshield time, not at deposit time, since the producer-fee note is now picked at shield time.)
 
 ```bash
 DEPOSIT_OUTPUT="$(
 /usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
   deposit \
-  --amount 300000
+  --amount 400000
 )"
 printf '%s\n' "$DEPOSIT_OUTPUT"
-DEPOSIT_ID="$(awk '/Submitted L1 bridge deposit/ {print $NF}' <<<"$DEPOSIT_OUTPUT")"
+PUBKEY_HASH="$(awk '/Submitted L1 bridge deposit/ {print $NF}' <<<"$DEPOSIT_OUTPUT")"
 ```
 
-The wallet prints an L1 operation hash and the intent hex. Wait for it to land,
-then poll:
+The wallet prints an L1 operation hash and the pool's pubkey_hash. Wait for the
+ticket to land, then poll:
 
 ```bash
 /usr/local/bin/tzel-wallet --wallet alice.wallet balance
 ```
 
-Do not continue until `tzel-wallet sync` reports the slot has been picked up:
+Do not continue until `tzel-wallet sync` shows the pool funded:
 
 ```text
-Synced: ... 1 slots assigned, ..., pending_deposit_total=400001
+Synced: ... pool_funded_total=400000, pools_awaiting_credit=0
 ```
 
-## 7. Shield Alice’s Funds
+## 7. Shield Alice's Funds
 
 Shield into a self-address first:
 
@@ -312,12 +314,15 @@ Shield into a self-address first:
   --reprove-bin /usr/local/bin/reprove \
   --executables-dir /opt/tzel/cairo/target/dev \
   shield \
-  --deposit-id "$DEPOSIT_ID"
+  --pubkey-hash "$PUBKEY_HASH" \
+  --amount 300000
 ```
+
+The wallet picks `fee = required_tx_fee_now` and `producer_fee` from the profile, signs the shield sighash with the next available WOTS+ key index in Alice's auth tree, generates the proof, and submits.
 
 Expected output includes:
 
-- `Submitted shield draining deposit ...`
+- `Submitted shield draining pool ...`
 - `Submission id: sub-...`
 
 Track the submission:
@@ -338,7 +343,7 @@ Keep polling until the operator reports a final state. Then sync Alice:
 
 Acceptance:
 
-- The deposit slot for `(intent, debit)` disappears (single-shot, tombstoned)
+- The pool's balance is debited by `v + fee + producer_fee` (and the entry is removed if the pool reaches zero)
 - Alice's private available balance becomes non-zero by exactly the recipient note's value
 
 ## 8. Derive Bob’s Receive Address
@@ -415,14 +420,14 @@ For the first successful live run, save:
   - DAL node is up, but slot publication / commitment inclusion is not advancing
 - `unattested`:
   - the public DAL node is not reachable enough from the network
-- `0 slots assigned` even after the L1 deposit lands:
+- `pool_funded_total=0` even after the L1 deposit lands:
   - bridge config is wrong, the kernel did not parse the ticket, or the rollup node is not following the right rollup
 - `sync` finds nothing after a successful operator state:
   - rollup node is stale, wrong `rollup_node_url`, or wrong wallet profile
-- `WARNING: N orphan deposit slot(s) detected` during sync:
-  - someone (typically a dust-attacking watcher) has deposited an L1 ticket with the same `(intent, amount)` as one of your settled shields. The kernel allocated extra open slots that your shield did not drain. Each orphan slot still holds real L1 mutez backed by the bridge.
-  - To recover, re-shield against each orphan slot with `tzel-wallet shield --deposit-id <hex> --slot-id <orphan-id> --correlate`. The wallet reuses the stored deposit witness; the result is a duplicate `cm` at a new tree position with a distinct nullifier — fully spendable, but the two leaves are publicly correlatable to the same intent. The `--correlate` flag is required to make the privacy cost an explicit user choice — without it, shield only consumes the canonical slot.
-  - Orphan-drain only works if the wallet still holds the matching settled `PendingDeposit` (it does, because settled deposits are kept around precisely to enable this). A slot that was never witness-tracked by this wallet cannot be drained.
+- Shield rejected with "deposit pool balance too small":
+  - the pool wasn't credited with enough mutez for `v + fee + producer_fee`. Send another L1 ticket to the same `deposit:<hex(pubkey_hash)>` recipient (top-up); shielding can be retried once sync sees the larger balance.
+- Shield rejected with "fee below minimum":
+  - the rollup's `required_tx_fee` ticked up since the wallet quoted it. Re-run shield (the wallet re-quotes on each invocation); regenerate the proof if necessary.
 
 ## 12. Minimal Success Bar
 

@@ -2,8 +2,6 @@ use crate::canonical_wire::{
     decode_tze, encode_tze, felt_to_wire, u16_to_wire, u64_to_wire, wire_to_felt, wire_to_u16,
     wire_to_u64, WireEncryptedNote, WireFelt, WireU16Le, WireU64Le,
 };
-#[cfg(test)]
-use crate::PaymentAddress;
 use crate::{
     hash, wots_sign, EncryptedNote, ProgramHashes, Proof, ShieldReq, ShieldResp, TransferReq,
     TransferResp, UnshieldReq, UnshieldResp, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES,
@@ -13,7 +11,7 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 16;
+pub const KERNEL_WIRE_VERSION: u16 = 17;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
@@ -72,16 +70,15 @@ pub struct KernelStarkProof {
     pub output_preimage: Vec<F>,
 }
 
-/// Shield message: an L1 user has previously deposited to `deposit_id` (which
-/// is `shield_intent(...)` over the fields below). Both notes are fully
-/// constructed client-side and the server has no role in fabricating them.
-/// `deposit_slot` selects the specific bridge-deposit record being drained;
-/// each L1 ticket allocates its own slot, so dust deposits to the same intent
-/// cannot brick a legitimate one.
+/// Shield message: drains `v + fee + producer_fee` mutez from the deposit
+/// pool keyed by `pubkey_hash`. Both notes are fully constructed client-side
+/// and the server has no role in fabricating them. The shield's STARK proof
+/// includes an in-circuit WOTS+ signature under the recipient's auth tree
+/// (matching `pubkey_hash = H(auth_domain, auth_root, auth_pub_seed, blind)`),
+/// authorizing this specific draw.
 #[derive(Debug, Clone)]
 pub struct KernelShieldReq {
-    pub deposit_id: F,
-    pub deposit_slot: u64,
+    pub pubkey_hash: F,
     pub fee: u64,
     pub v: u64,
     pub producer_fee: u64,
@@ -233,8 +230,7 @@ struct WireSignedKernelBridgeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireKernelShieldReq {
-    deposit_id: WireFelt,
-    deposit_slot: WireU64Le,
+    pubkey_hash: WireFelt,
     fee: WireU64Le,
     v: WireU64Le,
     producer_fee: WireU64Le,
@@ -561,8 +557,7 @@ pub fn kernel_proof_to_host(proof: &KernelStarkProof) -> Proof {
 
 pub fn kernel_shield_req_to_host(req: &KernelShieldReq) -> ShieldReq {
     ShieldReq {
-        deposit_id: req.deposit_id,
-        deposit_slot: req.deposit_slot,
+        pubkey_hash: req.pubkey_hash,
         fee: req.fee,
         v: req.v,
         producer_fee: req.producer_fee,
@@ -907,8 +902,7 @@ fn encoded_felt_list_from_wire(wire: WireEncodedFeltList) -> Result<Vec<F>, Stri
 
 fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldReq, String> {
     Ok(WireKernelShieldReq {
-        deposit_id: felt_to_wire(&req.deposit_id),
-        deposit_slot: u64_to_wire(req.deposit_slot),
+        pubkey_hash: felt_to_wire(&req.pubkey_hash),
         fee: u64_to_wire(req.fee),
         v: u64_to_wire(req.v),
         producer_fee: u64_to_wire(req.producer_fee),
@@ -922,8 +916,7 @@ fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldRe
 
 fn kernel_shield_req_from_wire(wire: WireKernelShieldReq) -> Result<KernelShieldReq, String> {
     Ok(KernelShieldReq {
-        deposit_id: wire_to_felt(wire.deposit_id)?,
-        deposit_slot: wire_to_u64(wire.deposit_slot)?,
+        pubkey_hash: wire_to_felt(wire.pubkey_hash)?,
         fee: wire_to_u64(wire.fee)?,
         v: wire_to_u64(wire.v)?,
         producer_fee: wire_to_u64(wire.producer_fee)?,
@@ -1137,7 +1130,6 @@ fn unshield_resp_from_wire(wire: WireUnshieldResp) -> Result<UnshieldResp, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES;
     use crate::{DETECT_K, ZERO};
     use proptest::prelude::*;
 
@@ -1187,27 +1179,6 @@ mod tests {
             })
     }
 
-    fn arb_payment_address() -> impl Strategy<Value = PaymentAddress> {
-        (
-            arb_felt(),
-            arb_felt(),
-            arb_felt(),
-            arb_felt(),
-            prop::collection::vec(any::<u8>(), ML_KEM768_ENCAPSULATION_KEY_BYTES),
-            prop::collection::vec(any::<u8>(), ML_KEM768_ENCAPSULATION_KEY_BYTES),
-        )
-            .prop_map(|(d_j, auth_root, auth_pub_seed, nk_tag, ek_v, ek_d)| {
-                PaymentAddress {
-                    d_j,
-                    auth_root,
-                    auth_pub_seed,
-                    nk_tag,
-                    ek_v,
-                    ek_d,
-                }
-            })
-    }
-
     fn arb_kernel_stark_proof() -> impl Strategy<Value = KernelStarkProof> {
         (
             prop::collection::vec(any::<u8>(), 0..128),
@@ -1221,11 +1192,10 @@ mod tests {
 
     #[test]
     fn kernel_inbox_roundtrip_preserves_shield_request() {
-        let deposit_id = [0x42; 32];
+        let pubkey_hash = [0x42; 32];
         let client_cm = [0x55; 32];
         let message = KernelInboxMessage::Shield(KernelShieldReq {
-            deposit_id,
-            deposit_slot: 0,
+            pubkey_hash,
             fee: 3,
             v: 42,
             producer_fee: 5,
@@ -1239,7 +1209,7 @@ mod tests {
         let decoded = decode_kernel_inbox_message(&encoded).unwrap();
         match decoded {
             KernelInboxMessage::Shield(req) => {
-                assert_eq!(req.deposit_id, deposit_id);
+                assert_eq!(req.pubkey_hash, pubkey_hash);
                 assert_eq!(req.fee, 3);
                 assert_eq!(req.v, 42);
                 assert_eq!(req.producer_fee, 5);
@@ -1318,8 +1288,7 @@ mod tests {
             output_preimage: vec![[0x11; 32], [0x22; 32], [0x33; 32], [0x44; 32], [0x55; 32]],
         };
         let message = KernelInboxMessage::Shield(KernelShieldReq {
-            deposit_id: [0x42; 32],
-            deposit_slot: 0,
+            pubkey_hash: [0x42; 32],
             fee: 2,
             v: 7,
             producer_fee: 4,
@@ -1593,25 +1562,6 @@ mod tests {
         assert_eq!(pointer.payload_hash, [0xA5; 32]);
     }
 
-    fn sample_payment_address() -> PaymentAddress {
-        let mut d_j = [0x11u8; 32];
-        d_j[31] &= 0x07;
-        let mut auth_root = [0x22u8; 32];
-        auth_root[31] &= 0x07;
-        let mut auth_pub_seed = [0x33u8; 32];
-        auth_pub_seed[31] &= 0x07;
-        let mut nk_tag = [0x44u8; 32];
-        nk_tag[31] &= 0x07;
-        PaymentAddress {
-            d_j,
-            auth_root,
-            auth_pub_seed,
-            nk_tag,
-            ek_v: vec![0x55; ML_KEM768_ENCAPSULATION_KEY_BYTES],
-            ek_d: vec![0x66; ML_KEM768_ENCAPSULATION_KEY_BYTES],
-        }
-    }
-
     fn sample_encrypted_note(fill: u8) -> EncryptedNote {
         EncryptedNote {
             ct_d: vec![fill; crate::ML_KEM768_CIPHERTEXT_BYTES],
@@ -1633,7 +1583,7 @@ mod tests {
     proptest! {
         #[test]
         fn prop_kernel_shield_roundtrip_preserves_fields(
-            deposit_id in arb_felt(),
+            pubkey_hash in arb_felt(),
             fee in any::<u64>(),
             v in any::<u64>(),
             producer_fee in 1u64..u64::MAX,
@@ -1644,8 +1594,7 @@ mod tests {
             producer_enc in arb_encrypted_note(),
         ) {
             let message = KernelInboxMessage::Shield(KernelShieldReq {
-                deposit_id,
-                deposit_slot: 0,
+                pubkey_hash,
                 fee,
                 v,
                 producer_fee,
@@ -1661,8 +1610,7 @@ mod tests {
             let KernelInboxMessage::Shield(req) = decoded else {
                 panic!("decoded wrong kernel message variant");
             };
-            prop_assert_eq!(req.deposit_id, deposit_id);
-            prop_assert_eq!(req.deposit_slot, 0);
+            prop_assert_eq!(req.pubkey_hash, pubkey_hash);
             prop_assert_eq!(req.fee, fee);
             prop_assert_eq!(req.v, v);
             prop_assert_eq!(req.producer_fee, producer_fee);
@@ -1889,7 +1837,7 @@ mod tests {
 
         #[test]
         fn prop_kernel_requests_to_host_preserve_fields(
-            deposit_id in arb_felt(),
+            pubkey_hash in arb_felt(),
             recipient in small_string(32),
             root in arb_felt(),
             nullifiers in prop::collection::vec(arb_felt(), 0..8),
@@ -1912,8 +1860,7 @@ mod tests {
             producer_enc in arb_encrypted_note(),
         ) {
             let shield = KernelShieldReq {
-                deposit_id,
-                deposit_slot: 0,
+                pubkey_hash,
                 fee,
                 v: value,
                 producer_fee,
@@ -1924,7 +1871,7 @@ mod tests {
                 producer_enc: producer_enc.clone(),
             };
             let shield_host = kernel_shield_req_to_host(&shield);
-            prop_assert_eq!(shield_host.deposit_id, deposit_id);
+            prop_assert_eq!(shield_host.pubkey_hash, pubkey_hash);
             prop_assert_eq!(shield_host.fee, fee);
             prop_assert_eq!(shield_host.v, value);
             prop_assert_eq!(shield_host.producer_fee, producer_fee);

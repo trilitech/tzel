@@ -18,16 +18,10 @@
 let tree_depth = 48
 let max_valid_roots = 4096
 
-(* One pending L1-bridge deposit slot. Open slots live in `deposit_slots`
-   keyed by id; consumed slots are removed. The `deposits_by_intent` index
-   lets the wallet enumerate all slots for a given intent (multiple slots
-   can share an intent under a dust attack — the consumer picks the one
-   whose amount matches the bound debit). *)
-type deposit_slot = {
-  slot_intent : Felt.t;
-  slot_amount : int64;
-}
-
+(* Per-pool aggregated deposit balance, keyed by the hex-encoded
+   `deposit_pubkey_hash`. Each L1 ticket addressed to
+   `deposit:<hex(pubkey_hash)>` increments the balance; shield
+   decrements it. Pools at zero balance are removed to bound storage. *)
 type t = {
   tree : Merkle.tree_with_leaves;
   nullifier_set : (string, unit) Hashtbl.t;
@@ -35,9 +29,15 @@ type t = {
   root_history : string Queue.t;
   withdrawals : (string * int64) Queue.t;
   auth_domain : Felt.t;
-  mutable next_deposit_slot_id : int64;
-  deposit_slots : (int64, deposit_slot) Hashtbl.t;
-  deposits_by_intent : (string, int64 list ref) Hashtbl.t;
+  deposit_balances : (string, int64) Hashtbl.t;
+  (* Replay-protection set for shield commitments. Each successful
+     apply_shield records its `cm_new` here; a subsequent shield
+     carrying the same `cm_new` is rejected. Without this, anyone
+     could top up a drained pool and resubmit a victim's old proof,
+     minting a duplicate of the recipient's note at a fresh tree
+     position (independently spendable, since nullifiers are per-
+     position). *)
+  applied_shield_cms : (string, unit) Hashtbl.t;
 }
 
 let record_root_with_limit ledger ~max_roots root_hex =
@@ -58,8 +58,8 @@ let create ~auth_domain =
   let root_set = Hashtbl.create 256 in
   let root_history = Queue.create () in
   let withdrawals = Queue.create () in
-  let deposit_slots = Hashtbl.create 64 in
-  let deposits_by_intent = Hashtbl.create 64 in
+  let deposit_balances = Hashtbl.create 64 in
+  let applied_shield_cms = Hashtbl.create 256 in
   let initial_root = Merkle.root_with_leaves tree in
   let initial_root_hex = Felt.to_hex initial_root in
   Hashtbl.replace root_set initial_root_hex ();
@@ -67,47 +67,40 @@ let create ~auth_domain =
   {
     tree; nullifier_set; root_set; root_history;
     withdrawals; auth_domain;
-    next_deposit_slot_id = 0L;
-    deposit_slots; deposits_by_intent;
+    deposit_balances;
+    applied_shield_cms;
   }
 
-(* Record an L1 bridge deposit. Returns the new slot id. Each call allocates
-   its own slot, so dust attackers depositing 1 mutez to the same intent
-   simply create their own orphan slot (no brick). *)
-let record_deposit ledger ~intent ~amount =
-  let id = ledger.next_deposit_slot_id in
-  ledger.next_deposit_slot_id <- Int64.add id 1L;
-  Hashtbl.replace ledger.deposit_slots id
-    { slot_intent = intent; slot_amount = amount };
-  let key = Felt.to_hex intent in
-  (match Hashtbl.find_opt ledger.deposits_by_intent key with
-   | None -> Hashtbl.replace ledger.deposits_by_intent key (ref [id])
-   | Some r -> r := id :: !r);
-  id
+(* Credit an L1 bridge deposit to the pool keyed by `pubkey_hash`. Multiple
+   deposits to the same `pubkey_hash` aggregate (top-up). *)
+let credit_deposit ledger ~pubkey_hash ~amount =
+  let key = Felt.to_hex pubkey_hash in
+  let current =
+    match Hashtbl.find_opt ledger.deposit_balances key with
+    | None -> 0L
+    | Some n -> n
+  in
+  Hashtbl.replace ledger.deposit_balances key (Int64.add current amount)
 
-let consume_deposit_slot ledger ~slot_id ~intent ~debit =
-  match Hashtbl.find_opt ledger.deposit_slots slot_id with
+(* Debit `amount` from the pool keyed by `pubkey_hash`. Returns Error if the
+   pool does not exist or its balance is below `amount`. When the resulting
+   balance is zero the entry is removed to bound storage. *)
+let debit_deposit ledger ~pubkey_hash ~amount =
+  let key = Felt.to_hex pubkey_hash in
+  match Hashtbl.find_opt ledger.deposit_balances key with
   | None ->
-      Error (Printf.sprintf "deposit slot %Ld not found or already consumed" slot_id)
-  | Some slot ->
-      if not (Felt.equal slot.slot_intent intent) then
-        Error (Printf.sprintf "deposit slot %Ld intent mismatch" slot_id)
-      else if Int64.compare slot.slot_amount debit <> 0 then
-        Error (Printf.sprintf
-                 "deposit slot %Ld amount mismatch: have %Ld, expected exactly %Ld"
-                 slot_id slot.slot_amount debit)
-      else begin
-        Hashtbl.remove ledger.deposit_slots slot_id;
-        (* Prune the by-intent index entry. Mirrors the kernel's
-           swap-with-last semantics; bounds index size to open-slot count. *)
-        let key = Felt.to_hex intent in
-        (match Hashtbl.find_opt ledger.deposits_by_intent key with
-         | None -> ()
-         | Some r ->
-           r := List.filter (fun id -> Int64.compare id slot_id <> 0) !r;
-           if !r = [] then Hashtbl.remove ledger.deposits_by_intent key);
-        Ok ()
-      end
+      Error (Printf.sprintf "deposit pool %s does not exist" key)
+  | Some current when Int64.compare current amount < 0 ->
+      Error (Printf.sprintf
+               "deposit pool %s balance %Ld too small to debit %Ld"
+               key current amount)
+  | Some current ->
+      let next = Int64.sub current amount in
+      if Int64.compare next 0L = 0 then
+        Hashtbl.remove ledger.deposit_balances key
+      else
+        Hashtbl.replace ledger.deposit_balances key next;
+      Ok ()
 
 
 let withdrawals ledger =
@@ -265,43 +258,34 @@ let check_and_insert_nullifiers ledger nullifiers =
     insert_nullifiers ledger nullifiers;
     Ok ()
 
-(* Intent-bound shield. The deposit_id MUST equal shield_intent over every
-   public output; the kernel recomputes it and rejects mismatch. Shield
-   consumes a specific kernel-side slot (allocated when the L1 ticket
-   landed) whose `(intent, amount)` must match `(deposit_id, v + fee +
-   producer_fee)` exactly. On success the slot is removed and both notes
-   are appended to the commitment tree. *)
+(* Pool-bound shield. The shield message names a `pubkey_hash` identifying
+   a deposit-balance pool; the kernel decrements it by `v + fee +
+   producer_fee` and appends both notes. The in-circuit WOTS+ signature
+   under the recipient's auth tree binds (v, fee, producer_fee, cm_recipient,
+   cm_producer, mh_recipient, mh_producer); this OCaml mirror trusts the
+   STARK has already validated those bindings. *)
 let apply_shield ledger ~(pub : Transaction.shield_public)
-    ~deposit_slot ~memo_ct_hash ~producer_memo_ct_hash =
+    ~memo_ct_hash ~producer_memo_ct_hash =
   if not (Felt.equal pub.auth_domain ledger.auth_domain) then
     Error "auth_domain mismatch"
   else if not (Felt.equal memo_ct_hash pub.memo_ct_hash) then
     Error "memo_ct_hash mismatch"
   else if not (Felt.equal producer_memo_ct_hash pub.producer_memo_ct_hash) then
     Error "producer_memo_ct_hash mismatch"
+  else if Int64.compare pub.producer_fee 0L <= 0 then
+    Error "producer_fee must be positive"
   else begin
-    let recomputed =
-      Transaction.shield_intent
-        ~auth_domain:pub.auth_domain
-        ~v_pub:pub.v_pub ~fee:pub.fee ~producer_fee:pub.producer_fee
-        ~cm_new:pub.cm_new ~cm_producer:pub.cm_producer
-        ~memo_ct_hash:pub.memo_ct_hash
-        ~producer_memo_ct_hash:pub.producer_memo_ct_hash
-    in
-    if not (Felt.equal recomputed pub.deposit_id) then
-      Error "shield intent mismatch"
-    else if Int64.compare pub.producer_fee 0L <= 0 then
-      Error "producer_fee must be positive"
+    let cm_key = Felt.to_hex pub.cm_new in
+    if Hashtbl.mem ledger.applied_shield_cms cm_key then
+      Error (Printf.sprintf "shield replay: cm %s already applied" cm_key)
     else
       let debit =
         Int64.add pub.v_pub (Int64.add pub.fee pub.producer_fee)
       in
-      match
-        consume_deposit_slot ledger ~slot_id:deposit_slot
-          ~intent:pub.deposit_id ~debit
-      with
+      match debit_deposit ledger ~pubkey_hash:pub.pubkey_hash ~amount:debit with
       | Error e -> Error e
       | Ok () ->
+        Hashtbl.replace ledger.applied_shield_cms cm_key ();
         append_commitment ledger pub.cm_new;
         append_commitment ledger pub.cm_producer;
         Ok ()

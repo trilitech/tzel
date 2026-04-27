@@ -1,9 +1,9 @@
 use tzel_core::{
-    commit, default_auth_domain, derive_account, derive_address, derive_ask, derive_auth_pub_seed,
-    derive_nk_tag, derive_rcm, felt_tag, hash, hash_two, nullifier, owner_tag, shield_intent,
-    transfer_sighash, u64_to_felt, unshield_sighash, wots_pk, wots_pk_to_leaf, wots_sign,
-    xmss_tree_node_hash, Account, CircuitKind, MerkleTree, AUTH_DEPTH, AUTH_TREE_SIZE, DEPTH, F,
-    MIN_TX_FEE, WOTS_CHAINS,
+    commit, deposit_pubkey_hash, derive_account, derive_address, derive_ask,
+    derive_auth_pub_seed, derive_nk_tag, derive_rcm, felt_tag, hash, hash_two, nullifier,
+    owner_tag, shield_sighash, transfer_sighash, u64_to_felt, unshield_sighash, wots_pk,
+    wots_pk_to_leaf, wots_sign, xmss_tree_node_hash, Account, CircuitKind, MerkleTree,
+    AUTH_DEPTH, AUTH_TREE_SIZE, DEPTH, F, MIN_TX_FEE, WOTS_CHAINS,
 };
 
 pub const MAX_BENCH_INPUTS: usize = 7;
@@ -86,83 +86,107 @@ fn synthetic_output_fields(base: u64) -> (F, F, F, F, F, F) {
     )
 }
 
+/// Build a witness for the XMSS-signed shield circuit. The recipient
+/// note is owned by `addr_index = 0`'s auth tree (which the shield
+/// circuit also signs under), and the WOTS+ key at `auth_idx = 0` is
+/// consumed.
 pub fn build_shield_bench_witness() -> BenchWitness {
-    let (d_j, auth_root, auth_pub_seed, nk_tag, memo_ct_hash_f, rseed) =
-        synthetic_output_fields(0xC000);
-    let (
-        producer_d_j,
-        producer_auth_root,
-        producer_auth_pub_seed,
-        producer_nk_tag,
-        producer_memo_ct_hash_f,
-        producer_rseed,
-    ) = synthetic_output_fields(0xC100);
-    let auth_domain = default_auth_domain();
-    let v_pub = 200_000u64;
+    let account = bench_account();
+    let addr_index = 0u32;
+    let ask_j = derive_ask(&account.ask_base, addr_index);
+    let d_j = derive_address(&account.incoming_seed, addr_index);
+    let nk_spend = account.nk;
+    let nk_tag = derive_nk_tag(&nk_spend);
+    let (auth_root, auth_pub_seed, auth_paths) = build_auth_root_and_paths(&ask_j, 1);
+    let auth_path = auth_paths.into_iter().next().expect("path 0");
+
+    let auth_domain = u64_to_felt(0xF101);
+    let blind = hash_two(&felt_tag(b"bench-blind"), &u64_to_felt(0xCAFE));
+    let pubkey_hash = deposit_pubkey_hash(&auth_domain, &auth_root, &auth_pub_seed, &blind);
+
+    let v_note = 400_000u64;
     let fee = MIN_TX_FEE;
     let producer_fee = 1u64;
-    let cm = commit(
+
+    let rseed = bench_rseed(b"bench-shield-recipient", 0);
+    let cm_new = commit(
         &d_j,
-        v_pub,
+        v_note,
         &derive_rcm(&rseed),
         &owner_tag(&auth_root, &auth_pub_seed, &nk_tag),
     );
-    let producer_cm = commit(
+
+    // Producer note has its own independent owner witness; the circuit
+    // only checks the commitment opens correctly.
+    let (producer_d_j, producer_auth_root, producer_auth_pub_seed, producer_nk_tag, mh_producer, producer_rseed) =
+        synthetic_output_fields(0xE100);
+    let cm_producer = commit(
         &producer_d_j,
         producer_fee,
         &derive_rcm(&producer_rseed),
-        &owner_tag(
-            &producer_auth_root,
-            &producer_auth_pub_seed,
-            &producer_nk_tag,
-        ),
+        &owner_tag(&producer_auth_root, &producer_auth_pub_seed, &producer_nk_tag),
     );
-    let deposit_id = shield_intent(
+    let mh_recipient = hash_two(&felt_tag(b"bench-mh-recipient"), &u64_to_felt(0));
+
+    let sighash = shield_sighash(
         &auth_domain,
-        v_pub,
+        &pubkey_hash,
+        v_note,
         fee,
         producer_fee,
-        &cm,
-        &producer_cm,
-        &memo_ct_hash_f,
-        &producer_memo_ct_hash_f,
+        &cm_new,
+        &cm_producer,
+        &mh_recipient,
+        &mh_producer,
     );
+    let (sig, _, _) = wots_sign(&ask_j, 0, &sighash);
 
-    let args = vec![
-        felt_to_hex(&auth_domain),
-        felt_u64_to_hex(v_pub),
-        felt_u64_to_hex(fee),
-        felt_u64_to_hex(producer_fee),
-        felt_to_hex(&cm),
-        felt_to_hex(&producer_cm),
-        felt_to_hex(&deposit_id),
-        felt_to_hex(&memo_ct_hash_f),
-        felt_to_hex(&producer_memo_ct_hash_f),
-        felt_to_hex(&auth_root),
-        felt_to_hex(&auth_pub_seed),
-        felt_to_hex(&nk_tag),
-        felt_to_hex(&d_j),
-        felt_to_hex(&rseed),
-        felt_to_hex(&producer_auth_root),
-        felt_to_hex(&producer_auth_pub_seed),
-        felt_to_hex(&producer_nk_tag),
-        felt_to_hex(&producer_d_j),
-        felt_to_hex(&producer_rseed),
+    let total_fields = 16 + WOTS_CHAINS + AUTH_DEPTH + 5;
+    let mut args = Vec::with_capacity(total_fields + 1);
+    args.push(felt_u64_to_hex(total_fields as u64));
+    args.push(felt_to_hex(&auth_domain));
+    args.push(felt_to_hex(&pubkey_hash));
+    args.push(felt_u64_to_hex(v_note));
+    args.push(felt_u64_to_hex(fee));
+    args.push(felt_u64_to_hex(producer_fee));
+    args.push(felt_to_hex(&cm_new));
+    args.push(felt_to_hex(&cm_producer));
+    args.push(felt_to_hex(&mh_recipient));
+    args.push(felt_to_hex(&mh_producer));
+    args.push(felt_to_hex(&auth_root));
+    args.push(felt_to_hex(&auth_pub_seed));
+    args.push(felt_to_hex(&nk_tag));
+    args.push(felt_to_hex(&d_j));
+    args.push(felt_to_hex(&rseed));
+    args.push(felt_to_hex(&blind));
+    args.push(felt_u64_to_hex(0));
+    for s in &sig {
+        args.push(felt_to_hex(s));
+    }
+    for sibling in &auth_path {
+        args.push(felt_to_hex(sibling));
+    }
+    args.push(felt_to_hex(&producer_auth_root));
+    args.push(felt_to_hex(&producer_auth_pub_seed));
+    args.push(felt_to_hex(&producer_nk_tag));
+    args.push(felt_to_hex(&producer_d_j));
+    args.push(felt_to_hex(&producer_rseed));
+
+    let expected_public_outputs = vec![
+        auth_domain,
+        pubkey_hash,
+        u64_to_felt(v_note),
+        u64_to_felt(fee),
+        u64_to_felt(producer_fee),
+        cm_new,
+        cm_producer,
+        mh_recipient,
+        mh_producer,
     ];
 
     BenchWitness {
         args,
-        expected_public_outputs: vec![
-            auth_domain,
-            u64_to_felt(v_pub),
-            u64_to_felt(fee),
-            u64_to_felt(producer_fee),
-            cm,
-            producer_cm,
-            deposit_id,
-            memo_ct_hash_f,
-            producer_memo_ct_hash_f,
-        ],
+        expected_public_outputs,
     }
 }
 

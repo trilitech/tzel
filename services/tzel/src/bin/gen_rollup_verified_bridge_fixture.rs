@@ -1,3 +1,26 @@
+//! Generator for `tezos/rollup-kernel/testdata/verified_bridge_flow.json`.
+//!
+//! Produces a triple of (shield, transfer, unshield) STARK proofs against the
+//! current Cairo executables in `cairo/target/dev/`. The verifier-side tests
+//! load the fixture and check that each proof validates against its program
+//! hash and that tampering with the public-output preimage breaks
+//! verification.
+//!
+//! The shield circuit verifies an in-circuit WOTS+ signature under the
+//! recipient's auth tree (post-Phase-3 deposit-pool design), so the shield
+//! consumes one WOTS+ key from the pool-owning address. To keep the fixture
+//! a single connected flow (`shield -> transfer -> unshield`) the transfer
+//! input spends the shield recipient note via the pool address's *next*
+//! auth-tree key (`auth_idx = 1`), whose path is computed up-front via
+//! `auth_tree_path` (one full XMSS rebuild — acceptable for a one-shot
+//! generator).
+//!
+//! Run with:
+//!     cargo run --release --bin gen_rollup_verified_bridge_fixture
+//!
+//! The binary builds the `reprove` prover via the `apps/prover` workspace if
+//! it isn't already present, then writes the fixture JSON in place.
+
 use ml_kem::{ml_kem_768, KeyExport};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -83,6 +106,17 @@ fn build_fixture() -> Result<VerifiedBridgeFixture, String> {
     let alice_addr_1 = fixture_address(&wallet, 1)?;
     let bob_addr_0 = fixture_address(&wallet, 2)?;
 
+    // Shield: pool key derived from alice_addr_0; recipient note owned by
+    // alice_addr_0 (the circuit binds these); WOTS+ signature consumes
+    // alice_addr_0's auth_idx=0.
+    let shield_blind = fixed_felt(0x10);
+    let shield_pubkey_hash = deposit_pubkey_hash(
+        &auth_domain,
+        &alice_addr_0.payment.auth_root,
+        &alice_addr_0.payment.auth_pub_seed,
+        &shield_blind,
+    );
+
     let shield_rseed = fixed_felt(0x21);
     let shield_enc = deterministic_note(
         &alice_addr_0.payment,
@@ -110,25 +144,34 @@ fn build_fixture() -> Result<VerifiedBridgeFixture, String> {
     let shield_proof = generate_shield_proof(
         &program_hashes,
         &auth_domain,
-        "alice",
         SHIELD_AMOUNT,
         MIN_TX_FEE,
         DAL_PRODUCER_FEE,
-        &alice_addr_0.payment,
+        &shield_blind,
+        shield_pubkey_hash,
+        &alice_addr_0,
         &shield_rseed,
         &shield_enc,
         shield_cm,
+        0,
         &alice_addr_1.payment,
         &shield_producer_rseed,
         &shield_producer_enc,
         shield_producer_cm,
     )?;
 
+    // Transfer spends the shield recipient note (tree[0], owned by
+    // alice_addr_0). Since shield consumed alice_addr_0's auth_idx=0,
+    // transfer signs with auth_idx=1 — its auth path is computed via a
+    // one-shot full-tree rebuild.
     let mut tree = MerkleTree::new();
     tree.append(shield_cm);
     tree.append(shield_producer_cm);
     let root_after_shield = tree.root();
     let shield_nf = nullifier(&alice_addr_0.nk_spend, &shield_cm, 0);
+
+    eprintln!("computing alice_addr_0 auth path for auth_idx=1 (full XMSS rebuild)...");
+    let alice_addr_0_auth_path_1 = auth_tree_path(&alice_addr_0.ask_j, 1);
 
     let transfer_rseed_change = fixed_felt(0x22);
     let transfer_rseed_bob = fixed_felt(0x23);
@@ -181,6 +224,8 @@ fn build_fixture() -> Result<VerifiedBridgeFixture, String> {
         shield_cm,
         SHIELD_AMOUNT,
         &shield_rseed,
+        1,
+        &alice_addr_0_auth_path_1,
         MIN_TX_FEE,
         transfer_cm_change,
         &alice_addr_1.payment,
@@ -235,27 +280,12 @@ fn build_fixture() -> Result<VerifiedBridgeFixture, String> {
         &tree,
     )?;
 
-    let shield_intent_id = tzel_core::shield_intent(
-        &auth_domain,
-        SHIELD_AMOUNT,
-        MIN_TX_FEE,
-        DAL_PRODUCER_FEE,
-        &shield_cm,
-        &shield_producer_cm,
-        &memo_ct_hash(&shield_enc),
-        &memo_ct_hash(&shield_producer_enc),
-    );
-    let _ = &alice_addr_0; // kept for documentation; address is now committed via cm only
     Ok(VerifiedBridgeFixture {
         auth_domain,
         program_hashes,
         bridge_ticketer: BRIDGE_TICKETER.into(),
         shield: ShieldReq {
-            deposit_id: shield_intent_id,
-            // Slot 0 — by construction the only slot allocated in this fixture
-            // (kernel `apply_deposit` is the only path that mints slots, and
-            // the fixture issues a single deposit before the shield).
-            deposit_slot: 0,
+            pubkey_hash: shield_pubkey_hash,
             v: SHIELD_AMOUNT,
             fee: MIN_TX_FEE,
             producer_fee: DAL_PRODUCER_FEE,
@@ -292,28 +322,29 @@ fn build_fixture() -> Result<VerifiedBridgeFixture, String> {
     })
 }
 
-/// Build the witness arguments for the intent-bound shield circuit.
+/// Build the witness arguments for the deposit-pool / pubkey_hash shield
+/// circuit. Layout matches `cairo/src/run_shield.cairo`:
 ///
-/// LAYOUT NOTE: this matches the *new* run_shield.cairo layout — the circuit
-/// must compute `intent = shield_intent(auth_domain, v, fee, producer_fee,
-/// cm, producer_cm, mh, producer_mh)` and assert it equals the public
-/// `deposit_id` output. The witness no longer carries a `deposit_secret`;
-/// instead the prover gets the full note material for both the recipient
-/// and producer-fee notes, which the L1 deposit's `intent` already binds.
-/// Until the Cairo circuit is updated to match, regenerating the bridge
-/// fixture from this binary will fail at the in-circuit assertion.
+///   total_fields, auth_domain, pubkey_hash, v, fee, producer_fee,
+///   cm_new, cm_producer, mh, producer_mh,
+///   auth_root, auth_pub_seed, nk_tag, d_j, rseed, blind,
+///   auth_idx, wots_sig[WOTS_CHAINS], auth_siblings[AUTH_DEPTH],
+///   producer_auth_root, producer_auth_pub_seed, producer_nk_tag,
+///   producer_d_j, producer_rseed
 #[allow(clippy::too_many_arguments)]
 fn generate_shield_proof(
     program_hashes: &ProgramHashes,
     auth_domain: &F,
-    _sender: &str,
     amount: u64,
     fee: u64,
     producer_fee: u64,
-    address: &PaymentAddress,
+    blind: &F,
+    pubkey_hash: F,
+    recipient: &DerivedAddress,
     rseed: &F,
     enc: &EncryptedNote,
     cm: F,
+    auth_idx: u32,
     producer_address: &PaymentAddress,
     producer_rseed: &F,
     producer_enc: &EncryptedNote,
@@ -321,30 +352,53 @@ fn generate_shield_proof(
 ) -> Result<Proof, String> {
     let mh = memo_ct_hash(enc);
     let producer_mh = memo_ct_hash(producer_enc);
-    let intent =
-        tzel_core::shield_intent(auth_domain, amount, fee, producer_fee, &cm, &producer_cm, &mh, &producer_mh);
-    let args = vec![
-        felt_u64_to_hex(19),
+    let sighash = shield_sighash(
+        auth_domain,
+        &pubkey_hash,
+        amount,
+        fee,
+        producer_fee,
+        &cm,
+        &producer_cm,
+        &mh,
+        &producer_mh,
+    );
+    let (sig, _, _) = wots_sign(&recipient.ask_j, auth_idx, &sighash);
+
+    let total_fields = 16 + WOTS_CHAINS + AUTH_DEPTH + 5;
+    let mut args = vec![
+        felt_u64_to_hex(total_fields as u64),
         felt_to_hex(auth_domain),
+        felt_to_hex(&pubkey_hash),
         felt_u64_to_hex(amount),
         felt_u64_to_hex(fee),
         felt_u64_to_hex(producer_fee),
         felt_to_hex(&cm),
         felt_to_hex(&producer_cm),
-        felt_to_hex(&intent),
         felt_to_hex(&mh),
         felt_to_hex(&producer_mh),
-        felt_to_hex(&address.auth_root),
-        felt_to_hex(&address.auth_pub_seed),
-        felt_to_hex(&address.nk_tag),
-        felt_to_hex(&address.d_j),
+        felt_to_hex(&recipient.payment.auth_root),
+        felt_to_hex(&recipient.payment.auth_pub_seed),
+        felt_to_hex(&recipient.payment.nk_tag),
+        felt_to_hex(&recipient.payment.d_j),
         felt_to_hex(rseed),
+        felt_to_hex(blind),
+        felt_u64_to_hex(auth_idx as u64),
+    ];
+    for s in &sig {
+        args.push(felt_to_hex(s));
+    }
+    for sibling in &recipient.auth_path_0 {
+        args.push(felt_to_hex(sibling));
+    }
+    args.extend([
         felt_to_hex(&producer_address.auth_root),
         felt_to_hex(&producer_address.auth_pub_seed),
         felt_to_hex(&producer_address.nk_tag),
         felt_to_hex(&producer_address.d_j),
         felt_to_hex(producer_rseed),
-    ];
+    ]);
+
     let proof = proof_from_bundle(generate_stark_bundle("run_shield.executable.json", &args)?);
     DirectProofVerifier::verified(false, program_hashes.clone())
         .validate(&proof, CircuitKind::Shield)?;
@@ -361,6 +415,8 @@ fn generate_transfer_proof(
     input_cm: F,
     input_value: u64,
     input_rseed: &F,
+    input_auth_idx: u32,
+    input_auth_path: &[F],
     fee: u64,
     cm_1: F,
     output_1: &PaymentAddress,
@@ -383,6 +439,13 @@ fn generate_transfer_proof(
     if path_root != root {
         return Err("transfer input path root mismatch".into());
     }
+    if input_auth_path.len() != AUTH_DEPTH {
+        return Err(format!(
+            "transfer input auth path has wrong length: {} != {}",
+            input_auth_path.len(),
+            AUTH_DEPTH
+        ));
+    }
 
     let nullifiers = vec![nf];
     let mh_1 = memo_ct_hash(enc_1);
@@ -400,7 +463,7 @@ fn generate_transfer_proof(
         &mh_2,
         &mh_3,
     );
-    let (sig, _, _) = wots_sign(&input_addr.ask_j, 0, &sighash);
+    let (sig, _, _) = wots_sign(&input_addr.ask_j, input_auth_idx, &sighash);
 
     let total_fields = 4 + 9 + DEPTH + AUTH_DEPTH + WOTS_CHAINS + 24;
     let mut args = vec![
@@ -413,7 +476,7 @@ fn generate_transfer_proof(
         felt_to_hex(&input_addr.nk_spend),
         felt_to_hex(&input_addr.payment.auth_root),
         felt_to_hex(&input_addr.payment.auth_pub_seed),
-        felt_u64_to_hex(0),
+        felt_u64_to_hex(input_auth_idx as u64),
         felt_to_hex(&input_addr.payment.d_j),
         felt_u64_to_hex(input_value),
         felt_to_hex(input_rseed),
@@ -423,7 +486,7 @@ fn generate_transfer_proof(
     for sibling in &cm_path {
         args.push(felt_to_hex(sibling));
     }
-    for sibling in &input_addr.auth_path_0 {
+    for sibling in input_auth_path {
         args.push(felt_to_hex(sibling));
     }
     for felt in &sig {
@@ -470,6 +533,7 @@ fn generate_transfer_proof(
     Ok(proof)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_unshield_proof(
     auth_domain: F,
     program_hashes: &ProgramHashes,

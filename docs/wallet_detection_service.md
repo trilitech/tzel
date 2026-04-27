@@ -62,10 +62,11 @@ tzel-wallet --wallet alice.watch.json profile init-shadownet \
 ```
 
 `public-account` is only used for non-shielded balance reporting. Shield
-deposits are intent-bound: the deposit_id is a hash of the entire shield
-(recipient, value, fees, encrypted-note bytes), and the wallet stores the
-full witness alongside the L1 deposit. Watch-only material does not include
-the deposit witness.
+deposits are pool-keyed: each deposit pool is identified by
+`pubkey_hash = H(auth_domain, auth_root, auth_pub_seed, blind)` and the
+wallet stores `(blind, address_index)` so it can re-derive the
+`pubkey_hash` and prove ownership at shield time. Watch-only material
+exposes no spending material and cannot construct shield witnesses.
 
 ## Sync Manually
 

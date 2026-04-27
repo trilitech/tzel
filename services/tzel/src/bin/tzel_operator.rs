@@ -1572,8 +1572,8 @@ mod tests {
         producer_enc: EncryptedNote,
     ) -> Vec<u8> {
         let _policy = sample_fee_policy();
-        let mut deposit_id = [0u8; 32];
-        deposit_id[..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let mut pubkey_hash = [0u8; 32];
+        pubkey_hash[..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
         // Use a deterministic synthetic client cm/enc for the operator's
         // fee-policy decoder; consensus validation is exercised elsewhere.
         let mut client_cm = [0u8; 32];
@@ -1581,8 +1581,7 @@ mod tests {
         let client_enc = producer_enc.clone();
         encode_kernel_inbox_message(&KernelInboxMessage::Shield(
             tzel_core::kernel_wire::KernelShieldReq {
-                deposit_id,
-                deposit_slot: 0,
+                pubkey_hash,
                 fee: 100_000,
                 v: 25,
                 producer_fee,
@@ -1591,9 +1590,9 @@ mod tests {
                     output_preimage: vec![],
                 },
                 client_cm,
-                client_enc: client_enc,
+                client_enc,
                 producer_cm,
-                producer_enc: producer_enc,
+                producer_enc,
             },
         ))
         .expect("shield payload should encode")

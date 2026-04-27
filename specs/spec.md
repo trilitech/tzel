@@ -233,37 +233,45 @@ separate resource price from the burned rollup fee above.
 
 ### Shield (public -> private)
 
-**Public outputs:** `[auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer, deposit_id, memo_ct_hash, producer_memo_ct_hash]`
+**Public outputs:** `[auth_domain, pubkey_hash, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash]`
 
-`deposit_id` is defined in [Intent-Bound Deposit Identifiers](#intent-bound-deposit-identifiers); it is the hash of every other public output and so commits to the *exact* shield being authorized. `auth_root` does NOT appear in the public outputs; it is a private input used only to compute `owner_tag`.
+`pubkey_hash` is the deposit-pool key (see [Deposit-Pool Identifiers](#deposit-pool-identifiers) below). The shield circuit additionally verifies an **in-circuit WOTS+ signature** from the recipient's auth tree, mirroring the structure used by transfer and unshield. The signature binds the entire request payload, so a delegated prover that holds the witness still cannot redirect funds, change values, or swap recipients without the wallet's spending key.
 
 **Circuit constraints:**
 1. `rcm = H(H(TAG_RCM), rseed)`
 2. `owner_tag = H_owner(auth_root, pub_seed, nk_tag)` where `auth_root`, `pub_seed`, and `nk_tag` are private inputs from the recipient's payment address
 3. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
 4. `producer_rcm = H(H(TAG_RCM), producer_rseed)`
-5. `producer_owner_tag = H_owner(producer_auth_root, producer_pub_seed, producer_nk_tag)` where those values are private inputs from the DAL producer's payment address
+5. `producer_owner_tag = H_owner(producer_auth_root, producer_pub_seed, producer_nk_tag)`
 6. `cm_producer = H_commit(producer_d_j, producer_fee, producer_rcm, producer_owner_tag)`
 7. `producer_fee > 0`
-8. `intent = H_intent(auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)` (left-fold using the `sighSP__` personalization with leading type tag `0x03`)
-9. `deposit_id == intent`
+8. `pubkey_hash = H_pubkey(auth_domain, auth_root, pub_seed, blind)` (left-fold with the `sighSP__` personalization and leading type tag `0x04`); the `blind` is a private input the wallet derives deterministically from `master_sk` per deposit
+9. WOTS+ signature verification under the recipient's auth tree: the circuit recovers the WOTS+ public-key endpoints from the signature, computes the `auth_leaf` via the L-tree, and verifies its inclusion in `auth_root`. The signed message is the shield sighash:
+   ```
+   sighash = fold(0x03, auth_domain, pubkey_hash, v_pub, fee, producer_fee,
+                  cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)
+   ```
 
-`memo_ct_hash` and `producer_memo_ct_hash` are computed client-side as
-`H(ct_d || tag || ct_v || nonce || encrypted_data || outgoing_ct)` —
-covering ALL on-chain note data — and passed into the circuit as public inputs.
+`memo_ct_hash` and `producer_memo_ct_hash` are computed client-side as `H(ct_d || tag || ct_v || nonce || encrypted_data || outgoing_ct)` and passed into the circuit as public inputs.
 
-There is no `deposit_secret` in the witness. The L1 deposit transaction (signed by the depositor's L1 key) is itself the spend authorization: by addressing the rollup recipient string to `deposit:<hex(intent)>`, it commits to every detail of the shield. Anything an untrusted prover could rewrite (recipient address, value, fee, producer fee, encrypted-note bytes, even auth_domain) is folded into `intent` — modifying any field changes the deposit_id, so the kernel's slot lookup either returns no slot at all or a slot whose intent disagrees with the request's `deposit_id`. **This makes shield safe to delegate to an untrusted prover**, unlike the legacy secret-bound deposit which leaked spend authority to the prover.
+The L1 deposit transaction (signed by the depositor's L1 key) credits the deposit pool keyed by `pubkey_hash`. The actual `(v, fee, producer_fee, cm_recipient, cm_producer)` is chosen at *shield time*, not at deposit time, and the in-circuit WOTS+ sig is what binds it. This means the wallet must be online to sign each shield, but it also makes shielding much more flexible: the same pool can be drained over multiple shields, and the user can pick the recipient at shield time rather than committing at deposit time.
 
-**Contract / ledger checks:** proof valid, deposit binding per [Shield deposit binding](#shield-deposit-binding), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= required_tx_fee`, and (consensus-level) the request's `deposit_id` MUST equal the recomputed `intent` from the request fields.
+**Contract / ledger checks:** proof valid (including in-circuit WOTS+ verify), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= required_tx_fee`, and the kernel's pinned public outputs (`auth_domain`, `pubkey_hash`, `v`, `fee`, `producer_fee`, `cm_new`, `cm_producer`, memo hashes) match the request fields. Consensus also requires the deposit pool keyed by `pubkey_hash` to have at least `v + fee + producer_fee` mutez.
 
-**Per-deposit slots.** Every L1 ticket the kernel observes for a `deposit:<hex(intent)>` recipient allocates a fresh **deposit slot**. The slot's *key* is a `slot_id` drawn from a kernel-controlled monotonic counter — depositors cannot influence, predict, or collide slot ids. The slot's *content* is `(intent, amount)`. Two L1 tickets can have identical content (same intent, same amount) and still get distinct slot ids; nothing about the key is depositor-controlled. The kernel's per-intent index lets the wallet enumerate every slot funded for a given intent — important because an attacker can dust-deposit any victim's `deposit:<hex(intent)>` recipient string. Each dust deposit allocates its own orphan slot rather than corrupting any other slot's amount.
+**Aggregated deposit pools.** Every L1 ticket the kernel observes for a `deposit:<hex(pubkey_hash)>` recipient credits a per-pool aggregated balance. Two tickets to the same recipient string sum into one balance — there is no per-ticket "slot" to brick. The pool is keyed by `H_pubkey(auth_domain, auth_root, pub_seed, blind)`, so:
 
-**Shield consumes a specific slot.** `ShieldReq` carries a `deposit_slot: u64` field. The kernel verifies that:
-1. The slot exists and is open (not previously consumed).
-2. `slot.intent == req.deposit_id`.
-3. `slot.amount == v_pub + fee + producer_fee` (exactly).
+- A wallet that doesn't reveal its `(auth_root, pub_seed, blind)` triple is the only entity that can produce a valid WOTS+ sig under `auth_root`, and therefore the only entity that can shield against the pool.
+- Dust attackers who mirror-deposit to the same `pubkey_hash` simply add to the victim's pool balance — they pay mutez to subsidize the victim's eventual shield.
+- The user can top up an existing pool by sending another L1 ticket; multiple deposits compose linearly.
 
-On success the slot is tombstoned (single-shot consumption), and `cm_new` / `cm_producer` are appended to T. Mismatches leave state untouched. Wallets MUST size the L1 deposit precisely; sender-side mistakes (over/under-deposit) leave the slot orphaned but do not affect any other slot.
+**Shield drains a pool by `(v + fee + producer_fee)`.** The user picks (recipient, value, fees) at shield time. The kernel:
+1. Verifies the proof (which includes the in-circuit WOTS+ sig).
+2. Pins the proof's public outputs to the request fields.
+3. Reads `balance = pool[pubkey_hash]`. Rejects if `balance < v + fee + producer_fee`.
+4. Decrements `pool[pubkey_hash]` by `v + fee + producer_fee`. If the new balance is zero, the entry is removed.
+5. Appends `cm_new` and `cm_producer` to T.
+
+Pool overfunding is fine: the surplus stays available for future shields. Underfunding (or congestion-driven `required_tx_fee` exceeding what the pool covers) just makes shield reject at step 3 — the user can top up via another L1 ticket and retry. The shield circuit does not commit `fee` into the pool key, so a fee revision between deposit and shield does not strand the pool.
 
 ### Transfer (N->recipient + change + producer fee, where 1 <= N <= 7)
 
@@ -376,11 +384,11 @@ For each output note, the contract MUST verify `H(posted_note_calldata) == memo_
 
 ### Shield deposit binding
 
-Bridge deposits for shielding MUST be addressed to the canonical recipient string `deposit:<hex(intent)>`. Each accepted L1 ticket allocates its own kernel-side **slot**. The slot's *key* is a fresh `slot_id` drawn from a kernel-controlled monotonic counter (depositors have no influence over the id). The slot's *content* is `(intent, amount)`. Slots are NOT a single mutable bucket per intent: dust deposits to the same intent allocate their own orphan slots and cannot corrupt any other slot.
+Bridge deposits for shielding MUST be addressed to the canonical recipient string `deposit:<hex(pubkey_hash)>` where `pubkey_hash = H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)`. Each accepted L1 ticket credits a **per-pool aggregated balance** keyed by `pubkey_hash`. Multiple tickets to the same recipient string aggregate (top-ups), and dust attackers depositing to a victim's pool simply add to the victim's balance.
 
-The shield proof MUST recompute `intent = H_intent(auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)` in-circuit and emit it as a public output equal to `deposit_id`; the kernel additionally MUST recompute the same intent from the request fields and reject any request whose `deposit_id` disagrees.
+The shield proof verifies an in-circuit WOTS+ signature under the recipient's auth tree — the same signature scheme used by transfer and unshield. The signed message is the full shield sighash `fold(0x03, auth_domain, pubkey_hash, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)`, so the prover cannot redirect funds, change values, or swap recipients — only the wallet that holds the corresponding signing key in the auth tree can produce a valid shield.
 
-`ShieldReq` carries a `deposit_slot: u64` selecting which slot to drain. The kernel MUST verify that the slot exists, is open, has matching intent, and has `amount == v_pub + fee + producer_fee` exactly. On success the slot is tombstoned in a single shot.
+`ShieldReq` carries a `pubkey_hash: F` field selecting the deposit pool and the user-chosen `(v, fee, producer_fee, cm_recipient, cm_producer)` quadruple. The kernel MUST verify that the proof is valid, the pinned public outputs match the request fields, and the pool's balance is at least `v + fee + producer_fee`. On success the pool's balance is decremented; if it reaches zero the entry is removed.
 
 ### Spend authorization (all spending transactions)
 
@@ -512,11 +520,11 @@ outgoing_ct     —   185 bytes   ChaCha20-Poly1305(role:1 || v:8 || rseed:32 ||
 ### Shield
 
 ```
-proof             — ~295 KB    circuit proof (ZK, two-level recursive STARK)
-public_outputs    —  288 B     [auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer, deposit_id, memo_ct_hash, producer_memo_ct_hash] (9 x 32 bytes)
+proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
+public_outputs    —  288 B     [auth_domain, pubkey_hash, v, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash] (9 x 32 bytes)
 note_data         —  6.8 KB    2 output notes
                   ----------
-                  ~302 KB total (no in-circuit spend signature — ownership is bound by the intent-committing L1 deposit)
+                  ~302 KB total (in-circuit WOTS+ signature under the recipient's auth tree binds the entire request payload)
 ```
 
 ### Transfer (N->recipient + change + producer fee)
@@ -680,49 +688,51 @@ The reference CLI currently exposes JSON over HTTP. That JSON must map losslessl
 - raw byte fields are serialized as lowercase hex strings, no `0x` prefix
 - `index` is serialized as a JSON integer
 - canonical binary `index` is `u64le`; the JSON mapping uses the same integer value
-- shield requests carry `deposit_id` as a `felt252` hex field
+- shield requests carry `pubkey_hash` as a `felt252` hex field
 - unshield recipients remain JSON strings outside the circuit and are canonicalized before hashing into `recipient_id`
 
 This JSON mapping is a convenience API, not the normative interoperability format.
 
-### Intent-Bound Deposit Identifiers
+### Deposit-Pool Identifiers
 
-The bridge receiver for a shield deposit is a namespaced intent-bound recipient string:
+The bridge receiver for a shield deposit is a namespaced pubkey-hash recipient string:
 
 ```text
-intent              = H_intent(auth_domain, v_pub, fee, producer_fee,
-                               cm_new, cm_producer,
-                               memo_ct_hash, producer_memo_ct_hash)
-deposit_id          = intent
-deposit_recipient   = "deposit:" || lowercase_hex_32(deposit_id)
+pubkey_hash         = H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)
+deposit_recipient   = "deposit:" || lowercase_hex_32(pubkey_hash)
 ```
 
-`H_intent` is the sequential left-fold using BLAKE2s with the `sighSP__` personalization (the same primitive as `sighash_fold`) over a leading type-tag felt `0x03` followed by the eight intent fields above. The 0x03 tag distinguishes shield intents from transfer (0x01) and unshield (0x02) sighashes; collisions across constructions are infeasible by domain separation.
+`H_pubkey` is the sequential left-fold using BLAKE2s with the `sighSP__` personalization (the same primitive as `sighash_fold`) over a leading type-tag felt `0x04` followed by the four pubkey-hash fields. The 0x04 tag domain-separates pubkey hashes from transfer sighashes (0x01), unshield sighashes (0x02), and shield sighashes (0x03).
 
-The `deposit:` namespace is the canonical L1-bridge recipient string. It prevents a raw 64-character hex deposit id from being confused with hex-encoded durable bytes by rollup RPC clients. The bridge MUST reject non-canonical deposit recipients, including missing prefixes, mixed-case hex, and malformed lengths.
+`auth_domain` is the deployment's frozen authentication domain. `auth_root` and `auth_pub_seed` together name a specific WOTS+ key tree that the wallet controls; only the holder of that tree's signing material can later produce a valid shield. `blind` is a per-deposit randomness the wallet derives deterministically from `master_sk` so each pool gets its own unlinkable identifier even when the same auth tree is reused.
 
-#### Per-Deposit Slots (anti-dust)
+The `deposit:` namespace is the canonical L1-bridge recipient string. It prevents a raw 64-character hex pubkey hash from being confused with hex-encoded durable bytes by rollup RPC clients. The bridge MUST reject non-canonical deposit recipients, including missing prefixes, mixed-case hex, and malformed lengths.
 
-Each accepted L1 ticket allocates its own kernel-side **deposit slot**. The *key* is a `slot_id` drawn from a kernel-controlled monotonic counter — depositors have no way to influence, predict, or collide slot ids. The *content* is `(intent, amount)`. The kernel maintains:
+#### Aggregated Deposit Pools
 
-- `deposit_slots: HashMap<u64, (intent, amount)>` — open slots, keyed by `slot_id`
-- `deposits_by_intent: HashMap<intent, [slot_id]>` — wallet-visible index of every slot funded for a given intent
+The kernel maintains a single per-pool aggregated balance:
 
-Slots are NOT a single mutable bucket per intent, and two L1 tickets with identical `(intent, amount)` content still get distinct ids. If an attacker observes a victim's `deposit:<hex(intent)>` recipient string on L1 and dust-deposits the same recipient string, the kernel allocates a fresh slot for the dust ticket — the victim's slot's `(intent, amount)` is unchanged, and the wallet's shield can still drain it by referring to its `slot_id`. Without the per-deposit slot scheme, summing all credits into one balance bucket would let a 1-mutez dust deposit permanently brick a victim's shield (the bucket would hold `debit + 1`, which is not the exact debit, so shield would always reject).
+- `deposit_balances: HashMap<pubkey_hash, u64>` — open pool balances. A pool with zero balance is removed from storage to bound durable footprint.
 
-The wallet observes its slot id by polling the rollup state for the by-intent index after the L1 deposit settles, then matches the slot whose amount equals the bound debit.
+Each L1 ticket addressed to `deposit:<hex(pubkey_hash)>` increments `deposit_balances[pubkey_hash]`. Multiple tickets to the same recipient string aggregate; this is how top-ups work.
 
-The kernel prunes the by-intent index on slot consumption: the consumed `slot_id` is removed by **swap-with-last** (overwriting its index entry with the last entry's value, then decrementing the count); when the count reaches zero, the count key remains at `0` rather than being deleted. The slot's `by-id` record is overwritten with a tombstone rather than deleted, so a re-run shield against a consumed slot fails with "already consumed" rather than "not found." This bounds the index size to the live open-slot count per intent — a dust attacker cannot inflate per-intent enumeration cost beyond the open frontier.
+This scheme is robust against the dust-bricking attack that motivated the original per-slot scheme. Under the slot scheme, an attacker depositing 1 mutez to a victim's `deposit:<hex(intent)>` string created an "orphan slot" because the intent committed to a specific debit and the kernel demanded an exact match. Under aggregated pools, the dust just adds to the victim's pool balance — the victim drains whatever they want at shield time, and any extra mutez in the pool is the user's to drain in a follow-up shield. **Mirror-depositing is therefore a donation to the victim**, not a brick.
 
-If a wallet's settled deposit has additional open slots in the by-intent index (typically because an attacker mirror-deposited the same `(intent, amount)` after observing the victim's L1 ticket), the wallet can re-shield against an orphan slot using the same recipient witness. The reference wallet exposes this through the regular shield command with an explicit slot override: `tzel-wallet shield --deposit-id <hex> --slot-id N --correlate`. Without `--slot-id`, shield consumes the slot the wallet's sync recorded against this deposit; with `--slot-id N` the wallet drains slot `N` instead. The `--correlate` flag is required whenever the deposit has **already settled** (its recipient `cm` is in the tree from a prior shield) — at that point any further shield produces a duplicate `cm` leaf at a new tree position, regardless of which open slot is being drained. Keying the privacy guard off settlement, not slot-id equality, is load-bearing: the wallet's recorded slot id can rotate to a still-open slot if the user drained an orphan first, so a slot-id check would let the second shield through silently. The drained slot produces a duplicate recipient `cm` at a new tree position; the two leaves are publicly correlatable to the same intent, but each gets a distinct nullifier (nullifier folds in tree position, see [Position-Dependent Nullifiers](#position-dependent-nullifiers)) and is independently spendable.
+#### Shield Authorization (in-circuit XMSS sig)
 
-The intent commits to *every* prover-rewritable field. As a consequence:
+A shield proof verifies an in-circuit WOTS+ signature under the recipient's auth tree, mirroring the structure used by transfer and unshield. The signature signs `fold(0x03, auth_domain, pubkey_hash, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)`, so it binds the entire request payload. A delegated prover with the witness still cannot redirect funds, change values, or swap recipients because they don't have access to the wallet's WOTS+ signing material.
 
-- A malicious untrusted prover cannot redirect funds: any change of recipient, value, fee, producer fee, encrypted-note bytes, or auth_domain produces a different deposit_id, so the kernel's slot lookup either returns no slot or a slot whose intent disagrees with the request's `deposit_id`.
-- The shield proof needs no signature inside the circuit; the L1 deposit transaction's own L1 signature is the spend authorization.
-- Each L1 deposit corresponds to exactly one shield. There is no partial drain and no top-up — both would require updating `intent`, which contradicts the L1 commitment. Wallets MUST size deposits exactly. Sender-side mistakes (over- or under-deposit) leave an orphan slot but cannot brick any other slot.
+This makes the wallet **not stateless**: each shield consumes one WOTS+ key index from the recipient's auth tree (the same index management used for transfer and unshield).
 
-A slot is shield-only. The L1 deposit binds *one* shield's worth of authority and nothing else.
+Top-ups, partial drains, and abandoned deposits are all natural under this scheme:
+
+- **Top-up**: send another L1 ticket to the same `deposit:<hex(pubkey_hash)>` recipient. The pool's balance increments. No new pool record is allocated.
+- **Partial drain**: the user picks `(v, fee, producer_fee)` at shield time. The kernel debits exactly that, leaves the rest. The same pool can be drained by multiple shields.
+- **Abandoned deposits**: a user whose wallet is offline indefinitely can never sign a shield, so the funds remain locked. There is no protocol-level recall mechanism in this version of the design — abandonment is the user's responsibility. (Future versions may add an L1-recall escape hatch.)
+
+#### Privacy of Aggregation
+
+Multiple L1 deposits to the same `deposit:<hex(pubkey_hash)>` recipient are publicly correlatable on L1 (they share the same recipient string). Wallets that want unlinkable deposits use a fresh `blind` per deposit, producing a fresh pubkey_hash per deposit. Wallets that want top-up convenience reuse a `blind` (and therefore a pubkey_hash) deliberately. The choice is per-deposit and entirely user-controlled.
 
 ### L1 Withdrawal Recipient Encoding
 

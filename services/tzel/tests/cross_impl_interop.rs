@@ -43,22 +43,20 @@ fn ocaml_scenario() -> InteropScenario {
     serde_json::from_slice(&out.stdout).expect("valid interop scenario JSON")
 }
 
-fn shield_req(step: &InteropShieldStep, auth_domain: &F, deposit_slot: u64) -> (F, ShieldReq) {
-    // Intent-bound shield: deposit_id is the sighash_fold over every public
-    // output. Both implementations recompute it the same way.
-    let deposit_id = shield_intent(
-        auth_domain,
-        step.v,
-        step.fee,
-        step.producer_fee,
-        &step.cm,
-        &step.producer_cm,
-        &step.memo_ct_hash,
-        &step.producer_memo_ct_hash,
-    );
+fn shield_req(step: &InteropShieldStep, auth_domain: &F) -> (F, ShieldReq) {
+    // The interop scenario doesn't carry a (blind, auth tree) for the
+    // deposit pool — it only needs the cross-impl ledger transition to
+    // agree on the outputs of `shield`/`transfer`/`unshield`. Synthesize
+    // a deterministic pubkey_hash from the step fields and seed the
+    // matching pool with the exact debit; the host-side proof check is
+    // satisfied by an output_preimage that mirrors the request.
+    let pubkey_hash = tzel_core::hash(&[
+        auth_domain.as_slice(),
+        step.cm.as_slice(),
+        step.producer_cm.as_slice(),
+    ].concat());
     let req = ShieldReq {
-        deposit_id,
-        deposit_slot,
+        pubkey_hash,
         v: step.v,
         fee: step.fee,
         producer_fee: step.producer_fee,
@@ -66,12 +64,12 @@ fn shield_req(step: &InteropShieldStep, auth_domain: &F, deposit_slot: u64) -> (
             proof_bytes: vec![1],
             output_preimage: vec![
                 *auth_domain,
+                pubkey_hash,
                 u64_to_felt(step.v),
                 u64_to_felt(step.fee),
                 u64_to_felt(step.producer_fee),
                 step.cm,
                 step.producer_cm,
-                deposit_id,
                 step.memo_ct_hash,
                 step.producer_memo_ct_hash,
             ],
@@ -81,7 +79,7 @@ fn shield_req(step: &InteropShieldStep, auth_domain: &F, deposit_slot: u64) -> (
         producer_cm: step.producer_cm,
         producer_enc: step.producer_enc.clone(),
     };
-    (deposit_id, req)
+    (pubkey_hash, req)
 }
 
 fn transfer_req(step: &InteropTransferStep, auth_domain: &F) -> TransferReq {
@@ -142,26 +140,13 @@ fn unshield_req(step: &InteropUnshieldStep, auth_domain: &F) -> UnshieldReq {
 fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     let scenario = ocaml_scenario();
     let mut ledger = Ledger::with_auth_domain(scenario.auth_domain);
-    // Allocate a deposit slot for the shield intent.
     let exact_debit = scenario.shield.v + scenario.shield.fee + scenario.shield.producer_fee;
-    let intent_for_funding = shield_intent(
-        &scenario.auth_domain,
-        scenario.shield.v,
-        scenario.shield.fee,
-        scenario.shield.producer_fee,
-        &scenario.shield.cm,
-        &scenario.shield.producer_cm,
-        &scenario.shield.memo_ct_hash,
-        &scenario.shield.producer_memo_ct_hash,
-    );
-    let slot_id = ledger
-        .deposit(&deposit_recipient_string(&intent_for_funding), exact_debit)
-        .expect("deposit slot");
-
-    let (deposit_id, shield_req) = shield_req(&scenario.shield, &scenario.auth_domain, slot_id);
-    assert_eq!(deposit_id, intent_for_funding);
-
-    let shield_resp = ledger.shield(&shield_req).expect("shield");
+    let (pubkey_hash, shield_req_built) =
+        shield_req(&scenario.shield, &scenario.auth_domain);
+    ledger
+        .deposit(&deposit_recipient_string(&pubkey_hash), exact_debit)
+        .expect("deposit pool");
+    let shield_resp = ledger.shield(&shield_req_built).expect("shield");
     assert_eq!(shield_resp.cm, scenario.shield.cm);
     assert_eq!(shield_resp.index, 0);
     assert_eq!(shield_resp.producer_cm, scenario.shield.producer_cm);
@@ -180,8 +165,8 @@ fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     assert_eq!(unshield_resp.change_index, None);
     assert_eq!(unshield_resp.producer_index, 5);
 
-    // Slot was consumed by shield.
-    assert!(ledger.deposit_slots.get(&slot_id).is_none());
+    // Pool drained.
+    assert!(ledger.deposit_balances.get(&pubkey_hash).is_none());
     assert_eq!(ledger.withdrawals, scenario.expected.withdrawals.clone());
     assert_eq!(ledger.tree.leaves.len(), scenario.expected.tree_size);
     assert_eq!(ledger.nullifiers.len(), scenario.expected.nullifier_count);

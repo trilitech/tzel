@@ -129,10 +129,10 @@ The rollup state therefore contains:
   \item an append-only Merkle tree of note commitments;
   \item a global set of spent nullifiers;
   \item a historical set of Merkle roots usable as spend anchors;
-  \item a set of public bridge deposit receipts keyed by intent-bound deposit
-        identifiers (each id is a hash of the entire shield it authorizes:
-        recipient note, producer-fee note, fees, and authorization domain),
-        used only to move value into the shielded pool;
+  \item a per-pool aggregated bridge-deposit balance, keyed by a wallet-
+        derived pubkey hash (a hash of the deployment's auth domain plus
+        the recipient's auth tree root and a per-deposit blind), drained
+        only by shield;
   \item verifier configuration, public-account bindings, and fee-policy state.
 \end{itemize}
 
@@ -144,7 +144,7 @@ A \emph{shielded transaction} is any transaction that creates or destroys notes.
 \toprule
 Transaction & Consumes & Creates \\
 \midrule
-Shield & a bridge deposit receipt keyed by an intent-bound deposit identifier & a user note and a DAL-producer fee note \\
+Shield & some balance from a bridge-deposit pool keyed by a wallet-derived pubkey hash & a user note and a DAL-producer fee note \\
 Transfer & 1--7 shielded input notes & a recipient note, a change note, and a DAL-producer fee note \\
 Unshield & 1--7 shielded input notes & a public credit, an optional change note, and a DAL-producer fee note \\
 \bottomrule
@@ -428,71 +428,65 @@ elsewhere.
 \subsection{Shield}
 
 Shield takes value that has already crossed from L1 into the rollup and moves it
-into the shielded pool. The public rollup object being consumed is not a normal
-transparent account balance. It is a bridge deposit receipt keyed by an
-\emph{intent-bound} deposit identifier:
+into the shielded pool. The public rollup object being consumed is a
+\emph{deposit pool} keyed by a wallet-derived pubkey hash:
 
 \[
-intent = \Hash_{intent}(auth\_domain,\, v_{pub},\, fee,\, producer\_fee,\,
-                        \cm_{user},\, \cm_{producer},\,
-                        mh_{user},\, mh_{producer}),
-\quad deposit\_id = intent.
+pubkey\_hash = \Hash_{pubkey}(auth\_domain,\, auth\_root,\, auth\_pub\_seed,\, blind).
 \]
 
-\(\Hash_{intent}\) is the sequential left-fold using the \texttt{sighSP\_\_}
-personalization with leading type tag \(0x03\) (the same primitive as the
-spend-authorization sighash but with a distinct type tag for domain
-separation). The L1 deposit transaction is addressed to the canonical
-recipient string \texttt{deposit:<hex(intent)>}, and the kernel allocates a
-fresh per-deposit \emph{slot} for that L1 ticket. The slot's \emph{key}
-is a \(slot\_id\) drawn from a kernel-controlled monotonic counter
-(depositors cannot influence, predict, or collide slot ids); the slot's
-\emph{content} is \((intent, amount)\). There is no separate
-\(deposit\_secret\): the L1 deposit's own L1 signature is the spend
-authorization, and the deposit-id binding propagates to every detail of the
-shield.
+\(\Hash_{pubkey}\) is the sequential left-fold using the \texttt{sighSP\_\_}
+personalization with leading type tag \(0x04\) (domain-separated from
+transfer / unshield / shield sighashes, which use tags \(0x01\), \(0x02\),
+\(0x03\)). The L1 deposit transaction is addressed to the canonical
+recipient string \texttt{deposit:<hex(pubkey\_hash)>}; the kernel
+maintains a per-pool aggregated balance and credits it on each L1 ticket.
+\(blind\) is a per-deposit randomness the wallet derives deterministically
+from \(master\_sk\), so distinct deposits to the same auth tree get
+distinct pool ids by default and the wallet can recover all its pools
+from the seed alone.
 
-\paragraph{Per-deposit slots and dust resistance.} Two different L1
-tickets addressed to the same \texttt{deposit:<hex(intent)>} recipient
-string each allocate their own slot rather than accumulating into a
-shared balance, and even tickets with identical \((intent, amount)\)
-content still get distinct slot ids. This matters because the
-\texttt{deposit:<hex(intent)>} string is public on L1: an attacker could
-observe a victim's deposit, send a 1-mutez ticket to the same recipient
-string, and (under a single shared balance scheme) push the balance
-above the bound debit, permanently bricking the legitimate shield
-(which requires the balance to equal the debit exactly). With
-per-deposit slots, the dust ticket creates an orphan slot and the
-legitimate slot's content is unchanged.
+\paragraph{Aggregation and dust resistance.} Multiple L1 tickets to the
+same \texttt{deposit:<hex(pubkey\_hash)>} recipient string aggregate into
+one balance. The \texttt{deposit:<hex(pubkey\_hash)>} string is public on
+L1: an attacker observing a victim's deposit and dust-depositing the
+same recipient string just adds to the victim's pool balance. Mirror-
+depositing is therefore a donation rather than a brick — the attacker pays
+mutez that only the victim (sole holder of the auth tree's signing
+material) can later shield-and-spend.
 
 The public outputs of shield are
 
 \[
-[auth\_domain,\, v_{pub},\, fee,\, producer\_fee,\, \cm_{user},\, \cm_{producer},\, deposit\_id,\,
+[auth\_domain,\, pubkey\_hash,\, v_{pub},\, fee,\, producer\_fee,\, \cm_{user},\, \cm_{producer},\,
  mh_{user},\, mh_{producer}].
 \]
 
 The circuit proves the user commitment, the producer-fee commitment, the
-condition \(producer\_fee > 0\), and that \(deposit\_id\) equals the
-recomputed \(intent\). The shield request additionally carries a
-\(deposit\_slot\) field selecting which kernel-side slot to drain. The
-rollup recomputes \(intent\) from the request fields and rejects any
-mismatch, verifies note-data hashes, and looks up the slot. It accepts only
-if the slot's \(intent\) equals \(deposit\_id\) and its \(amount\) equals
-\(v_{pub} + fee + producer\_fee\) exactly. On success the slot is
-tombstoned in a single shot. There is no partial drain and no top-up; an
-over- or under-deposit leaves an orphan slot but cannot affect any other.
+condition \(producer\_fee > 0\), and \emph{verifies an in-circuit WOTS+
+signature} from the recipient's auth tree (the same scheme used by
+transfer and unshield). The signed message is the shield sighash:
+\[
+\Hash_{sigh}(0x03,\, auth\_domain,\, pubkey\_hash,\, v_{pub},\, fee,\, producer\_fee,\,
+              \cm_{user},\, \cm_{producer},\, mh_{user},\, mh_{producer}).
+\]
+The kernel reads \(balance = \mathrm{pool}[pubkey\_hash]\), rejects unless
+\(balance \ge v_{pub} + fee + producer\_fee\), debits the pool, and
+appends both notes. Pool overfunding is fine — the surplus stays
+available for future shields. The user picks
+\((v_{pub}, fee, producer\_fee)\) at shield time, so fee revisions
+between deposit and shield are a wallet-side retry, not a stranded slot.
 
 \paragraph{Untrusted-prover safety.} The witness exposes the recipient's
 address fields, value, randomness, and the encrypted-note bytes. None of these
-grants spend authority because the intent commits to all of them: any
-modification by an untrusted prover yields a different \(deposit\_id\) whose
-L1 balance is empty. This makes shield safe to delegate to an external proving
-service without any in-circuit signature.
+grants spend authority because (a) the in-circuit WOTS+ signature binds the
+entire request payload, and (b) the prover does not have the wallet's
+auth-tree signing material. Delegated proving requires the wallet to
+sign each request — the same operational model as transfer / unshield.
 
-\paragraph{auth\_domain freeze.} Because \(intent\) commits to
+\paragraph{auth\_domain freeze.} Because \(pubkey\_hash\) commits to
 \(auth\_domain\), any reconfiguration of the deployment's
-\(auth\_domain\) between the wallet computing \(intent\) and the L1
+\(auth\_domain\) between the wallet computing \(pubkey\_hash\) and the L1
 ticket landing would silently strand the deposit. The kernel therefore
 freezes \(auth\_domain\) on first verifier configuration: subsequent
 \texttt{configure\_verifier} messages may rotate program hashes or the
@@ -515,32 +509,19 @@ from the profile-supplied DAL-fee receiver equals the published
 consensus rule — a custom wallet that skips it merely loses its own fee
 notes.
 
-\paragraph{Orphan-slot drain.} If an attacker mirror-deposits a victim's
-\texttt{deposit:<hex(intent)>} recipient string with the same
-\(amount\) as the victim's settled shield, the extra L1 ticket allocates
-an orphan slot that holds real mutez but is not consumed by the victim's
-shield. Because the victim's wallet still holds the full deposit
-witness, it can re-shield the original recipient \(\cm\) against the
-orphan slot, recovering the L1 mutez. Reference wallets expose this
-through the same shield command with an explicit slot override (so
-"orphan drain" is not a separate operation, just a non-canonical slot
-target requiring the user to acknowledge the privacy cost). The drained
-slot produces a duplicate recipient commitment at a new tree position;
-the two leaves are publicly correlatable to the same intent but each
-gets a distinct nullifier (nullifiers fold in tree position) and is
-independently spendable. Mirror-depositing is therefore an asymmetric
-attack: the attacker burns mutez to a slot only the victim's witness
-can drain, and the only "damage" is the on-chain intent linkage exposed
-when the victim chooses to recover the funds.
+\paragraph{Top-ups and partial drains.} A user can send multiple L1
+tickets to the same \texttt{deposit:<hex(pubkey\_hash)>} recipient; each
+ticket adds to the pool's balance. Each shield then debits some
+\((v_{pub} + fee + producer\_fee)\) at the user's discretion. Shielding
+is not exclusive of further deposits or further shields: pools live as
+long as their balance is positive.
 
 \paragraph{Ownership binding accounting.} \(v_{pub}\) becomes the user's
 shielded note, \(producer\_fee\) becomes the DAL-producer fee note, and
-\(fee\) is burned. There is no separate direct-withdraw path for the deposit
-receipt; only Shield can consume it. Under the intent-bound scheme,
-\(deposit\_id\) is a hash of off-chain witness data that the wallet persists
-and that is not revealed by the L1 deposit alone, so a third party who merely
-observes the deposit cannot construct an alternative shield against the same
-\(deposit\_id\).
+\(fee\) is burned. There is no separate direct-withdraw path for the
+deposit pool; only Shield can drain it. The pool's signing material
+lives in the wallet's auth tree; a third party who observes the L1
+deposit on chain cannot construct a valid shield without the auth tree.
 
 \subsection{Transfer}
 
@@ -691,10 +672,10 @@ state-transition rules that are not handled inside the proof. These include:
         proof outputs;
   \item equality between posted note data and the note-data hashes in the
         proof outputs;
-  \item correct binding of shield to the exact intent-bound deposit receipt
-        being consumed (the kernel recomputes \(intent\) from the request
-        fields and requires \(deposit\_id == intent\); the L1 balance must
-        also equal exactly \(v_{pub} + fee + producer\_fee\));
+  \item correct binding of shield to the deposit-pool balance being drained
+        (the kernel pins the proof's \(pubkey\_hash\) to the request and
+        verifies the pool's balance is at least
+        \(v_{pub} + fee + producer\_fee\));
   \item correct binding of unshield to the intended canonical L1 recipient
         string;
   \item enough remaining commitment-tree capacity for every output note before
@@ -795,16 +776,19 @@ protocol guarantee.
         authorizations under the same one-time key, it may be able to forge
         further authorizations. Wallets should therefore allocate one leaf per
         spend and persist that state durably.
-  \item \textbf{Shield is intent-bound and safe to delegate.} Every
-        prover-rewritable shield field --- \(auth\_domain\), value, fees,
-        recipient and producer commitments, ciphertext memo hashes ---
-        is folded into \(deposit\_id\). Cross-deployment replay fails
-        because \(auth\_domain\) is in the intent, and prover-side
-        redirection fails because the kernel recomputes the intent from
-        request fields. The cost is that shield is single-shot and
-        exact-amount: an L1 deposit that does not equal the bound debit
-        is unrecoverable, since no other intent collides with the same
-        \(deposit\_id\). Wallet UX must therefore size deposits precisely.
+  \item \textbf{Shield is signed by the auth tree and aggregates per
+        pool.} The shield circuit verifies an in-circuit WOTS+ signature
+        from the recipient's auth tree, binding every prover-rewritable
+        field --- value, fees, recipient and producer commitments,
+        ciphertext memo hashes --- under the same scheme used for
+        transfer and unshield. Cross-deployment replay fails because
+        \(auth\_domain\) is in \(pubkey\_hash\); prover-side redirection
+        fails because the prover does not have the wallet's signing
+        material. The cost is that shielding is no longer stateless on
+        the wallet side: each shield consumes one WOTS+ key from the
+        recipient's auth tree. Top-ups and partial drains are first-class
+        — multiple L1 tickets to the same pool aggregate, and one pool
+        can be drained by multiple shields.
 \end{itemize}
 
 \section{Size and Data Path}
