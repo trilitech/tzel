@@ -490,15 +490,16 @@ entire request payload, and (b) the prover does not have the wallet's
 auth-tree signing material. Delegated proving requires the wallet to
 sign each request — the same operational model as transfer / unshield.
 
-\paragraph{auth\_domain freeze.} Because \(pubkey\_hash\) commits to
-\(auth\_domain\), any reconfiguration of the deployment's
-\(auth\_domain\) between the wallet computing \(pubkey\_hash\) and the L1
-ticket landing would silently strand the deposit. The kernel therefore
-freezes \(auth\_domain\) on first verifier configuration: subsequent
-\texttt{configure\_verifier} messages may rotate program hashes, but
-any attempt to change \(auth\_domain\) is rejected, even on a
-still-pristine ledger. Other verifier-config fields remain rotatable
-while pristine.
+\paragraph{Verifier configuration is one-shot.} Because
+\(pubkey\_hash\) commits to \(auth\_domain\), any reconfiguration
+between the wallet computing \(pubkey\_hash\) and the L1 ticket landing
+would silently strand the deposit. The kernel therefore makes the
+entire verifier configuration one-shot for the lifetime of the
+deployment: once a signed \texttt{configure\_verifier} message is
+accepted, every subsequent \texttt{configure\_verifier} is rejected —
+same fields, different \(auth\_domain\), different program hashes,
+anything. Wallets that read \(auth\_domain\) once therefore never have
+to worry about it changing under them.
 
 \paragraph{Producer-fee receiver is a publisher-side concern.} The
 producer-fee note recipient is a private input; the circuit only proves
