@@ -534,6 +534,14 @@ struct PendingDeposit {
     /// pool; sync reads the kernel-side authoritative balance.
     amount: u64,
     operation_hash: Option<String>,
+    /// `Some(client_cm)` once the wallet has submitted a shield request
+    /// against this pool. The kernel's balance entry will read empty
+    /// once the shield lands; this flag lets reporting code distinguish
+    /// "drained by us" from "never credited yet". Cleared by sync /
+    /// pruning once the recipient note has been observed in the rollup
+    /// tree.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "hex_f_option")]
+    shielded_cm: Option<F>,
 }
 
 const WATCH_WALLET_VERSION: u16 = 1;
@@ -3036,23 +3044,16 @@ enum UserCmd {
     Balance,
     /// Check whether the wallet profile, operator, and rollup node are usable.
     Check,
-    /// Deposit tez on L1 into the configured bridge ticketer for an
-    /// intent-bound shield. The wallet builds the recipient + producer-fee
-    /// notes, computes the deposit's intent, and instructs the bridge to
-    /// credit `deposit:<hex(intent)>` for exactly `amount + fee + dal_fee`.
-    /// The recipient (`--to`) is bound at deposit time.
+    /// Deposit tez on L1 into a fresh self-owned pool. The wallet
+    /// allocates a new auth-tree address, derives a deterministic blind,
+    /// computes `pubkey_hash = H(0x04, auth_domain, auth_root,
+    /// auth_pub_seed, blind)`, and instructs the bridge to credit
+    /// `deposit:<hex(pubkey_hash)>` for `amount` mutez. Recipient,
+    /// fee, and memo are decided later at shield time, not here.
     Deposit {
-        /// Amount of tez (in mutez) that will end up in the recipient note.
+        /// L1 mutez to credit to the pool.
         #[arg(long)]
         amount: u64,
-        /// Burned rollup fee. Omit to use the rollup's quoted required fee.
-        #[arg(long)]
-        fee: Option<u64>,
-        /// Path to recipient address JSON. Defaults to a fresh self-address.
-        #[arg(long)]
-        to: Option<String>,
-        #[arg(long)]
-        memo: Option<String>,
     },
     /// Drain a deposit pool into a shielded note owned by the pool's own
     /// auth tree. The shield circuit verifies an in-circuit WOTS+ signature
@@ -3328,14 +3329,9 @@ fn run_user(cli: UserCli) -> Result<(), String> {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_wallet_check(&cli.wallet, &profile)
         }
-        UserCmd::Deposit {
-            amount,
-            fee,
-            to,
-            memo,
-        } => {
+        UserCmd::Deposit { amount } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_bridge_deposit(&cli.wallet, &profile, amount, fee, to, memo)
+            cmd_bridge_deposit(&cli.wallet, &profile, amount)
         }
         UserCmd::Shield {
             pubkey_hash,
@@ -3863,6 +3859,9 @@ struct ScanSummary {
     confirmed_pending: usize,
     /// Snapshot of each known pool's current kernel-side balance.
     pool_balances: std::collections::HashMap<F, u64>,
+    /// Number of `PendingDeposit` entries pruned because their
+    /// `shielded_cm` was observed as a tree leaf this round.
+    pruned_drained_pools: usize,
 }
 
 fn apply_scan_feed(
@@ -3897,12 +3896,31 @@ fn apply_scan_feed(
     w.pending_spends
         .retain(|pending| !pending.nullifiers.iter().all(|nf| nf_set.contains(nf)));
 
+    // Prune `PendingDeposit` entries whose recipient note has now
+    // been seen on chain (cm matches a leaf in the rollup tree
+    // alongside a zero kernel-side pool balance). Until we observe
+    // the cm, the entry stays around so a wallet that ran shield
+    // but never re-synced still has the metadata it needs.
+    let known_cms: std::collections::HashSet<F> = feed.notes.iter().map(|nm| nm.cm).collect();
+    let before_pools = w.pending_deposits.len();
+    w.pending_deposits.retain(|p| {
+        let drained_on_chain = pool_balances.get(&p.pubkey_hash).copied().unwrap_or(0) == 0;
+        let cm_observed = p
+            .shielded_cm
+            .as_ref()
+            .map(|cm| known_cms.contains(cm))
+            .unwrap_or(false);
+        !(drained_on_chain && cm_observed)
+    });
+    let pruned_drained_pools = before_pools - w.pending_deposits.len();
+
     w.scanned = feed.next_cursor;
     ScanSummary {
         found,
         spent,
         confirmed_pending: before_pending - w.pending_spends.len(),
         pool_balances: pool_balances.clone(),
+        pruned_drained_pools,
     }
 }
 
@@ -5594,6 +5612,122 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_scan_feed_prunes_drained_pool_after_recipient_cm_seen() {
+        // After a successful shield, the wallet marks the pool's
+        // PendingDeposit with `shielded_cm = Some(cm)`. The kernel
+        // entry reads empty (best-effort delete after full drain),
+        // but the wallet must keep the entry around until it has
+        // *also* observed the recipient note in the rollup feed —
+        // otherwise an offline wallet would discard the metadata it
+        // needs if the shield message never lands. Once both signals
+        // line up, sync prunes.
+        let mut w = test_wallet(1);
+        let pubkey_hash = felt_tag(b"scan-feed-prune-pkh");
+        let blind = felt_tag(b"scan-feed-prune-blind");
+        let auth_domain = felt_tag(b"scan-feed-prune-domain");
+        let recipient_cm = felt_tag(b"scan-feed-prune-cm");
+
+        w.pending_deposits.push(PendingDeposit {
+            pubkey_hash,
+            blind,
+            address_index: 0,
+            auth_domain,
+            amount: 100_000,
+            operation_hash: Some("opAfterShield".into()),
+            shielded_cm: Some(recipient_cm),
+        });
+
+        // First sync: kernel reports zero balance for the pool but
+        // the recipient note is NOT yet in the feed → keep the entry.
+        let pool_balances_drained: std::collections::HashMap<F, u64> =
+            std::collections::HashMap::new();
+        let summary = apply_scan_feed(
+            &mut w,
+            &NotesFeedResp {
+                notes: vec![],
+                next_cursor: 1,
+            },
+            Vec::<F>::new(),
+            &pool_balances_drained,
+        );
+        assert_eq!(
+            summary.pruned_drained_pools, 0,
+            "must not prune before observing the recipient cm in the feed"
+        );
+        assert_eq!(w.pending_deposits.len(), 1);
+
+        // Second sync: kernel still reports zero balance and the
+        // recipient cm is now in the feed → prune.
+        let alien_nm = NoteMemo {
+            index: 7,
+            cm: recipient_cm,
+            enc: encrypt_note(
+                100_000,
+                &felt_tag(b"prune-alien-rseed"),
+                None,
+                &kem_keygen_from_seed(&[0xAA; 64]).0,
+                &kem_keygen_from_seed(&[0xBB; 64]).0,
+            ),
+        };
+        let summary = apply_scan_feed(
+            &mut w,
+            &NotesFeedResp {
+                notes: vec![alien_nm],
+                next_cursor: 2,
+            },
+            Vec::<F>::new(),
+            &pool_balances_drained,
+        );
+        assert_eq!(summary.pruned_drained_pools, 1);
+        assert!(w.pending_deposits.is_empty());
+    }
+
+    #[test]
+    fn test_apply_scan_feed_keeps_funded_pool_even_when_cm_observed() {
+        // Defensive: a pool with a positive kernel-side balance is
+        // never pruned, even if its `shielded_cm` happens to also
+        // appear in the feed (e.g., a dust attacker top-up after our
+        // shield landed). The wallet may still want to drain the
+        // residue.
+        let mut w = test_wallet(1);
+        let pubkey_hash = felt_tag(b"scan-feed-keep-pkh");
+        let cm = felt_tag(b"scan-feed-keep-cm");
+        w.pending_deposits.push(PendingDeposit {
+            pubkey_hash,
+            blind: felt_tag(b"scan-feed-keep-blind"),
+            address_index: 0,
+            auth_domain: felt_tag(b"scan-feed-keep-domain"),
+            amount: 100,
+            operation_hash: None,
+            shielded_cm: Some(cm),
+        });
+        let mut pool_balances = std::collections::HashMap::new();
+        pool_balances.insert(pubkey_hash, 42u64);
+        let alien_nm = NoteMemo {
+            index: 0,
+            cm,
+            enc: encrypt_note(
+                100,
+                &felt_tag(b"keep-alien-rseed"),
+                None,
+                &kem_keygen_from_seed(&[0xAA; 64]).0,
+                &kem_keygen_from_seed(&[0xBB; 64]).0,
+            ),
+        };
+        let summary = apply_scan_feed(
+            &mut w,
+            &NotesFeedResp {
+                notes: vec![alien_nm],
+                next_cursor: 1,
+            },
+            Vec::<F>::new(),
+            &pool_balances,
+        );
+        assert_eq!(summary.pruned_drained_pools, 0);
+        assert_eq!(w.pending_deposits.len(), 1);
+    }
+
+    #[test]
     fn test_apply_scan_feed_drops_newly_recovered_note_if_already_nullified() {
         let mut w = test_wallet(1);
         let new_rseed = felt_tag(b"wallet-scan-new-spent");
@@ -6034,24 +6168,51 @@ fn cmd_user_balance(path: &str) -> Result<(), String> {
     if profile_path.exists() {
         let profile = load_network_profile(&profile_path)?;
         let rollup = RollupRpc::new(&profile);
-        // Deposit-pool reporting: query the kernel for each tracked pool's
-        // current balance (None == pool drained or never credited).
         let balances = rollup.load_pool_balances(&w.pending_deposits)?;
-        let funded_count = balances.len();
-        let total_funded: u64 = balances.values().sum();
-        println!(
-            "Deposit pools: {} funded, total balance {} mutez",
-            funded_count, total_funded
-        );
-        let unfunded = w.pending_deposits.len() - funded_count;
-        if unfunded > 0 {
-            println!(
-                "Deposit pools awaiting on-chain credit: {}",
-                unfunded
-            );
-        }
+        print_deposit_pool_summary(&w, &balances);
     }
     Ok(())
+}
+
+/// Three-way deposit-pool tally: funded (positive kernel balance),
+/// awaiting on-chain credit (no balance and we have not submitted a
+/// shield), and drained-pending-prune (no balance because we already
+/// shielded; sync clears these once the recipient note has been
+/// observed in the tree).
+fn print_deposit_pool_summary(
+    w: &WalletFile,
+    balances: &std::collections::HashMap<F, u64>,
+) {
+    let funded_count = balances.len();
+    let total_funded: u64 = balances.values().sum();
+    let mut drained_pending_scan = 0usize;
+    let mut awaiting_credit = 0usize;
+    for p in &w.pending_deposits {
+        if balances.contains_key(&p.pubkey_hash) {
+            continue;
+        }
+        if p.shielded_cm.is_some() {
+            drained_pending_scan += 1;
+        } else {
+            awaiting_credit += 1;
+        }
+    }
+    println!(
+        "Deposit pools: {} funded, total balance {} mutez",
+        funded_count, total_funded
+    );
+    if awaiting_credit > 0 {
+        println!(
+            "Deposit pools awaiting on-chain credit: {}",
+            awaiting_credit
+        );
+    }
+    if drained_pending_scan > 0 {
+        println!(
+            "Deposit pools drained but not yet pruned (run `tzel-wallet sync`): {}",
+            drained_pending_scan
+        );
+    }
 }
 
 fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), String> {
@@ -6063,9 +6224,6 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     let tree_size = snapshot.tree.leaves.len();
     let required_tx_fee = snapshot.required_tx_fee;
     let balances = rollup.load_pool_balances(&wallet.pending_deposits)?;
-    let funded_count = balances.len();
-    let total_funded: u64 = balances.values().sum();
-    let unfunded = wallet.pending_deposits.len() - funded_count;
 
     println!("Wallet file: {}", path);
     println!("Network: {}", profile.network);
@@ -6083,13 +6241,7 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
         wallet.pending_spends.len(),
         wallet.scanned
     );
-    println!(
-        "Deposit pools: {} funded, total balance {} mutez",
-        funded_count, total_funded
-    );
-    if unfunded > 0 {
-        println!("Deposit pools awaiting on-chain credit: {}", unfunded);
-    }
+    print_deposit_pool_summary(&wallet, &balances);
 
     if let Some(operator_url) = &profile.operator_url {
         let health_url = format!("{}/healthz", operator_url.trim_end_matches('/'));
@@ -6116,17 +6268,29 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
     let pool_balances = rollup.load_pool_balances(&w.pending_deposits)?;
     let summary = apply_scan_feed(&mut w, &feed, nullifiers, &pool_balances);
     save_wallet(path, &w)?;
-    let funded_count = summary.pool_balances.len();
     let total_funded: u64 = summary.pool_balances.values().sum();
-    let pending_unfunded = w.pending_deposits.len() - funded_count;
+    let mut pools_awaiting_credit = 0usize;
+    let mut pools_drained_pending_scan = 0usize;
+    for p in &w.pending_deposits {
+        if summary.pool_balances.contains_key(&p.pubkey_hash) {
+            continue;
+        }
+        if p.shielded_cm.is_some() {
+            pools_drained_pending_scan += 1;
+        } else {
+            pools_awaiting_credit += 1;
+        }
+    }
     println!(
-        "Synced: {} new notes, {} spent removed, {} pending confirmed, private_available={}, pool_funded_total={}, pools_awaiting_credit={}",
+        "Synced: {} new notes, {} spent removed, {} pending confirmed, {} drained-pool entries pruned, private_available={}, pool_funded_total={}, pools_awaiting_credit={}, pools_drained_pending_scan={}",
         summary.found,
         summary.spent,
         summary.confirmed_pending,
+        summary.pruned_drained_pools,
         w.available_balance(),
         total_funded,
-        pending_unfunded,
+        pools_awaiting_credit,
+        pools_drained_pending_scan,
     );
     Ok(())
 }
@@ -6186,9 +6350,6 @@ fn cmd_bridge_deposit(
     path: &str,
     profile: &WalletNetworkProfile,
     amount: u64,
-    _fee_arg: Option<u64>,
-    _to: Option<String>,
-    _memo: Option<String>,
 ) -> Result<(), String> {
     let rollup = RollupRpc::new(profile);
     let head_hash = rollup.head_hash()?;
@@ -6240,6 +6401,7 @@ fn cmd_bridge_deposit(
         auth_domain,
         amount,
         operation_hash: None,
+        shielded_cm: None,
     };
     wallet.pending_deposits.push(pending);
     save_wallet(path, &wallet)?;
@@ -7041,6 +7203,18 @@ fn cmd_shield_rollup(
     };
     let kernel_req = shield_req_to_kernel(&req)?;
     let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
+    // Mark every local PendingDeposit for this pool as consumed by this
+    // shield's recipient cm. Sync's `apply_scan_feed` later observes
+    // the cm in the rollup tree and prunes the entries entirely; until
+    // then, balance/check reporting can distinguish "drained by us"
+    // from "never credited".
+    for p in w
+        .pending_deposits
+        .iter_mut()
+        .filter(|p| p.pubkey_hash == pubkey_hash && p.shielded_cm.is_none())
+    {
+        p.shielded_cm = Some(note_recipient.cm);
+    }
     save_wallet(path, &w)?;
 
     println!(

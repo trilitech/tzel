@@ -67,6 +67,32 @@ pub mod hex_f {
     }
 }
 
+pub mod hex_f_option {
+    use super::F;
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<F>, s: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(f) => s.serialize_some(&hex::encode(f)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<F>, D::Error> {
+        let opt: Option<String> = Option::deserialize(d)?;
+        let Some(s) = opt else {
+            return Ok(None);
+        };
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom("expected 32 bytes"));
+        }
+        let mut f = [0u8; 32];
+        f.copy_from_slice(&bytes);
+        Ok(Some(f))
+    }
+}
+
 pub mod hex_f_vec {
     use super::F;
     use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
