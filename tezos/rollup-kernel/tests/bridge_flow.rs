@@ -191,7 +191,6 @@ fn default_verifier_config() -> KernelVerifierConfig {
     KernelVerifierConfig {
         auth_domain: default_auth_domain(),
         verified_program_hashes: sample_program_hashes(),
-        operator_producer_owner_tag: ZERO,
     }
 }
 
@@ -964,7 +963,6 @@ fn configure_verified_bridge_via_dal(host: &mut TestHost, fixture: &VerifiedBrid
         encode_kernel_inbox_message(&signed_verifier_message(KernelVerifierConfig {
             auth_domain: fixture.auth_domain,
             verified_program_hashes: fixture.program_hashes.clone(),
-            operator_producer_owner_tag: ZERO,
         }))
         .unwrap();
     let verifier_pointer = KernelDalPayloadPointer {
@@ -1023,7 +1021,6 @@ fn configure_verified_bridge_with_hashes(
         encode_external_kernel_message(signed_verifier_message(KernelVerifierConfig {
             auth_domain: fixture.auth_domain,
             verified_program_hashes: hashes,
-            operator_producer_owner_tag: ZERO,
         })),
     );
     host.push_input(

@@ -1626,7 +1626,6 @@ mod tests {
                         transfer: [0x23; 32],
                         unshield: [0x24; 32],
                     },
-                    operator_producer_owner_tag: [0x00; 32],
                 },
             )
             .unwrap(),

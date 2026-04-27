@@ -47,11 +47,7 @@ The kernel does not keep the full ledger as one serialized blob. It stores:
 - queued withdrawals under append-only per-index paths
 - the configured bridge ticketer (one-shot; reconfiguration is
   rejected once set)
-- the verifier config (`auth_domain`, program hashes, and a vestigial
-  `operator_producer_owner_tag` slot — see specs for why this is not a
-  consensus-relevant field; the producer fee is a market price paid to
-  whichever DAL slot publisher includes the transaction, and the kernel
-  does not cross-check it); also one-shot.
+- the verifier config (`auth_domain`, program hashes); also one-shot.
 
 The current POC kernel uses a simple congestion fee policy for private
 transactions:

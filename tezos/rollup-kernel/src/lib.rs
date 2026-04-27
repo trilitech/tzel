@@ -2333,7 +2333,6 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: default_auth_domain(),
             verified_program_hashes: sample_program_hashes(),
-            operator_producer_owner_tag: ZERO,
         };
         host.write_store(
             PATH_VERIFIER_CONFIG,
@@ -2421,7 +2420,6 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: sample_felt(0x41),
             verified_program_hashes: sample_program_hashes(),
-            operator_producer_owner_tag: ZERO,
         };
         let payload =
             encode_kernel_inbox_message(&signed_verifier_message(config.clone())).unwrap();
@@ -3249,7 +3247,6 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: new_domain,
             verified_program_hashes: sample_program_hashes(),
-            operator_producer_owner_tag: ZERO,
         };
         host.inputs.push_back(InputMessage {
             level: 8,
@@ -3278,7 +3275,6 @@ mod tests {
         let initial = KernelVerifierConfig {
             auth_domain: sample_felt(0x55),
             verified_program_hashes: sample_program_hashes(),
-            operator_producer_owner_tag: ZERO,
         };
         host.inputs.push_back(InputMessage {
             level: 1,
@@ -3302,13 +3298,11 @@ mod tests {
                     transfer: hash(b"new-transfer"),
                     unshield: hash(b"new-unshield"),
                 },
-                operator_producer_owner_tag: ZERO,
             },
             // Different auth_domain.
             KernelVerifierConfig {
                 auth_domain: sample_felt(0x66),
                 verified_program_hashes: sample_program_hashes(),
-                operator_producer_owner_tag: ZERO,
             },
         ];
         for (level, attempt) in attempts.into_iter().enumerate() {
@@ -3364,7 +3358,6 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: sample_felt(0x57),
             verified_program_hashes: sample_program_hashes(),
-            operator_producer_owner_tag: ZERO,
         };
 
         host.inputs.push_back(InputMessage {
@@ -3399,7 +3392,6 @@ mod tests {
             KernelVerifierConfig {
                 auth_domain: sample_felt(0x56),
                 verified_program_hashes: sample_program_hashes(),
-                operator_producer_owner_tag: ZERO,
             },
         )
         .unwrap();
@@ -3517,7 +3509,6 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: sample_felt(0x55),
             verified_program_hashes: sample_program_hashes(),
-            operator_producer_owner_tag: ZERO,
         };
         let mut host = MockHost::with_inputs(vec![
             InputMessage {
@@ -3573,7 +3564,6 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: default_auth_domain(),
             verified_program_hashes: sample_program_hashes(),
-            operator_producer_owner_tag: ZERO,
         };
         let verifier = DirectProofVerifier::from_kernel_config(&config).unwrap();
 
@@ -4031,7 +4021,6 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: default_auth_domain(),
             verified_program_hashes: sample_program_hashes(),
-            operator_producer_owner_tag: ZERO,
         };
         host.write_store(
             PATH_VERIFIER_CONFIG,

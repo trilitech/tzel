@@ -37,17 +37,6 @@ const MAX_UNSHIELD_PAYLOAD_BYTES: usize =
 pub struct KernelVerifierConfig {
     pub auth_domain: F,
     pub verified_program_hashes: ProgramHashes,
-    /// Deployment-blessed default DAL slot publisher's owner_tag, expressed
-    /// as `H_owner(auth_root, auth_pub_seed, nk_tag)`. Vestigial: there is
-    /// no privileged rollup operator; producer fees are a permissionless
-    /// market price paid to whichever DAL slot publisher chooses to include
-    /// the transaction, and publishers enforce their own inclusion policy
-    /// off-chain. The kernel does not cross-check this field against
-    /// anything, and a `ZERO` value is treated as "no default published."
-    /// Reference wallets may use it as a default routing hint; they remain
-    /// free to target any other publisher. Kept for now to preserve the
-    /// kernel-config wire format; removable in a later cleanup.
-    pub operator_producer_owner_tag: F,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +199,6 @@ struct WireStarkProof {
 struct WireKernelVerifierConfig {
     auth_domain: WireFelt,
     verified_program_hashes: WireProgramHashes,
-    operator_producer_owner_tag: WireFelt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -606,7 +594,6 @@ fn config_to_wire(config: &KernelVerifierConfig) -> WireKernelVerifierConfig {
     WireKernelVerifierConfig {
         auth_domain: felt_to_wire(&config.auth_domain),
         verified_program_hashes: program_hashes_to_wire(&config.verified_program_hashes),
-        operator_producer_owner_tag: felt_to_wire(&config.operator_producer_owner_tag),
     }
 }
 
@@ -623,7 +610,6 @@ fn config_from_wire(wire: WireKernelVerifierConfig) -> Result<KernelVerifierConf
     Ok(KernelVerifierConfig {
         auth_domain: wire_to_felt(wire.auth_domain)?,
         verified_program_hashes: program_hashes_from_wire(wire.verified_program_hashes)?,
-        operator_producer_owner_tag: wire_to_felt(wire.operator_producer_owner_tag)?,
     })
 }
 
@@ -1806,7 +1792,6 @@ mod tests {
                     transfer,
                     unshield,
                 },
-                operator_producer_owner_tag: ZERO,
             };
 
             let signed = sign_kernel_verifier_config(&ask, config).unwrap();

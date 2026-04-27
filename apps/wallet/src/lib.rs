@@ -9,8 +9,8 @@ use tezos_smart_rollup_encoding::{
     smart_rollup::SmartRollupAddress,
 };
 use tzel_services::kernel_wire::{
-    decode_kernel_verifier_config, encode_kernel_inbox_message, KernelInboxMessage,
-    KernelShieldReq, KernelStarkProof, KernelTransferReq, KernelUnshieldReq,
+    encode_kernel_inbox_message, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
+    KernelTransferReq, KernelUnshieldReq,
 };
 use tzel_services::operator_api::{
     RollupSubmission, RollupSubmissionKind, RollupSubmissionStatus, RollupSubmissionTransport,
@@ -1948,17 +1948,6 @@ impl<'a> RollupRpc<'a> {
         Ok(u64::from_le_bytes(out))
     }
 
-    fn read_optional_durable_bytes_at_block(
-        &self,
-        block_ref: &str,
-        key: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        if self.read_durable_length_at_block(block_ref, key)?.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(self.read_durable_bytes_at_block(block_ref, key)?))
-    }
-
     fn read_optional_u64_at_block(
         &self,
         block_ref: &str,
@@ -2238,10 +2227,10 @@ impl<'a> RollupRpc<'a> {
     /// Confirm the rollup node `rollup_node_url` actually serves the
     /// rollup at `profile.rollup_address`. Without this cross-check, a
     /// stale or malicious profile that points the two at different
-    /// rollups could pass the verifier / ticketer / owner_tag preflight
-    /// (all of which read state from `rollup_node_url`) while the L1
-    /// mint targets `rollup_address` — sending real mutez to a rollup
-    /// the wallet has never inspected.
+    /// rollups could pass the verifier / ticketer preflight (both of
+    /// which read state from `rollup_node_url`) while the L1 mint
+    /// targets `rollup_address` — sending real mutez to a rollup the
+    /// wallet has never inspected.
     fn ensure_rollup_address_matches(&self) -> Result<(), String> {
         let url = self.smart_rollup_address_url();
         let raw = get_text(&url)
@@ -2254,61 +2243,6 @@ impl<'a> RollupRpc<'a> {
                  refusing to send a bridge deposit. Update the wallet profile or point \
                  rollup_node_url at the right rollup.",
                 served, self.profile.rollup_address,
-            ));
-        }
-        Ok(())
-    }
-
-    /// Read the deployment's blessed default DAL-slot-publisher owner_tag
-    /// from the kernel's verifier config. Returns `None` if the verifier
-    /// has not been configured. This is an advisory hint, not a
-    /// security-critical value: producer fees are paid in a permissionless
-    /// market to whichever DAL slot publisher chooses to include the
-    /// transaction, and publishers gate inclusion off-chain. The kernel
-    /// does not cross-check this field.
-    fn read_operator_producer_owner_tag(&self, block_ref: &str) -> Result<Option<F>, String> {
-        let Some(bytes) =
-            self.read_optional_durable_bytes_at_block(block_ref, DURABLE_VERIFIER_CONFIG)?
-        else {
-            return Ok(None);
-        };
-        let cfg = decode_kernel_verifier_config(&bytes)
-            .map_err(|e| format!("kernel verifier config decode: {}", e))?;
-        Ok(Some(cfg.operator_producer_owner_tag))
-    }
-
-    /// Advisory check that `wallet_dal_fee_owner_tag` matches the
-    /// deployment's published default-publisher hint. Refuses if the hint
-    /// is set non-zero AND the wallet targets a different publisher;
-    /// passes silently otherwise. This is profile-drift detection, not a
-    /// consensus check: the producer fee is a market price between the
-    /// wallet and a DAL slot publisher of its choosing, and any publisher
-    /// will gate inclusion themselves on the producer note being routed
-    /// to them.
-    fn ensure_operator_producer_owner_tag_matches(
-        &self,
-        block_ref: &str,
-        wallet_dal_fee_owner_tag: &F,
-    ) -> Result<(), String> {
-        let Some(rollup_tag) = self.read_operator_producer_owner_tag(block_ref)? else {
-            return Err(
-                "rollup verifier is not configured yet — refusing to send a deposit/unshield."
-                    .into(),
-            );
-        };
-        if rollup_tag == ZERO {
-            return Ok(());
-        }
-        if rollup_tag != *wallet_dal_fee_owner_tag {
-            return Err(format!(
-                "wallet profile dal_fee_address owner_tag ({}) does not match the deployment's \
-                 published default DAL-slot-publisher owner_tag ({}). This is advisory — there \
-                 is no canonical receiver enforced on chain — but the mismatch usually means the \
-                 wallet profile has drifted from the deployment's blessed default. Update one to \
-                 match, or override this check if you intend to route producer fees to a \
-                 different publisher.",
-                hex::encode(wallet_dal_fee_owner_tag),
-                hex::encode(&rollup_tag),
             ));
         }
         Ok(())
@@ -7433,15 +7367,7 @@ fn cmd_shield_rollup(
     let fee = snapshot.required_tx_fee;
     ensure_positive_dal_fee(profile.dal_fee)?;
     let producer_fee = profile.dal_fee;
-
-    // Verify the producer-fee receiver matches what the operator published.
     let producer_address = profile.dal_fee_address.clone();
-    let wallet_dal_owner_tag = owner_tag(
-        &producer_address.auth_root,
-        &producer_address.auth_pub_seed,
-        &producer_address.nk_tag,
-    );
-    rollup.ensure_operator_producer_owner_tag_matches(&head_hash, &wallet_dal_owner_tag)?;
 
     // Pool must currently hold at least the fixed fees; otherwise even a
     // zero-value shield can't settle.
@@ -7662,19 +7588,6 @@ fn cmd_transfer_rollup(
     ensure_positive_dal_fee(profile.dal_fee)?;
     let root = snapshot.current_root();
 
-    // Advisory check: warn if the wallet profile's DAL fee receiver has
-    // drifted from the deployment's blessed default publisher hint. Not a
-    // security gate — producer fees are a market price to whichever DAL
-    // slot publisher includes the tx, and publishers enforce inclusion
-    // themselves.
-    let head_hash = rollup.head_hash()?;
-    let wallet_dal_owner_tag = owner_tag(
-        &profile.dal_fee_address.auth_root,
-        &profile.dal_fee_address.auth_pub_seed,
-        &profile.dal_fee_address.nk_tag,
-    );
-    rollup.ensure_operator_producer_owner_tag_matches(&head_hash, &wallet_dal_owner_tag)?;
-
     let mut w = load_wallet(path)?;
     let outgoing_seed = w.account().outgoing_seed;
     let recipient = load_address(to_path)?;
@@ -7882,19 +7795,6 @@ fn cmd_unshield_rollup(
     let fee = resolve_requested_tx_fee(fee, snapshot.required_tx_fee)?;
     ensure_positive_dal_fee(profile.dal_fee)?;
     let root = snapshot.current_root();
-
-    // Advisory check: warn if the wallet profile's DAL fee receiver has
-    // drifted from the deployment's blessed default publisher hint. Not a
-    // security gate — producer fees are a market price to whichever DAL
-    // slot publisher includes the tx, and publishers enforce inclusion
-    // themselves.
-    let head_hash = rollup.head_hash()?;
-    let wallet_dal_owner_tag = owner_tag(
-        &profile.dal_fee_address.auth_root,
-        &profile.dal_fee_address.auth_pub_seed,
-        &profile.dal_fee_address.nk_tag,
-    );
-    rollup.ensure_operator_producer_owner_tag_matches(&head_hash, &wallet_dal_owner_tag)?;
 
     let mut w = load_wallet(path)?;
     let outgoing_seed = w.account().outgoing_seed;
@@ -8530,7 +8430,6 @@ mod network_profile_tests {
                         transfer: hash(b"test-transfer"),
                         unshield: hash(b"test-unshield"),
                     },
-                    operator_producer_owner_tag: ZERO,
                 };
                 let encoded = tzel_services::kernel_wire::encode_kernel_verifier_config(&cfg)
                     .expect("verifier config encodes");
@@ -8550,7 +8449,6 @@ mod network_profile_tests {
                         transfer: hash(b"test-transfer"),
                         unshield: hash(b"test-unshield"),
                     },
-                    operator_producer_owner_tag: ZERO,
                 };
                 let encoded = tzel_services::kernel_wire::encode_kernel_verifier_config(&cfg)
                     .expect("verifier config encodes");

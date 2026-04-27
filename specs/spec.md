@@ -348,9 +348,8 @@ The kernel persists a signed `KernelVerifierConfig` containing:
 
 - `auth_domain` (frozen by the one-shot rule, see above)
 - `verified_program_hashes` for `run_shield`, `run_transfer`, `run_unshield`
-- `operator_producer_owner_tag = H_owner(auth_root, pub_seed, nk_tag)` — vestigial: a deployment-blessed default DAL slot publisher hint. There is no privileged rollup operator. Producer fees are paid in a permissionless market to whichever DAL slot publisher chooses to include the transaction; publishers gate inclusion off-chain on the producer note's `owner_tag` matching their own. A `ZERO` value means "no default published"; any non-zero value is at most a default routing hint, and the kernel does not cross-check it against any submitted proof.
 
-The signature covers all fields, so rotating the default-publisher hint requires a fresh signed config; this matters only insofar as wallets relying on the default do not get pointed elsewhere mid-flight.
+The signature covers all fields. There is no privileged rollup operator and no on-chain notion of a canonical producer-fee receiver — producer fees are paid in a permissionless market to whichever DAL slot publisher chooses to include the transaction.
 
 The producer-fee receiver is **not enforced in-circuit and not enforced on chain**. The shield / transfer / unshield circuits prove only that `cm_producer = H_commit(producer_d_j, producer_fee, producer_rcm, producer_otag)` and that the witness is internally consistent. Enforcement of "the producer note is payable to me" is the DAL slot publisher's own inclusion policy — they refuse to bundle transactions whose producer note isn't routed to them, since that note is their revenue. A wallet that targets a publisher and routes the fee elsewhere simply doesn't get included.
 
@@ -361,9 +360,8 @@ Bridge deposits and unshield/transfer submissions are irreversible at the L1 / i
 1. **Verifier configured** — `verifier_config.bin` exists. Deposits before configuration would land in a kernel that rejects them.
 2. **Bridge ticketer matches** — `bridge/ticketer` equals the wallet profile's `bridge_ticketer`. The kernel rejects deposits whose `transfer.sender` doesn't match its configured ticketer; an L1 ticket against the wrong ticketer burns mutez to a pool that never appears.
 4. **Rollup address matches** — the rollup node's `/global/smart_rollup_address` equals the wallet profile's `rollup_address`. The kernel reads at `rollup_node_url`; the L1 mint targets `rollup_address`. Without this cross-check, a stale or malicious profile that points the two at different rollups can pass the verifier / ticketer preflight while sending an irreversible L1 ticket to the wrong rollup.
-3. **Default publisher owner_tag matches (advisory)** — the `owner_tag` derived from `profile.dal_fee_address` equals `KernelVerifierConfig.operator_producer_owner_tag` if the latter is non-zero. This is *not* a security gate: the producer fee is a market price between the wallet and a DAL slot publisher, and any publisher will gate their own inclusion. The check exists to flag profile drift away from the deployment's blessed default publisher. If the rollup-published value is zero, the wallet proceeds without comment; if it is non-zero and disagrees, the wallet warns or refuses depending on policy.
 
-These checks bind the wallet to the deployment it thinks it is talking to. They are reference behavior, not a consensus rule — a custom wallet that skips them merely loses funds privately.
+These checks bind the wallet to the deployment it thinks it is talking to. They are reference behavior, not a consensus rule — a custom wallet that skips them merely loses funds privately. There is intentionally no producer-fee-receiver preflight: that fee is a market price the wallet pays to a DAL slot publisher of its own choosing, and the publisher gates inclusion themselves off-chain.
 
 ### Executable binding (all proof-verified transactions)
 

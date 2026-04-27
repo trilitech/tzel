@@ -559,10 +559,9 @@ payable to them. A wallet that routes the fee to "the wrong receiver"
 just won't get included.
 
 The kernel field `operator_producer_owner_tag` and the wallet helper
-`ensure_operator_producer_owner_tag_matches` are vestiges of this wrong
-model and have been left in code with corrected docs; their actual role
-is at most a deployment-blessed default publisher hint, not a
-consensus-relevant binding. Removing them is a separate cleanup.
+`ensure_operator_producer_owner_tag_matches` were vestiges of this
+wrong model and have since been removed from the kernel verifier
+config wire format and the wallet preflight gates respectively.
 
 ---
 

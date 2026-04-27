@@ -338,7 +338,6 @@ mod tests {
         let verifier = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
             auth_domain: f(77),
             verified_program_hashes: sample_hashes(),
-            operator_producer_owner_tag: ZERO,
         })
         .unwrap();
 
@@ -359,7 +358,6 @@ mod tests {
         let verifier = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
             auth_domain: f(77),
             verified_program_hashes: sample_hashes(),
-            operator_producer_owner_tag: ZERO,
         })
         .unwrap();
 
