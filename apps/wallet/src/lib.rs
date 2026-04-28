@@ -1497,7 +1497,16 @@ fn post_json_with_bearer<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
     if let Some(token) = bearer_token {
         req = req.header("Authorization", &format!("Bearer {}", token));
     }
+    // Don't let ureq's default `error_on_status_codes` swallow the 4xx/5xx
+    // response body — surface the server-provided error to the caller so
+    // the daemon's runner.rs can stream it up to the UI's
+    // friendlyError-mapped technical-details panel. Without this, an
+    // operator 502 looked like "HTTP error: http status: 502" with no
+    // way to know what actually failed (kernel decode? auth? upstream?).
     let resp = req
+        .config()
+        .http_status_as_error(false)
+        .build()
         .send_json(serde_json::to_value(body).unwrap())
         .map_err(|e| format!("HTTP error: {}", e))?;
     let status = resp.status();
