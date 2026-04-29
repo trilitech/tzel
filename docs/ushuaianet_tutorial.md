@@ -62,9 +62,11 @@ fresh rollup origination using the committed kernel build.
 
 ## 0. Ushuaianet Network Parameters
 
-The currently deployed TzEL rollup runs on **Ushuaianet**. The values below
-are the canonical ones; if you are operating your own rollup, substitute the
-addresses you originated.
+The currently deployed TzEL rollup runs on **Ushuaianet**. The L1 / DAL /
+explorer endpoints below are stable; the rollup-address and bridge-ticketer
+are tied to a specific origination and are kept out of this tutorial as
+literals — fetch them from the canonical config so the doc never drifts
+from the live deployment.
 
 | Parameter | Value |
 |---|---|
@@ -74,17 +76,20 @@ addresses you originated.
 | DAL bootstrap P2P | `dal.ushuaianet.teztnets.com:11732` |
 | Faucet | `https://faucet.ushuaianet.teztnets.com` |
 | TzKT explorer | `https://ushuaianet.tzkt.io` |
-| TzEL rollup address | `sr193pvbiGEhrxYnhgKcpaiWVRJmWjWYCaqH` |
-| TzEL bridge ticketer | `KT1F8CR34VPaiMVYwSbucpdEYQ2itTJsqV9A` |
+| TzEL rollup address | `sr1...` — see `tzel-infra/networks/ushuaianet.yml` (`tzel_rollup_address`) |
+| TzEL bridge ticketer | `KT1...` — see `tzel-infra/networks/ushuaianet.yml` (`tzel_bridge_ticketer`) |
 | Operator DAL fee (mutez) | `100000` |
 | Operator fee address | see `tzel-infra/networks/ushuaianet-operator-fee-address.json` |
 
-The rollup address and bridge ticketer above match
-`networks/ushuaianet.yml` in `trilitech/tzel-infra` (branch
-`feat/ushaianet-4vm-refactor` at the time of writing). If you re-originate
-the rollup, regenerate them with
-`make originate NETWORK=ushaianet` in `tzel-infra` and use the resulting
-values in place of the literals here.
+Both addresses live at:
+
+```
+https://github.com/trilitech/tzel-infra/blob/feat/ushaianet-4vm-refactor/networks/ushuaianet.yml
+```
+
+If you originated your own rollup, substitute the `sr1…` / `KT1…` values
+from the `make originate NETWORK=ushaianet` output in `tzel-infra` for the
+canonical ones below.
 
 > **Withdrawal period:** Ushuaianet's commitment period is short — withdrawals
 > become executable on L1 in roughly 6 to 7 minutes after the unshield batch
@@ -127,10 +132,12 @@ sudo cp ops/shadownet/shadownet.env.example /etc/tzel/shadownet.env
 
 Edit `/etc/tzel/shadownet.env`:
 
-- set `TZEL_ROLLUP_ADDRESS=sr193pvbiGEhrxYnhgKcpaiWVRJmWjWYCaqH`
-  (or your re-originated address — see §0)
-- set `TZEL_BRIDGE_TICKETER=KT1F8CR34VPaiMVYwSbucpdEYQ2itTJsqV9A`
-  (or your re-originated ticketer)
+- set `TZEL_ROLLUP_ADDRESS=<sr1...>` — pull from
+  `tzel-infra/networks/ushuaianet.yml` (`tzel_rollup_address`) or your
+  re-originated value (see §0)
+- set `TZEL_BRIDGE_TICKETER=<KT1...>` — pull from
+  `tzel-infra/networks/ushuaianet.yml` (`tzel_bridge_ticketer`) or your
+  re-originated ticketer
 - set `TZEL_OCTEZ_NETWORK=ushuaianet` (the env file template still shows the
   old default — override it explicitly so `octez-node config init` and
   `--network` pick up Ushuaianet)
@@ -187,13 +194,22 @@ mismatch the running rollup.
 git fetch origin && git checkout 558c2b2
 ```
 
-Set the shell variables first:
+Set the shell variables first. Pull `ROLLUP_ADDRESS` and `BRIDGE_TICKETER`
+from `tzel-infra/networks/ushuaianet.yml` (or your local
+`make originate NETWORK=ushaianet` output if you re-originated):
 
 ```bash
 export OPERATOR_URL=http://127.0.0.1:8787
 export OPERATOR_BEARER_TOKEN="$(cat /etc/tzel/operator-bearer-token)"
-export ROLLUP_ADDRESS=sr193pvbiGEhrxYnhgKcpaiWVRJmWjWYCaqH
-export BRIDGE_TICKETER=KT1F8CR34VPaiMVYwSbucpdEYQ2itTJsqV9A
+
+# Fetch canonical addresses from tzel-infra (requires `yq`):
+USHUAIANET_YML=https://raw.githubusercontent.com/trilitech/tzel-infra/feat/ushaianet-4vm-refactor/networks/ushuaianet.yml
+export ROLLUP_ADDRESS="$(curl -fsSL "$USHUAIANET_YML" | yq -r .tzel_rollup_address)"
+export BRIDGE_TICKETER="$(curl -fsSL "$USHUAIANET_YML" | yq -r .tzel_bridge_ticketer)"
+
+# Or set them by hand:
+# export ROLLUP_ADDRESS=sr1...
+# export BRIDGE_TICKETER=KT1...
 ```
 
 Extract the verifier configuration values from the checked-in verified fixture:
