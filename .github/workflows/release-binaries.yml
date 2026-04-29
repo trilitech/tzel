@@ -1,0 +1,129 @@
+name: tzel binaries image
+
+# Builds + publishes ghcr.io/<owner>/tzel-binaries:<tag> from
+# docker/Dockerfile.binaries. The image is a binary-distribution
+# artifact — not meant to be run on its own. Downstream tzel-infra
+# image builds (wallet daemon, operator, proving-service) consume it
+# via `COPY --from=ghcr.io/trilitech/tzel-binaries:<tag> ...` so they
+# don't rebuild the ~20 min Stwo crypto chain on every image rebuild.
+#
+# Triggers:
+#   - push of a tag matching `v*` (e.g. v0.3.0). Publishes to the
+#     matching version tag + `latest`.
+#   - `workflow_dispatch` — manual build for testing; pushes only if
+#     explicitly requested.
+#
+# The image is published to the GHCR namespace of the repo owner that
+# triggers the workflow. So a fork's manual dispatch publishes to
+# ghcr.io/<fork-owner>/tzel-binaries (handy for testing); the canonical
+# release lives at ghcr.io/trilitech/tzel-binaries once tags are pushed
+# upstream.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Also push the image (defaults false on manual runs)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: tzel-binaries-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/tzel-binaries
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tzel
+        uses: actions/checkout@v4
+
+      - name: Compute image tags + push flag
+        id: tags
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "revision=$SHA" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$TS" >> "$GITHUB_OUTPUT"
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              VERSION="${GITHUB_REF#refs/tags/}"
+              echo "tags=${IMAGE}:${VERSION},${IMAGE}:latest,${IMAGE}:sha-${SHA}" >> "$GITHUB_OUTPUT"
+              echo "push=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "tags=${IMAGE}:dev-${SHA}" >> "$GITHUB_OUTPUT"
+              echo "push=${{ github.event.inputs.push }}" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.tags.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (+ push if applicable)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.binaries
+          # linux/amd64 only — this is a binary-distribution image
+          # consumed by GCP-hosted server images. arm64 (Apple Silicon
+          # docker) is not a target today; downstream wallet-daemon
+          # bundle takes care of arm64 separately, and that image
+          # could continue to build the wallet CLI from source until
+          # an arm64 native runner is wired up here.
+          platforms: linux/amd64
+          push: ${{ steps.tags.outputs.push == 'true' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            TZEL_REVISION=${{ github.sha }}
+            TZEL_BUILD_TIMESTAMP=${{ steps.tags.outputs.timestamp }}
+          # GHA cache keeps the Stwo + ML-KEM + WOTS+ dep graph hot
+          # across runs — cold build is ~15-20 min; warm builds reuse
+          # ~everything.
+          cache-from: type=gha,scope=tzel-binaries
+          cache-to: type=gha,mode=max,scope=tzel-binaries
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=tzel runtime binaries (tzel-wallet, tzel-detect, tzel-operator, reprove, gen-proof-bench-args, cairo executables) for downstream image consumption
+
+      - name: Summary
+        run: |
+          {
+            echo "### tzel-binaries image"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| tags | \`${{ steps.tags.outputs.tags }}\` |"
+            echo "| pushed | \`${{ steps.tags.outputs.push }}\` |"
+            echo "| revision | \`${{ steps.tags.outputs.revision }}\` |"
+            echo "| build timestamp | \`${{ steps.tags.outputs.timestamp }}\` |"
+            echo ""
+            echo "Downstream consumption (in a tzel-infra Dockerfile):"
+            echo ""
+            echo "\`\`\`dockerfile"
+            echo "ARG TZEL_BINARIES=ghcr.io/trilitech/tzel-binaries:latest"
+            echo "FROM \${TZEL_BINARIES} AS tzel-bins"
+            echo "..."
+            echo "COPY --from=tzel-bins /usr/local/bin/reprove /usr/local/bin/reprove"
+            echo "COPY --from=tzel-bins /opt/tzel/executables/ /opt/tzel/executables/"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

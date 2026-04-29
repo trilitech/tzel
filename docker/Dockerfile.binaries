@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1.7
+#
+# Binary-distribution image for the tzel runtime artifacts. Published
+# as ghcr.io/<owner>/tzel-binaries:<tag> from
+# .github/workflows/release-binaries.yml. Not meant to be run on its
+# own — downstream image builds (in tzel-infra: wallet daemon,
+# operator, proving-service) consume it via `COPY --from=...` to skip
+# rebuilding the ~20 min Stwo crypto chain on every image rebuild.
+#
+# What's inside:
+#   /usr/local/bin/tzel-wallet           — wallet CLI
+#   /usr/local/bin/tzel-detect           — wallet auto-detect daemon
+#   /usr/local/bin/tzel-operator         — operator service
+#   /usr/local/bin/reprove               — STARK prover binary (apps/prover)
+#   /usr/local/bin/gen-proof-bench-args  — proving-service helper
+#   /opt/tzel/executables/run_shield.executable.json
+#   /opt/tzel/executables/run_transfer.executable.json
+#   /opt/tzel/executables/run_unshield.executable.json
+#   /opt/tzel/VERSION                    — commit SHA + build timestamp
+#
+# The image runs `cat /opt/tzel/VERSION` by default so a smoke
+# `docker run --rm <image>` reports what's inside.
+
+# ---- Stage 1: cargo build (workspace + apps/prover) -------------------
+
+FROM rust:1.90 AS rust-builder
+
+ARG RUST_TOOLCHAIN=nightly-2025-07-14
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin the toolchain that matches rust-toolchain.toml at workspace root
+# AND apps/prover/rust-toolchain.toml. Both currently track the same
+# nightly; if they diverge, set RUST_TOOLCHAIN at build time and bump
+# both pin files in lockstep.
+RUN rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal \
+    && rustup component add --toolchain "${RUST_TOOLCHAIN}" rustfmt cargo
+
+WORKDIR /src
+COPY . .
+
+# Workspace binaries — single cargo invocation so the dep graph is
+# resolved once.
+RUN cargo "+${RUST_TOOLCHAIN}" build --release \
+        -p tzel-services --bin tzel-operator --bin gen_proof_bench_args \
+        -p tzel-wallet-app --bin tzel-wallet --bin tzel-detect
+
+# `reprove` lives in apps/prover with its own Cargo.toml/Cargo.lock —
+# not in the workspace. Build it separately.
+RUN cd apps/prover \
+    && cargo "+${RUST_TOOLCHAIN}" build --release --bin reprove
+
+# ---- Stage 2: scarb build (cairo executables) -------------------------
+
+FROM starknet/scarb:2.16.1 AS scarb-builder
+
+WORKDIR /src
+COPY cairo ./cairo
+WORKDIR /src/cairo
+RUN scarb build
+
+# ---- Stage 3: artifact image ------------------------------------------
+
+# debian-slim (not scratch) so `docker run --rm <image>` can `cat
+# /opt/tzel/VERSION` and consumers can `docker run --entrypoint sh`
+# for inspection. ~30 MB overhead vs scratch — worth the ergonomics
+# for a binary-distribution image.
+FROM debian:bookworm-slim AS artifact
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=rust-builder /src/target/release/tzel-operator        /usr/local/bin/tzel-operator
+COPY --from=rust-builder /src/target/release/tzel-wallet          /usr/local/bin/tzel-wallet
+COPY --from=rust-builder /src/target/release/tzel-detect          /usr/local/bin/tzel-detect
+COPY --from=rust-builder /src/target/release/gen_proof_bench_args /usr/local/bin/gen-proof-bench-args
+COPY --from=rust-builder /src/apps/prover/target/release/reprove  /usr/local/bin/reprove
+
+# Cairo executables consumed by `reprove --program <path>`. Keep all
+# three side-by-side under /opt/tzel/executables so consumers can
+# point TZEL_PROGRAMS_DIR at one path.
+COPY --from=scarb-builder /src/cairo/target/dev/run_shield.executable.json   /opt/tzel/executables/run_shield.executable.json
+COPY --from=scarb-builder /src/cairo/target/dev/run_transfer.executable.json /opt/tzel/executables/run_transfer.executable.json
+COPY --from=scarb-builder /src/cairo/target/dev/run_unshield.executable.json /opt/tzel/executables/run_unshield.executable.json
+
+# Build-time provenance, baked in by the workflow via --build-arg.
+ARG TZEL_REVISION=unknown
+ARG TZEL_BUILD_TIMESTAMP=unknown
+RUN printf 'tzel binaries\nrevision: %s\nbuilt: %s\n' "${TZEL_REVISION}" "${TZEL_BUILD_TIMESTAMP}" \
+    > /opt/tzel/VERSION
+
+# Default command surfaces the manifest so a one-shot
+# `docker run --rm <image>` answers "what's actually in here?".
+CMD ["cat", "/opt/tzel/VERSION"]
