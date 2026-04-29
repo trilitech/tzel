@@ -3316,6 +3316,19 @@ fn emit_operator_done_event(receipt: &RollupSubmissionReceipt) {
 // The `--json` flag flips a process-global atomic. `user_out!` chooses
 // between `println!` (default) and a queued JSON envelope emitted at
 // end-of-command by `emit_json_envelope`.
+//
+// Threading assumption: the wallet CLI is single-threaded — every
+// subcommand runs to completion on the thread that called `run_user`,
+// with blocking ureq HTTP and synchronous octez-client subprocesses.
+// Under that assumption the asymmetry between a process-global
+// `JSON_MODE` and a thread-local `USER_JSON_BUFFER` is harmless: every
+// `user_json_put` and the closing `emit_json_envelope` execute on the
+// same thread, so the buffer survives across calls until it's drained.
+// If the CLI ever spawns worker threads (rayon, scoped threads, a
+// tokio runtime) that call `user_json_put`, those contributions will
+// be silently dropped at envelope-emit time — switch the buffer to a
+// `Mutex<Map>` (or pass it through explicitly) before adding any such
+// concurrency.
 
 static JSON_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -3722,8 +3735,6 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::ExportOutgoing { .. } => "export-outgoing",
         UserCmd::Watch { .. } => "watch",
     };
-    set_json_mode(cli.json);
-
 
     let outcome: Result<(), String> = match cli.cmd {
         UserCmd::Init => cmd_keygen(&cli.wallet),
@@ -11056,6 +11067,46 @@ mod network_profile_tests {
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         // 2026-04-25 = 20_568 days since epoch
         assert_eq!(civil_from_days(20_568), (2026, 4, 25));
+    }
+
+    /// Pin the micheline-JSON shape that `--prepare-only` deposits emit.
+    /// The bridge ticketer's `mint` entrypoint expects
+    /// `Pair (bytes recipient) (string rollup_address)`, where `recipient`
+    /// is the ASCII-encoded `deposit:<hex(pubkey_hash)>` durable-state
+    /// key. A drift in either field name (`prim`, `args`, `bytes`,
+    /// `string`) or in the recipient encoding would silently break
+    /// every Temple/Beacon-driven deposit, since the daemon forwards
+    /// this object verbatim to the signer.
+    #[test]
+    fn deposit_mint_michelson_params_match_expected_shape() {
+        // Deterministic 32-byte pubkey_hash so the recipient hex is
+        // pinned: 0x01, 0x02, ..., 0x20.
+        let pubkey_hash: F = std::array::from_fn(|i| (i as u8) + 1);
+        let rollup_address = "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP";
+        let params = deposit_mint_michelson_params(&pubkey_hash, rollup_address);
+
+        assert_eq!(params["prim"], "Pair");
+        let args = params["args"].as_array().expect("args is an array");
+        assert_eq!(args.len(), 2);
+
+        // First arg: bytes(ASCII("deposit:" + hex(pubkey_hash))).
+        let recipient_ascii =
+            format!("deposit:{}", hex::encode(&pubkey_hash));
+        assert_eq!(
+            args[0]["bytes"].as_str().expect("bytes is a string"),
+            hex::encode(recipient_ascii.as_bytes()),
+        );
+        assert!(
+            args[0].get("string").is_none(),
+            "first arg must be `bytes`, not `string`"
+        );
+
+        // Second arg: string(rollup_address) verbatim.
+        assert_eq!(args[1]["string"], rollup_address);
+        assert!(
+            args[1].get("bytes").is_none(),
+            "second arg must be `string`, not `bytes`"
+        );
     }
 
     /// Pool-model port of the legacy
