@@ -4,7 +4,7 @@ This directory contains the thin user-facing shells:
 
 - `wallet/` for:
   - `sp-client`, the developer/test wallet that talks to `sp-ledger`
-  - `tzel-wallet`, the rollup-backed wallet for Shadownet / rollup flows
+  - `tzel-wallet`, the rollup-backed wallet for Ushuaianet / rollup flows
   - `tzel-detect`, the watch-only detection service companion
 - `ledger/` for `sp-ledger`
 - `prover/` for `reprove`
