@@ -590,8 +590,8 @@
         <div class="nav-links">
           <a href="#why">Why PQ</a>
           <a href="#live">Status</a>
-          <a href="https://github.com/murbard/tzel/tree/main/docs" target="_blank" rel="noreferrer">Docs</a>
-          <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">View on GitHub</a>
+          <a href="https://github.com/trilitech/tzel/tree/main/docs" target="_blank" rel="noreferrer">Docs</a>
+          <a href="https://github.com/trilitech/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">View on GitHub</a>
         </div>
       </div>
     </nav>
@@ -603,8 +603,8 @@
           TzEL is an experimental Tezos smart rollup for private, post-quantum transactions. It replaces elliptic-curve cryptography with hashes, ML-KEM, and STARK proofs.
         </p>
         <div class="hero-actions">
-          <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">View on GitHub</a>
-          <a href="https://github.com/murbard/tzel/blob/main/docs/shadownet_tutorial.md" class="btn btn-outline" target="_blank" rel="noreferrer">Open the tutorial</a>
+          <a href="https://github.com/trilitech/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">View on GitHub</a>
+          <a href="https://github.com/trilitech/tzel/blob/main/docs/shadownet_tutorial.md" class="btn btn-outline" target="_blank" rel="noreferrer">Open the tutorial</a>
         </div>
       </div>
     </section>
@@ -663,7 +663,7 @@
               <path d="M17 14v6"></path>
             </svg>
           </div>
-          <div class="stat-value">Live on Shadownet</div>
+          <div class="stat-value">Live on Ushuaianet</div>
           <div class="stat-label">Shield and private-send transactions already execute on a public Tezos test network.</div>
         </div>
         <div class="stat">
@@ -707,7 +707,7 @@
       <div class="feature">
         <div>
           <h3>How far along is it?<br>Experimental, but already running.</h3>
-          <p>TzEL is still R&amp;D code and not suitable for real value. It already runs as a Tezos smart rollup on Shadownet, with proof-bearing shield and private-send transactions going through the DAL.</p>
+          <p>TzEL is still R&amp;D code and not suitable for real value. It already runs as a Tezos smart rollup on Ushuaianet, with proof-bearing shield and private-send transactions going through the DAL.</p>
           <p>Today there is a real testnet path from wallet to rollup execution, not just isolated proofs or local demos.</p>
         </div>
         <div class="feature-visual">
@@ -789,8 +789,11 @@
           <span class="dim">detection key:</span><br>
           &nbsp;&nbsp;<span class="hl">candidate matches</span><br>
           <br>
-          <span class="dim">viewing key:</span><br>
-          &nbsp;&nbsp;<span class="hl">incoming notes and memos</span><br>
+          <span class="dim">incoming viewing key:</span><br>
+          &nbsp;&nbsp;<span class="hl">received notes, amounts, memos</span><br>
+          <br>
+          <span class="dim">outgoing viewing key:</span><br>
+          &nbsp;&nbsp;<span class="hl">sent notes (recipient + value, not memo)</span><br>
           <br>
           <span class="dim">spending key:</span><br>
           &nbsp;&nbsp;move funds<br>
@@ -800,7 +803,7 @@
       </div>
     </div>
     <footer>
-      <p>TzEL &mdash; Tezos Encrypted Ledger &mdash; <a href="https://github.com/murbard/tzel" target="_blank" rel="noreferrer">github.com/murbard/tzel</a></p>
+      <p>TzEL &mdash; Tezos Encrypted Ledger &mdash; <a href="https://github.com/trilitech/tzel" target="_blank" rel="noreferrer">github.com/trilitech/tzel</a></p>
     </footer>
   </div>
 </body>
