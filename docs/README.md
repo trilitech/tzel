@@ -18,10 +18,10 @@ This directory is the entry point for the project documentation.
 
 ## Tutorials And Guides
 
-- [shadownet_tutorial.md](./shadownet_tutorial.md)
-  - step-by-step `tzel-wallet` tutorial for Shadownet `deposit -> shield -> send`
-    with the current burned `100000` mutez rollup fee plus a private
-    DAL-producer fee note
+- [ushuaianet_tutorial.md](./ushuaianet_tutorial.md)
+  - step-by-step `tzel-wallet` tutorial for the Ushuaianet
+    `deposit -> shield -> send -> unshield` flow, with the current burned
+    `100000` mutez rollup fee plus a private DAL-producer fee note
 - [wallet_detection_service.md](./wallet_detection_service.md)
   - watch-only `tzel-wallet` flow and `tzel-detect`
 
@@ -58,6 +58,6 @@ This directory is the entry point for the project documentation.
 
 1. [../README.md](../README.md)
 2. [../specs/spec.md](../specs/spec.md)
-3. [shadownet_tutorial.md](./shadownet_tutorial.md)
+3. [ushuaianet_tutorial.md](./ushuaianet_tutorial.md)
 4. [../ops/shadownet/README.md](../ops/shadownet/README.md)
 5. [wallet_detection_service.md](./wallet_detection_service.md)

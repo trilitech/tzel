@@ -106,7 +106,7 @@ TzEL binaries:
 sudo ./scripts/install_tzel_binaries.sh --skip-build --prefix /usr/local --executables-dir /opt/tzel/cairo/target/dev
 ```
 
-On the public Shadownet operator box, the optional systemd unit is:
+On the public Ushuaianet operator box, the optional systemd unit is:
 
 - `ops/shadownet/systemd/tzel-detect.service`
 

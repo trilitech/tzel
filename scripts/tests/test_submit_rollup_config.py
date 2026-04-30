@@ -9,7 +9,7 @@ from pathlib import Path
 class SubmitRollupConfigTest(unittest.TestCase):
     def test_tutorial_documents_operator_submission_status_route(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
-        tutorial = repo_root / "docs" / "shadownet_tutorial.md"
+        tutorial = repo_root / "docs" / "ushuaianet_tutorial.md"
         text = tutorial.read_text(encoding="utf-8")
 
         self.assertIn("$OPERATOR_URL/v1/rollup/submissions/<id>", text)
