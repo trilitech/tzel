@@ -3,16 +3,13 @@
 This tutorial covers an Ushuaianet `deposit -> shield -> send -> unshield`
 flow against the deployed TzEL rollup using the operator box.
 
-> **Naming note:** the test network is **Ushuaianet** (replaces Shadownet —
-> DAL slot latency 20 s vs 50 s, withdrawal period ~6.5 min vs 14 days, plus
-> the `dal_fee_address` mechanism that only exists post-Ushuaianet).
->
-> A few wallet-CLI subcommands and operator-box file paths still use the old
-> `shadownet` spelling (`profile init-shadownet`, `/etc/tzel/shadownet.env`,
-> `ops/shadownet/`, `scripts/shadownet_*.sh`, `--source-alias tzelshadownet`).
-> They are kept as-is in this tutorial because renaming them would touch the
-> wallet CLI surface, the systemd units, and CI tests; that rename is tracked
-> separately. Everywhere else, "Ushuaianet" is the correct name.
+> **Naming note:** a few wallet-CLI subcommands and operator-box file paths
+> still use the legacy `shadownet` spelling (`profile init-shadownet`,
+> `/etc/tzel/shadownet.env`, `ops/shadownet/`, `scripts/shadownet_*.sh`,
+> `--source-alias tzelshadownet`). They are kept as-is in this tutorial
+> because renaming them would touch the wallet CLI surface, the systemd
+> units, and CI tests; that rename is tracked separately. Everywhere else,
+> "Ushuaianet" is the correct name.
 
 > **Status note:** the protocol uses **deposit pools** keyed by a wallet-
 > derived pubkey hash. The L1 deposit transaction credits the pool keyed
@@ -310,20 +307,21 @@ Create wallet files:
 /usr/local/bin/tzel-wallet --wallet bob.wallet init
 ```
 
-> **Important — DAL fee address is the operator's wallet, not yours.**
-> On every shield/transfer/unshield the kernel includes a tiny note encrypted
-> with `dal_fee_address`. The operator's `enforce_dal_fee_policy` then
-> detects+decrypts that note with the view material configured under
-> `--dal-fee-view-material`. If you point `--dal-fee-address` at your own
-> receive address (the simplest-looking thing to do), the operator's
-> incoming-seed/address-index will not match, the note will be rejected, and
-> the operator returns `502 DAL fee note is not detectable by the configured
-> operator fee address`. This trap exists post-Ushuaianet and is documented
-> in `tzel-infra/docs/gcp-deploy-runbook.md` §16.
+> **DAL fee address.** Every shield/transfer/unshield attaches a small
+> note encrypted under `dal_fee_address`. Whoever bundles a transaction
+> into a DAL slot earns that note as their inclusion fee, so they only
+> bundle submissions whose note is payable to them — they enforce this
+> by trial-decrypting the note against their own view material and
+> rejecting submissions where decryption fails.
 >
-> For Ushuaianet, the canonical operator-fee address is checked into
-> `tzel-infra/networks/ushuaianet-operator-fee-address.json`. Use that file
-> directly — do not regenerate a fresh "producer" wallet locally.
+> Ushuaianet's deployed bundling service (the `tzel-operator` instance
+> running on the public ops box) has a published address for this
+> purpose; use it directly:
+> `tzel-infra/networks/ushuaianet-operator-fee-address.json`. The
+> service rejects submissions routed elsewhere with `502 DAL fee note
+> is not detectable by the configured operator fee address`. The
+> mechanism is documented in `tzel-infra/docs/gcp-deploy-runbook.md`
+> §16.
 
 Fetch the canonical operator-fee address:
 
@@ -333,8 +331,8 @@ curl -fsSL \
   -o ushuaianet-operator-fee-address.json
 ```
 
-(If you originated your own rollup, generate the equivalent file from the
-operator-fee wallet on the operator VM — `wallet receive --json` followed by
+(If you are running your own bundling service, generate the equivalent
+file from its DAL-fee wallet — `wallet receive --json` followed by
 `export-view`, in that order from the same wallet state, per
 gcp-deploy-runbook §16.)
 
@@ -371,11 +369,12 @@ Create wallet profiles for Ushuaianet (the CLI subcommand is still spelled
 
 Notes:
 
-- `dal_fee_address` is the operator's PaymentAddress (full record with
-  `ek_v` and `ek_d`, not just the auth fields). Each shield/transfer/unshield
-  encrypts the operator's DAL fee note to this address — see the callout above.
-  `--dal-fee-address` reads the file once and inlines the JSON into the saved
-  profile; editing the file later does not re-read it (gcp-deploy-runbook §17).
+- `dal_fee_address` is the published PaymentAddress for Ushuaianet's
+  bundling service (full record with `ek_v` and `ek_d`, not just the
+  auth fields). Each shield/transfer/unshield encrypts the DAL fee
+  note to this address — see the callout above. `--dal-fee-address`
+  reads the file once and inlines the JSON into the saved profile;
+  editing the file later does not re-read it (gcp-deploy-runbook §17).
 - each `deposit` derives a fresh `pubkey_hash = H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)` for a wallet-controlled auth tree, then L1-tickets the deposit amount to `deposit:<hex(pubkey_hash)>`. Multiple deposits to the same `pubkey_hash` aggregate (top-ups). The shield circuit verifies an in-circuit WOTS+ signature under the recipient's auth tree, binding the entire shield request — only the wallet that holds the auth tree's signing material can drain the pool.
 - `public_account` in the profile is vestigial wallet metadata — unshield now emits an L1 outbox transfer directly to a tz/KT1 recipient supplied at unshield time.
 - keep Alice and Bob distinct
@@ -591,7 +590,7 @@ For the first successful live run, save:
 - Shield rejected with "fee below minimum":
   - the rollup's `required_tx_fee` ticked up since the wallet quoted it. Re-run shield (the wallet re-quotes on each invocation); regenerate the proof if necessary.
 - Operator returns `502 DAL fee note is not detectable by the configured operator fee address`:
-  - `dal_fee_address` was pointed at the user's wallet rather than the operator-fee wallet. Re-run `profile init-shadownet` with `--dal-fee-address ushuaianet-operator-fee-address.json` (or patch `wallet.json.network.json` in place — the field is embedded JSON, see gcp-deploy-runbook §17).
+  - `dal_fee_address` did not match the bundling service's published address. Re-run `profile init-shadownet` with `--dal-fee-address ushuaianet-operator-fee-address.json` (or patch `wallet.json.network.json` in place — the field is embedded JSON, see gcp-deploy-runbook §17).
 - `execute-outbox` rejected as "commitment not yet finalized":
   - the Ushuaianet commitment period (~6.5 min) has not elapsed. Wait and retry.
 
