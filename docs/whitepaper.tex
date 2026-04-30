@@ -509,11 +509,10 @@ that the note has positive value. The producer fee is paid to whichever
 DAL slot publisher includes the transaction. DAL slot publishing is a
 permissionless market: any participant can pay bakers to publish a slot
 and keep the spread between producer fees they collect and the L1
-inclusion costs they pay. Publishers therefore gate inclusion off-chain
-on \(producer\_otag\) matching an address they control — a wallet that
-routes fees elsewhere simply does not get bundled. The kernel
-intentionally does not cross-check the producer receiver against any
-on-chain value: enforcement lives at the publisher, where it belongs.
+inclusion costs they pay. Routing of \(producer\_otag\) is enforced at
+the publisher, who only bundles transactions whose producer note is
+payable to an address they control — a wallet that routes fees
+elsewhere simply does not get bundled.
 
 \paragraph{Top-ups and partial drains.} A user can send multiple L1
 tickets to the same \texttt{deposit:<hex(pubkey\_hash)>} recipient; each

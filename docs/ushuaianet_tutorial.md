@@ -1,7 +1,7 @@
 # Ushuaianet Tutorial
 
 This tutorial covers an Ushuaianet `deposit -> shield -> send -> unshield`
-flow against the deployed TzEL rollup using the public ops host.
+flow against the deployed TzEL rollup using the public Ushuaianet host.
 
 > **Naming note:** a few wallet-CLI subcommands and ops-host file paths
 > still use the legacy `shadownet` spelling (`profile init-shadownet`,
@@ -35,7 +35,7 @@ burn fee.
 
 It assumes:
 
-- a public ops host running `octez-node`, `octez-dal-node`,
+- a public Ushuaianet host running `octez-node`, `octez-dal-node`,
   `octez-smart-rollup-node`, and `tzel-operator`
 - a live rollup `sr1...`
 - a live bridge ticketer `KT1...`
@@ -273,7 +273,7 @@ exercises Ushuaianet.)
 
 ## 4. Decide Where To Run The Wallet
 
-Simplest option: run the wallet on the public ops host itself.
+Simplest option: run the wallet on the public Ushuaianet host itself.
 
 If you want to run it from another machine, create SSH tunnels first:
 
@@ -315,12 +315,12 @@ Create wallet files:
 > hold. Wallets pick a publisher to pay by setting `dal_fee_address` to
 > the address that publisher has advertised.
 >
-> For Ushuaianet, the public host advertises its address in
+> For Ushuaianet, the DAL slot publisher running on the public host
+> advertises its address in
 > `tzel-infra/networks/ushuaianet-operator-fee-address.json` — point
-> your wallet at that file. Submissions whose `dal_fee_address` does
-> not match are rejected upstream with `502 DAL fee note is not
-> detectable by the configured operator fee address`. Mechanism details
-> in `tzel-infra/docs/gcp-deploy-runbook.md` §16.
+> your wallet at that file. Mechanism details in
+> `tzel-infra/docs/gcp-deploy-runbook.md` §16; failure modes are
+> covered in §12.
 
 Fetch the DAL fee address advertised by the public Ushuaianet host:
 
@@ -600,4 +600,4 @@ We can say "Ushuaianet shielded tx is working" when all of the following are tru
 - one live `deposit -> shield` succeeds
 - one live `send` succeeds (Bob can independently sync and observe the received note)
 - one live `unshield -> execute-outbox` round-trip lands the funds back on L1
-- the flow is reproducible on the public ops host from a clean wallet directory
+- the flow is reproducible on the public Ushuaianet host from a clean wallet directory
