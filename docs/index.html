@@ -165,6 +165,48 @@
 
     .nav-links a:hover { color: var(--text); }
 
+    .nav-toggle {
+      display: none;
+      width: 44px;
+      height: 44px;
+      padding: 0;
+      background: transparent;
+      border: 1px solid rgba(173, 197, 255, 0.18);
+      border-radius: 12px;
+      cursor: pointer;
+      position: relative;
+      transition: border-color var(--transition), background var(--transition);
+    }
+
+    .nav-toggle:hover {
+      border-color: rgba(173, 197, 255, 0.34);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .nav-toggle span {
+      position: absolute;
+      left: 12px;
+      width: 20px;
+      height: 1.5px;
+      background: var(--text);
+      border-radius: 1px;
+      transition: top var(--transition), transform var(--transition), opacity var(--transition);
+    }
+
+    .nav-toggle span:nth-child(1) { top: 15px; }
+    .nav-toggle span:nth-child(2) { top: 21px; }
+    .nav-toggle span:nth-child(3) { top: 27px; }
+
+    .nav-toggle[aria-expanded="true"] span:nth-child(1) {
+      top: 21px;
+      transform: rotate(45deg);
+    }
+    .nav-toggle[aria-expanded="true"] span:nth-child(2) { opacity: 0; }
+    .nav-toggle[aria-expanded="true"] span:nth-child(3) {
+      top: 21px;
+      transform: rotate(-45deg);
+    }
+
     .btn {
       display: inline-flex;
       align-items: center;
@@ -556,7 +598,44 @@
 
     @media (max-width: 900px) {
       .nav-inner { width: min(calc(100% - 28px), var(--max-width)); }
-      .nav-links a:not(.btn) { display: none; }
+      .nav-toggle { display: block; }
+
+      .nav-links {
+        position: absolute;
+        top: 100%;
+        left: 0;
+        right: 0;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0;
+        padding: 12px 24px 22px;
+        background: rgba(8, 12, 18, 0.96);
+        backdrop-filter: blur(20px);
+        border-bottom: 1px solid rgba(173, 197, 255, 0.08);
+        transform: translateY(-8px);
+        opacity: 0;
+        pointer-events: none;
+        transition: transform var(--transition), opacity var(--transition);
+      }
+
+      .nav-links[data-open="true"] {
+        transform: translateY(0);
+        opacity: 1;
+        pointer-events: auto;
+      }
+
+      .nav-links a:not(.btn) {
+        padding: 14px 4px;
+        border-bottom: 1px solid rgba(173, 197, 255, 0.06);
+        font-size: 1rem;
+        color: var(--text);
+      }
+
+      .nav-links .btn {
+        margin-top: 14px;
+        width: 100%;
+      }
+
       section, .features, .cta-section { padding: 84px 24px; }
       .hero { padding: 120px 24px 80px; }
       .feature {
@@ -587,7 +666,12 @@
           <div class="logo-icon"><svg viewBox="0 0 47 64" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tz-grad" x1="0" y1="0" x2="47" y2="64" gradientUnits="userSpaceOnUse"><stop stop-color="#0D61FF"/><stop offset="1" stop-color="#24D0C4"/></linearGradient></defs><path fill="url(#tz-grad)" d="M30.252 63.441c-4.55 0-7.864-1.089-9.946-3.267-2.08-2.177-3.121-4.525-3.121-7.041 0-.92.181-1.694.544-2.323a3.993 3.993 0 0 1 1.489-1.489c.629-.363 1.403-.544 2.323-.544.92 0 1.693.181 2.323.544.629.363 1.125.86 1.488 1.489.363.629.544 1.403.544 2.323 0 1.113-.266 2.02-.798 2.722-.533.702-1.162 1.161-1.888 1.38.63.87 1.622 1.487 2.977 1.85 1.355.388 2.71.581 4.065.581 1.887 0 3.593-.508 5.118-1.524 1.524-1.017 2.65-2.517 3.376-4.501.726-1.984 1.089-4.235 1.089-6.752 0-2.734-.4-5.07-1.198-7.005-.775-1.96-1.924-3.412-3.449-4.356a9.21 9.21 0 0 0-4.936-1.415c-1.162 0-2.613.484-4.356 1.452l-3.194 1.597v-1.597L37.076 16.4H17.185v19.89c0 1.646.363 3.001 1.089 4.066s1.839 1.597 3.34 1.597c1.16 0 2.274-.387 3.339-1.162a11.803 11.803 0 0 0 2.758-2.83c.097-.219.218-.376.363-.473a.723.723 0 0 1 .472-.181c.266 0 .58.133.944.4.339.386.508.834.508 1.342a9.243 9.243 0 0 1-.182 1.017c-.822 1.839-1.96 3.242-3.412 4.21a8.457 8.457 0 0 1-4.79 1.452c-4.308 0-7.285-.847-8.93-2.54-1.645-1.695-2.468-3.994-2.468-6.897V16.4H.052v-3.703h10.164v-8.42L7.893 1.952V.066h6.751l2.54 1.306v11.325l26.28-.072 2.614 2.613-16.116 16.116a10.807 10.807 0 0 1 3.049-.726c1.742 0 3.702.557 5.88 1.67 2.202 1.089 3.896 2.59 5.081 4.5 1.186 1.888 1.948 3.703 2.287 5.445.363 1.743.545 3.291.545 4.646 0 3.098-.654 5.977-1.96 8.64-1.307 2.661-3.291 4.645-5.953 5.952-2.662 1.307-5.542 1.96-8.639 1.96z"/></svg></div>
           TzEL
         </a>
-        <div class="nav-links">
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="nav-menu" aria-label="Toggle navigation menu">
+          <span></span>
+          <span></span>
+          <span></span>
+        </button>
+        <div class="nav-links" id="nav-menu">
           <a href="#why">Why PQ</a>
           <a href="#live">Status</a>
           <a href="https://github.com/trilitech/tzel/tree/main/docs" target="_blank" rel="noreferrer">Docs</a>
@@ -807,5 +891,32 @@
       <p>TzEL &mdash; Tezos Encrypted Ledger &mdash; <a href="https://github.com/trilitech/tzel" target="_blank" rel="noreferrer">github.com/trilitech/tzel</a></p>
     </footer>
   </div>
+  <script>
+    (function () {
+      var toggle = document.querySelector('.nav-toggle');
+      var menu = document.getElementById('nav-menu');
+      if (!toggle || !menu) return;
+
+      function setOpen(open) {
+        toggle.setAttribute('aria-expanded', String(open));
+        menu.dataset.open = String(open);
+      }
+
+      toggle.addEventListener('click', function () {
+        setOpen(toggle.getAttribute('aria-expanded') !== 'true');
+      });
+
+      menu.addEventListener('click', function (e) {
+        if (e.target.closest('a')) setOpen(false);
+      });
+
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && toggle.getAttribute('aria-expanded') === 'true') {
+          setOpen(false);
+          toggle.focus();
+        }
+      });
+    })();
+  </script>
 </body>
 </html>
