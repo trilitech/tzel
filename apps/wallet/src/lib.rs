@@ -3379,23 +3379,38 @@ enum UserCmd {
     /// Create a new wallet file.
     Init {
         /// Initialise `wallet.json.scanned` to this rollup commitment-tree
-        /// size instead of 0. A brand-new wallet has, by definition,
-        /// received no notes prior to its creation, so scanning the
-        /// historical commits `[0..tree_size)` finds nothing — but on a
-        /// long-running rollup that scan currently costs 5–10 min wallclock
-        /// while holding the wallet flock, blocking every other wallet
-        /// operation. Pass the current tree size at init time and the
-        /// first sync becomes a no-op (or a tiny delta if the rollup
-        /// advanced between init and first sync). Caller (e.g. the
-        /// wallet daemon) is responsible for querying the rollup-node's
+        /// size instead of 0.
+        ///
+        /// **Precondition (load-bearing):** the `master_sk` written by this
+        /// `cmd_init` invocation is freshly sampled — see `random_felt()`
+        /// in `cmd_keygen`. No external party can have encrypted a note
+        /// to a payment address derived from a `master_sk` that did not
+        /// exist when the corresponding commitment was published, so
+        /// commits in `[0..tree_size_at_init)` are guaranteed empty for
+        /// this wallet and the historical scan can be skipped. On a
+        /// long-running rollup that's 5–10 min wallclock saved on the
+        /// first sync (which currently holds the wallet flock and
+        /// blocks every other wallet operation through the daemon).
+        ///
+        /// **Do NOT pass this flag from a key-import path** (a future
+        /// feature where the caller seeds `master_sk` from an existing
+        /// key rather than sampling a fresh one). For an imported key
+        /// notes minted in `[0..N)` to that key DO exist on the rollup
+        /// and would be silently skipped — recoverable only by re-init
+        /// at `scanned = 0`. The CLI cannot enforce this precondition
+        /// (`master_sk` randomness is unobservable post-write); the
+        /// caller is responsible.
+        ///
+        /// The CLI itself stays rollup-agnostic — it does no network
+        /// I/O. The caller (e.g. the wallet daemon) is responsible for
+        /// querying the rollup-node's
         /// `/global/state/values/tzel/v1/state/tree/size` and threading
         /// the value here.
         ///
-        /// Omitting the flag preserves the legacy behaviour (`scanned = 0`)
-        /// — useful when the caller wants the wallet to surface every
-        /// historical note (e.g. importing into a fresh wallet a key that
-        /// was previously used elsewhere; or when rollup-rpc is unavailable
-        /// at init time).
+        /// Omitting the flag preserves the legacy behaviour
+        /// (`scanned = 0`) — useful when rollup-rpc is unavailable at
+        /// init time, or when the wallet should surface every
+        /// historical note for any reason.
         #[arg(long, value_name = "N")]
         at_tree_size: Option<u64>,
     },
@@ -11263,6 +11278,21 @@ mod network_profile_tests {
         let path = dir.path().join("wallet.json");
         let path_str = path.to_str().unwrap();
         cmd_keygen(path_str, None).expect("init succeeds");
+        let w = load_wallet(path_str).expect("load created wallet");
+        assert_eq!(w.scanned, 0);
+    }
+
+    /// `at_tree_size = Some(0)` must be equivalent to `None` — both
+    /// produce `scanned = 0`. Locks the boundary so a future rewrite
+    /// that special-cases `Some(0)` differently (e.g. interprets it
+    /// as "skip everything", which would be a u64 → usize sign-change
+    /// footgun) breaks loudly.
+    #[test]
+    fn cmd_keygen_at_tree_size_zero_equals_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        let path_str = path.to_str().unwrap();
+        cmd_keygen(path_str, Some(0)).expect("init succeeds");
         let w = load_wallet(path_str).expect("load created wallet");
         assert_eq!(w.scanned, 0);
     }
