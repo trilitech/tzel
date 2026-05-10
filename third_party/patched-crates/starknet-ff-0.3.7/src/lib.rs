@@ -1,5 +1,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(clippy::comparison_chain)]
+// Vendored, patched third-party crate. Suppress lints triggered by the
+// `MontConfig` derive expansion (non_local_definitions inside the derive,
+// unexpected `cfg(asm)` from upstream `ark_ff_macros`).
+#![allow(non_local_definitions)]
+#![allow(unexpected_cfgs)]
 
 #[cfg(all(not(feature = "std"), any(test, feature = "alloc")))]
 #[cfg_attr(test, macro_use)]

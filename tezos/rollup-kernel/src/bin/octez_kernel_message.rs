@@ -216,10 +216,7 @@ fn main() {
                 .parse::<u64>()
                 .expect("payload_len should parse as u64");
             let mut chunks = Vec::new();
-            loop {
-                let Some(published_level) = args.next() else {
-                    break;
-                };
+            while let Some(published_level) = args.next() {
                 let Some(slot_index) = args.next() else {
                     usage();
                 };

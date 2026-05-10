@@ -93,19 +93,19 @@ fn merkle_root(depth: usize, leaves: &[F]) -> F {
     }
 
     let mut level_nodes = leaves.to_vec();
-    for level in 0..depth {
+    for &zero_hash in zero_hashes.iter().take(depth) {
         let mut next = Vec::new();
         let mut i = 0;
         loop {
             let left = if i < level_nodes.len() {
                 level_nodes[i]
             } else {
-                zero_hashes[level]
+                zero_hash
             };
             let right = if i + 1 < level_nodes.len() {
                 level_nodes[i + 1]
             } else {
-                zero_hashes[level]
+                zero_hash
             };
             next.push(hash_merkle(&left, &right));
             i += 2;

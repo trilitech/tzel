@@ -154,7 +154,12 @@ struct ParsedBridgeDeposit {
     amount: u64,
 }
 
+// clippy::large_enum_variant: KernelInboxMessage carries shield/transfer/
+// unshield request bodies; this enum is short-lived (one per inbox entry,
+// dropped immediately after dispatch) so the size disparity does not
+// inflate any persistent allocation.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum ParsedRollupMessage {
     Kernel(KernelInboxMessage),
     Deposit(ParsedBridgeDeposit),
@@ -1158,8 +1163,8 @@ struct PreparedDurableUnshieldCommit {
 /// live frontier nodes — it never inspects stale-but-set slots.
 fn assert_frontier_matches_tree_size(branches: &[Option<F>], tree_size: u64) -> Result<(), String> {
     let mut bits = tree_size;
-    for level in 0..DEPTH {
-        if bits & 1 == 1 && branches[level].is_none() {
+    for (level, slot) in branches.iter().enumerate().take(DEPTH) {
+        if bits & 1 == 1 && slot.is_none() {
             return Err(format!(
                 "corrupted Merkle frontier: tree_size {} requires live left child at level {} but durable slot is empty",
                 tree_size, level
@@ -2604,7 +2609,7 @@ mod tests {
         assert!(read_persisted_note(&host, 2).is_some());
         assert!(host.store.contains_key(&nullifier_path(&nf)));
         assert!(host.store.contains_key(&branch_path(0)));
-        assert!(host.store.contains_key(&PATH_TREE_ROOT.to_vec()));
+        assert!(host.store.contains_key(PATH_TREE_ROOT));
         assert!(!host
             .store
             .contains_key(b"/tzel/v1/state/ledger.json".as_slice()));
@@ -2943,8 +2948,10 @@ mod tests {
 
     #[test]
     fn unshield_output_failure_does_not_mutate_ledger() {
-        let mut host = MockHost::default();
-        host.fail_output = Some("outbox full".into());
+        let mut host = MockHost {
+            fail_output: Some("outbox full".into()),
+            ..MockHost::default()
+        };
         install_test_verifier(&mut host);
         install_test_bridge(&mut host);
 
@@ -4042,6 +4049,7 @@ mod tests {
         PublicKeyHash::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN").unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)] // test helper mirroring the request struct
     fn sample_kernel_unshield_req(
         root: F,
         nullifiers: Vec<F>,

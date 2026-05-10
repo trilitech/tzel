@@ -166,12 +166,12 @@ fn verify_stark_proof(reprove_bin: &str, executable: &Path, proof: &Proof) -> Re
 }
 
 fn encode_verify_bundle_json(
-    proof_bytes: &Vec<u8>,
-    output_preimage: &Vec<F>,
+    proof_bytes: &[u8],
+    output_preimage: &[F],
 ) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&VerifyProofBundle {
-        proof_bytes: proof_bytes.clone(),
-        output_preimage: output_preimage.clone(),
+        proof_bytes: proof_bytes.to_vec(),
+        output_preimage: output_preimage.to_vec(),
     })
     .map_err(|e| e.to_string())
 }
@@ -409,7 +409,7 @@ mod tests {
         assert_ne!(leaf_0, leaf_1);
     }
 
-    /// End-to-end: shield → scan → transfer → scan → unshield, all locally.
+    // End-to-end: shield -> scan -> transfer -> scan -> unshield, all locally.
 
     // ═══════════════════════════════════════════════════════════════════
     // Attack tests — these attacks would succeed without output_preimage
@@ -730,8 +730,8 @@ mod tests {
         );
     }
 
-    /// Attack: shield with inflated amount.
-    /// Attacker's proof proves v_pub=1 but submits v=1000000.
+    // Attack: shield with inflated amount.
+    // Attacker's proof proves v_pub=1 but submits v=1000000.
 
     /// Attack: transfer with fabricated nullifier.
     /// Attacker submits a nullifier not in the proof's output_preimage.
@@ -772,7 +772,7 @@ mod tests {
 
     // ── State-level checks (no proof needed) ─────────────────────────
 
-    /// Shield: insufficient public balance.
+    // Shield: insufficient public balance.
 
     /// Transfer: zero inputs rejected.
     #[test]
@@ -956,7 +956,7 @@ mod tests {
 
     // ── Proof output_preimage checks ────────────────────────────────
 
-    /// Attack: shield with proof cm that doesn't match client_cm.
+    // Attack: shield with proof cm that doesn't match client_cm.
 
     /// Attack: transfer with proof root that doesn't match request root.
     #[test]
@@ -1234,17 +1234,17 @@ mod tests {
         );
     }
 
-    /// Regression: shield with Stark proof MUST provide client_cm.
-    /// Bug: ledger accepted Stark proofs with client_cm=ZERO and generated
-    /// its own cm, making the proof commit to a different commitment than
-    /// what was appended to the tree.
+    // Regression: shield with Stark proof MUST provide client_cm.
+    // Bug: ledger accepted Stark proofs with client_cm=ZERO and generated
+    // its own cm, making the proof commit to a different commitment than
+    // what was appended to the tree.
 
-    /// Regression: shield proof must bind to the funded deposit id.
-    /// Bug: the ledger did not validate the deposit id from the proof's
-    /// output_preimage, allowing front-running of shield proofs.
+    // Regression: shield proof must bind to the funded deposit id.
+    // Bug: the ledger did not validate the deposit id from the proof's
+    // output_preimage, allowing front-running of shield proofs.
 
-    /// Regression: shield proof must bind to memo_ct_hash.
-    /// Bug: the ledger didn't validate memo_ct_hash, allowing memo spoofing.
+    // Regression: shield proof must bind to memo_ct_hash.
+    // Bug: the ledger didn't validate memo_ct_hash, allowing memo spoofing.
 
     /// Regression: unshield proof mh_change must be 0 when no change note.
     /// Bug: the ledger didn't validate mh_change=0 for no-change unshields,
@@ -1806,8 +1806,8 @@ mod tests {
         assert!(r.unwrap_err().contains("public output length mismatch"));
     }
 
-    /// Shield with Stark proof: client_cm used instead of server-generated.
-    /// Covers the client_cm/client_enc branch in shield().
+    // Shield with Stark proof: client_cm used instead of server-generated.
+    // Covers the client_cm/client_enc branch in shield().
 
     // ═══════════════════════════════════════════════════════════════════
     // Mutation-killing tests — each targets specific surviving mutants
@@ -2050,15 +2050,15 @@ mod tests {
         assert_ne!(leaf_0, leaf_2);
     }
 
-    /// Group 5a: shield balance edge cases.
-    /// Kills: replace < with ==/<=  in balance check
+    // Group 5a: shield balance edge cases.
+    // Kills: replace < with ==/<=  in balance check
 
-    /// Group 5a-extra: shield output_preimage length boundary.
-    /// Kills: replace < with ==/<=  in output_preimage.len() < 4
+    // Group 5a-extra: shield output_preimage length boundary.
+    // Kills: replace < with ==/<=  in output_preimage.len() < 4
 
-    /// Group 5b: shield with client_cm but no client_enc (TrustMeBro path).
-    /// Kills: replace && with || in client_cm/client_enc check at line 932.
-    /// With ||, cm!=ZERO alone would enter the client path and unwrap() None → panic.
+    // Group 5b: shield with client_cm but no client_enc (TrustMeBro path).
+    // Kills: replace && with || in client_cm/client_enc check at line 932.
+    // With ||, cm!=ZERO alone would enter the client path and unwrap() None -> panic.
 
 
     /// Group 5c: transfer and unshield with 7 inputs (max) must succeed, 8 must fail.
@@ -2210,10 +2210,10 @@ mod tests {
         assert!(r.is_err(), "swapped cm_1/cm_2 positions must be caught");
     }
 
-    /// Kills 3 mutants that survive with N=1 nullifier:
-    /// - line 986: `<` vs `<=` (exact-length preimage)
-    /// - line 998: `1+i` vs `1-i` (multi-nullifier indexing)
-    /// - line 1012: `cm1_pos+2` vs `cm1_pos*2` (diverge when cm1_pos=3)
+    // Kills 3 mutants that survive with N=1 nullifier:
+    // - line 986: `<` vs `<=` (exact-length preimage)
+    // - line 998: `1+i` vs `1-i` (multi-nullifier indexing)
+    // - line 1012: `cm1_pos+2` vs `cm1_pos*2` (diverge when cm1_pos=3)
 
     // ═══════════════════════════════════════════════════════════════════
     // Regression tests for security audit findings

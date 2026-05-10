@@ -97,6 +97,9 @@ pub mod hex_f_vec {
     use super::F;
     use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
 
+    // clippy::ptr_arg: serde's `serialize_with` callback requires the
+    // exact field type `&Vec<F>` — collapsing to `&[F]` breaks the derive.
+    #[allow(clippy::ptr_arg)]
     pub fn serialize<S: Serializer>(v: &Vec<F>, s: S) -> Result<S::Ok, S::Error> {
         let hexes: Vec<String> = v.iter().map(hex::encode).collect();
         hexes.serialize(s)
@@ -264,6 +267,7 @@ pub fn deposit_pubkey_hash(
 /// cm_producer, mh_recipient, mh_producer)` against the deposit pool keyed by
 /// `pubkey_hash`. Type tag 0x03 distinguishes from transfer (0x01) and
 /// unshield (0x02).
+#[allow(clippy::too_many_arguments)] // sighash inputs are fixed by the protocol
 pub fn shield_sighash(
     auth_domain: &F,
     pubkey_hash: &F,
@@ -403,6 +407,7 @@ pub fn default_auth_domain() -> F {
 }
 
 /// Compute transfer sighash from public outputs.
+#[allow(clippy::too_many_arguments)] // sighash inputs are fixed by the protocol
 pub fn transfer_sighash(
     auth_domain: &F,
     root: &F,
@@ -434,6 +439,7 @@ pub fn transfer_sighash(
 }
 
 /// Compute unshield sighash from public outputs.
+#[allow(clippy::too_many_arguments)] // sighash inputs are fixed by the protocol
 pub fn unshield_sighash(
     auth_domain: &F,
     root: &F,

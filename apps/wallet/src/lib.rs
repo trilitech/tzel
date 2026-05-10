@@ -910,7 +910,7 @@ impl WalletFile {
             .filter(|(_, note)| !pending.contains(&note_nullifier(note)))
             .map(|(i, n)| (i, n.v))
             .collect();
-        indexed.sort_by(|a, b| b.1.cmp(&a.1)); // largest first
+        indexed.sort_by_key(|&(_, v)| std::cmp::Reverse(v)); // largest first
         let mut sum = 0u128;
         let mut selected = vec![];
         for (i, v) in indexed {
@@ -1621,6 +1621,7 @@ fn default_octez_burn_cap() -> String {
     "1".into()
 }
 
+#[allow(clippy::too_many_arguments)] // CLI-driven profile constructor; args mirror clap flags
 fn shadownet_profile(
     rollup_node_url: String,
     rollup_address: String,
@@ -3374,7 +3375,11 @@ macro_rules! user_out {
     }};
 }
 
+// clippy::large_enum_variant: clap-driven subcommand enum; variant size is
+// dominated by inline argument structs. Lives on the stack briefly while
+// dispatching one CLI invocation, so boxing only adds indirection.
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum UserCmd {
     /// Create a new wallet file.
     Init {
@@ -3570,7 +3575,10 @@ enum UserWatchCmd {
     Show,
 }
 
+// clippy::large_enum_variant: clap-driven subcommand enum; same reasoning
+// as `UserCmd` above.
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum UserProfileCmd {
     /// Save a Shadownet profile for this wallet.
     InitShadownet {
@@ -8015,6 +8023,7 @@ fn print_rollup_sync_hint(submission: &RollupSubmissionReceipt) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // CLI command: args mirror clap flags
 fn cmd_transfer(
     path: &str,
     ledger: &str,
@@ -8279,6 +8288,7 @@ fn cmd_transfer(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // CLI command: args mirror clap flags
 fn cmd_unshield(
     path: &str,
     ledger: &str,
@@ -9314,6 +9324,7 @@ struct PreparedUnshieldSubmit {
     req: UnshieldReq,
 }
 
+#[allow(clippy::too_many_arguments)] // protocol-level transfer args (root, fees, addrs, memo, ...)
 fn prepare_transfer_skip_proof(
     w: &mut WalletFile,
     root: F,

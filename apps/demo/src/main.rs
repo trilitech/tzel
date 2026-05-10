@@ -685,6 +685,9 @@ impl Chain {
 
     /// Contract-side memo verification: check that the posted memo data
     /// matches the hash committed in the proof's public outputs.
+    // dead_code: kept as protocol-documentation reference for the contract-side
+    // memo-hash check; not exercised by the demo flow.
+    #[allow(dead_code)]
     fn verify_memo(&self, cm: &F) -> bool {
         if let Some(expected) = self.memo_hashes.get(cm) {
             if let Some((_, enc)) = self.memos.iter().find(|(c, _)| c == cm) {
@@ -695,6 +698,7 @@ impl Chain {
     }
 
     /// Shield: deposit public tokens into a private note.
+    #[allow(clippy::too_many_arguments)] // protocol surface mirrors the spec
     fn shield(
         &mut self,
         sender: &str,
@@ -809,8 +813,9 @@ impl Chain {
         Ok(())
     }
 
-    /// Transfer: spend N notes → 2 private outputs. Value conserved.
-    /// Mirrors the Cairo N→2 transfer circuit.
+    /// Transfer: spend N notes -> 2 private outputs. Value conserved.
+    /// Mirrors the Cairo N->2 transfer circuit.
+    #[allow(clippy::too_many_arguments)] // protocol surface mirrors the spec
     fn transfer(
         &mut self,
         inputs: &[Note],
@@ -1115,7 +1120,7 @@ mod tests {
             .unwrap();
         a.scan(&c);
         let n = a.notes[0].clone();
-        c.unshield(&[n.clone()], 500, "a", None).unwrap();
+        c.unshield(std::slice::from_ref(&n), 500, "a", None).unwrap();
         assert!(c.unshield(&[n], 500, "a", None).is_err());
     }
 

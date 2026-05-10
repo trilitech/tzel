@@ -318,8 +318,12 @@ struct WireOptionalEncodedNote {
     note: Option<WireEncodedNote>,
 }
 
+// clippy::large_enum_variant: this enum is the on-the-wire kernel inbox
+// message; its layout is dictated by the Nom/Bin codec derives and the
+// rollup protocol. Boxing a variant would change the encoding.
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 #[encoding(tags = "u8")]
+#[allow(clippy::large_enum_variant)]
 enum WireKernelInboxMessage {
     #[encoding(tag = 0)]
     ConfigureVerifier(WireSignedKernelVerifierConfig),
