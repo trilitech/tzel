@@ -29,7 +29,7 @@ use tzel_core::kernel_wire::{
 use tzel_core::kernel_wire::{
     KernelShieldReq, KernelStarkProof, KernelTransferReq, KernelUnshieldReq,
 };
-use tzel_core::{default_auth_domain, deposit_recipient_string, hash, ProgramHashes, F, ZERO};
+use tzel_core::{default_auth_domain, deposit_recipient_string, hash, ProgramHashes, F};
 
 /// Test-only deterministic pubkey_hash derived from a label. The real
 /// pubkey_hash is `H(0x04, auth_domain, auth_root, auth_pub_seed,
@@ -390,7 +390,7 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
     }
     // Pool drained: kernel writes empty bytes (best-effort delete) when
     // the residual balance is zero.
-    assert!(host.read_store(&balance_path, 8).map_or(true, |b| b.is_empty()));
+    assert!(host.read_store(&balance_path, 8).is_none_or(|b| b.is_empty()));
     let ledger = read_ledger(&host).unwrap();
     assert_eq!(
         ledger.tree.leaves,
@@ -839,9 +839,7 @@ fn assert_outbox_withdrawal(bytes: &[u8], ticketer: &str, recipient: &str, amoun
         TezosOutboxMessage::<MichelsonPair<MichelsonContract, FA2_1Ticket>>::nom_read(bytes)
             .expect("valid outbox encoding");
     assert!(rest.is_empty(), "outbox encoding should consume all bytes");
-    let batch = match decoded {
-        TezosOutboxMessage::AtomicTransactionBatch(batch) => batch,
-    };
+    let TezosOutboxMessage::AtomicTransactionBatch(batch) = decoded;
     assert_eq!(batch.len(), 1);
     let tx = &batch[0];
     assert_eq!(tx.destination.to_b58check(), ticketer);

@@ -1796,7 +1796,7 @@ fn canonicalize_public_balance_key(source_hash: &str, value: &str) -> Result<Str
     public_balance_key(source_hash, value)
 }
 
-fn withdraw_owner_from_public_balance_key<'a>(value: &'a str) -> Result<&'a str, String> {
+fn withdraw_owner_from_public_balance_key(value: &str) -> Result<&str, String> {
     if is_implicit_tezos_account_id(value) {
         return Ok(value);
     }
@@ -1927,7 +1927,7 @@ impl<'a> RollupRpc<'a> {
 
     fn parse_durable_length(key: &str, raw: &str) -> Result<Option<usize>, String> {
         let value: Option<serde_json::Value> =
-            serde_json::from_str(&raw).map_err(|e| format!("parse durable length: {}", e))?;
+            serde_json::from_str(raw).map_err(|e| format!("parse durable length: {}", e))?;
         match value {
             None => Ok(None),
             Some(serde_json::Value::String(text)) => {
@@ -1972,7 +1972,7 @@ impl<'a> RollupRpc<'a> {
             ));
         }
         let mut out = [0u8; 8];
-        out.copy_from_slice(&bytes);
+        out.copy_from_slice(bytes);
         Ok(u64::from_le_bytes(out))
     }
 
@@ -2009,7 +2009,7 @@ impl<'a> RollupRpc<'a> {
             ));
         }
         let mut out = [0u8; 4];
-        out.copy_from_slice(&bytes);
+        out.copy_from_slice(bytes);
         Ok(i32::from_le_bytes(out))
     }
 
@@ -2027,7 +2027,7 @@ impl<'a> RollupRpc<'a> {
             ));
         }
         let mut out = ZERO;
-        out.copy_from_slice(&bytes);
+        out.copy_from_slice(bytes);
         Ok(out)
     }
 
@@ -2752,7 +2752,7 @@ fn parse_rollup_rpc_bytes(raw: &str) -> Result<Vec<u8>, String> {
         .unwrap_or(payload);
 
     if !payload.is_empty()
-        && payload.len() % 2 == 0
+        && payload.len().is_multiple_of(2)
         && payload.chars().all(|ch| ch.is_ascii_hexdigit())
     {
         return hex::decode(payload).map_err(|e| e.to_string());
@@ -9011,9 +9011,9 @@ fn cmd_transfer_rollup(
     save_wallet(path, &w)?;
 
     // Upstream patch ①.
-    let cm_1_hex = hex::encode(&note_1.cm);
-    let cm_2_hex = hex::encode(&note_2.cm);
-    let cm_3_hex = hex::encode(&note_3.cm);
+    let cm_1_hex = hex::encode(note_1.cm);
+    let cm_2_hex = hex::encode(note_2.cm);
+    let cm_3_hex = hex::encode(note_3.cm);
     user_out!(
         json: {
             "amount" => amount,
@@ -9264,7 +9264,7 @@ fn cmd_unshield_rollup(
     // L1-recipient outbox/cementation wording introduced by the streamline-
     // unshield-withdrawals rewrite.
     let change_cm_hex = if change > 0 {
-        Some(hex::encode(&cm_change))
+        Some(hex::encode(cm_change))
     } else {
         None
     };
@@ -9278,7 +9278,7 @@ fn cmd_unshield_rollup(
             "recipient" => recipient,
             "nullifiers" => nullifiers_hex,
             "change_cm" => change_cm_hex,
-            "producer_cm" => hex::encode(&producer_note.cm),
+            "producer_cm" => hex::encode(producer_note.cm),
             "outbox_note" => outbox_note,
         },
         human: "Submitted unshield of {} to L1 recipient {} with fee {} + dal fee {}",
@@ -11140,7 +11140,7 @@ mod network_profile_tests {
 
         // First arg: bytes(ASCII("deposit:" + hex(pubkey_hash))).
         let recipient_ascii =
-            format!("deposit:{}", hex::encode(&pubkey_hash));
+            format!("deposit:{}", hex::encode(pubkey_hash));
         assert_eq!(
             args[0]["bytes"].as_str().expect("bytes is a string"),
             hex::encode(recipient_ascii.as_bytes()),

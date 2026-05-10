@@ -135,7 +135,7 @@ pub(crate) fn validate_canonical_verify_meta(meta: &VerifyMeta) -> Result<()> {
             "non-canonical verify_meta public_output_values length"
         ));
     }
-    if meta.public_output_values.len() % 4 != 0 {
+    if !meta.public_output_values.len().is_multiple_of(4) {
         return Err(anyhow!(
             "non-canonical verify_meta public_output_values alignment"
         ));
@@ -247,7 +247,7 @@ impl ProofBundle {
                 .iter()
                 .map(
                     |s| stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId {
-                        id: s.clone().into(),
+                        id: s.clone(),
                     },
                 )
                 .collect(),

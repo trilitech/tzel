@@ -98,7 +98,7 @@ pub mod hex_f_vec {
     use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(v: &Vec<F>, s: S) -> Result<S::Ok, S::Error> {
-        let hexes: Vec<String> = v.iter().map(|f| hex::encode(f)).collect();
+        let hexes: Vec<String> = v.iter().map(hex::encode).collect();
         hexes.serialize(s)
     }
 
@@ -1360,6 +1360,12 @@ pub struct MerkleTree {
     zero_hashes: Vec<F>,
 }
 
+impl Default for MerkleTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MerkleTree {
     pub fn new() -> Self {
         let mut z = vec![ZERO];
@@ -1637,7 +1643,7 @@ impl CircuitKind {
         }
     }
 
-    pub fn expected_program_hash<'a>(self, hashes: &'a ProgramHashes) -> &'a F {
+    pub fn expected_program_hash(self, hashes: &ProgramHashes) -> &F {
         match self {
             CircuitKind::Shield => &hashes.shield,
             CircuitKind::Transfer => &hashes.transfer,
@@ -1936,6 +1942,12 @@ pub trait LedgerState {
     fn mark_applied_shield(&mut self, client_cm: F) -> Result<(), String>;
 }
 
+impl Default for Ledger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Ledger {
     pub fn new() -> Self {
         Self::with_auth_domain(default_auth_domain())
@@ -2177,7 +2189,7 @@ pub fn prepare_shield<S: LedgerState>(
     if state.has_applied_shield(&req.client_cm)? {
         return Err(format!(
             "shield replay: cm {} already applied",
-            hex::encode(&req.client_cm)
+            hex::encode(req.client_cm)
         ));
     }
     req.client_enc
@@ -2202,7 +2214,7 @@ pub fn prepare_shield<S: LedgerState>(
         .ok_or_else(|| {
             format!(
                 "no deposit pool for pubkey_hash {}; submit an L1 bridge deposit first",
-                hex::encode(&req.pubkey_hash)
+                hex::encode(req.pubkey_hash)
             )
         })?;
     if pool_balance < debit {

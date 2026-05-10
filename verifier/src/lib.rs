@@ -204,7 +204,7 @@ mod tests {
     use std::sync::OnceLock;
 
     use serde::Deserialize;
-    use tzel_core::{u64_to_felt, F, ZERO};
+    use tzel_core::{u64_to_felt, F};
 
     use crate::bundle::{canonical_verify_meta, validate_canonical_verify_meta};
 

@@ -2931,9 +2931,7 @@ mod tests {
         assert!(ledger.nullifiers.contains(&nf));
         assert_eq!(host.outputs.len(), 1);
         let outbox = decode_test_withdrawal_outbox(&host.outputs[0]);
-        let batch = match outbox {
-            TezosOutboxMessage::AtomicTransactionBatch(batch) => batch,
-        };
+        let TezosOutboxMessage::AtomicTransactionBatch(batch) = outbox;
         assert_eq!(batch.len(), 1);
         let tx = &batch[0];
         assert_eq!(tx.destination.to_b58check(), sample_ticketer());
