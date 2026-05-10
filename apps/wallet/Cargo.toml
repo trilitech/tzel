@@ -32,3 +32,6 @@ ureq = { version = "3", features = ["json"] }
 
 [dev-dependencies]
 proptest = "1"
+
+[lints]
+workspace = true

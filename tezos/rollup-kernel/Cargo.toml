@@ -26,3 +26,6 @@ getrandom = { version = "0.2.17", features = ["custom"] }
 
 [dev-dependencies]
 ml-kem = "=0.3.0-rc.2"
+
+[lints]
+workspace = true

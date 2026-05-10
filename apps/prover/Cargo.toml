@@ -5,6 +5,12 @@ edition = "2021"
 
 [workspace]
 
+[workspace.lints.clippy]
+uninlined_format_args = "deny"
+
+[lints]
+workspace = true
+
 [[bin]]
 name = "reprove"
 path = "src/main.rs"

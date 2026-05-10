@@ -41,3 +41,6 @@ tezos-smart-rollup-encoding = "0.2.2"
 nom = "7"
 
 [dev-dependencies]
+
+[lints]
+workspace = true
