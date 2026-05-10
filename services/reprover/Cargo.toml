@@ -3,6 +3,19 @@ name = "tzel-reprover"
 version = "0.1.0"
 edition = "2024"
 
+# Mirror `apps/prover`'s `uninlined_format_args = "deny"` policy
+# directly (rather than `[lints] workspace = true`). Cargo's
+# workspace-lookup for `workspace = true` walks up the filesystem,
+# which finds the wallet workspace at the repo root rather than the
+# prover workspace at `apps/prover/`. Declaring the policy locally
+# sidesteps that path-resolution issue. The lint fires here when
+# clippy is invoked on the prover workspace via
+# `cargo clippy --manifest-path apps/prover/Cargo.toml --workspace`,
+# which lists this crate as a sibling member — co-membership avoids
+# the `--cap-lints=allow` neutralisation that affects pure path-deps.
+[lints.clippy]
+uninlined_format_args = "deny"
+
 [lib]
 name = "tzel_reprover"
 path = "src/lib.rs"

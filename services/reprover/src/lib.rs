@@ -91,7 +91,7 @@ pub fn run_privacy_bootloader(
     // Convert Vec<Felt> to a BigUintAsHex temp file, or use provided file directly.
     let args_temp = if let Some(felts) = args {
         let file = NamedTempFile::new()?;
-        let hex_args: Vec<String> = felts.iter().map(|f| format!("{:#x}", f)).collect();
+        let hex_args: Vec<String> = felts.iter().map(|f| format!("{f:#x}")).collect();
         serde_json::to_writer(&file, &hex_args)?;
         Some(file)
     } else {
