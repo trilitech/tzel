@@ -17,7 +17,7 @@ path = "src/bin/tzel-detect.rs"
 
 [dependencies]
 axum = "0.8"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
 ml-kem = { version = "=0.3.0-rc.2", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,3 +32,8 @@ ureq = { version = "3", features = ["json"] }
 
 [dev-dependencies]
 proptest = "1"
+# `serial_test` to gate the cooperative-yield tests that share the
+# process-global `SYNC_CHECKPOINT_HOOK`. cargo-test runs in-binary tests
+# in parallel; without serialization, one test's `set_sync_checkpoint_hook`
+# can leak into another concurrent test's checkpoint callbacks.
+serial_test = "3"
