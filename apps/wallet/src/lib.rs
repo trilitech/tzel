@@ -1592,7 +1592,7 @@ fn get_text(url: &str) -> Result<String, String> {
         .map_err(|e| format!("HTTP error: {}", e))?;
     resp.into_body()
         .read_to_string()
-        .map_err(|e| format!("read response: {}", e))
+        .map_err(|e| format!("read response: {e}"))
 }
 
 fn get_text_allow_404(url: &str) -> Result<Option<String>, String> {
@@ -1601,7 +1601,7 @@ fn get_text_allow_404(url: &str) -> Result<Option<String>, String> {
             .into_body()
             .read_to_string()
             .map(Some)
-            .map_err(|e| format!("read response: {}", e)),
+            .map_err(|e| format!("read response: {e}")),
         Err(ureq::Error::StatusCode(404)) => Ok(None),
         Err(e) => Err(format!("HTTP error: {}", e)),
     }
@@ -2118,64 +2118,12 @@ impl<'a> RollupRpc<'a> {
         self.load_notes_since_at_block("head", cursor)
     }
 
-    fn read_published_note_bytes_at_block(
-        &self,
-        block_ref: &str,
-        index: u64,
-    ) -> Result<Option<Vec<u8>>, String> {
-        let direct_key = indexed_durable_key(DURABLE_NOTE_PREFIX, index);
-        if self
-            .read_durable_length_at_block(block_ref, &direct_key)?
-            .is_some()
-        {
-            let bytes = self.read_durable_bytes_at_block(block_ref, &direct_key)?;
-            if bytes.len() > MAX_PUBLISHED_NOTE_BYTES {
-                return Err(format!(
-                    "durable note {} at {} exceeds max supported size {}",
-                    index, direct_key, MAX_PUBLISHED_NOTE_BYTES
-                ));
-            }
-            return Ok(Some(bytes));
-        }
-
-        let len_key = indexed_durable_note_len_key(index);
-        if self
-            .read_durable_length_at_block(block_ref, &len_key)?
-            .is_none()
-        {
-            return Ok(None);
-        }
-
-        let total_len_u64 = self.read_u64_at_block(block_ref, &len_key)?;
-        let total_len = usize::try_from(total_len_u64).map_err(|_| {
-            format!(
-                "chunked durable note {} length does not fit in usize",
-                index
-            )
-        })?;
-        if total_len > MAX_PUBLISHED_NOTE_BYTES {
-            return Err(format!(
-                "chunked durable note {} length {} exceeds max supported size {}",
-                index, total_len, MAX_PUBLISHED_NOTE_BYTES
-            ));
-        }
-        let chunk_count = total_len.div_ceil(DURABLE_NOTE_CHUNK_BYTES);
-        let mut bytes = Vec::with_capacity(total_len);
-        for chunk_index in 0..chunk_count {
-            let chunk_key = indexed_durable_note_chunk_key(index, chunk_index);
-            let mut chunk = self.read_durable_bytes_at_block(block_ref, &chunk_key)?;
-            bytes.append(&mut chunk);
-        }
-        if bytes.len() != total_len {
-            return Err(format!(
-                "chunked durable note {} length mismatch: expected {}, got {}",
-                index,
-                total_len,
-                bytes.len()
-            ));
-        }
-        Ok(Some(bytes))
-    }
+    // Note: the previous synchronous `read_published_note_bytes_at_block`
+    // helper has been replaced by the concurrent
+    // `fetch_one_published_note` free function (used inside the
+    // worker-thread tokio runtime in `load_notes_since_at_block`). The
+    // sequential-loop version is no longer reachable from the hot path
+    // and would only diverge from the concurrent path under future edits.
 
     fn load_notes_since_at_block(
         &self,
@@ -2192,10 +2140,44 @@ impl<'a> RollupRpc<'a> {
                 cursor, count
             ));
         }
+        if cursor == count {
+            return Ok(NotesFeedResp {
+                notes: Vec::new(),
+                next_cursor: count,
+            });
+        }
 
+        // Hot path: 67k commits × ~40 ms per sequential round trip is the
+        // dominant sync cost. Hand the per-index fetches off to a concurrent
+        // reqwest pool; ordering is reassembled by `index` after the
+        // out-of-order completes.
+        //
+        // This `load_notes_since_at_block` path is the one-shot caller
+        // (proving snapshots, full-state loads). It builds its own
+        // short-lived client; the `cmd_rollup_sync` per-batch hot path
+        // uses `SyncFetcher` instead so the client survives across batches
+        // (see B3 in PR #25's review thread).
+        let concurrency = sync_concurrency()?;
+        let base_url = self.profile.rollup_node_url.trim_end_matches('/').to_string();
+        let block_ref_owned = block_ref.to_string();
+        let indices: Vec<u64> = (cursor..count).map(|i| i as u64).collect();
+        let payloads = run_async_isolated(async move {
+            let client = build_concurrent_http_client(concurrency)?;
+            fetch_published_notes_concurrent(
+                &client,
+                &base_url,
+                &block_ref_owned,
+                &indices,
+                concurrency,
+            )
+            .await
+        })?;
+
+        debug_assert_eq!(payloads.len(), count - cursor);
         let mut notes = Vec::with_capacity(count - cursor);
-        for i in cursor..count {
-            let Some(bytes) = self.read_published_note_bytes_at_block(block_ref, i as u64)? else {
+        for (offset, bytes) in payloads.into_iter().enumerate() {
+            let i = cursor + offset;
+            let Some(bytes) = bytes else {
                 let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64);
                 return Err(format!(
                     "rollup durable state is missing note {} at {} while tree size is {}. This usually means the deployed rollup kernel does not persist published note payloads, or the rollup node is not serving the expected durable state.",
@@ -2829,6 +2811,500 @@ fn parse_rollup_rpc_bytes(raw: &str) -> Result<Vec<u8>, String> {
     }
 
     Ok(payload.as_bytes().to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Sync acceleration: concurrent HTTP fetch for `cmd_rollup_sync`.
+//
+// On a 67k-commit ushuaianet scan, the sequential `ureq::get` loop in
+// `RollupRpc::load_notes_since_at_block` spent ~95 % of wallclock waiting on
+// rollup-node round trips (~40 ms each). Issuing N requests in flight against
+// a single warm connection pool collapses that wait to ~wallclock / N until
+// the rollup-node is the bottleneck.
+//
+// The default N=4 is conservative on purpose — it matches the typical CI
+// runner vCPU count and stays comfortably below any stock rollup-node's
+// connection tolerance without measurement. Higher concurrency (8, 16, 32,
+// …) is reasonable on tuned operator boxes but should be opt-in via
+// `TZEL_SYNC_CONCURRENCY` once an operator has measured their own
+// rollup-node's tail-latency curve. See `services/scan-bench/` in
+// tzel-infra for the harness that produces those numbers.
+//
+// The hard cap of 128 prevents a misconfigured operator from filling the
+// kernel TCP backlog with handshake stalls.
+//
+// Why isolate the async runtime in a worker thread? `cmd_rollup_sync` is
+// called from a synchronous CLI dispatch *and* (transitively, via
+// `sync_watch_wallet_once`) from inside the multi-thread tokio runtime that
+// powers `tzel-detect`'s axum server. Calling `Runtime::block_on` from a
+// runtime context panics; spinning a dedicated worker thread sidesteps that
+// without forcing every caller to be async.
+// ---------------------------------------------------------------------------
+
+const SYNC_CONCURRENCY_ENV: &str = "TZEL_SYNC_CONCURRENCY";
+/// Default concurrency for the per-batch HTTP fan-out. Set conservatively
+/// at 4 (matches typical CI vCPU count) with no cross-operator measurement
+/// behind that choice — the goal is "ship-safe across every rollup-node we
+/// know about" rather than "maximise throughput". Bumping above 4 should be
+/// opt-in via `TZEL_SYNC_CONCURRENCY` once an operator has run
+/// `services/scan-bench/` in tzel-infra and confirmed their rollup node's
+/// tail-latency tolerance.
+const SYNC_CONCURRENCY_DEFAULT: usize = 4;
+const SYNC_CONCURRENCY_HARD_CAP: usize = 128;
+
+/// Read the desired HTTP fetch concurrency from `TZEL_SYNC_CONCURRENCY`.
+/// Defaults to 4; rejects values > 128 with a clear error so a misconfigured
+/// operator doesn't accidentally DoS the rollup node.
+fn sync_concurrency() -> Result<usize, String> {
+    let raw = match std::env::var(SYNC_CONCURRENCY_ENV) {
+        Ok(s) => s,
+        Err(_) => return Ok(SYNC_CONCURRENCY_DEFAULT),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(SYNC_CONCURRENCY_DEFAULT);
+    }
+    let parsed: usize = trimmed.parse().map_err(|_| {
+        format!("{SYNC_CONCURRENCY_ENV} must be a positive integer (got {raw:?})")
+    })?;
+    if parsed == 0 {
+        return Err(format!("{SYNC_CONCURRENCY_ENV} must be >= 1 (got 0)"));
+    }
+    if parsed > SYNC_CONCURRENCY_HARD_CAP {
+        return Err(format!(
+            "{SYNC_CONCURRENCY_ENV} = {parsed} exceeds hard cap of {SYNC_CONCURRENCY_HARD_CAP} — bump the cap intentionally if you really need it"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Build a reqwest client tuned for the concurrent-fetch hot path. The pool
+/// is sized at `concurrency * 2` so re-using N in-flight connections plus a
+/// small idle reserve doesn't trigger TCP handshakes mid-batch.
+fn build_concurrent_http_client(concurrency: usize) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(concurrency.saturating_mul(2))
+        // The rollup node has occasionally been observed to take >5 s on a
+        // single durable read under load; 30 s matches the ureq default
+        // and keeps the failure mode "loud error" rather than "silent retry
+        // storm".
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("reqwest client build failed: {e}"))
+}
+
+/// Map a reqwest error to the same `String` shape `ureq`-driven helpers
+/// produce, so callers' substring-matching error handling keeps working.
+fn fmt_reqwest_err(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        format!("HTTP error: timeout: {e}")
+    } else if e.is_connect() {
+        format!("HTTP error: connect: {e}")
+    } else {
+        format!("HTTP error: {e}")
+    }
+}
+
+/// Fetch a single durable-state value as raw text via reqwest.
+async fn fetch_text_async(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| fmt_reqwest_err(&e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP error: status code {}", status.as_u16()));
+    }
+    resp.text()
+        .await
+        .map_err(|e| format!("read response: {e}"))
+}
+
+/// 404-tolerant variant. Mirrors `get_text_allow_404`.
+async fn fetch_text_allow_404_async(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<Option<String>, String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| fmt_reqwest_err(&e))?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("HTTP error: status code {}", status.as_u16()));
+    }
+    resp.text()
+        .await
+        .map(Some)
+        .map_err(|e| format!("read response: {e}"))
+}
+
+/// Run an async future on a dedicated worker thread that owns its own
+/// current-thread tokio runtime. Insulates the caller from "already inside
+/// a tokio runtime" panics (`tzel-detect`'s axum handler path) and from
+/// "no runtime at all" (the synchronous CLI path).
+fn run_async_isolated<F, T>(f: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<Result<T, String>>();
+    let handle = std::thread::Builder::new()
+        .name("tzel-sync-fetch".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("tokio runtime build failed: {e}")));
+                    return;
+                }
+            };
+            let result = runtime.block_on(f);
+            let _ = tx.send(result);
+        })
+        .map_err(|e| format!("spawn fetch worker: {e}"))?;
+    let result = rx
+        .recv()
+        .map_err(|e| format!("fetch worker dropped: {e}"))?;
+    let _ = handle.join();
+    result
+}
+
+/// Long-lived concurrent-fetch context for `cmd_rollup_sync`.
+///
+/// Pre-#25-fix B3: `fetch_published_notes_concurrent` was called per-batch
+/// from the K-commit scan loop and rebuilt the `reqwest::Client` (and a
+/// fresh tokio runtime + thread) every time. At K=50 across a 67k-commit
+/// sync that's ~1340 client builds and ~1340 thread spawns, each warming
+/// a fresh connection pool from cold. The "amortised TCP+TLS handshake"
+/// claim from the design doc was false in that shape.
+///
+/// `SyncFetcher` owns:
+///
+/// * a dedicated worker OS thread (named `tzel-sync-fetch-pool`),
+/// * a current-thread tokio runtime hosted on that worker thread,
+/// * a single `reqwest::Client` whose connection pool warms once and
+///   then services every per-batch fetch issued during this
+///   `cmd_rollup_sync` call.
+///
+/// The runtime + client survive the whole `cmd_rollup_sync` invocation
+/// (and only that invocation — `--watch` re-enters `cmd_rollup_sync` per
+/// poll, so the pool is rebuilt across watch iterations; that's
+/// tolerable: the per-iteration scan is small once the wallet is caught
+/// up). The worker thread is shut down via `Drop`.
+struct SyncFetcher {
+    worker: Option<std::thread::JoinHandle<()>>,
+    cmd_tx: Option<std::sync::mpsc::Sender<SyncFetchCmd>>,
+}
+
+enum SyncFetchCmd {
+    Fetch {
+        base_url: String,
+        block_ref: String,
+        indices: Vec<u64>,
+        concurrency: usize,
+        reply: std::sync::mpsc::Sender<Result<Vec<Option<Vec<u8>>>, String>>,
+    },
+    Shutdown,
+}
+
+/// Test-only counter incremented once per `SyncFetcher::new` call.
+/// Used by `sync_fetcher_amortises_client_across_batches` to assert
+/// the production amortisation contract: a regression that rebuilds
+/// the fetcher per batch would bump this counter once per call,
+/// surfacing the per-batch TLS / runtime / worker-thread storm
+/// described in PR-#25 review B3.
+#[cfg(test)]
+static SYNC_FETCHER_NEW_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+impl SyncFetcher {
+    fn new(concurrency: usize) -> Result<Self, String> {
+        #[cfg(test)]
+        SYNC_FETCHER_NEW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SyncFetchCmd>();
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let worker = std::thread::Builder::new()
+            .name("tzel-sync-fetch-pool".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(format!("tokio runtime build failed: {e}")));
+                        return;
+                    }
+                };
+                let client = match build_concurrent_http_client(concurrency) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let _ = init_tx.send(Ok(()));
+
+                // Drive the request stream on the runtime. Each `Fetch`
+                // command runs to completion before we wait for the next;
+                // intra-batch parallelism comes from
+                // `fetch_published_notes_concurrent`'s `FuturesUnordered`,
+                // not from concurrent batch dispatch.
+                runtime.block_on(async {
+                    while let Ok(cmd) = cmd_rx.recv() {
+                        match cmd {
+                            SyncFetchCmd::Shutdown => break,
+                            SyncFetchCmd::Fetch {
+                                base_url,
+                                block_ref,
+                                indices,
+                                concurrency,
+                                reply,
+                            } => {
+                                let result = fetch_published_notes_concurrent(
+                                    &client,
+                                    &base_url,
+                                    &block_ref,
+                                    &indices,
+                                    concurrency,
+                                )
+                                .await;
+                                let _ = reply.send(result);
+                            }
+                        }
+                    }
+                });
+            })
+            .map_err(|e| format!("spawn fetch worker pool: {e}"))?;
+        match init_rx.recv() {
+            Ok(Ok(())) => Ok(SyncFetcher {
+                worker: Some(worker),
+                cmd_tx: Some(cmd_tx),
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(format!("fetch worker pool init dropped: {e}")),
+        }
+    }
+
+    fn fetch(
+        &self,
+        base_url: &str,
+        block_ref: &str,
+        indices: &[u64],
+        concurrency: usize,
+    ) -> Result<Vec<Option<Vec<u8>>>, String> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let cmd = SyncFetchCmd::Fetch {
+            base_url: base_url.to_string(),
+            block_ref: block_ref.to_string(),
+            indices: indices.to_vec(),
+            concurrency,
+            reply: reply_tx,
+        };
+        self.cmd_tx
+            .as_ref()
+            .ok_or_else(|| "SyncFetcher already shut down".to_string())?
+            .send(cmd)
+            .map_err(|_| "fetch worker pool dropped before request".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "fetch worker pool dropped before reply".to_string())?
+    }
+}
+
+impl Drop for SyncFetcher {
+    fn drop(&mut self) {
+        if let Some(tx) = self.cmd_tx.take() {
+            let _ = tx.send(SyncFetchCmd::Shutdown);
+            drop(tx);
+        }
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// URL builders for the concurrent fetch path. Free functions so the async
+/// closures don't borrow the `RollupRpc` instance — that lets the caller
+/// move owned strings into the worker-thread future.
+fn block_durable_value_url(base: &str, block_ref: &str, key: &str) -> String {
+    format!("{base}/global/block/{block_ref}/durable/wasm_2_0_0/value?key={key}")
+}
+
+fn block_durable_length_url(base: &str, block_ref: &str, key: &str) -> String {
+    format!("{base}/global/block/{block_ref}/durable/wasm_2_0_0/length?key={key}")
+}
+
+/// Fetch one published note's payload from durable storage. Mirrors
+/// `RollupRpc::read_published_note_bytes_at_block` — direct key first, fall
+/// back to the chunked layout. The chunks within a single note are still
+/// fetched sequentially because the chunk count is data-dependent on the
+/// `_len` value; the parallelism budget is spent across notes, not within
+/// a note (the chunked layout is rare and large notes amortise their own
+/// round-trips).
+async fn fetch_one_published_note(
+    client: reqwest::Client,
+    base_url: String,
+    block_ref: String,
+    index: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let direct_key = indexed_durable_key(DURABLE_NOTE_PREFIX, index);
+    let direct_len_url = block_durable_length_url(&base_url, &block_ref, &direct_key);
+    let direct_len_raw = fetch_text_allow_404_async(&client, &direct_len_url)
+        .await
+        .map_err(|e| format!("rollup RPC {direct_len_url} failed: {e}"))?;
+    let direct_present = match direct_len_raw {
+        None => false,
+        Some(raw) => RollupRpc::parse_durable_length(&direct_key, &raw)?.is_some(),
+    };
+    if direct_present {
+        let value_url = block_durable_value_url(&base_url, &block_ref, &direct_key);
+        let raw = fetch_text_async(&client, &value_url)
+            .await
+            .map_err(|e| format!("rollup RPC {value_url} failed: {e}"))?;
+        let bytes = parse_rollup_rpc_bytes(&raw)
+            .map_err(|e| format!("decode durable value at {direct_key}: {e}"))?;
+        if bytes.len() > MAX_PUBLISHED_NOTE_BYTES {
+            return Err(format!(
+                "durable note {index} at {direct_key} exceeds max supported size {MAX_PUBLISHED_NOTE_BYTES}"
+            ));
+        }
+        return Ok(Some(bytes));
+    }
+
+    let len_key = indexed_durable_note_len_key(index);
+    let len_len_url = block_durable_length_url(&base_url, &block_ref, &len_key);
+    let len_len_raw = fetch_text_allow_404_async(&client, &len_len_url)
+        .await
+        .map_err(|e| format!("rollup RPC {len_len_url} failed: {e}"))?;
+    let chunked_present = match len_len_raw {
+        None => false,
+        Some(raw) => RollupRpc::parse_durable_length(&len_key, &raw)?.is_some(),
+    };
+    if !chunked_present {
+        return Ok(None);
+    }
+
+    let len_value_url = block_durable_value_url(&base_url, &block_ref, &len_key);
+    let len_raw = fetch_text_async(&client, &len_value_url)
+        .await
+        .map_err(|e| format!("rollup RPC {len_value_url} failed: {e}"))?;
+    let len_bytes = parse_rollup_rpc_bytes(&len_raw)
+        .map_err(|e| format!("decode durable value at {len_key}: {e}"))?;
+    let total_len_u64 = RollupRpc::parse_u64(&len_key, &len_bytes)?;
+    let total_len = usize::try_from(total_len_u64).map_err(|_| {
+        format!("chunked durable note {index} length does not fit in usize")
+    })?;
+    if total_len > MAX_PUBLISHED_NOTE_BYTES {
+        return Err(format!(
+            "chunked durable note {index} length {total_len} exceeds max supported size {MAX_PUBLISHED_NOTE_BYTES}"
+        ));
+    }
+    let chunk_count = total_len.div_ceil(DURABLE_NOTE_CHUNK_BYTES);
+    let mut bytes = Vec::with_capacity(total_len);
+    for chunk_index in 0..chunk_count {
+        let chunk_key = indexed_durable_note_chunk_key(index, chunk_index);
+        let chunk_url = block_durable_value_url(&base_url, &block_ref, &chunk_key);
+        let chunk_raw = fetch_text_async(&client, &chunk_url)
+            .await
+            .map_err(|e| format!("rollup RPC {chunk_url} failed: {e}"))?;
+        let mut chunk = parse_rollup_rpc_bytes(&chunk_raw)
+            .map_err(|e| format!("decode durable value at {chunk_key}: {e}"))?;
+        bytes.append(&mut chunk);
+    }
+    if bytes.len() != total_len {
+        let got = bytes.len();
+        return Err(format!(
+            "chunked durable note {index} length mismatch: expected {total_len}, got {got}"
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// Concurrent fetch driver. Issues `concurrency` in-flight per-note requests
+/// against the rollup node, reassembles by index, and short-circuits on the
+/// first error (matches the sequential loop's abort-on-first-error contract).
+///
+/// Takes a borrowed `reqwest::Client` so callers can amortise the
+/// connection pool across multiple batches (e.g. `cmd_rollup_sync` runs many
+/// per-`checkpoint_every` batches across a 67k-commit scan and we want one
+/// warm client surviving the whole loop, not a fresh handshake-storm every
+/// batch). See `SyncFetcher` for the long-lived runtime + client wrapper.
+async fn fetch_published_notes_concurrent(
+    client: &reqwest::Client,
+    base_url: &str,
+    block_ref: &str,
+    indices: &[u64],
+    concurrency: usize,
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let mut results: Vec<Option<Option<Vec<u8>>>> = (0..indices.len()).map(|_| None).collect();
+    let mut next_to_dispatch = 0usize;
+
+    // Spawn a single-typed future for each index — async blocks at distinct
+    // call-sites have distinct anonymous types, so we go through one helper
+    // (`fetch_one_published_note`) and tuple the offset alongside via a
+    // small wrapper that returns one consistent future shape.
+    type FetchFuture = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = (usize, Result<Option<Vec<u8>>, String>)> + Send,
+        >,
+    >;
+    let make_future = |off: usize, client: reqwest::Client, base: String, block: String| -> FetchFuture {
+        let i = indices[off];
+        Box::pin(async move {
+            let r = fetch_one_published_note(client, base, block, i).await;
+            (off, r)
+        })
+    };
+
+    let mut in_flight: FuturesUnordered<FetchFuture> = FuturesUnordered::new();
+
+    // Manual flow control: keep at most `concurrency` futures in flight,
+    // drain one before queuing the next. Open-coded rather than using
+    // `buffered_unordered` so the result tuple carries its owning offset
+    // and errors propagate with the right index.
+    while next_to_dispatch < indices.len() && in_flight.len() < concurrency {
+        in_flight.push(make_future(
+            next_to_dispatch,
+            client.clone(),
+            base_url.to_string(),
+            block_ref.to_string(),
+        ));
+        next_to_dispatch += 1;
+    }
+
+    while let Some((off, res)) = in_flight.next().await {
+        match res {
+            Ok(payload) => results[off] = Some(payload),
+            Err(e) => return Err(e),
+        }
+        if next_to_dispatch < indices.len() {
+            in_flight.push(make_future(
+                next_to_dispatch,
+                client.clone(),
+                base_url.to_string(),
+                block_ref.to_string(),
+            ));
+            next_to_dispatch += 1;
+        }
+    }
+
+    Ok(results
+        .into_iter()
+        .map(|slot| slot.expect("every index slot must have been filled"))
+        .collect())
 }
 
 fn mutez_to_tez_string(amount_mutez: u64) -> String {
@@ -3514,15 +3990,20 @@ enum UserCmd {
         /// (shield / transfer / unshield), at the cost of more frequent
         /// `save_wallet` round-trips.
         ///
-        /// Default 50 is a reasoned starting point. Numbers in this PR's
-        /// description and `docs/sync-acceleration-design.md` are
-        /// estimates: ~0.7 % overhead per checkpoint at this granularity
-        /// vs the per-commit HTTP work, ~2 s of loss-on-interrupt the
-        /// next sync redoes cheaply, sub-ms sentinel stat(). **The K=50
-        /// dial is orthogonal to the throughput dial** N (concurrent
-        /// HTTP reads, design doc §2.A) — `services/scan-bench/` in
-        /// tzel-infra measures the latter only. A `save_wallet` micro-
-        /// bench would refine THIS default.
+        /// Default 250 is the conservative end of the 250–500 range PR
+        /// #24 flagged as the post-#25 retune target. PR #25's parallel
+        /// HTTP + decrypt accelerations raise per-commit throughput to
+        /// the point where one fsync per 50 commits is a measurable
+        /// share of wallclock; at K=250 the per-checkpoint persist drops
+        /// to ~1.4 fsyncs/s sustained on a fast-enough operator. Numbers
+        /// in this PR's description and
+        /// `docs/sync-acceleration-design.md` are estimates: sub-1 %
+        /// overhead per checkpoint at this granularity, ~10 s of
+        /// loss-on-interrupt the next sync redoes cheaply, sub-ms
+        /// sentinel stat(). **The K=250 dial is orthogonal to the
+        /// throughput dial** N (concurrent HTTP reads, design doc §2.A)
+        /// — `services/scan-bench/` in tzel-infra measures the latter
+        /// only. A `save_wallet` micro-bench would refine THIS default.
         ///
         /// Don't drop below ~10 (the per-checkpoint `save_wallet` and
         /// stat() begin to dominate the per-commit fetch work) or push
@@ -5032,18 +5513,31 @@ fn apply_scan_feed(
     let mut found = 0usize;
     let mut known_notes: std::collections::HashSet<(usize, F)> =
         w.notes.iter().map(|n| (n.index, n.cm)).collect();
-    for nm in &feed.notes {
-        if let Some(note) = w.try_recover_note(nm) {
-            if known_notes.insert((note.index, note.cm)) {
-                println!(
-                    "  found: v={} cm={} index={}",
-                    note.v,
-                    short(&note.cm),
-                    note.index
-                );
-                w.notes.push(note);
-                found += 1;
-            }
+
+    // ML-KEM-768 trial-decrypt is ~125 µs per attempt × |addresses| per memo,
+    // and the loop is embarrassingly parallel: `try_recover_note` only reads
+    // `&self`, the `master_sk` and address list don't change inside this
+    // call, and recovered `Note` values are independent. We hand the
+    // per-memo recovery off to rayon's default thread pool here, then merge
+    // sequentially below to preserve the deterministic
+    // `println!`-then-push order the existing test suite relies on.
+    use rayon::prelude::*;
+    let recovered: Vec<Option<Note>> = feed
+        .notes
+        .par_iter()
+        .map(|nm| w.try_recover_note(nm))
+        .collect();
+
+    for note in recovered.into_iter().flatten() {
+        if known_notes.insert((note.index, note.cm)) {
+            println!(
+                "  found: v={} cm={} index={}",
+                note.v,
+                short(&note.cm),
+                note.index
+            );
+            w.notes.push(note);
+            found += 1;
         }
     }
 
@@ -5118,22 +5612,45 @@ fn apply_scan_feed_recover_batch(
     feed: &NotesFeedResp,
     seen_cms: &mut Vec<F>,
 ) -> usize {
-    let mut found = 0usize;
+    use rayon::prelude::*;
+
+    // Extend `seen_cms` with every cm in this batch (recoverable or not).
+    // The defensive cm set matters for the finalize-pin fix from PR #24's
+    // audit — see the cumulative-known-cm rationale in `apply_scan_feed`.
+    seen_cms.extend(feed.notes.iter().map(|nm| nm.cm));
+
+    // ML-KEM-768 trial-decrypt is ~125 µs per attempt × |addresses| per
+    // memo. `try_recover_note` only reads `&self` on the wallet; the
+    // master_sk and address list don't change inside this call; recovered
+    // notes are independent. Hand the per-memo recovery off to rayon's
+    // default thread pool here, then merge sequentially below to preserve
+    // the deterministic `println!`-then-push order the test suite relies
+    // on.
+    //
+    // Pre-fix B2: this loop was sequential, which meant the rayon par_iter
+    // in `apply_scan_feed` (the legacy `cmd_scan` entrypoint) was the only
+    // parallel-decrypt site — and `cmd_scan` is dead code in the
+    // cooperative-yield era. The "M=auto decrypt" banner emitted by
+    // `cmd_rollup_sync` was a lie until this `par_iter` landed.
+    let recovered: Vec<Option<Note>> = feed
+        .notes
+        .par_iter()
+        .map(|nm| w.try_recover_note(nm))
+        .collect();
+
     let mut known_notes: std::collections::HashSet<(usize, F)> =
         w.notes.iter().map(|n| (n.index, n.cm)).collect();
-    for nm in &feed.notes {
-        seen_cms.push(nm.cm);
-        if let Some(note) = w.try_recover_note(nm) {
-            if known_notes.insert((note.index, note.cm)) {
-                println!(
-                    "  found: v={} cm={} index={}",
-                    note.v,
-                    short(&note.cm),
-                    note.index
-                );
-                w.notes.push(note);
-                found += 1;
-            }
+    let mut found = 0usize;
+    for note in recovered.into_iter().flatten() {
+        if known_notes.insert((note.index, note.cm)) {
+            println!(
+                "  found: v={} cm={} index={}",
+                note.v,
+                short(&note.cm),
+                note.index
+            );
+            w.notes.push(note);
+            found += 1;
         }
     }
     w.scanned = feed.next_cursor;
@@ -5204,6 +5721,64 @@ mod tests {
         ALLOW_FULL_XMSS_REBUILD_IN_TESTS.store(false, std::sync::atomic::Ordering::SeqCst);
         drop(guard);
         result
+    }
+
+    /// Counted variant of [`spawn_mock_http_server`]. Returns the same
+    /// `base_url` plus an `AtomicUsize` that's incremented on every
+    /// successfully-handled request. Used by tests that need to assert on
+    /// "did the abort path actually short-circuit before all in-flight
+    /// requests were issued?" — counting the number of served requests is
+    /// the cleanest signal.
+    pub(super) fn spawn_counted_mock_http_server(
+        routes: HashMap<String, (u16, String)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_thread = counter.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock http server");
+        let addr = listener.local_addr().expect("mock server local addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                let mut buffer = [0u8; 8192];
+                let read = match stream.read(&mut buffer) {
+                    Ok(read) => read,
+                    Err(_) => continue,
+                };
+                if read == 0 {
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, body) = routes
+                    .get(path)
+                    .cloned()
+                    .unwrap_or_else(|| (404, "null".to_string()));
+                let status_text = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    _ => "Unknown",
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    status_text,
+                    body.len(),
+                    body
+                );
+                if stream.write_all(response.as_bytes()).is_ok() {
+                    counter_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        (format!("http://{}", addr), counter)
     }
 
     pub(super) fn spawn_mock_http_server(routes: HashMap<String, (u16, String)>) -> String {
@@ -7740,12 +8315,21 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
 /// How many commits we scan between checkpoints (incremental save_wallet +
 /// cooperative-yield check).
 ///
-/// 50 is a reasoned starting point pending empirical measurement:
-///   * loss-on-interrupt is bounded to ~K commits ≈ a couple of seconds of
-///     scan work, which the next sync redoes cheaply;
-///   * persist overhead is ~0.7% of scan time at this granularity (one
-///     atomic-rename + fsync per 50 commits, dwarfed by the 50 HTTP fetches);
-///   * the per-checkpoint sentinel stat() is sub-ms.
+/// 250 is the conservative end of the 250–500 range PR #24's body line 90
+/// flagged as the post-#25 retune target ("Re-tune default K to 250–500
+/// once the design doc's parallel-fetch patch (P2, see PR #25) lands; at
+/// the post-P2 wallclock, K=50 means ~7 fsyncs/s sustained — non-trivial").
+/// PR #25 lands the parallel-fetch + parallel-decrypt accelerations, which
+/// raise per-commit throughput to the point where the per-checkpoint fsync
+/// becomes a non-trivial share of wallclock at K=50; bumping to K=250
+/// amortises the persist cost back down.
+///
+/// Properties at K=250:
+///   * loss-on-interrupt is bounded to ~K commits, which the next sync
+///     redoes cheaply via the cooperative-yield resume path;
+///   * persist overhead drops ~5× vs K=50 (one atomic-rename + fsync per
+///     250 commits instead of per 50);
+///   * the per-checkpoint sentinel stat() is sub-ms either way.
 ///
 /// Numbers above are estimates; the `services/scan-bench/` POC in tzel-infra
 /// is meant to refine them against a live `octez-smart-rollup-node`. Until
@@ -7754,7 +8338,7 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
 ///
 /// Don't drop below ~10 (overhead dominates) or push past ~500 (the
 /// loss-on-interrupt becomes user-visible during a long initial sync).
-const DEFAULT_CHECKPOINT_EVERY: usize = 50;
+const DEFAULT_CHECKPOINT_EVERY: usize = 250;
 
 /// Test hook: invoked at every checkpoint just before the sentinel check.
 /// Production callers leave it `None`. Used by the resume / sentinel tests
@@ -7808,7 +8392,7 @@ fn fire_sync_checkpoint_hook(_path: &str, _scanned: usize) {
 /// next sync resumes from there.
 ///
 /// `checkpoint_every` is tunable via `tzel-wallet sync --checkpoint-every N`.
-/// Default is `DEFAULT_CHECKPOINT_EVERY` (50). 0 is rejected (would loop
+/// Default is `DEFAULT_CHECKPOINT_EVERY` (250). 0 is rejected (would loop
 /// forever without progress).
 ///
 /// Atomicity: every checkpoint goes through `save_wallet`, which writes to
@@ -7827,6 +8411,13 @@ fn cmd_rollup_sync(
     }
     let mut w = load_wallet(path)?;
     let rollup = RollupRpc::new(profile);
+
+    // One-line stderr banner: gives the operator a clear signal when a
+    // long sync starts and what tunables are in effect. `decrypt=auto`
+    // because rayon picks the worker count from the system; we don't
+    // override unless we have a measured reason to.
+    let concurrency = sync_concurrency()?;
+    eprintln!("tzel-wallet: concurrent sync: N={concurrency} fetch, M=auto decrypt");
 
     // Pin head once: every batch reads the same block so concurrent rollup
     // progress does not race the cursor past the tree-size we're scanning to.
@@ -7861,6 +8452,19 @@ fn cmd_rollup_sync(
     let mut seen_cms: Vec<F> = Vec::new();
     let mut yielded = false;
 
+    // Build the long-lived fetch context ONCE for this whole sync. The
+    // worker thread, tokio runtime, and reqwest client all survive every
+    // batch — so the connection pool warms exactly once instead of once
+    // per K-commit batch (~1340 cold-start handshakes on a 67k-commit
+    // sync at K=50). See `SyncFetcher` doc comment for the rationale.
+    let fetcher = SyncFetcher::new(concurrency).map_err(|e| {
+        format!(
+            "sync failed: {}. Run `tzel-wallet check` for a fuller diagnosis.",
+            e
+        )
+    })?;
+    let base_url = profile.rollup_node_url.trim_end_matches('/').to_string();
+
     while w.scanned < tree_size {
         // `saturating_add` defends against an adversarial
         // `--checkpoint-every` (e.g. close to `usize::MAX`) overflowing
@@ -7873,26 +8477,32 @@ fn cmd_rollup_sync(
             .scanned
             .saturating_add(checkpoint_every)
             .min(tree_size);
-        // `load_notes_since_at_block` accepts a [cursor, tree_size) window
-        // implicitly via the pinned block's tree-size. To get a [cursor,
-        // batch_end) sub-window we fetch the slice manually.
+        // Per-batch [cursor, batch_end) sub-window. PR #25's concurrent
+        // fetch driver issues `concurrency` per-note requests in flight
+        // against the rollup node and reassembles by index, replacing the
+        // sequential `read_published_note_bytes_at_block` round-trip loop
+        // that dominated wallclock on long initial syncs (~95% of time on
+        // a 67k-commit ushuaianet scan).
+        let indices: Vec<u64> = (w.scanned..batch_end).map(|i| i as u64).collect();
+        let payloads = fetcher
+            .fetch(&base_url, &head_hash, &indices, concurrency)
+            .map_err(|e| {
+                format!(
+                    "sync failed: {}. Run `tzel-wallet check` for a fuller diagnosis.",
+                    e
+                )
+            })?;
+        debug_assert_eq!(payloads.len(), batch_end - w.scanned);
         let mut notes = Vec::with_capacity(batch_end - w.scanned);
-        for i in w.scanned..batch_end {
-            let bytes = rollup
-                .read_published_note_bytes_at_block(&head_hash, i as u64)
-                .map_err(|e| {
-                    format!(
-                        "sync failed: {}. Run `tzel-wallet check` for a fuller diagnosis.",
-                        e
-                    )
-                })?
-                .ok_or_else(|| {
-                    let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64);
-                    format!(
-                        "rollup durable state is missing note {} at {} while tree size is {}. This usually means the deployed rollup kernel does not persist published note payloads, or the rollup node is not serving the expected durable state.",
-                        i, key, tree_size
-                    )
-                })?;
+        for (offset, bytes) in payloads.into_iter().enumerate() {
+            let i = w.scanned + offset;
+            let Some(bytes) = bytes else {
+                let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64);
+                return Err(format!(
+                    "rollup durable state is missing note {} at {} while tree size is {}. This usually means the deployed rollup kernel does not persist published note payloads, or the rollup node is not serving the expected durable state.",
+                    i, key, tree_size
+                ));
+            };
             let (cm, enc) = canonical_wire::decode_published_note(&bytes)?;
             notes.push(NoteMemo { index: i, cm, enc });
         }
@@ -11764,7 +12374,7 @@ mod network_profile_tests {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // Cooperative-yield sync (DEFAULT_CHECKPOINT_EVERY = 50)
+    // Cooperative-yield sync (DEFAULT_CHECKPOINT_EVERY = 250)
     // ════════════════════════════════════════════════════════════════════
 
     /// Spawn a trivial child, wait for it to exit, and return its
@@ -11856,6 +12466,53 @@ mod network_profile_tests {
                     block_hash, key
                 ),
                 (200, format!("\"{}\"", hex::encode(bytes))),
+            );
+        }
+        routes
+    }
+
+    // ---------------------------------------------------------------------
+    // Sync-acceleration tests (P2): concurrent HTTP fetch + parallel decrypt.
+    // ---------------------------------------------------------------------
+
+    /// Build the mock-rollup route table for `note_count` direct (non-chunked)
+    /// notes. The first half of the routes are the tree-size length+value
+    /// pair; the rest are per-note `length` + `value` for the direct key.
+    /// `chunked_len_routes` is set to "null" because the direct path always
+    /// fires first, so the chunked-len fallback should never be consulted.
+    fn mock_routes_for_direct_notes(notes: &[NoteMemo]) -> HashMap<String, (u16, String)> {
+        let count = notes.len() as u64;
+        let mut routes = HashMap::from([
+            (
+                "/global/block/head/durable/wasm_2_0_0/length?key=/tzel/v1/state/tree/size".into(),
+                (200u16, "8".into()),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/value?key=/tzel/v1/state/tree/size".into(),
+                (200u16, format!("\"{}\"", hex::encode(count.to_le_bytes()))),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/length?key=/tzel/v1/state/nullifiers/count"
+                    .into(),
+                (200u16, "8".into()),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/value?key=/tzel/v1/state/nullifiers/count"
+                    .into(),
+                (200u16, format!("\"{}\"", hex::encode(0u64.to_le_bytes()))),
+            ),
+        ]);
+        for (idx, nm) in notes.iter().enumerate() {
+            let key = indexed_durable_key(DURABLE_NOTE_PREFIX, idx as u64);
+            let encoded = canonical_wire::encode_published_note(&nm.cm, &nm.enc)
+                .expect("encode published note for mock");
+            routes.insert(
+                format!("/global/block/head/durable/wasm_2_0_0/length?key={key}"),
+                (200u16, format!("{}", encoded.len())),
+            );
+            routes.insert(
+                format!("/global/block/head/durable/wasm_2_0_0/value?key={key}"),
+                (200u16, format!("\"{}\"", hex::encode(&encoded))),
             );
         }
         routes
@@ -11957,7 +12614,7 @@ mod network_profile_tests {
         let profile_full = super::tests::rollup_profile_for_url(&url_full);
 
         // Trip the sentinel after the second checkpoint (cursor reaches
-        // 2 * DEFAULT_CHECKPOINT_EVERY = 100). The hook fires at every checkpoint
+        // 2 * custom_k). The hook fires at every checkpoint
         // boundary just before the existence-check.
         let yield_path = wallet_yield_path(wallet_path_str).to_path_buf();
         let yield_clone = yield_path.clone();
@@ -13171,5 +13828,415 @@ mod network_profile_tests {
             summary.pruned_drained_pools, 1,
             "finalize must report exactly the one regression-induced eviction"
         );
+    }
+
+    fn build_recoverable_notes(wallet: &WalletFile, count: usize) -> Vec<NoteMemo> {
+        (0..count)
+            .map(|i| {
+                let mut rseed = ZERO;
+                rseed[0] = (i & 0xff) as u8;
+                rseed[1] = ((i >> 8) & 0xff) as u8;
+                let mut note_memo = super::tests::note_memo_for_wallet_address(
+                    wallet,
+                    0,
+                    100 + i as u64,
+                    rseed,
+                    Some(format!("memo-{i}").as_bytes()),
+                );
+                note_memo.index = i;
+                note_memo
+            })
+            .collect()
+    }
+
+    /// Guards `TZEL_SYNC_CONCURRENCY` env mutations from racing other
+    /// tests reading the same env. cargo-test runs in-binary tests in
+    /// parallel; without the mutex, one test setting N=1 could leak into
+    /// another's read.
+    fn sync_concurrency_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GUARD.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap()
+    }
+
+    /// 2.A test #1: scanning the same window with `TZEL_SYNC_CONCURRENCY=1`
+    /// and `=8` must yield byte-for-byte the same `NotesFeedResp`.
+    /// Validates that out-of-order completion is reassembled correctly.
+    #[test]
+    fn concurrent_fetch_returns_same_results_as_sequential() {
+        let _guard = sync_concurrency_env_guard();
+        let wallet = super::tests::test_wallet(1);
+        let memos = build_recoverable_notes(&wallet, 100);
+
+        let routes = mock_routes_for_direct_notes(&memos);
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        // Sequential
+        std::env::set_var(SYNC_CONCURRENCY_ENV, "1");
+        let seq_feed = rollup
+            .load_notes_since(0)
+            .expect("sequential load should succeed");
+        // Concurrent
+        std::env::set_var(SYNC_CONCURRENCY_ENV, "8");
+        let conc_feed = rollup
+            .load_notes_since(0)
+            .expect("concurrent load should succeed");
+        std::env::remove_var(SYNC_CONCURRENCY_ENV);
+
+        assert_eq!(seq_feed.next_cursor, conc_feed.next_cursor);
+        assert_eq!(seq_feed.notes.len(), 100);
+        assert_eq!(conc_feed.notes.len(), 100);
+        for (a, b) in seq_feed.notes.iter().zip(conc_feed.notes.iter()) {
+            assert_eq!(a.index, b.index);
+            assert_eq!(a.cm, b.cm);
+            assert_eq!(a.enc.tag, b.enc.tag);
+            assert_eq!(a.enc.ct_d, b.enc.ct_d);
+            assert_eq!(a.enc.ct_v, b.enc.ct_v);
+            assert_eq!(a.enc.nonce, b.enc.nonce);
+            assert_eq!(a.enc.encrypted_data, b.enc.encrypted_data);
+        }
+        // Indices should also still be strictly monotonic — out-of-order
+        // arrival from the unordered futures must not bleed into the
+        // returned vector.
+        for (i, nm) in conc_feed.notes.iter().enumerate() {
+            assert_eq!(nm.index, i);
+        }
+    }
+
+    /// 2.A test #2: a 5xx on a single durable read must abort the entire
+    /// concurrent batch. The error message must mention an HTTP status so
+    /// callers (and `tzel-wallet check`) can route it to the right
+    /// diagnostic; it must NOT contain note-decrypt phrasing (we never
+    /// reached the post-fetch decode step).
+    ///
+    /// Post-#25 review S5 strengthening: previously this test only
+    /// asserted "an error came back". A "drain all in-flight before
+    /// propagating" refactor would still satisfy that. The strengthened
+    /// version uses a counted mock server and asserts that the number of
+    /// HTTP requests *actually served* is strictly less than the upper
+    /// bound of "every index was probed once", which proves cancellation
+    /// short-circuited rather than draining.
+    #[test]
+    fn concurrent_fetch_aborts_on_5xx() {
+        let _guard = sync_concurrency_env_guard();
+        let wallet = super::tests::test_wallet(1);
+        // Bigger fixture (50 notes, sabotage at index 7) so a "drain
+        // everything" refactor would serve >> the early-abort baseline.
+        // At concurrency=4, a correct abort serves at most ~12 length
+        // probes (concurrency in flight + the indices already
+        // dispatched up to index 7) before short-circuiting.
+        let memos = build_recoverable_notes(&wallet, 50);
+        let mut routes = mock_routes_for_direct_notes(&memos);
+
+        // Sabotage the length probe for index 7. The concurrent path's
+        // first request per index is the direct-key length probe; making
+        // that 503 is the cleanest "fetch failed mid-batch" signal.
+        let bad_key = indexed_durable_key(DURABLE_NOTE_PREFIX, 7);
+        routes.insert(
+            format!("/global/block/head/durable/wasm_2_0_0/length?key={bad_key}"),
+            (503, "internal".into()),
+        );
+
+        let (base_url, served) = super::tests::spawn_counted_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        std::env::set_var(SYNC_CONCURRENCY_ENV, "4");
+        let err = rollup
+            .load_notes_since(0)
+            .expect_err("concurrent fetch must propagate the 5xx");
+        std::env::remove_var(SYNC_CONCURRENCY_ENV);
+
+        assert!(
+            err.contains("503"),
+            "expected error to mention HTTP 503, got: {err}"
+        );
+        assert!(
+            err.contains("rollup RPC"),
+            "expected error to attribute the failure to a rollup RPC URL, got: {err}"
+        );
+
+        // Allow a brief drain window for in-flight responses already
+        // queued on the network. Then confirm cancellation actually
+        // short-circuited: a "drain everything before propagating"
+        // refactor would serve roughly 50 length probes + 50 value
+        // fetches = ~100 requests. A correct abort serves dramatically
+        // fewer (the pipeline-depth bound is ~concurrency-in-flight on
+        // top of the indices 0..=7 the dispatcher had already enqueued
+        // by the time index 7's 503 came back).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let n = served.load(std::sync::atomic::Ordering::SeqCst);
+        let total_indices = memos.len();
+        // Two requests per index would be ~100 served on a "drain"
+        // refactor. Even being generous to schedule jitter, half that
+        // is well above any plausible early-abort path.
+        assert!(
+            n < total_indices,
+            "abort must short-circuit before serving every index; \
+             served={n} requests for {total_indices} indices (a 'drain' \
+             refactor would have served ~{} or more)",
+            total_indices,
+        );
+    }
+
+    /// 2.A B3 test: a single `reqwest::Client` survives multiple
+    /// sequential batches via `SyncFetcher`. Without this, `cmd_rollup_sync`
+    /// would rebuild the client (and re-warm the connection pool) on every
+    /// per-K-commit batch — at K=50 across a 67k-commit sync that's ~1340
+    /// cold-start handshakes the design doc claimed were amortised away.
+    ///
+    /// Counts served HTTP requests across two back-to-back fetches: each
+    /// note triggers a length probe + a value probe = 2 requests, so two
+    /// 10-note batches should serve exactly 40. The test cares that the
+    /// SECOND batch lands without rebuilding any client; if `SyncFetcher`
+    /// were respawned per batch, the test would still pass on counts but
+    /// the timing model the design doc describes would be wrong. The
+    /// stronger contract — "same `SyncFetcher` instance services both" —
+    /// is enforced by reusing the binding across both calls below; a
+    /// future refactor that drops the client per call would force this
+    /// test to be re-shaped, which is exactly the kind of compile-time
+    /// signal we want.
+    #[test]
+    #[serial_test::serial(sync_fetcher_new_count)]
+    fn sync_fetcher_amortises_client_across_batches() {
+        // Snapshot the global `SyncFetcher::new` counter before the
+        // test. A correct implementation calls `SyncFetcher::new` once
+        // per `cmd_rollup_sync` invocation (here: once for both
+        // batches); a regression that rebuilds it per batch bumps the
+        // counter twice. Counter is gated on `#[serial(...)]` so two
+        // concurrent tests sharing this static do not stomp each
+        // other.
+        let new_before =
+            SYNC_FETCHER_NEW_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+
+        let wallet = super::tests::test_wallet(1);
+        let memos = build_recoverable_notes(&wallet, 10);
+        let routes = mock_routes_for_direct_notes(&memos);
+
+        let (base_url, served) = super::tests::spawn_counted_mock_http_server(routes);
+        let fetcher = SyncFetcher::new(4).expect("SyncFetcher init");
+        let indices: Vec<u64> = (0..10).collect();
+
+        let r1 = fetcher
+            .fetch(&base_url, "head", &indices, 4)
+            .expect("first fetch");
+        assert_eq!(r1.len(), 10);
+        let n_after_first = served.load(std::sync::atomic::Ordering::SeqCst);
+
+        let r2 = fetcher
+            .fetch(&base_url, "head", &indices, 4)
+            .expect("second fetch");
+        assert_eq!(r2.len(), 10);
+        let n_after_second = served.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            r1, r2,
+            "two back-to-back fetches against the same window must produce identical results"
+        );
+        // 1 length + 1 value per index per call ⇒ exactly 20 served per call.
+        assert_eq!(
+            n_after_first, 20,
+            "first batch should serve exactly 1 length + 1 value per index"
+        );
+        assert_eq!(
+            n_after_second - n_after_first,
+            20,
+            "second batch should serve exactly 1 length + 1 value per index"
+        );
+
+        // **Load-bearing amortisation assertion** (post-#25-review):
+        // exactly one `SyncFetcher::new` call backed both fetches. A
+        // regression that constructs a fresh `SyncFetcher` per batch
+        // would surface here as `delta == 2`, and `cmd_rollup_sync`
+        // would lose the TLS+runtime+worker-thread amortisation across
+        // batches (the storm described in PR #25 review B3).
+        let new_after =
+            SYNC_FETCHER_NEW_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            new_after - new_before,
+            1,
+            "exactly one SyncFetcher must service both batches; \
+             a per-batch rebuild would bump the counter to 2"
+        );
+
+        // SyncFetcher is dropped here ⇒ worker thread receives Shutdown
+        // and joins. If the channel had been closed early or the runtime
+        // had panicked, the next fetch would hang or error; the test
+        // body finishing without timeout is the live-fetcher signal.
+        drop(fetcher);
+    }
+
+    /// 2.C test (post-#25 review B1 rewrite): rayon parallel
+    /// `try_recover_note` must return the same `Note`s as a single-threaded
+    /// run AND must match an independent fixture-time oracle.
+    ///
+    /// Pre-fix shape (replaced): the test compared sequential
+    /// `apply_scan_feed` against parallel `apply_scan_feed`. Both branches
+    /// went through the same function, so a regression that dropped half
+    /// the recoveries from `apply_scan_feed` failed both branches
+    /// identically — the equality assertion still passed. Reviewer
+    /// reproduced this by mutating `apply_scan_feed:5330-5334` to drop
+    /// half the recoveries; the old test stayed green.
+    ///
+    /// Post-fix shape: build the fixture so we KNOW a priori which
+    /// indices are recoverable and what their (cm, value) tuples are,
+    /// then assert that BOTH the sequential and the parallel pass each
+    /// produce exactly that oracle set — and that they match each other.
+    /// Mutating the recover path to drop half of any input now fails the
+    /// oracle equality on both branches, loud.
+    ///
+    /// The hot-path target is `apply_scan_feed_recover_batch` (the
+    /// per-batch recover function `cmd_rollup_sync` calls), not the
+    /// legacy `apply_scan_feed` (used only by the dead `cmd_scan` path).
+    /// That's the function the rayon `par_iter` was added to in B2; this
+    /// test pins the contract for the function callers actually hit.
+    #[test]
+    fn parallel_decrypt_returns_same_results_as_sequential() {
+        // The recoverable wallet only has address 0 cached.
+        let wallet = super::tests::test_wallet(1);
+
+        // The "broader" wallet has two addresses cached (0 and 1) and
+        // shares the same master_sk as `wallet` (per the test fixture).
+        // We use it to mint notes against ADDRESS 1 — `wallet` only has
+        // address 0 in its `addresses` list, so `try_recover_note`'s
+        // per-address detect loop never sees address 1's KEM keys and
+        // such notes are not recoverable for `wallet`. This is the
+        // "same seed, different active address" non-recoverability
+        // shape that mirrors a daemon's restricted-address profile.
+        let broader = super::tests::test_wallet(2);
+        let total = 50usize;
+
+        // Each entry is `(memo, expected_recoverable, expected_value)`.
+        // Indices [0..50): odd indices target address 0 (recoverable
+        // for `wallet`); even indices target address 1 (only present in
+        // `broader`, NOT recoverable for `wallet`).
+        struct OracleEntry {
+            memo: NoteMemo,
+            expected_recoverable: bool,
+            expected_value: u64,
+        }
+        let oracle: Vec<OracleEntry> = (0..total)
+            .map(|i| {
+                let mut rseed = ZERO;
+                rseed[0] = (i & 0xff) as u8;
+                rseed[1] = ((i >> 8) & 0xff) as u8;
+                let recoverable = i % 2 == 1;
+                let value = 100 + i as u64;
+                let (target_wallet, addr_idx): (&WalletFile, u32) = if recoverable {
+                    (&wallet, 0)
+                } else {
+                    (&broader, 1)
+                };
+                let mut nm = super::tests::note_memo_for_wallet_address(
+                    target_wallet,
+                    addr_idx,
+                    value,
+                    rseed,
+                    Some(format!("memo-{i}").as_bytes()),
+                );
+                nm.index = i;
+                OracleEntry {
+                    memo: nm,
+                    expected_recoverable: recoverable,
+                    expected_value: value,
+                }
+            })
+            .collect();
+
+        let memos: Vec<NoteMemo> = oracle.iter().map(|o| o.memo.clone()).collect();
+        let expected_recovered: Vec<(usize, F, u64)> = oracle
+            .iter()
+            .filter(|o| o.expected_recoverable)
+            .map(|o| (o.memo.index, o.memo.cm, o.expected_value))
+            .collect();
+        assert!(
+            !expected_recovered.is_empty(),
+            "fixture must contain at least one recoverable note for the test to be load-bearing"
+        );
+        assert!(
+            expected_recovered.len() < total,
+            "fixture must contain at least one non-recoverable note so the test catches over-recovery"
+        );
+
+        let feed = NotesFeedResp {
+            notes: memos.clone(),
+            next_cursor: total,
+        };
+
+        // Sequential branch: force a one-thread rayon pool. `install`
+        // makes any nested `par_iter` collapse to serial work.
+        // `WalletFile` isn't `Clone`, so we round-trip it through serde
+        // to get independent copies for each branch — recovery pushes
+        // notes into `w.notes`, so we cannot share state across the two
+        // runs.
+        let wallet_json = serde_json::to_string(&wallet).expect("serialize wallet");
+        let mut wallet_seq: WalletFile =
+            serde_json::from_str(&wallet_json).expect("clone wallet via serde");
+        let mut wallet_par: WalletFile =
+            serde_json::from_str(&wallet_json).expect("clone wallet via serde");
+
+        let pool_seq = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon single-thread pool");
+        let mut seen_cms_seq: Vec<F> = Vec::new();
+        let found_seq = pool_seq.install(|| {
+            apply_scan_feed_recover_batch(&mut wallet_seq, &feed, &mut seen_cms_seq)
+        });
+
+        // Parallel branch: default global rayon pool.
+        let mut seen_cms_par: Vec<F> = Vec::new();
+        let found_par = apply_scan_feed_recover_batch(&mut wallet_par, &feed, &mut seen_cms_par);
+
+        // Each branch matches the independently-computed oracle.
+        assert_eq!(
+            found_seq,
+            expected_recovered.len(),
+            "sequential branch must recover exactly the oracle set"
+        );
+        assert_eq!(
+            found_par,
+            expected_recovered.len(),
+            "parallel branch must recover exactly the oracle set"
+        );
+
+        let seq_tuples: Vec<(usize, F, u64)> = wallet_seq
+            .notes
+            .iter()
+            .map(|n| (n.index, n.cm, n.v))
+            .collect();
+        let par_tuples: Vec<(usize, F, u64)> = wallet_par
+            .notes
+            .iter()
+            .map(|n| (n.index, n.cm, n.v))
+            .collect();
+        assert_eq!(
+            seq_tuples, expected_recovered,
+            "sequential branch tuples must match the oracle"
+        );
+        assert_eq!(
+            par_tuples, expected_recovered,
+            "parallel branch tuples must match the oracle"
+        );
+        // Cross-check: the two branches must agree on each other too.
+        assert_eq!(seq_tuples, par_tuples);
+
+        // `seen_cms` carries every batch cm (recoverable or not) for
+        // the finalize-pin discipline. Both branches must produce the
+        // same multiset, in input order (we extend, we don't sort).
+        let expected_seen_cms: Vec<F> = memos.iter().map(|nm| nm.cm).collect();
+        assert_eq!(
+            seen_cms_seq, expected_seen_cms,
+            "sequential branch must extend seen_cms with every batch cm in input order"
+        );
+        assert_eq!(
+            seen_cms_par, expected_seen_cms,
+            "parallel branch must extend seen_cms with every batch cm in input order"
+        );
+
+        // Cursor advance.
+        assert_eq!(wallet_seq.scanned, total);
+        assert_eq!(wallet_par.scanned, total);
     }
 }
