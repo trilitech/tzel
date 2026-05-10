@@ -24,12 +24,12 @@ fn felt_to_hex(f: &F) -> String {
     if trimmed.is_empty() {
         "0x0".to_string()
     } else {
-        format!("0x{}", trimmed)
+        format!("0x{trimmed}")
     }
 }
 
 fn felt_u64_to_hex(v: u64) -> String {
-    format!("0x{:x}", v)
+    format!("0x{v:x}")
 }
 
 fn bench_master_sk() -> F {
@@ -523,6 +523,6 @@ pub fn build_named_bench_witness(
         ("unshield", Some(n)) => Ok((CircuitKind::Unshield, build_unshield_bench_witness(n))),
         ("shield", Some(_)) => Err("shield does not take an input count".into()),
         ("transfer", None) | ("unshield", None) => Err("missing input count".into()),
-        _ => Err(format!("unknown bench witness kind: {}", kind)),
+        _ => Err(format!("unknown bench witness kind: {kind}")),
     }
 }

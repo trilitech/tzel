@@ -237,8 +237,7 @@ fn assert_full_xmss_bds_rebuild_allowed(op: &str, depth: usize) {
     let test_trap = full_xmss_test_trap_enabled();
     if depth == AUTH_DEPTH && (env_trap || test_trap) {
         panic!(
-            "unexpected full depth-{} XMSS/BDS rebuild via {} — default tests must use fixed fixtures or small-depth helpers",
-            AUTH_DEPTH, op
+            "unexpected full depth-{AUTH_DEPTH} XMSS/BDS rebuild via {op} — default tests must use fixed fixtures or small-depth helpers"
         );
     }
 }
@@ -255,7 +254,7 @@ impl XmssBdsState {
             return Err("XMSS depth must be positive".to_string());
         }
         if k >= depth {
-            return Err(format!("invalid XMSS BDS k={} for depth {}", k, depth));
+            return Err(format!("invalid XMSS BDS k={k} for depth {depth}"));
         }
 
         let auth_tree_size = 1usize << depth;
@@ -336,7 +335,7 @@ impl XmssBdsState {
         assert_full_xmss_bds_rebuild_allowed("XmssBdsState::from_index_with_params", depth);
         let auth_tree_size = 1usize << depth;
         if next_index as usize > auth_tree_size {
-            return Err(format!("invalid XMSS index {}", next_index));
+            return Err(format!("invalid XMSS index {next_index}"));
         }
         let (mut state, root) = Self::new_with_params(ask_j, pub_seed, depth, k)?;
         for _ in 0..next_index {
@@ -388,11 +387,11 @@ impl XmssBdsState {
                 self.auth_path[h] = if h < treehash_levels {
                     self.treehash[h]
                         .take_ready()
-                        .ok_or_else(|| format!("missing BDS treehash node at level {}", h))?
+                        .ok_or_else(|| format!("missing BDS treehash node at level {h}"))?
                 } else {
                     self.retain[h]
                         .pop()
-                        .ok_or_else(|| format!("missing BDS retain node at level {}", h))?
+                        .ok_or_else(|| format!("missing BDS retain node at level {h}"))?
                 };
             }
 
@@ -693,8 +692,7 @@ impl WalletFile {
     ) -> Result<WalletAddressState, String> {
         #[cfg(test)]
         panic!(
-            "unexpected XMSS address derivation for j={} next_wots_index={} — default tests must use fixed prederived wallet/address fixtures",
-            j, next_wots_index
+            "unexpected XMSS address derivation for j={j} next_wots_index={next_wots_index} — default tests must use fixed prederived wallet/address fixtures"
         );
 
         #[cfg(not(test))]
@@ -824,14 +822,13 @@ impl WalletFile {
         let addr = self
             .addresses
             .get_mut(addr_index as usize)
-            .ok_or_else(|| format!("missing address record {}", addr_index))?;
+            .ok_or_else(|| format!("missing address record {addr_index}"))?;
         let ask_j = derive_ask(&ask_base, addr_index);
         let bds = &mut addr.bds;
         let key_idx = bds.next_index;
         if (key_idx as usize) >= AUTH_TREE_SIZE {
             return Err(format!(
-                "XMSS keys exhausted for address {} — generate a new address",
-                addr_index
+                "XMSS keys exhausted for address {addr_index} — generate a new address"
             ));
         }
         let path = bds.current_path().to_vec();
@@ -1195,21 +1192,21 @@ impl Drop for WalletLock {
 }
 
 fn wallet_lock_path(path: &str) -> PathBuf {
-    PathBuf::from(format!("{}.lock", path))
+    PathBuf::from(format!("{path}.lock"))
 }
 
 fn wallet_xmss_floor_path(path: &str) -> PathBuf {
-    PathBuf::from(format!("{}.xmss-floor", path))
+    PathBuf::from(format!("{path}.xmss-floor"))
 }
 
 #[cfg(unix)]
 fn is_stale_wallet_lock(path: &Path) -> Result<bool, String> {
-    let pid_text = std::fs::read_to_string(path).map_err(|e| format!("read lock file: {}", e))?;
+    let pid_text = std::fs::read_to_string(path).map_err(|e| format!("read lock file: {e}"))?;
     let pid = pid_text
         .trim()
         .parse::<u32>()
         .map_err(|_| "lock file contains invalid pid".to_string())?;
-    Ok(!PathBuf::from(format!("/proc/{}", pid)).exists())
+    Ok(!PathBuf::from(format!("/proc/{pid}")).exists())
 }
 
 #[cfg(not(unix))]
@@ -1226,9 +1223,9 @@ fn acquire_wallet_lock(path: &str) -> Result<WalletLock, String> {
         {
             Ok(mut file) => {
                 writeln!(file, "{}", std::process::id())
-                    .map_err(|e| format!("write lock file: {}", e))?;
+                    .map_err(|e| format!("write lock file: {e}"))?;
                 file.sync_all()
-                    .map_err(|e| format!("fsync lock file: {}", e))?;
+                    .map_err(|e| format!("fsync lock file: {e}"))?;
                 Ok(WalletLock {
                     path: lock_path.to_path_buf(),
                 })
@@ -1236,7 +1233,7 @@ fn acquire_wallet_lock(path: &str) -> Result<WalletLock, String> {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if allow_stale_recovery && is_stale_wallet_lock(lock_path).unwrap_or(false) {
                     std::fs::remove_file(lock_path)
-                        .map_err(|e| format!("remove stale lock: {}", e))?;
+                        .map_err(|e| format!("remove stale lock: {e}"))?;
                     return try_acquire(lock_path, false);
                 }
                 Err(format!(
@@ -1244,7 +1241,7 @@ fn acquire_wallet_lock(path: &str) -> Result<WalletLock, String> {
                     lock_path.display()
                 ))
             }
-            Err(e) => Err(format!("create lock file: {}", e)),
+            Err(e) => Err(format!("create lock file: {e}")),
         }
     }
 
@@ -1253,9 +1250,9 @@ fn acquire_wallet_lock(path: &str) -> Result<WalletLock, String> {
 
 fn load_wallet(path: &str) -> Result<WalletFile, String> {
     warn_if_wallet_permissions_are_too_open(path);
-    let data = std::fs::read_to_string(path).map_err(|e| format!("read wallet: {}", e))?;
+    let data = std::fs::read_to_string(path).map_err(|e| format!("read wallet: {e}"))?;
     let mut wallet: WalletFile =
-        serde_json::from_str(&data).map_err(|e| format!("parse wallet: {}", e))?;
+        serde_json::from_str(&data).map_err(|e| format!("parse wallet: {e}"))?;
     enforce_wallet_xmss_floor(path, &wallet)?;
     wallet.materialize_addresses()?;
     Ok(wallet)
@@ -1263,36 +1260,36 @@ fn load_wallet(path: &str) -> Result<WalletFile, String> {
 
 fn load_private_json<T: DeserializeOwned>(path: &str, label: &str) -> Result<T, String> {
     warn_if_wallet_permissions_are_too_open(path);
-    let data = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", label, e))?;
-    serde_json::from_str(&data).map_err(|e| format!("parse {}: {}", label, e))
+    let data = std::fs::read_to_string(path).map_err(|e| format!("read {label}: {e}"))?;
+    serde_json::from_str(&data).map_err(|e| format!("parse {label}: {e}"))
 }
 
 fn save_private_json<T: Serialize>(path: &str, value: &T, label: &str) -> Result<(), String> {
     let data =
-        serde_json::to_string_pretty(value).map_err(|e| format!("serialize {}: {}", label, e))?;
+        serde_json::to_string_pretty(value).map_err(|e| format!("serialize {label}: {e}"))?;
     let output_path = std::path::Path::new(path);
     let (tmp, mut file) = create_private_temp_file(output_path, label)?;
     file.write_all(data.as_bytes())
-        .map_err(|e| format!("write {} tmp: {}", label, e))?;
+        .map_err(|e| format!("write {label} tmp: {e}"))?;
     file.sync_all()
-        .map_err(|e| format!("fsync {} tmp: {}", label, e))?;
+        .map_err(|e| format!("fsync {label} tmp: {e}"))?;
     drop(file);
-    std::fs::rename(&tmp, output_path).map_err(|e| format!("rename {}: {}", label, e))?;
+    std::fs::rename(&tmp, output_path).map_err(|e| format!("rename {label}: {e}"))?;
     set_wallet_permissions(output_path)?;
     sync_parent_dir(output_path)
 }
 
 fn save_wallet(path: &str, w: &WalletFile) -> Result<(), String> {
-    let data = serde_json::to_string_pretty(w).map_err(|e| format!("serialize: {}", e))?;
+    let data = serde_json::to_string_pretty(w).map_err(|e| format!("serialize: {e}"))?;
     // Durable write: fsync temp file, rename atomically, then fsync the parent
     // directory so one-time WOTS state survives crashes before submit returns.
     let wallet_path = std::path::Path::new(path);
     let (tmp, mut file) = create_private_temp_file(wallet_path, "wallet")?;
     file.write_all(data.as_bytes())
-        .map_err(|e| format!("write tmp: {}", e))?;
-    file.sync_all().map_err(|e| format!("fsync tmp: {}", e))?;
+        .map_err(|e| format!("write tmp: {e}"))?;
+    file.sync_all().map_err(|e| format!("fsync tmp: {e}"))?;
     drop(file);
-    std::fs::rename(&tmp, wallet_path).map_err(|e| format!("rename: {}", e))?;
+    std::fs::rename(&tmp, wallet_path).map_err(|e| format!("rename: {e}"))?;
     set_wallet_permissions(wallet_path)?;
     sync_parent_dir(wallet_path)?;
     save_wallet_xmss_floor(path, &w.wallet_xmss_floor())
@@ -1308,15 +1305,15 @@ fn save_watch_wallet(path: &str, watch: &WatchWalletFile) -> Result<(), String> 
 
 fn save_wallet_xmss_floor(path: &str, floor: &WalletXmssFloor) -> Result<(), String> {
     let data =
-        serde_json::to_string_pretty(floor).map_err(|e| format!("serialize floor: {}", e))?;
+        serde_json::to_string_pretty(floor).map_err(|e| format!("serialize floor: {e}"))?;
     let floor_path = wallet_xmss_floor_path(path);
     let (tmp, mut file) = create_private_temp_file(&floor_path, "wallet xmss floor")?;
     file.write_all(data.as_bytes())
-        .map_err(|e| format!("write floor tmp: {}", e))?;
+        .map_err(|e| format!("write floor tmp: {e}"))?;
     file.sync_all()
-        .map_err(|e| format!("fsync floor tmp: {}", e))?;
+        .map_err(|e| format!("fsync floor tmp: {e}"))?;
     drop(file);
-    std::fs::rename(&tmp, &floor_path).map_err(|e| format!("rename floor: {}", e))?;
+    std::fs::rename(&tmp, &floor_path).map_err(|e| format!("rename floor: {e}"))?;
     set_wallet_permissions(&floor_path)?;
     sync_parent_dir(&floor_path)
 }
@@ -1354,17 +1351,17 @@ fn create_private_temp_file(
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| format!("system clock error: {}", e))?
+                .map_err(|e| format!("system clock error: {e}"))?
                 .as_nanos(),
             attempt
         ));
         match create_private_file(&tmp) {
             Ok(file) => return Ok((tmp, file)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(format!("create {} tmp: {}", label, err)),
+            Err(err) => return Err(format!("create {label} tmp: {err}")),
         }
     }
-    Err(format!("create {} tmp: too many collisions", label))
+    Err(format!("create {label} tmp: too many collisions"))
 }
 
 fn enforce_wallet_xmss_floor(path: &str, wallet: &WalletFile) -> Result<(), String> {
@@ -1373,7 +1370,7 @@ fn enforce_wallet_xmss_floor(path: &str, wallet: &WalletFile) -> Result<(), Stri
         return Ok(());
     };
     let floor: WalletXmssFloor =
-        serde_json::from_str(&data).map_err(|e| format!("parse xmss floor: {}", e))?;
+        serde_json::from_str(&data).map_err(|e| format!("parse xmss floor: {e}"))?;
     if floor.wallet_fingerprint != hash(&wallet.master_sk) {
         return Ok(());
     }
@@ -1387,8 +1384,7 @@ fn enforce_wallet_xmss_floor(path: &str, wallet: &WalletFile) -> Result<(), Stri
         let current_next = current_wallet_wots_floor(wallet, *addr_index);
         if current_next < *required_next {
             return Err(format!(
-                "wallet appears to be restored from a stale backup: address {} next_wots_index {} is behind durable XMSS floor {}",
-                addr_index, current_next, required_next
+                "wallet appears to be restored from a stale backup: address {addr_index} next_wots_index {current_next} is behind durable XMSS floor {required_next}"
             ));
         }
     }
@@ -1419,7 +1415,7 @@ fn set_wallet_permissions(path: &std::path::Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
     let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, perms).map_err(|e| format!("chmod wallet: {}", e))
+    std::fs::set_permissions(path, perms).map_err(|e| format!("chmod wallet: {e}"))
 }
 
 #[cfg(not(unix))]
@@ -1437,8 +1433,7 @@ fn warn_if_wallet_permissions_are_too_open(path: &str) {
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         eprintln!(
-            "warning: wallet file {} is not private (mode {:o}); it contains plaintext spending keys",
-            path, mode
+            "warning: wallet file {path} is not private (mode {mode:o}); it contains plaintext spending keys"
         );
     }
 }
@@ -1452,9 +1447,9 @@ fn warn_if_wallet_permissions_are_too_open(_path: &str) {}
 #[cfg(unix)]
 fn sync_parent_dir(path: &std::path::Path) -> Result<(), String> {
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let dir = std::fs::File::open(parent).map_err(|e| format!("open parent dir: {}", e))?;
+    let dir = std::fs::File::open(parent).map_err(|e| format!("open parent dir: {e}"))?;
     dir.sync_all()
-        .map_err(|e| format!("fsync parent dir: {}", e))
+        .map_err(|e| format!("fsync parent dir: {e}"))
 }
 
 #[cfg(not(unix))]
@@ -1463,8 +1458,8 @@ fn sync_parent_dir(_path: &std::path::Path) -> Result<(), String> {
 }
 
 fn load_address(path: &str) -> Result<PaymentAddress, String> {
-    let data = std::fs::read_to_string(path).map_err(|e| format!("read address: {}", e))?;
-    serde_json::from_str(&data).map_err(|e| format!("parse address: {}", e))
+    let data = std::fs::read_to_string(path).map_err(|e| format!("read address: {e}"))?;
+    serde_json::from_str(&data).map_err(|e| format!("parse address: {e}"))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1477,15 +1472,15 @@ fn post_json<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
 ) -> Result<Resp, String> {
     let resp = ureq::post(url)
         .send_json(serde_json::to_value(body).unwrap())
-        .map_err(|e| format!("HTTP error: {}", e))?;
+        .map_err(|e| format!("HTTP error: {e}"))?;
     let status = resp.status();
     if status != 200 {
         let body = resp.into_body().read_to_string().unwrap_or_default();
-        return Err(format!("HTTP {}: {}", status, body));
+        return Err(format!("HTTP {status}: {body}"));
     }
     resp.into_body()
         .read_json()
-        .map_err(|e| format!("parse response: {}", e))
+        .map_err(|e| format!("parse response: {e}"))
 }
 
 fn post_json_with_bearer<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
@@ -1495,7 +1490,7 @@ fn post_json_with_bearer<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
 ) -> Result<Resp, String> {
     let mut req = ureq::post(url);
     if let Some(token) = bearer_token {
-        req = req.header("Authorization", &format!("Bearer {}", token));
+        req = req.header("Authorization", &format!("Bearer {token}"));
     }
     // Don't let ureq's default `error_on_status_codes` swallow the 4xx/5xx
     // response body — surface the server-provided error to the caller so
@@ -1508,24 +1503,24 @@ fn post_json_with_bearer<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
         .http_status_as_error(false)
         .build()
         .send_json(serde_json::to_value(body).unwrap())
-        .map_err(|e| format!("HTTP error: {}", e))?;
+        .map_err(|e| format!("HTTP error: {e}"))?;
     let status = resp.status();
     if status != 200 {
         let body = resp.into_body().read_to_string().unwrap_or_default();
-        return Err(format!("HTTP {}: {}", status, body));
+        return Err(format!("HTTP {status}: {body}"));
     }
     resp.into_body()
         .read_json()
-        .map_err(|e| format!("parse response: {}", e))
+        .map_err(|e| format!("parse response: {e}"))
 }
 
 fn get_json<Resp: for<'de> Deserialize<'de>>(url: &str) -> Result<Resp, String> {
     let resp = ureq::get(url)
         .call()
-        .map_err(|e| format!("HTTP error: {}", e))?;
+        .map_err(|e| format!("HTTP error: {e}"))?;
     resp.into_body()
         .read_json()
-        .map_err(|e| format!("parse response: {}", e))
+        .map_err(|e| format!("parse response: {e}"))
 }
 
 fn get_json_with_bearer<Resp: for<'de> Deserialize<'de>>(
@@ -1534,21 +1529,21 @@ fn get_json_with_bearer<Resp: for<'de> Deserialize<'de>>(
 ) -> Result<Resp, String> {
     let mut req = ureq::get(url);
     if let Some(token) = bearer_token {
-        req = req.header("Authorization", &format!("Bearer {}", token));
+        req = req.header("Authorization", &format!("Bearer {token}"));
     }
-    let resp = req.call().map_err(|e| format!("HTTP error: {}", e))?;
+    let resp = req.call().map_err(|e| format!("HTTP error: {e}"))?;
     resp.into_body()
         .read_json()
-        .map_err(|e| format!("parse response: {}", e))
+        .map_err(|e| format!("parse response: {e}"))
 }
 
 fn get_text(url: &str) -> Result<String, String> {
     let resp = ureq::get(url)
         .call()
-        .map_err(|e| format!("HTTP error: {}", e))?;
+        .map_err(|e| format!("HTTP error: {e}"))?;
     resp.into_body()
         .read_to_string()
-        .map_err(|e| format!("read response: {}", e))
+        .map_err(|e| format!("read response: {e}"))
 }
 
 fn get_text_allow_404(url: &str) -> Result<Option<String>, String> {
@@ -1557,9 +1552,9 @@ fn get_text_allow_404(url: &str) -> Result<Option<String>, String> {
             .into_body()
             .read_to_string()
             .map(Some)
-            .map_err(|e| format!("read response: {}", e)),
+            .map_err(|e| format!("read response: {e}")),
         Err(ureq::Error::StatusCode(404)) => Ok(None),
-        Err(e) => Err(format!("HTTP error: {}", e)),
+        Err(e) => Err(format!("HTTP error: {e}")),
     }
 }
 
@@ -1606,7 +1601,7 @@ struct WalletNetworkProfile {
 }
 
 fn default_network_profile_path(wallet_path: &str) -> PathBuf {
-    PathBuf::from(format!("{}.network.json", wallet_path))
+    PathBuf::from(format!("{wallet_path}.network.json"))
 }
 
 fn default_octez_client_bin() -> String {
@@ -1658,8 +1653,8 @@ fn shadownet_profile(
 }
 
 fn load_network_profile(path: &Path) -> Result<WalletNetworkProfile, String> {
-    let data = std::fs::read_to_string(path).map_err(|e| format!("read network profile: {}", e))?;
-    serde_json::from_str(&data).map_err(|e| format!("parse network profile: {}", e))
+    let data = std::fs::read_to_string(path).map_err(|e| format!("read network profile: {e}"))?;
+    serde_json::from_str(&data).map_err(|e| format!("parse network profile: {e}"))
 }
 
 fn validate_network_profile(profile: &WalletNetworkProfile) -> Result<(), String> {
@@ -1698,14 +1693,14 @@ fn display_network_profile_json(profile: &WalletNetworkProfile) -> String {
 fn save_network_profile(path: &Path, profile: &WalletNetworkProfile) -> Result<(), String> {
     validate_network_profile(profile)?;
     let data =
-        serde_json::to_string_pretty(profile).map_err(|e| format!("serialize profile: {}", e))?;
+        serde_json::to_string_pretty(profile).map_err(|e| format!("serialize profile: {e}"))?;
     let (tmp, mut file) = create_private_temp_file(path, "network profile")?;
     file.write_all(data.as_bytes())
-        .map_err(|e| format!("write profile tmp: {}", e))?;
+        .map_err(|e| format!("write profile tmp: {e}"))?;
     file.sync_all()
-        .map_err(|e| format!("fsync profile tmp: {}", e))?;
+        .map_err(|e| format!("fsync profile tmp: {e}"))?;
     drop(file);
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename profile: {}", e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename profile: {e}"))?;
     sync_parent_dir(path)
 }
 
@@ -1713,8 +1708,7 @@ fn load_required_network_profile(wallet_path: &str) -> Result<WalletNetworkProfi
     let profile_path = default_network_profile_path(wallet_path);
     let profile = load_network_profile(&profile_path).map_err(|e| {
         format!(
-            "network profile is not configured: {}. Run `tzel-wallet profile init-shadownet --rollup-node-url ... --rollup-address ... --bridge-ticketer ... --dal-fee ... --dal-fee-address ... --source-alias ...`",
-            e
+            "network profile is not configured: {e}. Run `tzel-wallet profile init-shadownet --rollup-node-url ... --rollup-address ... --bridge-ticketer ... --dal-fee ... --dal-fee-address ... --source-alias ...`"
         )
     })?;
     if profile.network != "shadownet" {
@@ -1806,13 +1800,11 @@ fn withdraw_owner_from_public_balance_key(value: &str) -> Result<&str, String> {
             return Ok(owner);
         }
         return Err(format!(
-            "public rollup account {} has non-implicit owner {}",
-            value, owner
+            "public rollup account {value} has non-implicit owner {owner}"
         ));
     }
     Err(format!(
-        "public rollup account {} must be a tz1/tz2/tz3 address or public:<tz-address>:<label>",
-        value
+        "public rollup account {value} must be a tz1/tz2/tz3 address or public:<tz-address>:<label>"
     ))
 }
 
@@ -1851,7 +1843,7 @@ impl RollupStateSnapshot {
 
     fn merkle_path(&self, index: usize) -> Result<MerklePathResp, String> {
         if index >= self.notes.len() {
-            return Err(format!("note index {} is outside current tree", index));
+            return Err(format!("note index {index} is outside current tree"));
         }
         let (siblings, root) = self.tree.auth_path(index);
         Ok(MerklePathResp { siblings, root })
@@ -1909,7 +1901,7 @@ impl<'a> RollupRpc<'a> {
 
     fn read_durable_text_at_block(&self, block_ref: &str, key: &str) -> Result<String, String> {
         let url = self.block_durable_value_url(block_ref, key);
-        get_text(&url).map_err(|e| format!("rollup RPC {} failed: {}", url, e))
+        get_text(&url).map_err(|e| format!("rollup RPC {url} failed: {e}"))
     }
 
     fn read_durable_length_at_block(
@@ -1919,7 +1911,7 @@ impl<'a> RollupRpc<'a> {
     ) -> Result<Option<usize>, String> {
         let url = self.block_durable_length_url(block_ref, key);
         let Some(raw) =
-            get_text_allow_404(&url).map_err(|e| format!("rollup RPC {} failed: {}", url, e))?
+            get_text_allow_404(&url).map_err(|e| format!("rollup RPC {url} failed: {e}"))?
         else {
             return Ok(None);
         };
@@ -1928,35 +1920,34 @@ impl<'a> RollupRpc<'a> {
 
     fn parse_durable_length(key: &str, raw: &str) -> Result<Option<usize>, String> {
         let value: Option<serde_json::Value> =
-            serde_json::from_str(raw).map_err(|e| format!("parse durable length: {}", e))?;
+            serde_json::from_str(raw).map_err(|e| format!("parse durable length: {e}"))?;
         match value {
             None => Ok(None),
             Some(serde_json::Value::String(text)) => {
                 let parsed = text
                     .parse::<u64>()
-                    .map_err(|e| format!("parse durable length integer: {}", e))?;
+                    .map_err(|e| format!("parse durable length integer: {e}"))?;
                 usize::try_from(parsed)
                     .map(Some)
-                    .map_err(|_| format!("durable length at {} does not fit in usize", key))
+                    .map_err(|_| format!("durable length at {key} does not fit in usize"))
             }
             Some(serde_json::Value::Number(number)) => {
                 let parsed = number
                     .as_u64()
-                    .ok_or_else(|| format!("durable length at {} must be non-negative", key))?;
+                    .ok_or_else(|| format!("durable length at {key} must be non-negative"))?;
                 usize::try_from(parsed)
                     .map(Some)
-                    .map_err(|_| format!("durable length at {} does not fit in usize", key))
+                    .map_err(|_| format!("durable length at {key} does not fit in usize"))
             }
             Some(other) => Err(format!(
-                "durable length at {} has unexpected JSON form {}",
-                key, other
+                "durable length at {key} has unexpected JSON form {other}"
             )),
         }
     }
 
     fn read_durable_bytes_at_block(&self, block_ref: &str, key: &str) -> Result<Vec<u8>, String> {
         let raw = self.read_durable_text_at_block(block_ref, key)?;
-        parse_rollup_rpc_bytes(&raw).map_err(|e| format!("decode durable value at {}: {}", key, e))
+        parse_rollup_rpc_bytes(&raw).map_err(|e| format!("decode durable value at {key}: {e}"))
     }
 
     fn read_u64_at_block(&self, block_ref: &str, key: &str) -> Result<u64, String> {
@@ -2040,11 +2031,11 @@ impl<'a> RollupRpc<'a> {
         if let Ok(text) = serde_json::from_str::<String>(&raw) {
             return text
                 .parse::<i32>()
-                .map_err(|e| format!("parse head level integer: {}", e));
+                .map_err(|e| format!("parse head level integer: {e}"));
         }
         raw.trim()
             .parse::<i32>()
-            .map_err(|e| format!("parse head level integer: {}", e))
+            .map_err(|e| format!("parse head level integer: {e}"))
     }
 
     #[cfg(test)]
@@ -2088,8 +2079,7 @@ impl<'a> RollupRpc<'a> {
             let bytes = self.read_durable_bytes_at_block(block_ref, &direct_key)?;
             if bytes.len() > MAX_PUBLISHED_NOTE_BYTES {
                 return Err(format!(
-                    "durable note {} at {} exceeds max supported size {}",
-                    index, direct_key, MAX_PUBLISHED_NOTE_BYTES
+                    "durable note {index} at {direct_key} exceeds max supported size {MAX_PUBLISHED_NOTE_BYTES}"
                 ));
             }
             return Ok(Some(bytes));
@@ -2106,14 +2096,12 @@ impl<'a> RollupRpc<'a> {
         let total_len_u64 = self.read_u64_at_block(block_ref, &len_key)?;
         let total_len = usize::try_from(total_len_u64).map_err(|_| {
             format!(
-                "chunked durable note {} length does not fit in usize",
-                index
+                "chunked durable note {index} length does not fit in usize"
             )
         })?;
         if total_len > MAX_PUBLISHED_NOTE_BYTES {
             return Err(format!(
-                "chunked durable note {} length {} exceeds max supported size {}",
-                index, total_len, MAX_PUBLISHED_NOTE_BYTES
+                "chunked durable note {index} length {total_len} exceeds max supported size {MAX_PUBLISHED_NOTE_BYTES}"
             ));
         }
         let chunk_count = total_len.div_ceil(DURABLE_NOTE_CHUNK_BYTES);
@@ -2145,8 +2133,7 @@ impl<'a> RollupRpc<'a> {
             .map_err(|_| "tree size does not fit in usize".to_string())?;
         if cursor > count {
             return Err(format!(
-                "wallet cursor {} is ahead of rollup tree size {}",
-                cursor, count
+                "wallet cursor {cursor} is ahead of rollup tree size {count}"
             ));
         }
 
@@ -2155,8 +2142,7 @@ impl<'a> RollupRpc<'a> {
             let Some(bytes) = self.read_published_note_bytes_at_block(block_ref, i as u64)? else {
                 let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64);
                 return Err(format!(
-                    "rollup durable state is missing note {} at {} while tree size is {}. This usually means the deployed rollup kernel does not persist published note payloads, or the rollup node is not serving the expected durable state.",
-                    i, key, count
+                    "rollup durable state is missing note {i} at {key} while tree size is {count}. This usually means the deployed rollup kernel does not persist published note payloads, or the rollup node is not serving the expected durable state."
                 ));
             };
             let (cm, enc) = canonical_wire::decode_published_note(&bytes)?;
@@ -2263,7 +2249,7 @@ impl<'a> RollupRpc<'a> {
     fn ensure_rollup_address_matches(&self) -> Result<(), String> {
         let url = self.smart_rollup_address_url();
         let raw = get_text(&url)
-            .map_err(|e| format!("rollup RPC {} failed: {}", url, e))?;
+            .map_err(|e| format!("rollup RPC {url} failed: {e}"))?;
         let served = serde_json::from_str::<String>(&raw)
             .unwrap_or_else(|_| raw.trim().trim_matches('"').to_string());
         if served != self.profile.rollup_address {
@@ -2301,9 +2287,8 @@ impl<'a> RollupRpc<'a> {
             String::from_utf8(bytes).map_err(|_| "stored bridge ticketer is not UTF-8")?;
         if configured != expected_ticketer {
             return Err(format!(
-                "wallet profile's bridge_ticketer {} does not match the rollup's configured \
-                 ticketer {}; refusing to send a bridge deposit that the kernel would reject.",
-                expected_ticketer, configured
+                "wallet profile's bridge_ticketer {expected_ticketer} does not match the rollup's configured \
+                 ticketer {configured}; refusing to send a bridge deposit that the kernel would reject."
             ));
         }
         Ok(())
@@ -2452,7 +2437,7 @@ impl<'a> RollupRpc<'a> {
             (true, true) => String::new(),
             (false, true) => stdout.clone(),
             (true, false) => stderr.clone(),
-            (false, false) => format!("{}\n{}", stdout, stderr),
+            (false, false) => format!("{stdout}\n{stderr}"),
         };
 
         if !output.status.success() {
@@ -2472,7 +2457,7 @@ impl<'a> RollupRpc<'a> {
 
 fn encode_targeted_rollup_message(rollup_address: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
     let address = SmartRollupAddress::from_b58check(rollup_address)
-        .map_err(|_| format!("invalid rollup address: {}", rollup_address))?;
+        .map_err(|_| format!("invalid rollup address: {rollup_address}"))?;
     let frame = ExternalMessageFrame::Targetted {
         address,
         contents: payload,
@@ -2480,7 +2465,7 @@ fn encode_targeted_rollup_message(rollup_address: &str, payload: &[u8]) -> Resul
     let mut output = Vec::new();
     frame
         .bin_write(&mut output)
-        .map_err(|e| format!("failed to encode targeted rollup message: {}", e))?;
+        .map_err(|e| format!("failed to encode targeted rollup message: {e}"))?;
     Ok(output)
 }
 
@@ -2491,10 +2476,10 @@ fn write_temp_rollup_message_file(bytes: &[u8]) -> Result<std::path::PathBuf, St
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("system clock error: {}", e))?
+            .map_err(|e| format!("system clock error: {e}"))?
             .as_nanos()
     ));
-    std::fs::write(&path, bytes).map_err(|e| format!("write rollup message file: {}", e))?;
+    std::fs::write(&path, bytes).map_err(|e| format!("write rollup message file: {e}"))?;
     Ok(path)
 }
 
@@ -2555,7 +2540,7 @@ fn submit_kernel_message_via_operator(
 ) -> Result<RollupSubmissionReceipt, String> {
     let base = operator_url.trim_end_matches('/');
     let resp: SubmitRollupMessageResp = post_json_with_bearer(
-        &format!("{}/v1/rollup/submissions", base),
+        &format!("{base}/v1/rollup/submissions"),
         &SubmitRollupMessageReq {
             kind,
             rollup_address: rollup_address.to_string(),
@@ -2608,8 +2593,7 @@ fn submit_kernel_message_via_operator(
                 // daemon's settlement watcher still gets a chance to
                 // observe the eventual rollup-side delta.
                 eprintln!(
-                    "operator status polling stopped before terminal state: {}",
-                    err
+                    "operator status polling stopped before terminal state: {err}"
                 );
             }
         }
@@ -2683,7 +2667,7 @@ fn load_operator_submission(
 ) -> Result<SubmitRollupMessageResp, String> {
     let base = operator_url.trim_end_matches('/');
     get_json_with_bearer(
-        &format!("{}/v1/rollup/submissions/{}", base, submission_id),
+        &format!("{base}/v1/rollup/submissions/{submission_id}"),
         operator_bearer_token,
     )
 }
@@ -2706,7 +2690,7 @@ fn format_rollup_submission(submission: &RollupSubmission) -> String {
         format!("Status: {} via {}", status, transport),
     ];
     if let Some(op_hash) = &submission.operation_hash {
-        lines.push(format!("Operation hash: {}", op_hash));
+        lines.push(format!("Operation hash: {op_hash}"));
     }
     if !submission.dal_chunks.is_empty() {
         lines.push(format!("DAL chunks: {}", submission.dal_chunks.len()));
@@ -2724,7 +2708,7 @@ fn format_rollup_submission(submission: &RollupSubmission) -> String {
 }
 
 fn indexed_durable_key(prefix: &str, index: u64) -> String {
-    format!("{}{index:016x}", prefix)
+    format!("{prefix}{index:016x}")
 }
 
 fn indexed_durable_note_len_key(index: u64) -> String {
@@ -2768,7 +2752,7 @@ fn mutez_to_tez_string(amount_mutez: u64) -> String {
     if fractional == 0 {
         return whole.to_string();
     }
-    let mut out = format!("{}.{:06}", whole, fractional);
+    let mut out = format!("{whole}.{fractional:06}");
     while out.ends_with('0') {
         out.pop();
     }
@@ -2889,8 +2873,7 @@ fn extract_octez_prefixed_value(output: &str, prefix: &str) -> Option<String> {
 fn parse_octez_address_info(output: &str) -> Result<OctezAddressInfo, String> {
     let hash = extract_octez_prefixed_value(output, "Hash:").ok_or_else(|| {
         format!(
-            "could not parse octez-client address hash from output: {}",
-            output
+            "could not parse octez-client address hash from output: {output}"
         )
     })?;
     Ok(OctezAddressInfo { hash })
@@ -3046,7 +3029,7 @@ enum Cmd {
 pub fn sp_client_entry() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
@@ -3228,8 +3211,7 @@ fn phase_event_now_ts() -> String {
     let mm = (sod / 60) % 60;
     let ss = sod % 60;
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, mo, d, hh, mm, ss
+        "{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z"
     )
 }
 
@@ -3620,7 +3602,7 @@ enum UserProfileCmd {
 pub fn tzel_wallet_entry() {
     let cli = UserCli::parse();
     if let Err(e) = run_user(cli) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
@@ -3658,7 +3640,7 @@ pub fn tzel_detect_entry() {
         .build()
         .expect("tokio runtime");
     if let Err(e) = runtime.block_on(run_detect_service(cli)) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
@@ -3694,7 +3676,7 @@ async fn run_detect_service(cli: DetectServiceCli) -> Result<(), String> {
     println!("Detection service listening on http://{}", cli.bind);
     axum::serve(listener, app)
         .await
-        .map_err(|e| format!("run detection service: {}", e))
+        .map_err(|e| format!("run detection service: {e}"))
 }
 
 async fn detect_service_healthz() -> &'static str {
@@ -4009,12 +3991,12 @@ fn felt_to_hex(f: &F) -> String {
     if trimmed.is_empty() {
         "0x0".to_string()
     } else {
-        format!("0x{}", trimmed)
+        format!("0x{trimmed}")
     }
 }
 
 fn felt_u64_to_hex(v: u64) -> String {
-    format!("0x{:x}", v)
+    format!("0x{v:x}")
 }
 
 /// Parse a `--pubkey-hash` argument. Accepts exactly one canonical
@@ -4029,8 +4011,7 @@ fn parse_pubkey_hash_hex(value: &str) -> Result<F, String> {
     }
     if value.starts_with(DEPOSIT_RECIPIENT_PREFIX) {
         return Err(format!(
-            "pubkey_hash must be 64 lowercase hex chars (no `{}` prefix)",
-            DEPOSIT_RECIPIENT_PREFIX,
+            "pubkey_hash must be 64 lowercase hex chars (no `{DEPOSIT_RECIPIENT_PREFIX}` prefix)",
         ));
     }
     if value.len() != 64 {
@@ -4043,7 +4024,7 @@ fn parse_pubkey_hash_hex(value: &str) -> Result<F, String> {
         return Err("pubkey_hash must be lowercase hex (0-9, a-f) only".into());
     }
     let bytes =
-        hex::decode(value).map_err(|e| format!("invalid pubkey_hash hex: {}", e))?;
+        hex::decode(value).map_err(|e| format!("invalid pubkey_hash hex: {e}"))?;
     let mut out = ZERO;
     out.copy_from_slice(&bytes);
     Ok(out)
@@ -4062,12 +4043,12 @@ fn generate_proof(
     circuit: &str,
     args: &[String],
 ) -> Result<Proof, String> {
-    let executable = format!("{}/{}.executable.json", executables_dir, circuit);
-    let args_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
-    let args_json = serde_json::to_string(&args).map_err(|e| format!("json: {}", e))?;
-    std::fs::write(args_file.path(), &args_json).map_err(|e| format!("write: {}", e))?;
+    let executable = format!("{executables_dir}/{circuit}.executable.json");
+    let args_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {e}"))?;
+    let args_json = serde_json::to_string(&args).map_err(|e| format!("json: {e}"))?;
+    std::fs::write(args_file.path(), &args_json).map_err(|e| format!("write: {e}"))?;
 
-    let proof_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
+    let proof_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {e}"))?;
 
     // Upstream patch ④: phase event — local reprove subprocess about to
     // start. We don't have a job_id (subprocess), and the program_hash
@@ -4089,21 +4070,20 @@ fn generate_proof(
         .output()
         .map_err(|e| {
             format!(
-                "reprove failed to start: {} (is '{}' in PATH?)",
-                e, reprove_bin
+                "reprove failed to start: {e} (is '{reprove_bin}' in PATH?)"
             )
         })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("reprove failed: {}", stderr));
+        return Err(format!("reprove failed: {stderr}"));
     }
 
     // Parse the proof bundle
     let bundle_json =
-        std::fs::read_to_string(proof_file.path()).map_err(|e| format!("read proof: {}", e))?;
+        std::fs::read_to_string(proof_file.path()).map_err(|e| format!("read proof: {e}"))?;
     let bundle: VerifyProofBundle =
-        serde_json::from_str(&bundle_json).map_err(|e| format!("parse proof: {}", e))?;
+        serde_json::from_str(&bundle_json).map_err(|e| format!("parse proof: {e}"))?;
 
     let proof_kb = bundle.proof_bytes.len() / 1024;
     // Upstream patch ④: phase event — proof bundle parsed.
@@ -4191,10 +4171,9 @@ fn generate_proof_via_service(
         Ok(hash) => hash,
         Err(e) => {
             eprintln!(
-                "proving-service: /v1/programs lookup failed ({}), falling back to local reprove --program-hash",
-                e
+                "proving-service: /v1/programs lookup failed ({e}), falling back to local reprove --program-hash"
             );
-            let executable = format!("{}/{}.executable.json", executables_dir, circuit);
+            let executable = format!("{executables_dir}/{circuit}.executable.json");
             compute_program_hash(reprove_bin, &executable)?
         }
     };
@@ -4212,11 +4191,11 @@ fn generate_proof_via_service(
     );
 
     let submit = http_post_json(&url, &body)
-        .map_err(|e| format!("proving-service submit failed: {} (url={})", e, url))?;
+        .map_err(|e| format!("proving-service submit failed: {e} (url={url})"))?;
     let job_id = submit
         .get("job_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("proving-service: POST {} missing job_id", url))?
+        .ok_or_else(|| format!("proving-service: POST {url} missing job_id"))?
         .to_string();
 
     // Upstream patch ④: phase event — job created on the proving-service,
@@ -4244,11 +4223,11 @@ fn generate_proof_via_service(
     let mut last_status: Option<&'static str> = None;
     for _ in 0..PROVING_SERVICE_POLL_CAP {
         let poll_url = match last_status {
-            Some(s) => format!("{}?wait=30&if_state_changed_from={}", poll_url_base, s),
-            None => format!("{}?wait=30", poll_url_base),
+            Some(s) => format!("{poll_url_base}?wait=30&if_state_changed_from={s}"),
+            None => format!("{poll_url_base}?wait=30"),
         };
         let resp = http_get_json(&poll_url)
-            .map_err(|e| format!("proving-service poll failed: {} (url={})", e, poll_url))?;
+            .map_err(|e| format!("proving-service poll failed: {e} (url={poll_url})"))?;
         let status = resp
             .get("status")
             .and_then(|v| v.as_str())
@@ -4259,7 +4238,7 @@ fn generate_proof_via_service(
                     "proving-service: done response missing proof_bundle".to_string()
                 })?;
                 let bundle: VerifyProofBundle = serde_json::from_value(bundle_value.clone())
-                    .map_err(|e| format!("parse proof bundle: {}", e))?;
+                    .map_err(|e| format!("parse proof bundle: {e}"))?;
                 // Upstream patch ④: phase event — proof bundle delivered.
                 phase_event!("proving_finished", {
                     "proof_bytes": bundle.proof_bytes.len() as u64,
@@ -4282,7 +4261,7 @@ fn generate_proof_via_service(
                     .and_then(|e| e.get("message"))
                     .and_then(|m| m.as_str())
                     .unwrap_or("unknown");
-                return Err(format!("proving-service reported failure: {}", err));
+                return Err(format!("proving-service reported failure: {err}"));
             }
             "queued" => {
                 consecutive_unknown = 0;
@@ -4298,20 +4277,18 @@ fn generate_proof_via_service(
                 consecutive_unknown += 1;
                 if consecutive_unknown >= PROVING_SERVICE_MAX_UNKNOWN {
                     return Err(format!(
-                        "proving-service: job {} stuck reporting status=unknown for {} consecutive polls",
-                        job_id, consecutive_unknown,
+                        "proving-service: job {job_id} stuck reporting status=unknown for {consecutive_unknown} consecutive polls",
                     ));
                 }
                 continue;
             }
             other => {
-                return Err(format!("proving-service: unknown status '{}'", other));
+                return Err(format!("proving-service: unknown status '{other}'"));
             }
         }
     }
     Err(format!(
-        "proving-service: job {} did not complete within poll budget ({} iterations × 30 s wait)",
-        job_id, PROVING_SERVICE_POLL_CAP,
+        "proving-service: job {job_id} did not complete within poll budget ({PROVING_SERVICE_POLL_CAP} iterations × 30 s wait)",
     ))
 }
 
@@ -4329,11 +4306,11 @@ fn generate_proof_via_service(
 fn resolve_program_hash_via_service(service_url: &str, circuit: &str) -> Result<String, String> {
     let url = format!("{}/v1/programs", service_url.trim_end_matches('/'));
     let resp = http_get_json(&url)
-        .map_err(|e| format!("GET {} failed: {}", url, e))?;
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
     let programs = resp
         .get("programs")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| format!("GET {}: response missing 'programs' array", url))?;
+        .ok_or_else(|| format!("GET {url}: response missing 'programs' array"))?;
     for prog in programs {
         let name = prog.get("name").and_then(|v| v.as_str()).unwrap_or("");
         if name == circuit {
@@ -4341,7 +4318,7 @@ fn resolve_program_hash_via_service(service_url: &str, circuit: &str) -> Result<
                 .get("program_hash")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    format!("GET {}: program {} missing program_hash", url, circuit)
+                    format!("GET {url}: program {circuit} missing program_hash")
                 })?;
             return Ok(hash.to_string());
         }
@@ -4358,7 +4335,7 @@ fn compute_program_hash(reprove_bin: &str, executable: &str) -> Result<String, S
         .arg(executable)
         .arg("--program-hash")
         .output()
-        .map_err(|e| format!("reprove --program-hash failed to start: {}", e))?;
+        .map_err(|e| format!("reprove --program-hash failed to start: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "reprove --program-hash failed: {}",
@@ -4381,15 +4358,15 @@ fn http_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Val
         .build();
     let resp = req
         .send_json(body.clone())
-        .map_err(|e| format!("HTTP POST error: {}", e))?;
+        .map_err(|e| format!("HTTP POST error: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.into_body().read_to_string().unwrap_or_default();
-        return Err(format!("HTTP {}: {}", status, body));
+        return Err(format!("HTTP {status}: {body}"));
     }
     resp.into_body()
         .read_json()
-        .map_err(|e| format!("parse response: {}", e))
+        .map_err(|e| format!("parse response: {e}"))
 }
 
 /// HTTP JSON GET via `ureq`, with the same timeout discipline as
@@ -4401,15 +4378,15 @@ fn http_get_json(url: &str) -> Result<serde_json::Value, String> {
         .timeout_connect(Some(PROVING_SERVICE_CONNECT_TIMEOUT))
         .timeout_global(Some(PROVING_SERVICE_GLOBAL_TIMEOUT))
         .build();
-    let resp = req.call().map_err(|e| format!("HTTP GET error: {}", e))?;
+    let resp = req.call().map_err(|e| format!("HTTP GET error: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.into_body().read_to_string().unwrap_or_default();
-        return Err(format!("HTTP {}: {}", status, body));
+        return Err(format!("HTTP {status}: {body}"));
     }
     resp.into_body()
         .read_json()
-        .map_err(|e| format!("parse response: {}", e))
+        .map_err(|e| format!("parse response: {e}"))
 }
 
 fn persist_wallet_and_make_proof(
@@ -4429,7 +4406,7 @@ fn persist_wallet_and_make_proof(
 
 fn cmd_keygen(path: &str, at_tree_size: Option<u64>) -> Result<(), String> {
     if std::path::Path::new(path).exists() {
-        return Err(format!("{} already exists", path));
+        return Err(format!("{path} already exists"));
     }
     let master_sk = random_felt();
 
@@ -4599,7 +4576,7 @@ fn cmd_addresses(path: &str) -> Result<(), String> {
 }
 
 fn write_json_stdout_or_file<T: Serialize>(value: &T, out: Option<&str>) -> Result<(), String> {
-    let data = serde_json::to_string_pretty(value).map_err(|e| format!("serialize json: {}", e))?;
+    let data = serde_json::to_string_pretty(value).map_err(|e| format!("serialize json: {e}"))?;
     if let Some(path) = out {
         save_private_json(path, value, "export")?;
         // Upstream patch ①.
@@ -4614,7 +4591,7 @@ fn write_json_stdout_or_file<T: Serialize>(value: &T, out: Option<&str>) -> Resu
         // When --json is set and no --out is given, surface the exported
         // material inline under `content`.
         let value =
-            serde_json::to_value(value).map_err(|e| format!("serialize json: {}", e))?;
+            serde_json::to_value(value).map_err(|e| format!("serialize json: {e}"))?;
         user_json_put("wrote", serde_json::Value::Bool(false));
         user_json_put("content", value);
     } else {
@@ -4655,8 +4632,7 @@ fn cmd_watch_init(path: &str, material_path: &str, force: bool) -> Result<(), St
     let output_path = Path::new(path);
     if output_path.exists() && !force {
         return Err(format!(
-            "watch wallet {} already exists; pass --force to overwrite",
-            path
+            "watch wallet {path} already exists; pass --force to overwrite"
         ));
     }
     let material = load_watch_material(material_path)?;
@@ -4686,8 +4662,7 @@ fn sync_watch_wallet_once(
     let rollup = RollupRpc::new(profile);
     let feed = rollup.load_notes_since(cursor).map_err(|e| {
         format!(
-            "watch sync failed: {}. Run `tzel-wallet --wallet {} profile show` to confirm the saved rollup profile.",
-            e, path
+            "watch sync failed: {e}. Run `tzel-wallet --wallet {path} profile show` to confirm the saved rollup profile."
         )
     })?;
     let summary = apply_watch_feed(&mut watch, &feed);
@@ -4789,7 +4764,7 @@ fn cmd_watch_show(path: &str) -> Result<(), String> {
         println!(
             "{}",
             serde_json::to_string_pretty(&status)
-                .map_err(|e| format!("serialize watch status: {}", e))?
+                .map_err(|e| format!("serialize watch status: {e}"))?
         );
     }
     Ok(())
@@ -4886,7 +4861,7 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
 
     let url = format!("{}/notes?cursor={}", ledger, w.scanned);
     let feed: NotesFeedResp = get_json(&url)?;
-    let nf_resp: NullifiersResp = get_json(&format!("{}/nullifiers", ledger))?;
+    let nf_resp: NullifiersResp = get_json(&format!("{ledger}/nullifiers"))?;
     let pool_balances = fetch_pool_balances_http(ledger, &w.pending_deposits)?;
     let summary = apply_scan_feed(&mut w, &feed, nf_resp.nullifiers, &pool_balances);
     save_wallet(path, &w)?;
@@ -5059,7 +5034,7 @@ mod tests {
                 let _ = stream.write_all(response.as_bytes());
             }
         });
-        format!("http://{}", addr)
+        format!("http://{addr}")
     }
 
     pub(super) fn rollup_profile_for_url(base_url: &str) -> WalletNetworkProfile {
@@ -5339,8 +5314,7 @@ mod tests {
             assert!(treehash.node.present, "treehash should produce a node");
             assert_eq!(
                 treehash.node.value, expected,
-                "treehash root mismatch at height {} start {}",
-                height, start_idx
+                "treehash root mismatch at height {height} start {start_idx}"
             );
             assert_eq!(treehash.node_start_idx, start_idx);
             assert_eq!(treehash.node_height, height as u8);
@@ -5853,15 +5827,13 @@ mod tests {
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
-                    note_key
+                    "/global/block/head/durable/wasm_2_0_0/length?key={note_key}"
                 ),
                 (200, encoded.len().to_string()),
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    note_key
+                    "/global/block/head/durable/wasm_2_0_0/value?key={note_key}"
                 ),
                 (200, format!("\"{}\"", hex::encode(encoded))),
             ),
@@ -5917,15 +5889,13 @@ mod tests {
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
-                    note_key
+                    "/global/block/head/durable/wasm_2_0_0/length?key={note_key}"
                 ),
                 (200, encoded.len().to_string()),
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    note_key
+                    "/global/block/head/durable/wasm_2_0_0/value?key={note_key}"
                 ),
                 (200, format!("\"{}\"", hex::encode(encoded))),
             ),
@@ -6182,7 +6152,7 @@ mod tests {
             Ok(_) => panic!("stale restore should be rejected"),
             Err(err) => err,
         };
-        assert!(err.contains("stale backup"), "unexpected error: {}", err);
+        assert!(err.contains("stale backup"), "unexpected error: {err}");
     }
 
     #[test]
@@ -6215,8 +6185,7 @@ mod tests {
         let err = acquire_wallet_lock(wallet_path_str).unwrap_err();
         assert!(
             err.contains("wallet is locked by another process"),
-            "unexpected error: {}",
-            err
+            "unexpected error: {err}"
         );
     }
 
@@ -6404,19 +6373,16 @@ mod tests {
             assert_eq!(root, reference_root);
             assert_eq!(
                 rebuilt_from_reference, root,
-                "reference path must verify for key {}",
-                next_index
+                "reference path must verify for key {next_index}"
             );
             assert_eq!(
                 state.current_path(),
                 reference_path.as_slice(),
-                "BDS path bytes differ for key {}",
-                next_index
+                "BDS path bytes differ for key {next_index}"
             );
             assert_eq!(
                 rebuilt_from_bds, root,
-                "BDS path must verify for key {}",
-                next_index
+                "BDS path must verify for key {next_index}"
             );
         }
     }
@@ -6442,19 +6408,16 @@ mod tests {
             let expected_root = small_subtree_root(&ask_j, &pub_seed, 0, depth as u32);
             assert_eq!(
                 rebuilt_from_reference, expected_root,
-                "reference path must verify for key {}",
-                key_idx
+                "reference path must verify for key {key_idx}"
             );
             assert_eq!(
                 state.current_path(),
                 reference_path.as_slice(),
-                "BDS path bytes differ for key {}",
-                key_idx
+                "BDS path bytes differ for key {key_idx}"
             );
             assert_eq!(
                 rebuilt_from_bds, expected_root,
-                "BDS path must verify for key {}",
-                key_idx
+                "BDS path must verify for key {key_idx}"
             );
             state
                 .advance(&ask_j, &pub_seed)
@@ -7274,8 +7237,7 @@ mod tests {
 
         assert!(
             err.contains("reprove failed to start"),
-            "unexpected error: {}",
-            err
+            "unexpected error: {err}"
         );
         let loaded = load_wallet(wallet_path_str).expect("wallet should reload");
         assert_eq!(
@@ -7316,8 +7278,7 @@ mod tests {
 
         assert!(
             err.contains("reprove failed to start"),
-            "unexpected error: {}",
-            err
+            "unexpected error: {err}"
         );
         let loaded = load_wallet(wallet_path_str).expect("wallet should reload");
         assert_eq!(
@@ -7461,14 +7422,12 @@ fn print_deposit_pool_summary(
     );
     if awaiting_credit > 0 && !json_mode() {
         println!(
-            "Deposit pools awaiting on-chain credit: {}",
-            awaiting_credit
+            "Deposit pools awaiting on-chain credit: {awaiting_credit}"
         );
     }
     if drained_pending_scan > 0 && !json_mode() {
         println!(
-            "Deposit pools drained but not yet pruned (run `tzel-wallet sync`): {}",
-            drained_pending_scan
+            "Deposit pools drained but not yet pruned (run `tzel-wallet sync`): {drained_pending_scan}"
         );
     }
 }
@@ -7546,8 +7505,7 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
     let rollup = RollupRpc::new(profile);
     let feed = rollup.load_notes_since(w.scanned).map_err(|e| {
         format!(
-            "sync failed: {}. Run `tzel-wallet check` for a fuller diagnosis.",
-            e
+            "sync failed: {e}. Run `tzel-wallet check` for a fuller diagnosis."
         )
     })?;
     let nullifiers = rollup.load_nullifiers()?;
@@ -7792,7 +7750,7 @@ fn cmd_bridge_deposit(
         pubkey_hash_hex(&pubkey_hash)
     );
     if let Some(op_hash) = &submission.operation_hash {
-        println!("Operation hash: {}", op_hash);
+        println!("Operation hash: {op_hash}");
     }
     if !submission.output.is_empty() {
         println!("{}", submission.output);
@@ -7927,7 +7885,7 @@ fn cmd_recover_deposits(
     }
     save_wallet(path, &wallet)?;
 
-    println!("Recovered {} deposit pool(s)", recovered);
+    println!("Recovered {recovered} deposit pool(s)");
     println!("addr_counter now {}", wallet.addr_counter);
     println!("deposit_nonce now {}", wallet.deposit_nonce);
     if recovered == 0 {
@@ -7986,10 +7944,10 @@ fn print_rollup_submission(submission: &RollupSubmissionReceipt) {
             serde_json::Value::String(submission.output.clone()),
         );
         if let Some(submission_id) = &submission.submission_id {
-            eprintln!("Submission id: {}", submission_id);
+            eprintln!("Submission id: {submission_id}");
         }
         if let Some(op_hash) = &submission.operation_hash {
-            eprintln!("Operation hash: {}", op_hash);
+            eprintln!("Operation hash: {op_hash}");
         }
         if !submission.output.is_empty() {
             eprintln!("{}", submission.output);
@@ -7997,10 +7955,10 @@ fn print_rollup_submission(submission: &RollupSubmissionReceipt) {
         return;
     }
     if let Some(submission_id) = &submission.submission_id {
-        println!("Submission id: {}", submission_id);
+        println!("Submission id: {submission_id}");
     }
     if let Some(op_hash) = &submission.operation_hash {
-        println!("Operation hash: {}", op_hash);
+        println!("Operation hash: {op_hash}");
     }
     if !submission.output.is_empty() {
         println!("{}", submission.output);
@@ -8017,9 +7975,9 @@ fn print_rollup_sync_hint(submission: &RollupSubmissionReceipt) {
     if json_mode() {
         user_json_put("pending_dal", serde_json::Value::Bool(submission.pending_dal));
         user_json_put("sync_hint", serde_json::Value::String(hint.to_string()));
-        eprintln!("{}", hint);
+        eprintln!("{hint}");
     } else {
-        println!("{}", hint);
+        println!("{hint}");
     }
 }
 
@@ -8035,7 +7993,7 @@ fn cmd_transfer(
     memo: Option<String>,
     pc: &ProveConfig,
 ) -> Result<(), String> {
-    let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
+    let cfg: ConfigResp = get_json(&format!("{ledger}/config"))?;
     let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
     ensure_positive_dal_fee(dal_fee)?;
     let mut w = load_wallet(path)?;
@@ -8044,7 +8002,7 @@ fn cmd_transfer(
     let producer_address = load_address(dal_fee_address_path)?;
 
     // Get current root
-    let tree_info: TreeInfoResp = get_json(&format!("{}/tree", ledger))?;
+    let tree_info: TreeInfoResp = get_json(&format!("{ledger}/tree"))?;
     let root = tree_info.root;
 
     if pc.skip_proof {
@@ -8059,7 +8017,7 @@ fn cmd_transfer(
             memo.as_deref(),
         )?;
         save_wallet(path, &w)?;
-        let resp: TransferResp = post_json(&format!("{}/transfer", ledger), &prepared.req)?;
+        let resp: TransferResp = post_json(&format!("{ledger}/transfer"), &prepared.req)?;
         finalize_successful_spend(path, &mut w, &prepared.selected)?;
         println!(
             "Transferred {} to recipient, fee={}, dal fee={}, change={} (idx={},{},{})",
@@ -8166,15 +8124,14 @@ fn cmd_transfer(
             .collect();
         for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
             let path_resp: MerklePathResp =
-                get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
+                get_json(&format!("{ledger}/tree/path/{tree_idx}"))?;
             ensure_path_matches_root(&path_resp.root, &root, tree_idx)?;
             cm_paths.push(path_resp.siblings);
             let ask_j = derive_ask(&w.account().ask_base, addr_idx);
             let (key_idx, auth_root, auth_pub_seed, path) = w.reserve_next_auth(addr_idx)?;
             if auth_root != stored_auth_root {
                 return Err(format!(
-                    "auth_root mismatch for note at tree index {}",
-                    tree_idx
+                    "auth_root mismatch for note at tree index {tree_idx}"
                 ));
             }
             auth_paths.push(path);
@@ -8276,7 +8233,7 @@ fn cmd_transfer(
         enc_3: note_3.enc,
         proof,
     };
-    let resp: TransferResp = post_json(&format!("{}/transfer", ledger), &req)?;
+    let resp: TransferResp = post_json(&format!("{ledger}/transfer"), &req)?;
 
     finalize_successful_spend(path, &mut w, &selected)?;
 
@@ -8300,14 +8257,14 @@ fn cmd_unshield(
     pc: &ProveConfig,
 ) -> Result<(), String> {
     let recipient = validate_l1_withdrawal_recipient(recipient)?;
-    let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
+    let cfg: ConfigResp = get_json(&format!("{ledger}/config"))?;
     let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
     ensure_positive_dal_fee(dal_fee)?;
     let mut w = load_wallet(path)?;
     let outgoing_seed = w.account().outgoing_seed;
     let producer_address = load_address(dal_fee_address_path)?;
 
-    let tree_info: TreeInfoResp = get_json(&format!("{}/tree", ledger))?;
+    let tree_info: TreeInfoResp = get_json(&format!("{ledger}/tree"))?;
     let root = tree_info.root;
 
     if pc.skip_proof {
@@ -8321,7 +8278,7 @@ fn cmd_unshield(
             &recipient,
         )?;
         save_wallet(path, &w)?;
-        let resp: UnshieldResp = post_json(&format!("{}/unshield", ledger), &prepared.req)?;
+        let resp: UnshieldResp = post_json(&format!("{ledger}/unshield"), &prepared.req)?;
         finalize_successful_spend(path, &mut w, &prepared.selected)?;
         println!(
             "Unshielded {} to {}, fee={}, dal fee={}, change={} (change_idx={:?}, producer_idx={})",
@@ -8434,15 +8391,14 @@ fn cmd_unshield(
             .collect();
         for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
             let path_resp: MerklePathResp =
-                get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
+                get_json(&format!("{ledger}/tree/path/{tree_idx}"))?;
             ensure_path_matches_root(&path_resp.root, &root, tree_idx)?;
             cm_paths.push(path_resp.siblings);
             let ask_j = derive_ask(&w.account().ask_base, addr_idx);
             let (key_idx, auth_root, auth_pub_seed, path) = w.reserve_next_auth(addr_idx)?;
             if auth_root != stored_auth_root {
                 return Err(format!(
-                    "auth_root mismatch for note at tree index {}",
-                    tree_idx
+                    "auth_root mismatch for note at tree index {tree_idx}"
                 ));
             }
             auth_paths.push(path);
@@ -8537,7 +8493,7 @@ fn cmd_unshield(
         enc_fee: producer_note.enc,
         proof,
     };
-    let resp: UnshieldResp = post_json(&format!("{}/unshield", ledger), &req)?;
+    let resp: UnshieldResp = post_json(&format!("{ledger}/unshield"), &req)?;
 
     finalize_successful_spend(path, &mut w, &selected)?;
 
@@ -8649,7 +8605,7 @@ fn cmd_shield_rollup(
         .addresses
         .get(address_index as usize)
         .cloned()
-        .ok_or_else(|| format!("missing wallet address record {}", address_index))?;
+        .ok_or_else(|| format!("missing wallet address record {address_index}"))?;
     let recipient = recipient_state.payment_address(&ek_v_recipient, &ek_d_recipient);
 
     let outgoing_seed = w.account().outgoing_seed;
@@ -8906,8 +8862,7 @@ fn cmd_transfer_rollup(
             let (key_idx, auth_root, auth_pub_seed, path) = w.reserve_next_auth(addr_idx)?;
             if auth_root != stored_auth_root {
                 return Err(format!(
-                    "auth_root mismatch for note at tree index {}",
-                    tree_idx
+                    "auth_root mismatch for note at tree index {tree_idx}"
                 ));
             }
             auth_paths.push(path);
@@ -9015,7 +8970,7 @@ fn cmd_transfer_rollup(
     let nullifiers_hex: Vec<String> = nullifiers.iter().map(hex::encode).collect();
     w.register_pending_spend(
         nullifiers,
-        format!("transfer {}", amount),
+        format!("transfer {amount}"),
         submission.operation_hash.clone(),
     );
     save_wallet(path, &w)?;
@@ -9158,8 +9113,7 @@ fn cmd_unshield_rollup(
             let (key_idx, auth_root, auth_pub_seed, path) = w.reserve_next_auth(addr_idx)?;
             if auth_root != stored_auth_root {
                 return Err(format!(
-                    "auth_root mismatch for note at tree index {}",
-                    tree_idx
+                    "auth_root mismatch for note at tree index {tree_idx}"
                 ));
             }
             auth_paths.push(path);
@@ -9265,7 +9219,7 @@ fn cmd_unshield_rollup(
     let nullifiers_hex: Vec<String> = nullifiers.iter().map(hex::encode).collect();
     w.register_pending_spend(
         nullifiers,
-        format!("unshield {}", amount),
+        format!("unshield {amount}"),
         submission.operation_hash.clone(),
     );
     save_wallet(path, &w)?;
@@ -9296,9 +9250,9 @@ fn cmd_unshield_rollup(
     );
     print_rollup_submission(&submission);
     if json_mode() {
-        eprintln!("{}", outbox_note);
+        eprintln!("{outbox_note}");
     } else {
-        println!("{}", outbox_note);
+        println!("{outbox_note}");
     }
     Ok(())
 }
@@ -9677,22 +9631,19 @@ mod network_profile_tests {
             ),
             (
                 format!(
-                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_AUTH_DOMAIN
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={DURABLE_AUTH_DOMAIN}"
                 ),
                 (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
             ),
             (
                 format!(
-                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_TREE_SIZE
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={DURABLE_TREE_SIZE}"
                 ),
                 (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_TREE_ROOT
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={DURABLE_TREE_ROOT}"
                 ),
                 (200, format!("\"{}\"", hex::encode(root))),
             ),
@@ -9712,22 +9663,19 @@ mod network_profile_tests {
             ),
             (
                 format!(
-                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
@@ -9746,8 +9694,7 @@ mod network_profile_tests {
                     .expect("verifier config encodes");
                 (
                     format!(
-                        "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={}",
-                        DURABLE_VERIFIER_CONFIG
+                        "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={DURABLE_VERIFIER_CONFIG}"
                     ),
                     (200, encoded.len().to_string()),
                 )
@@ -9765,8 +9712,7 @@ mod network_profile_tests {
                     .expect("verifier config encodes");
                 (
                     format!(
-                        "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={}",
-                        DURABLE_VERIFIER_CONFIG
+                        "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={DURABLE_VERIFIER_CONFIG}"
                     ),
                     (200, format!("\"{}\"", hex::encode(&encoded))),
                 )
@@ -9925,15 +9871,13 @@ mod network_profile_tests {
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
-                    note_len_key
+                    "/global/block/head/durable/wasm_2_0_0/length?key={note_len_key}"
                 ),
                 (200, "8".into()),
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    note_len_key
+                    "/global/block/head/durable/wasm_2_0_0/value?key={note_len_key}"
                 ),
                 (
                     200,
@@ -9989,15 +9933,13 @@ mod network_profile_tests {
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
-                    note_len_key
+                    "/global/block/head/durable/wasm_2_0_0/length?key={note_len_key}"
                 ),
                 (200, "8".into()),
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    note_len_key
+                    "/global/block/head/durable/wasm_2_0_0/value?key={note_len_key}"
                 ),
                 (
                     200,
@@ -10027,43 +9969,37 @@ mod network_profile_tests {
             ("/global/block/BLmockhead/level".into(), (200, "11".into())),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, "4".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, "4".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, "8".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(3u64.to_le_bytes()))),
             ),
@@ -10084,43 +10020,37 @@ mod network_profile_tests {
             ("/global/block/BLmockhead/level".into(), (200, "10".into())),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, "4".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, "4".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, "8".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(6u64.to_le_bytes()))),
             ),
@@ -10141,43 +10071,37 @@ mod network_profile_tests {
             ("/global/block/BLmockhead/level".into(), (200, "10".into())),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, "4".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, "4".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, "8".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(3u64.to_le_bytes()))),
             ),
@@ -10201,43 +10125,37 @@ mod network_profile_tests {
             ("/global/block/BLmockhead/level".into(), (200, "10".into())),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, "4".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, "4".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(10i32.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, "8".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(6u64.to_le_bytes()))),
             ),
@@ -10258,22 +10176,19 @@ mod network_profile_tests {
             ("/global/block/BLmockhead/level".into(), (200, "12".into())),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
@@ -10294,65 +10209,56 @@ mod network_profile_tests {
             ("/global/block/BLstable/level".into(), (200, "10".into())),
             (
                 format!(
-                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLstable/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             ("/global/block/head/level".into(), (200, "10".into())),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/head/durable/wasm_2_0_0/length?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, "4".into()),
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/head/durable/wasm_2_0_0/value?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/head/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, "4".into()),
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/head/durable/wasm_2_0_0/value?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(11i32.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/head/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, "8".into()),
             ),
             (
                 format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/head/durable/wasm_2_0_0/value?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, format!("\"{}\"", hex::encode(6u64.to_le_bytes()))),
             ),
@@ -10387,22 +10293,19 @@ mod network_profile_tests {
             ("/global/block/BLmockhead/level".into(), (200, "12".into())),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_AUTH_DOMAIN
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_AUTH_DOMAIN}"
                 ),
                 (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_TREE_SIZE
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_TREE_SIZE}"
                 ),
                 (200, format!("\"{}\"", hex::encode(2u64.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_TREE_ROOT
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_TREE_ROOT}"
                 ),
                 (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
             ),
@@ -10441,22 +10344,19 @@ mod network_profile_tests {
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
@@ -10497,22 +10397,19 @@ mod network_profile_tests {
             ("/global/block/BLmockhead/level".into(), (200, "12".into())),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_AUTH_DOMAIN
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_AUTH_DOMAIN}"
                 ),
                 (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_TREE_SIZE
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_TREE_SIZE}"
                 ),
                 (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_TREE_ROOT
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_TREE_ROOT}"
                 ),
                 (200, format!("\"{}\"", hex::encode(root))),
             ),
@@ -10537,22 +10434,19 @@ mod network_profile_tests {
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
@@ -10587,22 +10481,19 @@ mod network_profile_tests {
             ("/global/block/BLmockhead/level".into(), (200, "12".into())),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_AUTH_DOMAIN
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_AUTH_DOMAIN}"
                 ),
                 (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_TREE_SIZE
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_TREE_SIZE}"
                 ),
                 (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_TREE_ROOT
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_TREE_ROOT}"
                 ),
                 (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
             ),
@@ -10627,22 +10518,19 @@ mod network_profile_tests {
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_LAST_INPUT_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_FEE_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={DURABLE_PRIVATE_TX_COUNT_IN_LEVEL}"
                 ),
                 (200, "null".into()),
             ),
@@ -10680,7 +10568,7 @@ mod network_profile_tests {
         let other_address = "sr1Ghp7iJC91k5tukgzMQTfUbY2t8ssVaHJk";
         let base_url = super::tests::spawn_mock_http_server(HashMap::from([(
             "/global/smart_rollup_address".into(),
-            (200, format!("\"{}\"", other_address)),
+            (200, format!("\"{other_address}\"")),
         )]));
 
         let profile = super::tests::rollup_profile_for_url(&base_url);
@@ -10758,8 +10646,7 @@ mod network_profile_tests {
             ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_AUTH_DOMAIN
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_AUTH_DOMAIN}"
                 ),
                 (200, format!("\"{}\"", hex::encode(auth_domain))),
             ),
@@ -10847,8 +10734,7 @@ mod network_profile_tests {
             ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
             (
                 format!(
-                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_AUTH_DOMAIN
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={DURABLE_AUTH_DOMAIN}"
                 ),
                 (200, format!("\"{}\"", hex::encode(auth_domain))),
             ),
@@ -10922,11 +10808,11 @@ mod network_profile_tests {
         assert_eq!(parse_pubkey_hash_hex(&hex).unwrap(), sample);
 
         // Old prefixed forms now reject.
-        let err = parse_pubkey_hash_hex(&format!("0x{}", hex)).unwrap_err();
+        let err = parse_pubkey_hash_hex(&format!("0x{hex}")).unwrap_err();
         assert!(err.contains("no `0x` prefix"), "{}", err);
-        let err = parse_pubkey_hash_hex(&format!("0X{}", hex)).unwrap_err();
+        let err = parse_pubkey_hash_hex(&format!("0X{hex}")).unwrap_err();
         assert!(err.contains("no `0x` prefix"), "{}", err);
-        let err = parse_pubkey_hash_hex(&format!("deposit:{}", hex)).unwrap_err();
+        let err = parse_pubkey_hash_hex(&format!("deposit:{hex}")).unwrap_err();
         assert!(err.contains("no `deposit:` prefix"), "{}", err);
 
         // Plain malformed inputs.
@@ -10963,7 +10849,7 @@ mod network_profile_tests {
 
         // Timestamp is RFC3339-shaped: 4-2-2 T 2:2:2 Z = 20 chars.
         let ts = parsed["ts"].as_str().unwrap();
-        assert_eq!(ts.len(), 20, "ts must be 20-char RFC3339 UTC: {}", ts);
+        assert_eq!(ts.len(), 20, "ts must be 20-char RFC3339 UTC: {ts}");
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[4..5], "-");
         assert_eq!(&ts[7..8], "-");
@@ -11195,15 +11081,13 @@ mod network_profile_tests {
             ),
             (
                 format!(
-                    "/global/block/BLpoolhead/durable/wasm_2_0_0/length?key={}",
-                    balance_key
+                    "/global/block/BLpoolhead/durable/wasm_2_0_0/length?key={balance_key}"
                 ),
                 (200, "8".into()),
             ),
             (
                 format!(
-                    "/global/block/BLpoolhead/durable/wasm_2_0_0/value?key={}",
-                    balance_key
+                    "/global/block/BLpoolhead/durable/wasm_2_0_0/value?key={balance_key}"
                 ),
                 (200, format!("\"{}\"", hex::encode(amount.to_le_bytes()))),
             ),

@@ -72,7 +72,7 @@ fn main() -> Result<()> {
 
     // ── Verify mode ──────────────────────────────────────────────────
     if let Some(bundle_path) = &cli.verify {
-        eprintln!("Verifying proof bundle: {:?}", bundle_path);
+        eprintln!("Verifying proof bundle: {bundle_path:?}");
         let bundle_json = std::fs::read_to_string(bundle_path)?;
         let bundle: ProofBundle = serde_json::from_str(&bundle_json)?;
         let program_hash = compute_executable_program_hash(&cli.executable)?;
@@ -84,7 +84,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("Proof INVALID: {}", e);
+                eprintln!("Proof INVALID: {e}");
                 std::process::exit(1);
             }
         }
@@ -115,10 +115,10 @@ fn main() -> Result<()> {
         if let Some(mem) = peak_mem_kb {
             eprintln!("Peak RSS: {:.1} MB", mem as f64 / 1024.0);
         }
-        println!("prove_ms={}", prove_ms);
+        println!("prove_ms={prove_ms}");
         println!("proof_zstd_bytes={}", compressed.len());
         if let Some(mem) = peak_mem_kb {
-            println!("peak_rss_kb={}", mem);
+            println!("peak_rss_kb={mem}");
         }
     } else {
         eprintln!("Running recursive prove...");
@@ -162,12 +162,12 @@ fn main() -> Result<()> {
         eprintln!("Total wall: {}ms", t_total.elapsed().as_millis());
         println!("cairo_prove_ms={}", proof_output.cairo_prove_ms);
         println!("circuit_prove_ms={}", proof_output.circuit_prove_ms);
-        println!("prove_ms={}", prove_ms);
+        println!("prove_ms={prove_ms}");
         println!("verify_ms={}", proof_output.verify_ms);
-        println!("proof_bytes={}", proof_size);
+        println!("proof_bytes={proof_size}");
         println!("output_preimage_len={}", proof_output.output_preimage.len());
         if let Some(mem) = peak_mem_kb {
-            println!("peak_rss_kb={}", mem);
+            println!("peak_rss_kb={mem}");
         }
     }
 

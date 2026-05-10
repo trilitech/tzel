@@ -23,7 +23,7 @@ fn main() -> Result<(), String> {
         std::fs::write(&output, json)
             .map_err(|e| format!("failed to write {}: {}", output.display(), e))?;
     } else {
-        println!("{}", json);
+        println!("{json}");
     }
     Ok(())
 }

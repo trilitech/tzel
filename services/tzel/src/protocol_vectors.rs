@@ -676,7 +676,7 @@ mod tests {
             "wire_encoding",
         ];
         for key in expected_keys {
-            assert!(top.contains_key(key), "missing section {}", key);
+            assert!(top.contains_key(key), "missing section {key}");
         }
 
         assert_eq!(

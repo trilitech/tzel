@@ -244,7 +244,7 @@ fn bridge_deposit_requires_configuration_and_recovers_after_external_configurati
         KernelResult::Error { message } => {
             assert!(message.contains("bridge ticketer is not configured"))
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
 
     // Verifier must be configured before bridge deposits are accepted —
@@ -308,7 +308,7 @@ fn bridge_deposit_rejects_non_pubkey_hash_receiver() {
                 "unexpected error: {message}"
             );
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
 }
 
@@ -343,7 +343,7 @@ fn bridge_deposit_rejects_non_canonical_pubkey_hash_receiver() {
                 "unexpected error: {message}"
             );
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
 }
 
@@ -386,7 +386,7 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
             assert_eq!(resp.cm, fixture.shield.client_cm);
             assert_eq!(resp.producer_index, 1);
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
     // Pool drained: kernel writes empty bytes (best-effort delete) when
     // the residual balance is zero.
@@ -403,7 +403,7 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
         KernelResult::Transfer(resp) => {
             assert_eq!((resp.index_1, resp.index_2, resp.index_3), (2, 3, 4))
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
     let ledger = read_ledger(&host).unwrap();
     assert_eq!(
@@ -427,7 +427,7 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
             assert_eq!(resp.change_index, None);
             assert_eq!(resp.producer_index, 5);
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
     let ledger = read_ledger(&restarted).unwrap();
     assert_eq!(ledger.nullifiers.len(), 2);
@@ -509,7 +509,7 @@ fn verified_bridge_can_be_configured_via_dal_pointers() {
             assert_eq!(resp.index, 0);
             assert_eq!(resp.producer_index, 1);
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
 }
 
@@ -540,11 +540,10 @@ fn verified_bridge_rejects_transfer_when_program_hashes_do_not_match_fixture() {
             assert!(
                 message.contains("invalid output_preimage for transfer circuit")
                     || message.contains("unexpected circuit program hash"),
-                "unexpected verifier error: {}",
-                message
+                "unexpected verifier error: {message}"
             );
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
 
     assert_ledger_state_unchanged(&before_transfer, &read_ledger(&host).unwrap());
@@ -579,7 +578,7 @@ fn verified_shield_rejects_tampered_client_note_without_mutating_pool() {
         KernelResult::Error { message } => {
             assert!(message.contains("proof memo_ct_hash mismatch"));
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
 
     assert_ledger_state_unchanged(&before_shield, &read_ledger(&host).unwrap());
@@ -615,7 +614,7 @@ fn verified_transfer_rejects_tampered_output_note_without_mutating_state() {
         KernelResult::Error { message } => {
             assert!(message.contains("proof memo_ct_hash_2 mismatch"));
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
 
     assert_ledger_state_unchanged(&before_transfer, &read_ledger(&host).unwrap());
@@ -638,7 +637,7 @@ fn verified_transfer_consumes_one_note_and_creates_change_and_recipient_notes() 
         KernelResult::Transfer(resp) => {
             assert_eq!((resp.index_1, resp.index_2, resp.index_3), (2, 3, 4))
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
 
     let after_transfer = read_ledger(&host).unwrap();
@@ -693,7 +692,7 @@ fn verified_unshield_rejects_tampered_recipient_without_mutating_state() {
         KernelResult::Error { message } => {
             assert!(message.contains("proof recipient mismatch"));
         }
-        other => panic!("unexpected rollup result: {:?}", other),
+        other => panic!("unexpected rollup result: {other:?}"),
     }
 
     assert_ledger_state_unchanged(&before_unshield, &read_ledger(&host).unwrap());
@@ -737,11 +736,10 @@ fn verified_shield_rejects_replay_after_pool_topup() {
                     || message.contains("already applied")
                     || message.contains("commitment already")
                     || message.contains("duplicate"),
-                "expected replay rejection, got: {}",
-                message
+                "expected replay rejection, got: {message}"
             );
         }
-        other => panic!("replay must be rejected, got: {:?}", other),
+        other => panic!("replay must be rejected, got: {other:?}"),
     }
 
     let after_replay = read_ledger(&host).unwrap();
@@ -852,7 +850,7 @@ fn assert_outbox_withdrawal(bytes: &[u8], ticketer: &str, recipient: &str, amoun
 fn indexed_path(prefix: &[u8], index: u64) -> Vec<u8> {
     let mut path = Vec::with_capacity(prefix.len() + 16);
     path.extend_from_slice(prefix);
-    path.extend_from_slice(format!("{:016x}", index).as_bytes());
+    path.extend_from_slice(format!("{index:016x}").as_bytes());
     path
 }
 

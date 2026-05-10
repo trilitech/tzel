@@ -258,7 +258,7 @@ async fn main() {
         Some(s) => match parse_felt_be_hex(s) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("ERROR: invalid --auth-domain: {}", e);
+                eprintln!("ERROR: invalid --auth-domain: {e}");
                 std::process::exit(2);
             }
         },
@@ -288,7 +288,7 @@ async fn main() {
         ) {
             Ok(verifier) => verifier,
             Err(e) => {
-                eprintln!("ERROR: {}", e);
+                eprintln!("ERROR: {e}");
                 std::process::exit(2);
             }
         },
@@ -320,7 +320,7 @@ async fn main() {
             cli.listen
         );
     }
-    eprintln!("sp-ledger listening on {}", addr);
+    eprintln!("sp-ledger listening on {addr}");
     let listener = TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

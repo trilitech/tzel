@@ -350,7 +350,7 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
             .checked_add(additional)
             .ok_or_else(|| "Merkle tree size overflow".to_string())?;
         if next > limit {
-            return Err(format!("Merkle tree full: 2^{} leaves", DEPTH));
+            return Err(format!("Merkle tree full: 2^{DEPTH} leaves"));
         }
         Ok(())
     }
@@ -358,7 +358,7 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
     fn append_note(&mut self, cm: F, enc: EncryptedNote) -> Result<usize, String> {
         let count = self.read_u64(PATH_TREE_SIZE)?.unwrap_or(0);
         if count >= (1u64 << DEPTH) {
-            return Err(format!("Merkle tree full: 2^{} leaves", DEPTH));
+            return Err(format!("Merkle tree full: 2^{DEPTH} leaves"));
         }
 
         let encoded = encode_published_note(&cm, &enc)?;
@@ -373,7 +373,7 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
             } else {
                 let left = self
                     .read_felt(&branch_path(level))?
-                    .ok_or_else(|| format!("missing Merkle frontier at level {}", level))?;
+                    .ok_or_else(|| format!("missing Merkle frontier at level {level}"))?;
                 current = hash_merkle(&left, &current);
             }
             index >>= 1;
@@ -527,7 +527,7 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
 fn indexed_path(prefix: &[u8], index: u64) -> Vec<u8> {
     let mut path = Vec::with_capacity(prefix.len() + 16);
     path.extend_from_slice(prefix);
-    path.extend_from_slice(format!("{:016x}", index).as_bytes());
+    path.extend_from_slice(format!("{index:016x}").as_bytes());
     path
 }
 
@@ -544,7 +544,7 @@ fn note_length_path(index: u64) -> Vec<u8> {
 fn note_chunk_path(index: u64, chunk_index: usize) -> Vec<u8> {
     let mut path = note_path(index);
     path.extend_from_slice(PATH_NOTE_CHUNK_PREFIX);
-    path.extend_from_slice(format!("{:08x}", chunk_index).as_bytes());
+    path.extend_from_slice(format!("{chunk_index:08x}").as_bytes());
     path
 }
 
@@ -566,7 +566,7 @@ fn write_note_payload<H: Host>(host: &mut H, index: u64, encoded: &[u8]) {
 fn branch_path(level: usize) -> Vec<u8> {
     let mut path = Vec::with_capacity(PATH_TREE_BRANCH_PREFIX.len() + 2);
     path.extend_from_slice(PATH_TREE_BRANCH_PREFIX);
-    path.extend_from_slice(format!("{:02x}", level).as_bytes());
+    path.extend_from_slice(format!("{level:02x}").as_bytes());
     path
 }
 
@@ -646,7 +646,7 @@ fn encode_withdrawal_outbox_message(
             MichelsonPair(MichelsonInt::from(0i32), MichelsonOption(None)),
             record.amount,
         )
-        .map_err(|e| format!("failed to build withdrawal ticket: {}", e))?,
+        .map_err(|e| format!("failed to build withdrawal ticket: {e}"))?,
     );
     let message = TezosOutboxMessage::AtomicTransactionBatch(
         vec![OutboxMessageTransaction {
@@ -660,7 +660,7 @@ fn encode_withdrawal_outbox_message(
     let mut bytes = Vec::new();
     message
         .bin_write(&mut bytes)
-        .map_err(|e| format!("failed to encode withdrawal outbox message: {}", e))?;
+        .map_err(|e| format!("failed to encode withdrawal outbox message: {e}"))?;
     Ok(bytes)
 }
 
@@ -852,7 +852,7 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
 
     for i in 0..tree_size {
         let note_bytes =
-            read_persisted_note(host, i).ok_or_else(|| format!("missing persisted note {}", i))?;
+            read_persisted_note(host, i).ok_or_else(|| format!("missing persisted note {i}"))?;
         let (cm, enc) = decode_published_note(&note_bytes)?;
         ledger.tree.leaves.push(cm);
         ledger.memos.push((cm, enc));
@@ -862,9 +862,9 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
         let path = indexed_path(PATH_NULLIFIER_INDEX_PREFIX, i);
         let bytes = host
             .read_store(&path, 32)
-            .ok_or_else(|| format!("missing persisted nullifier {}", i))?;
+            .ok_or_else(|| format!("missing persisted nullifier {i}"))?;
         if bytes.len() != 32 {
-            return Err(format!("bad persisted nullifier {}", i));
+            return Err(format!("bad persisted nullifier {i}"));
         }
         let mut nf = ZERO;
         nf.copy_from_slice(&bytes);
@@ -875,9 +875,9 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
         let path = indexed_path(PATH_VALID_ROOT_INDEX_PREFIX, i);
         let bytes = host
             .read_store(&path, 32)
-            .ok_or_else(|| format!("missing persisted root {}", i))?;
+            .ok_or_else(|| format!("missing persisted root {i}"))?;
         if bytes.len() != 32 {
-            return Err(format!("bad persisted root {}", i));
+            return Err(format!("bad persisted root {i}"));
         }
         let mut root = ZERO;
         root.copy_from_slice(&bytes);
@@ -888,7 +888,7 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
         let path = indexed_path(PATH_WITHDRAWAL_PREFIX, i);
         let bytes = host
             .read_store(&path, MAX_STORE_BINARY_BYTES)
-            .ok_or_else(|| format!("missing persisted withdrawal {}", i))?;
+            .ok_or_else(|| format!("missing persisted withdrawal {i}"))?;
         ledger.withdrawals.push(decode_withdrawal_record(&bytes)?);
     }
 
@@ -956,8 +956,7 @@ fn fetch_kernel_message_from_dal<H: Host>(
     }
     if payload_len > MAX_DAL_PAYLOAD_BYTES {
         return Err(format!(
-            "DAL payload too large: {} > {}",
-            payload_len, MAX_DAL_PAYLOAD_BYTES
+            "DAL payload too large: {payload_len} > {MAX_DAL_PAYLOAD_BYTES}"
         ));
     }
 
@@ -977,8 +976,7 @@ fn fetch_kernel_message_from_dal<H: Host>(
     })?;
     if declared_total != payload_len {
         return Err(format!(
-            "DAL chunk lengths do not sum to payload length: {} != {}",
-            declared_total, payload_len
+            "DAL chunk lengths do not sum to payload length: {declared_total} != {payload_len}"
         ));
     }
 
@@ -990,14 +988,13 @@ fn fetch_kernel_message_from_dal<H: Host>(
 
     for (index, chunk) in pointer.chunks.iter().enumerate() {
         let chunk_len = usize::try_from(chunk.payload_len)
-            .map_err(|_| format!("DAL chunk {} length does not fit in usize", index))?;
+            .map_err(|_| format!("DAL chunk {index} length does not fit in usize"))?;
         if chunk_len == 0 {
-            return Err(format!("DAL chunk {} has zero payload length", index));
+            return Err(format!("DAL chunk {index} has zero payload length"));
         }
         if chunk_len > slot_size {
             return Err(format!(
-                "DAL chunk {} length {} exceeds slot size {}",
-                index, chunk_len, slot_size
+                "DAL chunk {index} length {chunk_len} exceeds slot size {slot_size}"
             ));
         }
         if u64::from(chunk.slot_index) >= params.number_of_slots {
@@ -1019,13 +1016,12 @@ fn fetch_kernel_message_from_dal<H: Host>(
                 published_level,
                 chunk.slot_index,
                 u16::try_from(page_index)
-                    .map_err(|_| format!("DAL chunk {} page index overflow", index))?,
+                    .map_err(|_| format!("DAL chunk {index} page index overflow"))?,
                 page_size,
             )?;
             if page.len() > page_size {
                 return Err(format!(
-                    "DAL chunk {} page {} exceeds page size {}",
-                    index, page_index, page_size
+                    "DAL chunk {index} page {page_index} exceeds page size {page_size}"
                 ));
             }
             chunk_bytes.extend_from_slice(&page);
@@ -1040,8 +1036,7 @@ fn fetch_kernel_message_from_dal<H: Host>(
         }
         if chunk_bytes[chunk_len..].iter().any(|byte| *byte != 0) {
             return Err(format!(
-                "DAL chunk {} trailing padding contains non-zero data",
-                index
+                "DAL chunk {index} trailing padding contains non-zero data"
             ));
         }
         payload.extend_from_slice(&chunk_bytes[..chunk_len]);
@@ -1166,8 +1161,7 @@ fn assert_frontier_matches_tree_size(branches: &[Option<F>], tree_size: u64) -> 
     for (level, slot) in branches.iter().enumerate().take(DEPTH) {
         if bits & 1 == 1 && slot.is_none() {
             return Err(format!(
-                "corrupted Merkle frontier: tree_size {} requires live left child at level {} but durable slot is empty",
-                tree_size, level
+                "corrupted Merkle frontier: tree_size {tree_size} requires live left child at level {level} but durable slot is empty"
             ));
         }
         bits >>= 1;
@@ -1189,7 +1183,7 @@ fn simulate_frontier_append(
             current = hash_merkle(&current, &zero_hashes[level]);
         } else {
             let left = branches[level]
-                .ok_or_else(|| format!("missing Merkle frontier at level {}", level))?;
+                .ok_or_else(|| format!("missing Merkle frontier at level {level}"))?;
             current = hash_merkle(&left, &current);
         }
         index >>= 1;
@@ -1535,8 +1529,7 @@ fn process_input<H: Host>(host: &mut H, input: &InputMessage) {
         match encode_kernel_result(&result) {
             Ok(encoded) => host.write_store(PATH_LAST_RESULT, &encoded),
             Err(e) => host.write_debug(&format!(
-                "tzel-rollup-kernel: failed to encode result: {}\n",
-                e
+                "tzel-rollup-kernel: failed to encode result: {e}\n"
             )),
         }
     }
@@ -1547,8 +1540,8 @@ fn apply_input_message<H: Host>(host: &mut H, input: &InputMessage) -> Option<Ke
     let message = match decode_rollup_message(&input.payload, current_rollup.as_slice()) {
         Ok(message) => message,
         Err(e) => {
-            let msg = bounded_error_message(format!("invalid inbox message: {}", e));
-            host.write_debug(&format!("tzel-rollup-kernel: {}\n", msg));
+            let msg = bounded_error_message(format!("invalid inbox message: {e}"));
+            host.write_debug(&format!("tzel-rollup-kernel: {msg}\n"));
             return Some(KernelResult::Error { message: msg });
         }
     };
@@ -1580,7 +1573,7 @@ fn apply_input_message<H: Host>(host: &mut H, input: &InputMessage) -> Option<Ke
         Ok(success) => Some(success),
         Err(message) => {
             let message = bounded_error_message(message);
-            ledger_debug(host, &format!("transition failed: {}", message));
+            ledger_debug(host, &format!("transition failed: {message}"));
             Some(KernelResult::Error { message })
         }
     }
@@ -1594,7 +1587,7 @@ fn load_verifier<H: Host>(host: &H) -> Result<DirectProofVerifier, String> {
 
 fn parse_compiled_felt_hex(hex_value: &str, label: &str) -> Result<F, String> {
     let bytes = hex::decode(hex_value)
-        .map_err(|e| format!("invalid {} hex in kernel build: {}", label, e))?;
+        .map_err(|e| format!("invalid {label} hex in kernel build: {e}"))?;
     if bytes.len() != 32 {
         return Err(format!(
             "invalid {} length in kernel build: got {} bytes, expected 32",
@@ -1805,7 +1798,7 @@ fn configure_bridge<H: Host>(
 }
 
 fn ledger_debug<H: Host>(host: &mut H, message: &str) {
-    host.write_debug(&format!("tzel-rollup-kernel: {}\n", message));
+    host.write_debug(&format!("tzel-rollup-kernel: {message}\n"));
 }
 
 fn increment_u64<H: Host>(host: &mut H, path: &[u8], delta: u64) {
@@ -2325,7 +2318,7 @@ mod tests {
         assert_eq!(balance, 75);
         match read_last_result(&host).unwrap() {
             KernelResult::Deposit => {}
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -2405,7 +2398,7 @@ mod tests {
                 assert_eq!(result_producer_cm, producer_cm);
                 assert_eq!(producer_index, 1);
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -2547,7 +2540,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("DAL payload hash mismatch"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -2598,7 +2591,7 @@ mod tests {
             KernelResult::Error { message } => {
                 panic!("transfer failed: {} | debug: {}", message, host.debug)
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
 
         let ledger = read_ledger(&host).unwrap();
@@ -2653,7 +2646,7 @@ mod tests {
 
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => assert!(message.contains("duplicate nullifier")),
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
 
         let ledger = read_ledger(&host).unwrap();
@@ -2710,7 +2703,7 @@ mod tests {
             KernelResult::Error { message } => {
                 panic!("unshield failed: {} | debug: {}", message, host.debug)
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
 
         let ledger = read_ledger(&host).unwrap();
@@ -2767,7 +2760,7 @@ mod tests {
 
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => assert!(message.contains("duplicate nullifier")),
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
 
         let ledger = read_ledger(&host).unwrap();
@@ -2821,7 +2814,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("invalid L1 withdrawal recipient"));
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -2873,7 +2866,7 @@ mod tests {
                 assert_eq!(change_index, None);
                 assert_eq!(producer_index, 0);
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -2921,7 +2914,7 @@ mod tests {
             KernelResult::Error { message } => {
                 panic!("unshield failed: {} | debug: {}", message, host.debug)
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
 
         let ledger = read_ledger(&host).unwrap();
@@ -2986,7 +2979,7 @@ mod tests {
         assert!(host.outputs.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => assert!(message.contains("outbox full")),
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3032,7 +3025,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("bad u64 at /tzel/v1/state/withdrawals/count"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3075,7 +3068,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("invalid L1 withdrawal recipient"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3152,7 +3145,7 @@ mod tests {
                     && message.contains("level 0"),
                 "unexpected error message: {message}"
             ),
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3194,7 +3187,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("bridge ticketer is not configured"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3323,7 +3316,7 @@ mod tests {
                     "{}",
                     message
                 ),
-                other => panic!("expected one-shot rejection, got: {:?}", other),
+                other => panic!("expected one-shot rejection, got: {other:?}"),
             }
             // Persisted config never changed.
             let ledger = read_ledger(&host).unwrap();
@@ -3348,10 +3341,9 @@ mod tests {
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => assert!(
                 message.contains("bridge deposits not accepted before verifier configuration"),
-                "unexpected error: {}",
-                message
+                "unexpected error: {message}"
             ),
-            other => panic!("expected error result, got {:?}", other),
+            other => panic!("expected error result, got {other:?}"),
         }
     }
 
@@ -3416,7 +3408,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("configuration signature verification failed"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3446,7 +3438,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("configuration signature verification failed"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3486,7 +3478,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("proof verifier is not configured"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3504,7 +3496,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("invalid inbox message"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3584,8 +3576,7 @@ mod tests {
             err.contains("invalid output_preimage")
                 || err.contains("zstd decompress")
                 || err.contains("circuit verification FAILED"),
-            "unexpected verifier error: {}",
-            err
+            "unexpected verifier error: {err}"
         );
     }
 
@@ -3613,7 +3604,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("unexpected ticketer"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3634,7 +3625,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("bridge ticketer is not configured"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3660,7 +3651,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("token_id must be 0"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3686,7 +3677,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("creator does not match transfer sender"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3712,7 +3703,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("metadata must be None"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3738,7 +3729,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("receiver is not UTF-8"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3763,7 +3754,7 @@ mod tests {
             KernelResult::Error { message } => {
                 assert!(message.contains("must be a KT1 contract"))
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected rollup result: {other:?}"),
         }
     }
 
@@ -3794,7 +3785,7 @@ mod tests {
                     "{}",
                     message
                 ),
-                other => panic!("expected one-shot rejection, got: {:?}", other),
+                other => panic!("expected one-shot rejection, got: {other:?}"),
             }
             let persisted = host
                 .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
@@ -3863,7 +3854,7 @@ mod tests {
 
         match read_last_result(&host).unwrap() {
             KernelResult::Deposit => {}
-            other => panic!("redeposit after drain should succeed: {:?}", other),
+            other => panic!("redeposit after drain should succeed: {other:?}"),
         }
         let bytes = host
             .read_store(&balance_path, 8)

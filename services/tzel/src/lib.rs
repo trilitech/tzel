@@ -140,10 +140,10 @@ fn verify_stark_proof(reprove_bin: &str, executable: &Path, proof: &Proof) -> Re
         return Ok(());
     };
 
-    let bundle_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
+    let bundle_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {e}"))?;
     let encoded = encode_verify_bundle_json(proof_bytes, output_preimage)
-        .map_err(|e| format!("encode bundle: {}", e))?;
-    std::fs::write(bundle_file.path(), encoded).map_err(|e| format!("write bundle: {}", e))?;
+        .map_err(|e| format!("encode bundle: {e}"))?;
+    std::fs::write(bundle_file.path(), encoded).map_err(|e| format!("write bundle: {e}"))?;
 
     let output = std::process::Command::new(reprove_bin)
         .arg(executable)
@@ -152,7 +152,7 @@ fn verify_stark_proof(reprove_bin: &str, executable: &Path, proof: &Proof) -> Re
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|e| format!("reprove failed to start: {}", e))?;
+        .map_err(|e| format!("reprove failed to start: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1172,7 +1172,7 @@ mod tests {
             let mut input = ZERO;
             input[..4].copy_from_slice(&i.to_le_bytes());
             let h = hash(&input);
-            assert_eq!(h[31] & 0xF8, 0, "hash output >251 bits at input {}", i);
+            assert_eq!(h[31] & 0xF8, 0, "hash output >251 bits at input {i}");
 
             let h2 = hash_merkle(&input, &ZERO);
             assert_eq!(h2[31] & 0xF8, 0, "hash_merkle output >251 bits");
@@ -1559,7 +1559,7 @@ mod tests {
         // Extract and verify auth path for each leaf
         for (i, leaf) in [leaf_0, leaf_1, leaf_2].iter().enumerate() {
             let (siblings, path_root) = tree.auth_path(i);
-            assert_eq!(path_root, root, "auth_path root mismatch for leaf {}", i);
+            assert_eq!(path_root, root, "auth_path root mismatch for leaf {i}");
             assert_eq!(siblings.len(), DEPTH, "wrong sibling count");
 
             // Walk the path manually to verify
@@ -1573,7 +1573,7 @@ mod tests {
                 };
                 idx /= 2;
             }
-            assert_eq!(current, root, "manual path walk mismatch for leaf {}", i);
+            assert_eq!(current, root, "manual path walk mismatch for leaf {i}");
         }
     }
 
@@ -2106,8 +2106,7 @@ mod tests {
         if let Err(e) = &r {
             assert!(
                 !e.contains("bad nullifier count"),
-                "N=7 should pass the count check, got: {}",
-                e
+                "N=7 should pass the count check, got: {e}"
             );
         }
     }
@@ -2151,8 +2150,7 @@ mod tests {
         if let Err(e) = &r {
             assert!(
                 !e.contains("bad nullifier count"),
-                "N=7 should pass count check, got: {}",
-                e
+                "N=7 should pass count check, got: {e}"
             );
         }
     }
@@ -2375,8 +2373,7 @@ mod tests {
         let err = validate_single_task_program_hash(&output_preimage, &u(99999)).unwrap_err();
         assert!(
             err.contains("unexpected circuit program hash"),
-            "unexpected error: {}",
-            err
+            "unexpected error: {err}"
         );
     }
 
@@ -2412,13 +2409,11 @@ mod tests {
         let err = validate_stark_circuit(&proof, CircuitKind::Transfer, &hashes).unwrap_err();
         assert!(
             err.contains("unexpected circuit program hash"),
-            "unexpected error: {}",
-            err
+            "unexpected error: {err}"
         );
         assert!(
             err.contains("transfer"),
-            "expected circuit name in error: {}",
-            err
+            "expected circuit name in error: {err}"
         );
     }
 
@@ -2542,8 +2537,7 @@ exit 2
             .unwrap_err();
         assert!(
             err.contains("not configured with --reprove-bin"),
-            "unexpected error: {}",
-            err
+            "unexpected error: {err}"
         );
     }
 
@@ -2552,7 +2546,7 @@ exit 2
         let output_preimage = vec![u(1), u(7), u(12345), u(11), u(22), u(33)];
 
         let err = parse_single_task_output_preimage(&output_preimage).unwrap_err();
-        assert!(err.contains("length mismatch"), "unexpected error: {}", err);
+        assert!(err.contains("length mismatch"), "unexpected error: {err}");
     }
 
 

@@ -399,8 +399,7 @@ pub fn decode_kernel_inbox_message(bytes: &[u8]) -> Result<KernelInboxMessage, S
     let version = wire_to_u16(wire.version)?;
     if version != KERNEL_WIRE_VERSION {
         return Err(format!(
-            "unsupported kernel inbox wire version: got {}, expected {}",
-            version, KERNEL_WIRE_VERSION
+            "unsupported kernel inbox wire version: got {version}, expected {KERNEL_WIRE_VERSION}"
         ));
     }
     match wire.message {
@@ -450,8 +449,7 @@ pub fn decode_kernel_result(bytes: &[u8]) -> Result<KernelResult, String> {
     let version = wire_to_u16(wire.version)?;
     if version != KERNEL_WIRE_VERSION {
         return Err(format!(
-            "unsupported kernel result wire version: got {}, expected {}",
-            version, KERNEL_WIRE_VERSION
+            "unsupported kernel result wire version: got {version}, expected {KERNEL_WIRE_VERSION}"
         ));
     }
     match wire.result {
@@ -519,7 +517,7 @@ fn decode_tze_prefix<'a, T>(bytes: &'a [u8]) -> Result<(&'a [u8], T), String>
 where
     T: NomReader<'a>,
 {
-    T::nom_read(bytes).map_err(|e| format!("tezos_data_encoding read failed: {:?}", e))
+    T::nom_read(bytes).map_err(|e| format!("tezos_data_encoding read failed: {e:?}"))
 }
 
 fn take_u32_be_len(bytes: &mut &[u8], label: &str) -> Result<usize, String> {
@@ -822,8 +820,7 @@ fn kernel_proof_from_wire(proof: WireStarkProof) -> Result<KernelStarkProof, Str
     let proof_len = take_u32_be_len(&mut rest, "proof_bytes length")?;
     if proof_len > MAX_PROOF_BYTES {
         return Err(format!(
-            "proof too large for kernel wire: {} > {}",
-            proof_len, MAX_PROOF_BYTES
+            "proof too large for kernel wire: {proof_len} > {MAX_PROOF_BYTES}"
         ));
     }
     let proof_bytes = take_bytes(&mut rest, proof_len, "proof_bytes")?.to_vec();
@@ -831,8 +828,7 @@ fn kernel_proof_from_wire(proof: WireStarkProof) -> Result<KernelStarkProof, Str
     let output_preimage_len = take_u32_be_len(&mut rest, "output_preimage length")?;
     if output_preimage_len > MAX_OUTPUT_PREIMAGE_ITEMS {
         return Err(format!(
-            "output_preimage too long for kernel wire: {} > {}",
-            output_preimage_len, MAX_OUTPUT_PREIMAGE_ITEMS
+            "output_preimage too long for kernel wire: {output_preimage_len} > {MAX_OUTPUT_PREIMAGE_ITEMS}"
         ));
     }
     let mut output_preimage = Vec::with_capacity(output_preimage_len);
@@ -1215,7 +1211,7 @@ mod tests {
                 assert_eq!(req.producer_cm, [9u8; 32]);
                 assert_eq!(req.producer_enc.ct_d, sample_encrypted_note(0x77).ct_d);
             }
-            other => panic!("unexpected decoded message: {:?}", other),
+            other => panic!("unexpected decoded message: {other:?}"),
         }
     }
 
@@ -1246,7 +1242,7 @@ mod tests {
                     sample_kernel_stark_proof().output_preimage
                 );
             }
-            other => panic!("unexpected decoded message: {:?}", other),
+            other => panic!("unexpected decoded message: {other:?}"),
         }
     }
 
@@ -1476,7 +1472,7 @@ mod tests {
                 assert_eq!(req.enc_2.ct_v, sample_encrypted_note(0x22).ct_v);
                 assert_eq!(req.enc_3.tag, sample_encrypted_note(0x33).tag);
             }
-            other => panic!("unexpected decoded message: {:?}", other),
+            other => panic!("unexpected decoded message: {other:?}"),
         }
     }
 
@@ -1515,7 +1511,7 @@ mod tests {
                 );
                 assert_eq!(req.enc_fee.ct_d, sample_encrypted_note(0x44).ct_d);
             }
-            other => panic!("unexpected decoded message: {:?}", other),
+            other => panic!("unexpected decoded message: {other:?}"),
         }
     }
 

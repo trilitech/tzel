@@ -184,8 +184,7 @@ fn test_ledger_refuses_insecure_startup() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("refusing to start without proof verification"),
-        "unexpected stderr: {}",
-        stderr
+        "unexpected stderr: {stderr}"
     );
 }
 

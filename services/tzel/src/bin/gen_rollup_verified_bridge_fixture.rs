@@ -88,11 +88,11 @@ fn main() -> Result<(), String> {
     let fixture = build_fixture()?;
     let output_path = workspace_root().join(FIXTURE_PATH);
     if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create fixture dir: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create fixture dir: {e}"))?;
     }
     let json =
-        serde_json::to_string_pretty(&fixture).map_err(|e| format!("encode fixture: {}", e))?;
-    std::fs::write(&output_path, json).map_err(|e| format!("write fixture: {}", e))?;
+        serde_json::to_string_pretty(&fixture).map_err(|e| format!("encode fixture: {e}"))?;
+    std::fs::write(&output_path, json).map_err(|e| format!("write fixture: {e}"))?;
     println!("{}", output_path.display());
     Ok(())
 }
@@ -652,13 +652,13 @@ fn generate_stark_bundle(
         return Err(format!("missing executable {}", executable.display()));
     }
 
-    let args_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
+    let args_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {e}"))?;
     std::fs::write(
         args_file.path(),
-        serde_json::to_string(args).map_err(|e| format!("encode args: {}", e))?,
+        serde_json::to_string(args).map_err(|e| format!("encode args: {e}"))?,
     )
-    .map_err(|e| format!("write args: {}", e))?;
-    let proof_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
+    .map_err(|e| format!("write args: {e}"))?;
+    let proof_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {e}"))?;
 
     let output = Command::new(build_reprove_bin())
         .arg(&executable)
@@ -667,7 +667,7 @@ fn generate_stark_bundle(
         .arg("--output")
         .arg(proof_file.path())
         .output()
-        .map_err(|e| format!("failed to run reprove: {}", e))?;
+        .map_err(|e| format!("failed to run reprove: {e}"))?;
     if !output.status.success() {
         return Err(format!(
             "reprove failed for {}:\nstdout:\n{}\nstderr:\n{}",
@@ -678,8 +678,8 @@ fn generate_stark_bundle(
     }
 
     let bundle_json =
-        std::fs::read_to_string(proof_file.path()).map_err(|e| format!("read proof: {}", e))?;
-    serde_json::from_str(&bundle_json).map_err(|e| format!("parse proof bundle: {}", e))
+        std::fs::read_to_string(proof_file.path()).map_err(|e| format!("read proof: {e}"))?;
+    serde_json::from_str(&bundle_json).map_err(|e| format!("parse proof bundle: {e}"))
 }
 
 fn build_reprove_bin() -> PathBuf {
@@ -720,15 +720,15 @@ fn base_wallet_fixture_path() -> PathBuf {
 
 fn load_base_wallet_fixture() -> Result<FixtureWallet, String> {
     let fixture_json = std::fs::read_to_string(base_wallet_fixture_path())
-        .map_err(|e| format!("read base wallet fixture: {}", e))?;
-    serde_json::from_str(&fixture_json).map_err(|e| format!("parse base wallet fixture: {}", e))
+        .map_err(|e| format!("read base wallet fixture: {e}"))?;
+    serde_json::from_str(&fixture_json).map_err(|e| format!("parse base wallet fixture: {e}"))
 }
 
 fn fixture_address(wallet: &FixtureWallet, index: usize) -> Result<DerivedAddress, String> {
     let address = wallet
         .addresses
         .get(index)
-        .ok_or_else(|| format!("missing wallet fixture address {}", index))?;
+        .ok_or_else(|| format!("missing wallet fixture address {index}"))?;
     if address.bds.next_index != 0 {
         return Err(format!(
             "fixture address {} expected next_index 0, got {}",
@@ -814,10 +814,10 @@ fn felt_to_hex(f: &F) -> String {
     if trimmed.is_empty() {
         "0x0".to_string()
     } else {
-        format!("0x{}", trimmed)
+        format!("0x{trimmed}")
     }
 }
 
 fn felt_u64_to_hex(v: u64) -> String {
-    format!("0x{:x}", v)
+    format!("0x{v:x}")
 }

@@ -871,7 +871,7 @@ impl Chain {
         // Balance conservation.
         let sum_out = v1 as u128 + v2 as u128;
         if sum_in != sum_out {
-            return Err(format!("balance mismatch: in={} out={}", sum_in, sum_out));
+            return Err(format!("balance mismatch: in={sum_in} out={sum_out}"));
         }
 
         // Create two output notes.
@@ -1053,7 +1053,7 @@ fn main() {
         &alice.ek_v,
         &alice.ek_d,
     ) {
-        Err(e) => println!("REJECTED ({})", e),
+        Err(e) => println!("REJECTED ({e})"),
         Ok(()) => println!("BUG!"),
     }
 
@@ -1080,7 +1080,7 @@ fn main() {
         bob.balance(),
         carol.balance()
     );
-    println!("Total:   {} (invariant: 2000)", total);
+    println!("Total:   {total} (invariant: 2000)");
     assert_eq!(total, 2000, "value conservation violated!");
 }
 

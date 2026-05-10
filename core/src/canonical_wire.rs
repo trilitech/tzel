@@ -92,7 +92,7 @@ pub(crate) fn encode_tze<T: BinWriter>(value: &T) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     value
         .bin_write(&mut out)
-        .map_err(|e| format!("tezos_data_encoding write failed: {:?}", e))?;
+        .map_err(|e| format!("tezos_data_encoding write failed: {e:?}"))?;
     Ok(out)
 }
 
@@ -137,7 +137,7 @@ where
     for<'a> T: NomReader<'a>,
 {
     let (rest, decoded) =
-        T::nom_read(bytes).map_err(|e| format!("tezos_data_encoding read failed: {:?}", e))?;
+        T::nom_read(bytes).map_err(|e| format!("tezos_data_encoding read failed: {e:?}"))?;
     if !rest.is_empty() {
         return Err(format!(
             "tezos_data_encoding decode left {} trailing bytes",

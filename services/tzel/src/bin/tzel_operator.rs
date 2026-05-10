@@ -196,7 +196,7 @@ const MAX_WAITING_ATTESTATION_LEVEL_AGE: i32 = 12;
 fn main() {
     let cli = Cli::parse();
     if let Err(err) = run(cli) {
-        eprintln!("error: {}", err);
+        eprintln!("error: {err}");
         std::process::exit(1);
     }
 }
@@ -209,7 +209,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         (Some(token), None) => token.clone(),
         (None, Some(path)) => std::fs::read_to_string(path)
-            .map_err(|e| format!("read bearer token file: {}", e))?
+            .map_err(|e| format!("read bearer token file: {e}"))?
             .trim()
             .to_string(),
         (None, None) => {
@@ -243,7 +243,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
     let state_dir = PathBuf::from(&cli.state_dir);
     std::fs::create_dir_all(submissions_dir(&state_dir))
-        .map_err(|e| format!("create state dir: {}", e))?;
+        .map_err(|e| format!("create state dir: {e}"))?;
 
     let state = AppState {
         config: Arc::new(OperatorConfig {
@@ -281,7 +281,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         .map_err(|e| format!("bind {}: {}", cli.listen, e))?;
     axum::serve(listener, app)
         .await
-        .map_err(|e| format!("serve: {}", e))
+        .map_err(|e| format!("serve: {e}"))
 }
 
 async fn healthz() -> &'static str {
@@ -322,9 +322,9 @@ fn load_dal_fee_policy(
         return Err("required DAL fee must be greater than zero".into());
     }
     let body = std::fs::read_to_string(material_path)
-        .map_err(|e| format!("read DAL fee view material {}: {}", material_path, e))?;
+        .map_err(|e| format!("read DAL fee view material {material_path}: {e}"))?;
     let material: OperatorViewMaterial = serde_json::from_str(&body)
-        .map_err(|e| format!("parse DAL fee view material {}: {}", material_path, e))?;
+        .map_err(|e| format!("parse DAL fee view material {material_path}: {e}"))?;
     let (incoming_seed, addresses) = match material {
         OperatorViewMaterial::View {
             _version: _,
@@ -340,8 +340,7 @@ fn load_dal_fee_policy(
         .find(|record| record.index == address_index)
         .ok_or_else(|| {
             format!(
-                "DAL fee view material does not contain address index {}",
-                address_index
+                "DAL fee view material does not contain address index {address_index}"
             )
         })?;
     let (ek_v, _dk_v, ek_d, _dk_d) = derive_kem_keys(&incoming_seed, address_index);
@@ -399,8 +398,8 @@ fn dev_config_admin_ask() -> F {
 }
 
 fn parse_runtime_felt_hex(var: &str) -> Result<F, String> {
-    let value = std::env::var(var).map_err(|_| format!("missing required env var: {}", var))?;
-    let bytes = hex::decode(&value).map_err(|e| format!("{} is not valid hex: {}", var, e))?;
+    let value = std::env::var(var).map_err(|_| format!("missing required env var: {var}"))?;
+    let bytes = hex::decode(&value).map_err(|e| format!("{var} is not valid hex: {e}"))?;
     if bytes.len() != 32 {
         return Err(format!(
             "{} must decode to exactly 32 bytes, got {}",
@@ -496,7 +495,7 @@ fn decode_and_validate_submission_payload(
     payload: &[u8],
 ) -> Result<KernelInboxMessage, String> {
     let message = decode_kernel_inbox_message(payload)
-        .map_err(|e| format!("decode kernel payload: {}", e))?;
+        .map_err(|e| format!("decode kernel payload: {e}"))?;
     if !kernel_message_matches_submission_kind(kind, &message) {
         return Err("submission kind does not match kernel payload".into());
     }
@@ -589,8 +588,8 @@ async fn reconcile_loop(
         })
         .await
         {
-            Err(err) => eprintln!("reconciler join error: {}", err),
-            Ok(Err(err)) => eprintln!("reconciler: {}", err),
+            Err(err) => eprintln!("reconciler join error: {err}"),
+            Ok(Err(err)) => eprintln!("reconciler: {err}"),
             Ok(Ok(summary)) => {
                 if summary.updated > 0 || summary.errors > 0 {
                     eprintln!(
@@ -616,7 +615,7 @@ async fn submit_rollup_message(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("submission task failed: {}", e),
+                format!("submission task failed: {e}"),
             )
         })?
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
@@ -639,7 +638,7 @@ async fn get_rollup_submission(
     .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("load submission task failed: {}", e),
+            format!("load submission task failed: {e}"),
         )
     })?
     .map_err(map_load_submission_err)?;
@@ -670,7 +669,7 @@ fn reconcile_pending_submissions(config: &OperatorConfig) -> Result<ReconcileSum
             Ok(stored) => stored,
             Err(err) => {
                 summary.errors += 1;
-                eprintln!("reconciler: load submission {}: {}", id, err);
+                eprintln!("reconciler: load submission {id}: {err}");
                 continue;
             }
         };
@@ -693,7 +692,7 @@ fn reconcile_pending_submissions(config: &OperatorConfig) -> Result<ReconcileSum
             }
             Err(err) => {
                 summary.errors += 1;
-                eprintln!("reconciler: advance submission {}: {}", id, err);
+                eprintln!("reconciler: advance submission {id}: {err}");
             }
         }
     }
@@ -703,9 +702,9 @@ fn reconcile_pending_submissions(config: &OperatorConfig) -> Result<ReconcileSum
 fn submission_paths(state_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     let dir = submissions_dir(state_dir);
-    let entries = std::fs::read_dir(&dir).map_err(|e| format!("read submissions dir: {}", e))?;
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("read submissions dir: {e}"))?;
     for entry in entries {
-        let entry = entry.map_err(|e| format!("read submissions dir entry: {}", e))?;
+        let entry = entry.map_err(|e| format!("read submissions dir entry: {e}"))?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
             paths.push(path);
@@ -718,9 +717,9 @@ fn submission_paths(state_dir: &Path) -> Result<Vec<PathBuf>, String> {
 fn load_stored_submission(state_dir: &Path, id: &str) -> Result<StoredSubmission, String> {
     let path = submission_path(state_dir, id);
     let body =
-        std::fs::read_to_string(&path).map_err(|e| format!("read submission {}: {}", id, e))?;
+        std::fs::read_to_string(&path).map_err(|e| format!("read submission {id}: {e}"))?;
     let mut stored: StoredSubmission =
-        serde_json::from_str(&body).map_err(|e| format!("parse submission {}: {}", id, e))?;
+        serde_json::from_str(&body).map_err(|e| format!("parse submission {id}: {e}"))?;
     align_chunk_attempts(&mut stored);
     Ok(stored)
 }
@@ -863,7 +862,7 @@ fn maybe_advance_submission(
                         if age >= MAX_WAITING_ATTESTATION_LEVEL_AGE {
                             retry_indices.push((
                                 idx,
-                                format!("stale waiting_attestation after {} levels", age),
+                                format!("stale waiting_attestation after {age} levels"),
                             ));
                         } else {
                             waiting_for_attestation = true;
@@ -1076,7 +1075,7 @@ fn publish_dal_chunk_with_protocol(
         };
         let operation_hash = extract_operation_hash(&output);
         let block_hash = extract_block_hash(&output)
-            .ok_or_else(|| format!("missing block hash in dal commitment output: {}", output))?;
+            .ok_or_else(|| format!("missing block hash in dal commitment output: {output}"))?;
         let published_level = fetch_block_level(octez_node_endpoint, &block_hash)?;
         return Ok(RollupDalChunk {
             slot_index,
@@ -1108,7 +1107,7 @@ fn submission_chunk_bytes<'a>(
     index: usize,
 ) -> Result<&'a [u8], String> {
     if index >= submission.dal_chunks.len() {
-        return Err(format!("chunk index {} out of range", index));
+        return Err(format!("chunk index {index} out of range"));
     }
     let start: usize = submission
         .dal_chunks
@@ -1143,7 +1142,7 @@ fn update_submission_commitment_summary(submission: &mut RollupSubmission) -> Re
 
 fn select_slot_index(config: &OperatorConfig, number_of_slots: u64) -> Result<u16, String> {
     let slot = config.slot_counter.fetch_add(1, Ordering::Relaxed) % number_of_slots;
-    u16::try_from(slot).map_err(|_| format!("slot index {} does not fit in u16", slot))
+    u16::try_from(slot).map_err(|_| format!("slot index {slot} does not fit in u16"))
 }
 
 fn is_slot_header_collision(err: &str) -> bool {
@@ -1154,10 +1153,10 @@ fn fetch_dal_protocol_parameters(endpoint: &str) -> Result<DalProtocolParameters
     let url = format!("{}/protocol_parameters", endpoint.trim_end_matches('/'));
     let resp = ureq::get(&url)
         .call()
-        .map_err(|e| format!("DAL protocol parameters request failed: {}", e))?;
+        .map_err(|e| format!("DAL protocol parameters request failed: {e}"))?;
     resp.into_body()
         .read_json()
-        .map_err(|e| format!("parse DAL protocol parameters: {}", e))
+        .map_err(|e| format!("parse DAL protocol parameters: {e}"))
 }
 
 fn post_dal_slot(
@@ -1171,14 +1170,14 @@ fn post_dal_slot(
         slot_index
     );
     let body = serde_json::to_string(&json!({ "invalid_utf8_string": payload }))
-        .map_err(|e| format!("serialize DAL slot publish body: {}", e))?;
+        .map_err(|e| format!("serialize DAL slot publish body: {e}"))?;
     let resp = ureq::post(&url)
         .header("Content-Type", "application/json")
         .send(body)
-        .map_err(|e| format!("DAL slot publish request failed: {}", e))?;
+        .map_err(|e| format!("DAL slot publish request failed: {e}"))?;
     resp.into_body()
         .read_json()
-        .map_err(|e| format!("parse DAL slot publish response: {}", e))
+        .map_err(|e| format!("parse DAL slot publish response: {e}"))
 }
 
 fn publish_dal_commitment(
@@ -1223,11 +1222,11 @@ fn fetch_block_level(endpoint: &str, block_hash: &str) -> Result<i32, String> {
     );
     let resp = ureq::get(&url)
         .call()
-        .map_err(|e| format!("block header request failed: {}", e))?;
+        .map_err(|e| format!("block header request failed: {e}"))?;
     let header: BlockHeaderResp = resp
         .into_body()
         .read_json()
-        .map_err(|e| format!("parse block header: {}", e))?;
+        .map_err(|e| format!("parse block header: {e}"))?;
     Ok(header.level)
 }
 
@@ -1238,11 +1237,11 @@ fn fetch_head_level(endpoint: &str) -> Result<i32, String> {
     );
     let resp = ureq::get(&url)
         .call()
-        .map_err(|e| format!("block head header request failed: {}", e))?;
+        .map_err(|e| format!("block head header request failed: {e}"))?;
     let header: BlockHeaderResp = resp
         .into_body()
         .read_json()
-        .map_err(|e| format!("parse block head header: {}", e))?;
+        .map_err(|e| format!("parse block head header: {e}"))?;
     Ok(header.level)
 }
 
@@ -1260,12 +1259,12 @@ fn fetch_dal_slot_status(
     let resp = match ureq::get(&url).call() {
         Ok(resp) => resp,
         Err(ureq::Error::StatusCode(404)) => return Ok("waiting_attestation".into()),
-        Err(err) => return Err(format!("DAL slot status request failed: {}", err)),
+        Err(err) => return Err(format!("DAL slot status request failed: {err}")),
     };
     let parsed: DalSlotStatusResp = resp
         .into_body()
         .read_json()
-        .map_err(|e| format!("parse DAL slot status: {}", e))?;
+        .map_err(|e| format!("parse DAL slot status: {e}"))?;
     Ok(match parsed {
         DalSlotStatusResp::Plain(status) => status,
         DalSlotStatusResp::Detailed { kind, .. } => kind,
@@ -1310,7 +1309,7 @@ fn dal_pointer_from_submission(
 }
 
 fn decode_felt_hex(value: &str) -> Result<F, String> {
-    let bytes = hex::decode(value).map_err(|e| format!("invalid payload hash hex: {}", e))?;
+    let bytes = hex::decode(value).map_err(|e| format!("invalid payload hash hex: {e}"))?;
     if bytes.len() != 32 {
         return Err(format!(
             "payload hash must be 32 bytes, got {}",
@@ -1357,7 +1356,7 @@ fn inject_direct_message(
 
 fn encode_targeted_rollup_message(rollup_address: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
     let address = SmartRollupAddress::from_b58check(rollup_address)
-        .map_err(|_| format!("invalid rollup address: {}", rollup_address))?;
+        .map_err(|_| format!("invalid rollup address: {rollup_address}"))?;
     let frame = ExternalMessageFrame::Targetted {
         address,
         contents: payload,
@@ -1365,7 +1364,7 @@ fn encode_targeted_rollup_message(rollup_address: &str, payload: &[u8]) -> Resul
     let mut output = Vec::new();
     frame
         .bin_write(&mut output)
-        .map_err(|e| format!("failed to encode targeted rollup message: {}", e))?;
+        .map_err(|e| format!("failed to encode targeted rollup message: {e}"))?;
     Ok(output)
 }
 
@@ -1375,14 +1374,14 @@ fn run_command_collect_output(
 ) -> Result<String, String> {
     let output = command
         .output()
-        .map_err(|e| format!("failed to start {}: {}", program_name, e))?;
+        .map_err(|e| format!("failed to start {program_name}: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let combined = match (stdout.is_empty(), stderr.is_empty()) {
         (true, true) => String::new(),
         (false, true) => stdout,
         (true, false) => stderr,
-        (false, false) => format!("{}\n{}", stdout, stderr),
+        (false, false) => format!("{stdout}\n{stderr}"),
     };
     if !output.status.success() {
         return Err(if combined.is_empty() {
@@ -1424,10 +1423,10 @@ fn write_temp_payload(bytes: &[u8]) -> Result<PathBuf, String> {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("system clock error: {}", e))?
+            .map_err(|e| format!("system clock error: {e}"))?
             .as_nanos()
     ));
-    std::fs::write(&path, bytes).map_err(|e| format!("write payload file: {}", e))?;
+    std::fs::write(&path, bytes).map_err(|e| format!("write payload file: {e}"))?;
     Ok(path)
 }
 
@@ -1437,7 +1436,7 @@ fn next_submission_id(config: &OperatorConfig) -> String {
         .unwrap_or_default()
         .as_millis();
     let seq = config.id_counter.fetch_add(1, Ordering::Relaxed);
-    format!("sub-{}-{:04}", now, seq)
+    format!("sub-{now}-{seq:04}")
 }
 
 fn submissions_dir(state_dir: &Path) -> PathBuf {
@@ -1445,7 +1444,7 @@ fn submissions_dir(state_dir: &Path) -> PathBuf {
 }
 
 fn submission_path(state_dir: &Path, id: &str) -> PathBuf {
-    submissions_dir(state_dir).join(format!("{}.json", id))
+    submissions_dir(state_dir).join(format!("{id}.json"))
 }
 
 fn persist_submission(config: &OperatorConfig, stored: &StoredSubmission) -> Result<(), String> {
@@ -1455,17 +1454,17 @@ fn persist_submission(config: &OperatorConfig, stored: &StoredSubmission) -> Res
         stored.payload = None;
     }
     std::fs::create_dir_all(submissions_dir(&config.state_dir))
-        .map_err(|e| format!("create submissions dir: {}", e))?;
+        .map_err(|e| format!("create submissions dir: {e}"))?;
     let path = submission_path(&config.state_dir, &stored.submission.id);
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {}", e))?;
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
     let body = serde_json::to_string_pretty(&stored)
-        .map_err(|e| format!("serialize submission: {}", e))?;
+        .map_err(|e| format!("serialize submission: {e}"))?;
     file.write_all(body.as_bytes())
-        .map_err(|e| format!("write tmp: {}", e))?;
-    file.sync_all().map_err(|e| format!("fsync tmp: {}", e))?;
+        .map_err(|e| format!("write tmp: {e}"))?;
+    file.sync_all().map_err(|e| format!("fsync tmp: {e}"))?;
     drop(file);
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename submission: {}", e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename submission: {e}"))?;
     Ok(())
 }
 
@@ -1822,7 +1821,7 @@ mod tests {
                 let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
             }
         });
-        format!("http://{}", addr)
+        format!("http://{addr}")
     }
 
     #[test]

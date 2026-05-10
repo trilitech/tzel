@@ -331,7 +331,7 @@ pub fn public_balance_key(owner: &str, label: &str) -> Result<String, String> {
     if label.is_empty() {
         return Err("public balance label must not be empty".into());
     }
-    Ok(format!("{}{}:{}", PUBLIC_BALANCE_KEY_PREFIX, owner, label))
+    Ok(format!("{PUBLIC_BALANCE_KEY_PREFIX}{owner}:{label}"))
 }
 
 pub fn parse_public_balance_key(value: &str) -> Option<(&str, &str)> {
@@ -350,7 +350,7 @@ pub fn validate_l1_withdrawal_recipient(value: &str) -> Result<String, String> {
     }
     TezosContract::from_b58check(value)
         .map(|_| value.to_string())
-        .map_err(|_| format!("invalid L1 withdrawal recipient: {}", value))
+        .map_err(|_| format!("invalid L1 withdrawal recipient: {value}"))
 }
 
 pub fn derive_nk_spend(nk: &F, d_j: &F) -> F {
@@ -935,8 +935,7 @@ fn assert_full_xmss_rebuild_allowed(op: &str) {
         && std::env::var_os("TZEL_ALLOW_FULL_XMSS_REBUILD").is_none()
     {
         panic!(
-            "unexpected full depth-{} XMSS rebuild via {} — default tests must use fixed fixtures or small-depth helpers",
-            AUTH_DEPTH, op
+            "unexpected full depth-{AUTH_DEPTH} XMSS rebuild via {op} — default tests must use fixed fixtures or small-depth helpers"
         );
     }
 }
@@ -1394,8 +1393,7 @@ impl MerkleTree {
         let i = self.leaves.len();
         assert!(
             i < (1u64 << DEPTH) as usize,
-            "Merkle tree full: 2^{} leaves",
-            DEPTH
+            "Merkle tree full: 2^{DEPTH} leaves"
         );
         self.leaves.push(leaf);
         i
@@ -1532,8 +1530,7 @@ pub fn parse_single_task_output_preimage(
         .map_err(|_| "invalid bootloader task count".to_string())?;
     if n_tasks != 1 {
         return Err(format!(
-            "expected exactly 1 bootloader task, got {}",
-            n_tasks
+            "expected exactly 1 bootloader task, got {n_tasks}"
         ));
     }
 
@@ -1541,8 +1538,7 @@ pub fn parse_single_task_output_preimage(
         .map_err(|_| "invalid bootloader task output size".to_string())?;
     if task_output_size < 2 {
         return Err(format!(
-            "bootloader task output too short: {} < 2",
-            task_output_size
+            "bootloader task output too short: {task_output_size} < 2"
         ));
     }
 
@@ -2050,7 +2046,7 @@ impl LedgerState for Ledger {
     fn ensure_note_capacity(&self, additional: usize) -> Result<(), String> {
         let limit = (1usize)
             .checked_shl(DEPTH as u32)
-            .ok_or_else(|| format!("Merkle tree capacity exceeds usize for depth {}", DEPTH))?;
+            .ok_or_else(|| format!("Merkle tree capacity exceeds usize for depth {DEPTH}"))?;
         let next = self
             .tree
             .leaves
@@ -2058,7 +2054,7 @@ impl LedgerState for Ledger {
             .checked_add(additional)
             .ok_or_else(|| "Merkle tree size overflow".to_string())?;
         if next > limit {
-            return Err(format!("Merkle tree full: 2^{} leaves", DEPTH));
+            return Err(format!("Merkle tree full: 2^{DEPTH} leaves"));
         }
         Ok(())
     }
@@ -2200,10 +2196,10 @@ pub fn prepare_shield<S: LedgerState>(
     }
     req.client_enc
         .validate()
-        .map_err(|e| format!("invalid client encrypted note: {}", e))?;
+        .map_err(|e| format!("invalid client encrypted note: {e}"))?;
     req.producer_enc
         .validate()
-        .map_err(|e| format!("invalid producer encrypted note: {}", e))?;
+        .map_err(|e| format!("invalid producer encrypted note: {e}"))?;
 
     let auth_domain = state.auth_domain()?;
     let mh_recipient = memo_ct_hash(&req.client_enc);
@@ -2225,8 +2221,7 @@ pub fn prepare_shield<S: LedgerState>(
         })?;
     if pool_balance < debit {
         return Err(format!(
-            "deposit pool balance ({}) too small for v + fee + producer_fee ({})",
-            pool_balance, debit
+            "deposit pool balance ({pool_balance}) too small for v + fee + producer_fee ({debit})"
         ));
     }
 
@@ -2331,13 +2326,13 @@ pub fn apply_transfer<S: LedgerState>(
     }
     req.enc_1
         .validate()
-        .map_err(|e| format!("invalid output note 1: {}", e))?;
+        .map_err(|e| format!("invalid output note 1: {e}"))?;
     req.enc_2
         .validate()
-        .map_err(|e| format!("invalid output note 2: {}", e))?;
+        .map_err(|e| format!("invalid output note 2: {e}"))?;
     req.enc_3
         .validate()
-        .map_err(|e| format!("invalid output note 3: {}", e))?;
+        .map_err(|e| format!("invalid output note 3: {e}"))?;
     if !state.has_valid_root(&req.root)? {
         return Err("invalid root".into());
     }
@@ -2372,7 +2367,7 @@ pub fn apply_transfer<S: LedgerState>(
             }
             for (i, nf) in req.nullifiers.iter().enumerate() {
                 if tail[2 + i] != *nf {
-                    return Err(format!("proof nullifier {} mismatch", i));
+                    return Err(format!("proof nullifier {i} mismatch"));
                 }
             }
             let fee_pos = 2 + n;
@@ -2439,13 +2434,13 @@ pub fn prepare_unshield<S: LedgerState>(
         }
         (false, Some(enc)) => {
             enc.validate()
-                .map_err(|e| format!("invalid change note: {}", e))?;
+                .map_err(|e| format!("invalid change note: {e}"))?;
         }
         _ => {}
     }
     req.enc_fee
         .validate()
-        .map_err(|e| format!("invalid producer fee note: {}", e))?;
+        .map_err(|e| format!("invalid producer fee note: {e}"))?;
     if req.cm_fee == ZERO {
         return Err("producer fee note must have non-zero commitment".into());
     }
@@ -2483,7 +2478,7 @@ pub fn prepare_unshield<S: LedgerState>(
             }
             for (i, nf) in req.nullifiers.iter().enumerate() {
                 if tail[2 + i] != *nf {
-                    return Err(format!("proof nullifier {} mismatch", i));
+                    return Err(format!("proof nullifier {i} mismatch"));
                 }
             }
             if tail[2 + n] != u64_to_felt(req.v_pub) {
@@ -2840,14 +2835,14 @@ mod tests {
 
         fn ensure_note_capacity(&self, additional: usize) -> Result<(), String> {
             if self.remaining_note_capacity < additional {
-                return Err(format!("Merkle tree full: 2^{} leaves", DEPTH));
+                return Err(format!("Merkle tree full: 2^{DEPTH} leaves"));
             }
             Ok(())
         }
 
         fn append_note(&mut self, cm: F, enc: EncryptedNote) -> Result<usize, String> {
             if self.remaining_note_capacity == 0 {
-                return Err(format!("Merkle tree full: 2^{} leaves", DEPTH));
+                return Err(format!("Merkle tree full: 2^{DEPTH} leaves"));
             }
             self.remaining_note_capacity -= 1;
             self.inner.append_note(cm, enc)
@@ -3487,8 +3482,7 @@ mod tests {
             assert_eq!(
                 blake2s_personalized_iv(&personal),
                 expected,
-                "{:?}",
-                personal
+                "{personal:?}"
             );
         }
     }
@@ -3625,7 +3619,7 @@ mod tests {
             ),
         ];
         for (idx, perturbed) in perturbations.iter().enumerate() {
-            assert_ne!(*perturbed, base, "field {} did not affect sighash", idx);
+            assert_ne!(*perturbed, base, "field {idx} did not affect sighash");
         }
 
         // Domain-separated from transfer (0x01) and unshield (0x02): a
@@ -4319,8 +4313,7 @@ mod tests {
             .expect_err("replay must be rejected");
         assert!(
             err.contains("shield replay") || err.contains("already applied"),
-            "expected replay error, got: {}",
-            err
+            "expected replay error, got: {err}"
         );
 
         // Tree must not have grown; memos must not have grown.
@@ -4428,7 +4421,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("no deposit pool"), "err = {}", err);
+        assert!(err.contains("no deposit pool"), "err = {err}");
         assert!(ledger.deposit_balances.is_empty());
         assert!(ledger.memos.is_empty());
     }
@@ -4469,7 +4462,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("balance"), "err = {}", err);
+        assert!(err.contains("balance"), "err = {err}");
         // Pool still has its underfunded balance (rejection left state untouched).
         assert_eq!(
             ledger.deposit_balances.get(&pubkey_hash).copied(),
@@ -4524,7 +4517,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("public output length mismatch"), "err = {}", err);
+        assert!(err.contains("public output length mismatch"), "err = {err}");
         // Pool balance untouched.
         assert_eq!(
             ledger.deposit_balances.get(&pubkey_hash).copied(),
@@ -4582,7 +4575,7 @@ mod tests {
             })
             .unwrap_err();
 
-        assert!(err.contains("pubkey_hash mismatch"), "err = {}", err);
+        assert!(err.contains("pubkey_hash mismatch"), "err = {err}");
         // Pool balance untouched.
         assert_eq!(
             ledger.deposit_balances.get(&pubkey_hash).copied(),
@@ -4663,7 +4656,7 @@ mod tests {
             })
             .unwrap_err();
 
-        assert!(err.contains("auth_domain mismatch"), "err = {}", err);
+        assert!(err.contains("auth_domain mismatch"), "err = {err}");
         // Ledger B's pool is intact.
         assert_eq!(
             ledger_b.deposit_balances.get(&pubkey_hash_b).copied(),
@@ -5091,7 +5084,7 @@ mod tests {
                 nullifiers: vec![nf],
                 v_pub: 1,
                 fee: MIN_TX_FEE,
-                recipient: format!(" {} ", TEST_L1_RECIPIENT),
+                recipient: format!(" {TEST_L1_RECIPIENT} "),
                 cm_change: ZERO,
                 enc_change: None,
                 cm_fee,
