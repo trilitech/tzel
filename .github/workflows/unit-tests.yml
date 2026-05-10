@@ -19,6 +19,21 @@ env:
   TZEL_TRAP_FULL_XMSS_REBUILDS: "1"
   CARGO_TERM_COLOR: always
 
+# `Swatinem/rust-cache` amortises the cargo registry + target/ across
+# runs (cache key bumps on Cargo.lock), dropping warm wallclock from
+# ~9 min cold to ~3-4 min. This buys headroom against the org-level
+# wallclock cap that started clipping the workflow once the wallet
+# test suite grew (PR #24 cooperative-yield + PR #25 sync-acceleration
+# added enough runtime to push past the cap on cold runs).
+#
+# We also re-order Cairo to run BEFORE the Rust unit tests inside the
+# combined job: Cairo is short (~50-70 s) and emits sparse output
+# during scarb's final accounting phase. Empirically, when Cairo runs
+# AFTER a long Rust step, the runner tends to be reaped during that
+# quiet phase. Front-loading Cairo while the runner is "fresh" avoids
+# that pattern; an alternative split-jobs layout was tried (PR #27
+# attempt 1) and produced the same kill on the cairo-only job, so the
+# split is not the load-bearing fix here — caching + ordering is.
 jobs:
   rust-and-cairo:
     runs-on: ubuntu-latest
@@ -38,6 +53,20 @@ jobs:
         uses: software-mansion/setup-scarb@2a96b748888e3329ee44ac9ac073d930e692b3cd  # v1
         with:
           scarb-version: "2.16.1"
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6  # v2.7.8
+        with:
+          shared-key: rust-and-cairo
+
+      # Cairo first: it's short, and running it before the heavy Rust
+      # compile keeps the runner emitting output throughout — works
+      # around the runner-reaped-during-quiet-final-phase pattern that
+      # bit the workflow once the post-#25 Rust step grew long enough
+      # to delay scarb's start by ~6+ min.
+      - name: Run Cairo unit tests
+        working-directory: cairo
+        run: scarb test
 
       - name: Run Rust unit tests
         run: |
@@ -76,10 +105,6 @@ jobs:
             scripts.tests.test_shadownet_operator_paths \
             scripts.tests.test_workflow_references
 
-      - name: Run Cairo unit tests
-        working-directory: cairo
-        run: scarb test
-
   ocaml:
     runs-on: ubuntu-latest
     env:
@@ -107,6 +132,11 @@ jobs:
 
       - name: Set up Rust stable
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-04-30
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6  # v2.7.8
+        with:
+          shared-key: ocaml-cross-impl
 
       - name: Run OCaml unit tests
         run: opam exec -- ./scripts/ocaml_unit_tests.sh
