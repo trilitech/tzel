@@ -20,7 +20,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  clippy:
+  clippy-stable:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -31,8 +31,37 @@ jobs:
         with:
           components: clippy
 
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6  # v2.7.8
+        with:
+          key: clippy-stable
+
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  clippy-nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Rust nightly (verifier/prover toolchain)
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master @ 2026-04-30
+        with:
+          toolchain: nightly-2025-07-14
+          components: clippy
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6  # v2.7.8
+        with:
+          key: clippy-nightly-2025-07-14
+
+      - name: cargo +nightly-2025-07-14 clippy --workspace --all-targets -- -D warnings
+        run: cargo +nightly-2025-07-14 clippy --workspace --all-targets -- -D warnings
+
+      # apps/prover is intentionally out-of-workspace (its own rust-toolchain.toml
+      # pins nightly-2025-07-14). It pulls services/reprover in as a path dep, so
+      # this step covers reprover transitively -- no separate reprover step.
+      - name: cargo clippy --manifest-path apps/prover/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path apps/prover/Cargo.toml --all-targets -- -D warnings
 
   rust-and-cairo:
     runs-on: ubuntu-latest
