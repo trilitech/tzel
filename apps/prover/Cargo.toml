@@ -9,6 +9,12 @@ edition = "2021"
 name = "reprove"
 path = "src/main.rs"
 
+# `tzel_insecure_sandbox` is a build-time --cfg (sandbox/CI only, never
+# prod) that enables the no-proving stub mode. Declare it to silence the
+# unexpected-cfg lint.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tzel_insecure_sandbox)'] }
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

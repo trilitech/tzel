@@ -1675,6 +1675,49 @@ fn authenticate_bridge_config(config: &KernelSignedBridgeConfig) -> Result<(), S
     )
 }
 
+// ── Proof-verification skip path ─────────────────────────────────────
+// Two distinct magic-byte (`kernel-test-skip-verify`) behaviours exist, on
+// PURPOSE with DIFFERENT cfg gates — the sandbox skips strictly less than
+// unit tests:
+//
+//   1. `validate_transition_proof` early-returns Ok — skips ONLY the STARK
+//      crypto verify. Gated `#[cfg(any(test, tzel_insecure_sandbox))]`.
+//   2. `host_*_req_for_transition` remap proof -> Proof::TrustMeBro — makes
+//      core apply ALSO skip the output-binding checks. Gated `#[cfg(test)]`
+//      ONLY (NOT the sandbox).
+//
+// So under `--cfg tzel_insecure_sandbox` (the CI/e2e lane), only the
+// expensive STARK math is skipped; the proof stays Proof::Stark and core
+// apply STILL runs the full output-binding checks (auth_domain / root /
+// nullifiers / fee / cm vs the real `output_preimage` the prover stub emits
+// from the bootloader). This keeps the lane catching wire/output-format
+// regressions while avoiding the ~15 GB proving. Unit tests keep the older
+// TrustMeBro shortcut because they have no real `output_preimage`.
+//
+// `tzel_insecure_sandbox` is a cfg that NO prod/bundle build sets (and
+// `--cfg` values do not unify across the dependency graph, unlike cargo
+// features). A production kernel WASM is built `--release` without it, so it
+// gets the `cfg(not(...))` plain functions below — NO skip, full STARK
+// verification AND full binding. The cfg is set only by a sandbox/CI build
+// harness, never by a prod/bundle build.
+//
+// Build canary: this `#[used]` static embeds a distinctive ASCII string in the
+// kernel artifact ONLY when built with `--cfg tzel_insecure_sandbox`. Every
+// downstream path that builds a SHIPPED/deployed kernel must grep the compiled
+// `.wasm` for this marker and FAIL if present — proving no production kernel
+// carries the skip path. `#[used]` keeps it through LTO/linker GC; the bytes
+// land in the data section where `strings`/`grep` find them. NOTE: in the
+// wasm32 release kernel artifact ONLY this `#[used]` canary survives — the
+// functional magic-byte string (`kernel-test-skip-verify`) is elided by
+// wasm32 codegen, so the WASM gate rests on this canary alone (do not remove
+// it). On native host binaries the magic-byte string IS retained and serves
+// as a second signal. Any build that ships or deploys a kernel MUST run this
+// marker scan as a build-time gate. Don't rename either marker without
+// updating that scan.
+#[cfg(tzel_insecure_sandbox)]
+#[used]
+static TZEL_INSECURE_SANDBOX_BUILD_MARKER: [u8; 32] = *b"TZEL_INSECURE_SANDBOX_PROOF_SKIP";
+
 #[cfg(not(test))]
 fn host_shield_req_for_transition(
     req: &tzel_core::kernel_wire::KernelShieldReq,
@@ -1729,7 +1772,7 @@ fn host_unshield_req_for_transition(
     host_req
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, tzel_insecure_sandbox)))]
 fn validate_transition_proof<H: Host>(
     host: &H,
     proof: &tzel_core::kernel_wire::KernelStarkProof,
@@ -1739,7 +1782,7 @@ fn validate_transition_proof<H: Host>(
     verifier.validate_kernel(proof, circuit)
 }
 
-#[cfg(test)]
+#[cfg(any(test, tzel_insecure_sandbox))]
 fn validate_transition_proof<H: Host>(
     host: &H,
     proof: &tzel_core::kernel_wire::KernelStarkProof,

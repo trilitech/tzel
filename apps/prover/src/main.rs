@@ -101,6 +101,28 @@ fn main() -> Result<()> {
 
     let args_file = cli.arguments_file.clone();
 
+    // INSECURE SANDBOX/CI ONLY (gated by --cfg tzel_insecure_sandbox; no
+    // prod build sets it). Skip the ~15 GB / ~50 s STARK proving: run only
+    // the bootloader to get the real `output_preimage` (so note-crediting
+    // works), and emit the `kernel-test-skip-verify` magic-byte proof a
+    // tzel_insecure_sandbox kernel accepts. ~0.4 s / ~130 MB. A prod
+    // reprove physically lacks this branch.
+    #[cfg(tzel_insecure_sandbox)]
+    if std::env::var("TZEL_PROVE_MODE").as_deref() == Ok("stub") {
+        eprintln!("INSECURE SANDBOX stub: bootloader only, no proving");
+        let (_prover_input, output_preimage) =
+            tzel_reprover::run_privacy_bootloader(&cli.executable, None, args_file.clone())?;
+        let bundle = ProofBundle::from_proof_parts(
+            b"kernel-test-skip-verify".to_vec(),
+            output_preimage.iter().map(|felt| felt.to_bytes_le()).collect(),
+        );
+        if let Some(path) = &cli.output {
+            fs::write(path, serde_json::to_string(&bundle)?)?;
+        }
+        eprintln!("stub bundle written (no proof generated)");
+        return Ok(());
+    }
+
     if cli.debug_single_level {
         eprintln!("WARNING: single-level mode is NOT zero-knowledge");
         let t_prove = Instant::now();
