@@ -1,0 +1,76 @@
+name: Kernel — no insecure bypass
+
+# Enforces, in the repo that OWNS the kernel, that a PRODUCTION kernel WASM
+# never carries the compile-time proof-verification skip. That skip is gated
+# behind `--cfg tzel_insecure_sandbox` and embeds a `#[used]` canary
+# (`TZEL_INSECURE_SANDBOX_PROOF_SKIP`) in the artifact ONLY when the cfg is
+# set. A plain `--release` build (no cfg) must NOT contain it. This is the
+# upstream tripwire against a cfg leaking in via an ambient
+# RUSTFLAGS/CARGO_*RUSTFLAGS or a stray .cargo/config — so a forged-proof /
+# fund-theft kernel can never be built or shipped undetected.
+#
+# A positive-control step then asserts the canary IS present when the cfg IS
+# set, so the scan can never silently degrade into a no-op (e.g. if a future
+# toolchain stopped emitting the marker).
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kernel-no-insecure-bypass:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Rust nightly
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master @ 2026-04-30
+        with:
+          toolchain: nightly-2025-07-14
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6  # v2.7.8
+        with:
+          shared-key: kernel-no-insecure-bypass
+
+      - name: Build production kernel WASM (no cfg, scrubbed env)
+        run: |
+          unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
+          cargo +nightly-2025-07-14 build --release \
+            -p tzel-rollup-kernel --target wasm32-unknown-unknown
+
+      - name: Assert the production WASM carries NO insecure-bypass marker
+        run: |
+          wasm=target/wasm32-unknown-unknown/release/tzel_rollup_kernel.wasm
+          test -s "$wasm" || { echo "FATAL: kernel WASM not produced at $wasm" >&2; exit 1; }
+          if grep -a -q 'TZEL_INSECURE_SANDBOX_PROOF_SKIP' "$wasm"; then
+            echo "FATAL: production kernel WASM was built with --cfg tzel_insecure_sandbox" >&2
+            echo "       (proof-verification skip). Refusing. Check ambient RUSTFLAGS /" >&2
+            echo "       CARGO_ENCODED_RUSTFLAGS / CARGO_BUILD_RUSTFLAGS and .cargo/config." >&2
+            exit 1
+          fi
+          echo "OK: production kernel WASM has no insecure-bypass marker"
+
+      - name: Positive control — a cfg build MUST contain the marker
+        run: |
+          RUSTFLAGS='--cfg tzel_insecure_sandbox' cargo +nightly-2025-07-14 build --release \
+            -p tzel-rollup-kernel --target wasm32-unknown-unknown
+          wasm=target/wasm32-unknown-unknown/release/tzel_rollup_kernel.wasm
+          if ! grep -a -q 'TZEL_INSECURE_SANDBOX_PROOF_SKIP' "$wasm"; then
+            echo "FATAL: canary ABSENT from a --cfg tzel_insecure_sandbox build." >&2
+            echo "       The scan above would be a silent no-op — the marker no longer" >&2
+            echo "       survives codegen. Fix the canary before relying on this gate." >&2
+            exit 1
+          fi
+          echo "OK: canary present under cfg — the absence-scan is meaningful"
