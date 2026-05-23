@@ -46,7 +46,9 @@ jobs:
 
       - name: Build production kernel WASM (no cfg, scrubbed env)
         run: |
-          unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS
+          # Scrub every channel that can enable the skip: the global RUSTFLAGS
+          # aliases AND TZEL_INSECURE_SANDBOX (read by the kernel's build.rs).
+          unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS TZEL_INSECURE_SANDBOX
           cargo +nightly-2025-07-14 build --release \
             -p tzel-rollup-kernel --target wasm32-unknown-unknown
 
@@ -64,11 +66,13 @@ jobs:
 
       - name: Positive control — a cfg build MUST contain the marker
         run: |
-          RUSTFLAGS='--cfg tzel_insecure_sandbox' cargo +nightly-2025-07-14 build --release \
+          # Use the production trigger (TZEL_INSECURE_SANDBOX, read by build.rs),
+          # so this exercises the SAME path the sandbox lane uses — not RUSTFLAGS.
+          TZEL_INSECURE_SANDBOX=1 cargo +nightly-2025-07-14 build --release \
             -p tzel-rollup-kernel --target wasm32-unknown-unknown
           wasm=target/wasm32-unknown-unknown/release/tzel_rollup_kernel.wasm
           if ! grep -a -q 'TZEL_INSECURE_SANDBOX_PROOF_SKIP' "$wasm"; then
-            echo "FATAL: canary ABSENT from a --cfg tzel_insecure_sandbox build." >&2
+            echo "FATAL: canary ABSENT from a TZEL_INSECURE_SANDBOX=1 build." >&2
             echo "       The scan above would be a silent no-op — the marker no longer" >&2
             echo "       survives codegen. Fix the canary before relying on this gate." >&2
             exit 1
