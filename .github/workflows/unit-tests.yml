@@ -18,26 +18,48 @@ permissions:
 env:
   TZEL_TRAP_FULL_XMSS_REBUILDS: "1"
   CARGO_TERM_COLOR: always
+  # Cap compile parallelism to reduce peak memory. The rust-and-cairo job was
+  # intermittently losing its runner ("The runner has received a shutdown
+  # signal") mid-Cairo-phase — root-caused to runner-side resource exhaustion
+  # on this heavy job (3 toolchains + ~13 crates + scarb), which starves the
+  # runner agent's heartbeat and gets the agent reaped ~30 s later. Fewer
+  # concurrent rustc processes => lower peak RSS => no reap. Paired with the
+  # swap step below.
+  CARGO_BUILD_JOBS: "3"
 
-# `Swatinem/rust-cache` amortises the cargo registry + target/ across
-# runs (cache key bumps on Cargo.lock), dropping warm wallclock from
-# ~9 min cold to ~3-4 min. This buys headroom against the org-level
-# wallclock cap that started clipping the workflow once the wallet
-# test suite grew (PR #24 cooperative-yield + PR #25 sync-acceleration
-# added enough runtime to push past the cap on cold runs).
+# `Swatinem/rust-cache` amortises the cargo registry + target/ across runs
+# (cache key bumps on Cargo.lock), dropping warm wallclock from ~9 min cold
+# to ~3-4 min.
 #
-# We also re-order Cairo to run BEFORE the Rust unit tests inside the
-# combined job: Cairo is short (~50-70 s) and emits sparse output
-# during scarb's final accounting phase. Empirically, when Cairo runs
-# AFTER a long Rust step, the runner tends to be reaped during that
-# quiet phase. Front-loading Cairo while the runner is "fresh" avoids
-# that pattern; an alternative split-jobs layout was tried (PR #27
-# attempt 1) and produced the same kill on the cairo-only job, so the
-# split is not the load-bearing fix here — caching + ordering is.
+# Runner-reap flake (root cause, 2026-05-23 investigation): this job was
+# intermittently failing mid-Cairo with "The runner has received a shutdown
+# signal" — NOT a test failure, and NOT the "org wallclock cap" earlier
+# comments guessed (the kills were scattered across 59 s-578 s with no
+# wallclock clustering), and NOT cured by the earlier Cairo-first reorder
+# (that only changed which test the freeze landed near). It is runner-side
+# RESOURCE EXHAUSTION: the heavy multi-toolchain build (stable + nightly +
+# scarb, ~13 crates) spikes memory/CPU, the runner agent misses its heartbeat,
+# and the control plane reaps the agent ~30 s later. Mitigated by the swap
+# step (first job step) + the CARGO_BUILD_JOBS cap (env, above). Cairo still
+# runs first because it's cheap and keeps output flowing, but that's hygiene,
+# not the load-bearing fix.
 jobs:
   rust-and-cairo:
     runs-on: ubuntu-latest
     steps:
+      # Memory headroom against the runner-reap flake (see header). Adds 10 GB
+      # of swap on the large /mnt ephemeral disk so a transient RSS spike from
+      # the multi-toolchain build is paged out instead of starving the runner
+      # agent and getting it reaped. No external action (auditable, no SHA pin).
+      - name: Add swap space
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 10G /mnt/ci-swapfile || sudo dd if=/dev/zero of=/mnt/ci-swapfile bs=1M count=10240
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+          free -h
+
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
