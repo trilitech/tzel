@@ -18,13 +18,12 @@ permissions:
 env:
   TZEL_TRAP_FULL_XMSS_REBUILDS: "1"
   CARGO_TERM_COLOR: always
-  # Cap compile parallelism to reduce peak memory. The rust-and-cairo job was
-  # intermittently losing its runner ("The runner has received a shutdown
-  # signal") mid-Cairo-phase — root-caused to runner-side resource exhaustion
-  # on this heavy job (3 toolchains + ~13 crates + scarb), which starves the
-  # runner agent's heartbeat and gets the agent reaped ~30 s later. Fewer
-  # concurrent rustc processes => lower peak RSS => no reap. Paired with the
-  # swap step below.
+  # Cap compile parallelism (fewer concurrent rustc/LLVM codegen => lower peak
+  # RSS) for the heavy rust-and-cairo job's COMPILE phase. Secondary lever: the
+  # observed reap is in the Cairo TEST phase, which this does not touch — swap
+  # (below) is the primary mitigation there. Together they REDUCE the runner-
+  # reap probability; they are not a proven bound. If reaps persist, escalate
+  # to a larger runner (more RAM/vCPU) or split the heavy nightly builds out.
   CARGO_BUILD_JOBS: "3"
 
 # `Swatinem/rust-cache` amortises the cargo registry + target/ across runs
@@ -47,13 +46,19 @@ jobs:
   rust-and-cairo:
     runs-on: ubuntu-latest
     steps:
-      # Memory headroom against the runner-reap flake (see header). Adds 10 GB
-      # of swap on the large /mnt ephemeral disk so a transient RSS spike from
-      # the multi-toolchain build is paged out instead of starving the runner
-      # agent and getting it reaped. No external action (auditable, no SHA pin).
+      # Memory headroom against the runner-reap flake (see header). The observed
+      # freeze is in the Cairo TEST phase, so a transient RSS spike is the
+      # plausible trigger; 10 GB swap on the large /mnt ephemeral disk lets it
+      # page out instead of starving the runner agent. set -euo pipefail makes a
+      # partial failure loud (swapoff -a first means we briefly drop the ~4 GB
+      # default swap, so we must not silently end with less); rm -f guards a
+      # stale file on a (rare) reused runner. No external action.
       - name: Add swap space
+        shell: bash
         run: |
+          set -euo pipefail
           sudo swapoff -a || true
+          sudo rm -f /mnt/ci-swapfile
           sudo fallocate -l 10G /mnt/ci-swapfile || sudo dd if=/dev/zero of=/mnt/ci-swapfile bs=1M count=10240
           sudo chmod 600 /mnt/ci-swapfile
           sudo mkswap /mnt/ci-swapfile
