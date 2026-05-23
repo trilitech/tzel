@@ -7,6 +7,8 @@
 
 fn main() {
     println!("cargo:rerun-if-env-changed=TZEL_INSECURE_SANDBOX");
+    // Exact "1" match is intentional (fail-closed): "true"/"yes"/"0"/" 1" etc.
+    // must NOT enable the proof-skip. Do not loosen this.
     if std::env::var("TZEL_INSECURE_SANDBOX").as_deref() == Ok("1") {
         println!("cargo:rustc-cfg=tzel_insecure_sandbox");
     }

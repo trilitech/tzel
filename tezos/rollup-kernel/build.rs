@@ -18,7 +18,24 @@
 //! so it cannot be enabled via transitive feature unification.
 
 fn main() {
+    // Track the admin-material env vars baked into the kernel at compile time
+    // via `option_env!` (src/lib.rs configure_* paths). cargo does NOT
+    // fingerprint `option_env!` inputs on its own, and the release build flow
+    // (scripts/build_rollup_kernel_release.sh) sources a freshly-generated
+    // admin env then `cargo build`s WITHOUT `cargo clean` — so without this,
+    // a rotated admin ask would reuse a stale .wasm baked with the OLD leaves
+    // and the deployed kernel would reject signatures from the new ask.
+    for var in [
+        "TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX",
+        "TZEL_ROLLUP_VERIFIER_CONFIG_ADMIN_LEAF_HEX",
+        "TZEL_ROLLUP_BRIDGE_CONFIG_ADMIN_LEAF_HEX",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+
     println!("cargo:rerun-if-env-changed=TZEL_INSECURE_SANDBOX");
+    // Exact "1" match is intentional (fail-closed): "true"/"yes"/"0"/" 1" etc.
+    // must NOT enable the proof-skip. Do not loosen this.
     if std::env::var("TZEL_INSECURE_SANDBOX").as_deref() == Ok("1") {
         println!("cargo:rustc-cfg=tzel_insecure_sandbox");
     }
