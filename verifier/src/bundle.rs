@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use circuit_serialize::deserialize::deserialize_proof_with_config;
 use circuits::blake::HashValue;
 use circuits::ivalue::IValue;
-use circuits_stark_verifier::proof::ProofConfig;
+use circuits_stark_verifier::proof::{ComponentShape, ProofConfig};
 use circuits_stark_verifier::proof_from_stark_proof::pack_into_qm31s;
 use starknet_types_core::felt::Felt;
 use starknet_types_core::hash::Blake2Felt252;
@@ -195,20 +195,36 @@ impl ProofBundle {
     }
 
     pub fn verify(&self) -> Result<()> {
-        use circuit_air::verify::{verify_circuit, CircuitConfig, CircuitPublicData};
+        use circuit_verifier::verify::{verify_circuit, CircuitConfig, CircuitPublicData};
 
         let preimage_felts = self.output_preimage_felts();
         let meta = canonical_verify_meta_for_output_preimage(&preimage_felts)?;
 
+        // M1.6: ProofConfig API changes (stwo-circuits 2591775 → 2bf051f, Jun 2026):
+        //   - n_proof_of_work_bits → n_pow_bits
+        //   - interaction_pow_bits → n_interaction_pow_bits
+        //   - n_components field → derived from component_shapes.len()
+        //   - trace_columns_per_component + interaction_columns_per_component → Vec<ComponentShape>
+        //   - enabled_bits required (new): the circuit verifier always has all components
+        //     active in our usage, so vec![true; n_components].
+        let component_shapes: Vec<ComponentShape> = meta
+            .trace_columns_per_component
+            .iter()
+            .zip(meta.interaction_columns_per_component.iter())
+            .map(|(&trace_columns, &interaction_columns)| ComponentShape {
+                trace_columns,
+                interaction_columns,
+            })
+            .collect();
+        let enabled_bits = vec![true; meta.n_components];
         let proof_config = ProofConfig {
-            n_proof_of_work_bits: meta.n_pow_bits,
+            n_pow_bits: meta.n_pow_bits,
             n_preprocessed_columns: meta.n_preprocessed_columns,
             n_trace_columns: meta.n_trace_columns,
             n_interaction_columns: meta.n_interaction_columns,
-            trace_columns_per_component: meta.trace_columns_per_component.clone(),
-            interaction_columns_per_component: meta.interaction_columns_per_component.clone(),
+            component_shapes,
             cumulative_sum_columns: meta.cumulative_sum_columns.clone(),
-            n_components: meta.n_components,
+            enabled_bits,
             fri: circuits_stark_verifier::fri_proof::FriConfig {
                 log_trace_size: meta.fri_log_trace_size,
                 log_blowup_factor: meta.fri_log_blowup as usize,
@@ -216,7 +232,7 @@ impl ProofBundle {
                 log_n_last_layer_coefs: meta.fri_log_last_layer as usize,
                 fold_step: meta.fri_fold_step as usize,
             },
-            interaction_pow_bits: meta.interaction_pow_bits,
+            n_interaction_pow_bits: meta.interaction_pow_bits,
         };
 
         let qm31_from = |vals: &[u32]| -> QM31 {
@@ -229,6 +245,35 @@ impl ProofBundle {
         };
 
         let pr = &meta.preprocessed_root;
+        // M1.6: CircuitConfig API changes (stwo-circuits 2591775 → 2bf051f, Jun 2026):
+        //   - output_addresses, n_blake_gates fields REMOVED (now derived internally)
+        //   - preprocessed_column_ids: Vec<PreProcessedColumnId>
+        //       → preprocessed_column_log_sizes: OrderedHashMap<PreProcessedColumnId, u32>
+        //   - NEW field n_outputs: derived from output_addresses.len() in old code
+        //
+        // The compiled-in canonical_verify_meta.hex predates these changes and does not
+        // carry per-column log_sizes. For compilation only, we map each column ID to
+        // log_trace_size as a placeholder; runtime validation cannot pass against the
+        // current canonical blob — a fresh canonical blob must be regenerated separately.
+        let circuit_log_trace_size = (meta
+            .circuit_lifting
+            .unwrap_or(meta.fri_log_trace_size as u32 + meta.fri_log_blowup))
+            .saturating_sub(meta.circuit_fri_log_blowup);
+        let preprocessed_column_log_sizes: circuits_stark_verifier::order_hash_map::OrderedHashMap<
+            stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId,
+            u32,
+        > = meta
+            .preprocessed_column_ids
+            .iter()
+            .map(|s| {
+                (
+                    stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId {
+                        id: s.clone().into(),
+                    },
+                    circuit_log_trace_size,
+                )
+            })
+            .collect();
         let circuit_config = CircuitConfig {
             config: stwo::core::pcs::PcsConfig {
                 pow_bits: meta.circuit_pow_bits,
@@ -240,17 +285,8 @@ impl ProofBundle {
                 },
                 lifting_log_size: meta.circuit_lifting,
             },
-            output_addresses: meta.output_addresses.clone(),
-            n_blake_gates: meta.n_blake_gates,
-            preprocessed_column_ids: meta
-                .preprocessed_column_ids
-                .iter()
-                .map(
-                    |s| stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId {
-                        id: s.clone().into(),
-                    },
-                )
-                .collect(),
+            n_outputs: meta.output_addresses.len(),
+            preprocessed_column_log_sizes,
             preprocessed_root: HashValue(qm31_from(&pr[0..4]), qm31_from(&pr[4..8])),
         };
 
