@@ -31,6 +31,13 @@ struct Cli {
     #[arg(long, short)]
     output: Option<PathBuf>,
 
+    /// Write raw (uncompressed CircuitSerialize) proof bytes to this file.
+    /// Drop-in compatible with stwo-gnark-tzel's `l2_proof.bin` format —
+    /// use this when feeding the proof into the SNARK wrap pipeline.
+    /// Can be combined with `--output` to emit both formats in one run.
+    #[arg(long)]
+    bin_output: Option<PathBuf>,
+
     /// JSON file with witness arguments (array of hex felt strings, length-prefixed)
     #[arg(long)]
     arguments_file: Option<PathBuf>,
@@ -179,6 +186,17 @@ fn main() -> Result<()> {
             let json = serde_json::to_string(&bundle)?;
             fs::write(&path, &json)?;
             eprintln!("Proof bundle written to {:?} ({} bytes)", path, json.len());
+        }
+
+        // Write raw CircuitSerialize proof bytes (drop-in compatible with
+        // stwo-gnark-tzel's `l2_proof.bin` format).
+        if let Some(path) = cli.bin_output {
+            fs::write(&path, &proof_output.proof_uncompressed)?;
+            eprintln!(
+                "Raw proof bytes written to {:?} ({} bytes uncompressed)",
+                path,
+                proof_output.proof_uncompressed.len()
+            );
         }
 
         eprintln!("Total wall: {}ms", t_total.elapsed().as_millis());

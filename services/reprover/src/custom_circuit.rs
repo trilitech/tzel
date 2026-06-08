@@ -173,6 +173,10 @@ fn compute_output(output_preimage: &[Felt]) -> [M31; MEMORY_VALUES_LIMBS] {
 
 pub struct CustomProofOutput {
     pub proof: Vec<u8>,
+    /// Raw (uncompressed) CircuitSerialize bytes — drop-in compatible with
+    /// stwo-gnark-tzel's `l2_proof.bin` format. The `proof` field above is
+    /// the same data zstd-compressed for storage/transport.
+    pub proof_uncompressed: Vec<u8>,
     pub output_preimage: Vec<Felt>,
     pub cairo_prove_ms: u128,
     pub circuit_prove_ms: u128,
@@ -501,6 +505,7 @@ pub fn custom_recursive_prove(
     let mut proof_bytes: Vec<u8> = vec![];
     proof_qm31s.serialize(&mut proof_bytes);
     let compressed = zstd::encode_all(&proof_bytes[..], 3)?;
+    let proof_uncompressed = proof_bytes;
 
     // ── Verify both proofs ───────────────────────────────────────────
     let t_verify = Instant::now();
@@ -522,6 +527,7 @@ pub fn custom_recursive_prove(
 
     Ok(CustomProofOutput {
         proof: compressed,
+        proof_uncompressed,
         output_preimage,
         cairo_prove_ms,
         circuit_prove_ms,
