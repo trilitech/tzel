@@ -38,6 +38,16 @@ struct Cli {
     #[arg(long)]
     bin_output: Option<PathBuf>,
 
+    /// Use the chip-compat L2 PcsConfig (n_queries=23, log_blowup=1,
+    /// fold_step=1, pow_bits=10) instead of the prod one (n_queries=35,
+    /// log_blowup=2, fold_step=4, pow_bits=26). This aligns the produced
+    /// L2 STARK proof with stwo-gnark-tzel's BenchCircuit hardcoded shape,
+    /// at the cost of dropping standalone FRI soundness from ~96 to ~33
+    /// bits. Use only for SNARK-wrap pipeline bench/development — NOT
+    /// safe for mainnet until the chip is rebuilt for the prod shape.
+    #[arg(long)]
+    chip_compat: bool,
+
     /// JSON file with witness arguments (array of hex felt strings, length-prefixed)
     #[arg(long)]
     arguments_file: Option<PathBuf>,
@@ -150,6 +160,13 @@ fn main() -> Result<()> {
             println!("peak_rss_kb={}", mem);
         }
     } else {
+        if cli.chip_compat {
+            eprintln!(
+                "WARNING: chip-compat mode (n_queries=23, log_blowup=1, fold_step=1, \
+                 pow_bits=10) — L2 FRI soundness ~33 bits, NOT production-grade"
+            );
+            tzel_reprover::custom_circuit::set_chip_compat_mode();
+        }
         eprintln!("Running recursive prove...");
         let t_prove = Instant::now();
         let proof_output = prove_with_args_file(&cli.executable, args_file)?;

@@ -125,6 +125,57 @@ const CIRCUIT_FRI_CONFIG: FriConfig = FriConfig {
     fold_step: 4,
 };
 
+/// Level 2 PCS pow_bits for the prod config. 26 + 2*35 = 96-bit FRI soundness.
+const CIRCUIT_PCS_POW_BITS_PROD: u32 = 26;
+
+/// Chip-compat L2 FRI configuration — matches stwo-gnark-tzel's BenchCircuit
+/// hardcoded shape (n_queries=23, log_blowup=1, fold_step=1). Combined with
+/// PoW=10 this gives ~33-bit standalone FRI soundness, NOT production-grade.
+///
+/// Use this when feeding the resulting L2 STARK proof into the SNARK-wrap
+/// pipeline whose chip is currently hardcoded for this shape. The chip will
+/// be rebuilt for the prod shape before mainnet — at which point this
+/// constant goes away.
+const CIRCUIT_FRI_CONFIG_CHIP_COMPAT: FriConfig = FriConfig {
+    log_blowup_factor: 1,
+    log_last_layer_degree_bound: 0,
+    n_queries: 23,
+    fold_step: 1,
+};
+
+/// Chip-compat L2 PCS pow_bits.
+const CIRCUIT_PCS_POW_BITS_CHIP_COMPAT: u32 = 10;
+
+thread_local! {
+    /// When set (via [`set_chip_compat_mode`]), `run_leaf_pipeline_internal`
+    /// substitutes the chip-compat FRI + PoW config for the prod ones. Used
+    /// by the `--chip-compat` flag of `reprove`.
+    static CHIP_COMPAT_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable chip-compat L2 prove mode on the current thread. Subsequent calls
+/// to [`custom_recursive_prove`] (and friends) use the chip-aligned FRI
+/// config instead of the prod one. See [`CIRCUIT_FRI_CONFIG_CHIP_COMPAT`].
+pub fn set_chip_compat_mode() {
+    CHIP_COMPAT_MODE.with(|c| c.set(true));
+}
+
+fn active_circuit_fri_config() -> FriConfig {
+    if CHIP_COMPAT_MODE.with(|c| c.get()) {
+        CIRCUIT_FRI_CONFIG_CHIP_COMPAT
+    } else {
+        CIRCUIT_FRI_CONFIG
+    }
+}
+
+fn active_circuit_pcs_pow_bits() -> u32 {
+    if CHIP_COMPAT_MODE.with(|c| c.get()) {
+        CIRCUIT_PCS_POW_BITS_CHIP_COMPAT
+    } else {
+        CIRCUIT_PCS_POW_BITS_PROD
+    }
+}
+
 /// Level 1 (Cairo) PCS configuration.
 /// Security: pow_bits(27) + log_blowup(3) * n_queries(23) = 96 bits.
 /// lifting_log_size = 23 means the FRI evaluation domain is 2^23 (= 2^20 trace * 2^3 blowup).
@@ -361,7 +412,9 @@ fn run_leaf_pipeline_internal(
     // making it deterministic but unpredictable to an adversary.
 
     let zk_blinding_seed = cairo_proof.extended_stark_proof.proof.commitments.0[1].0;
-    add_zk_blinding(&mut context, zk_blinding_seed, CIRCUIT_FRI_CONFIG.n_queries);
+    let circuit_fri_config = active_circuit_fri_config();
+    let circuit_pcs_pow_bits = active_circuit_pcs_pow_bits();
+    add_zk_blinding(&mut context, zk_blinding_seed, circuit_fri_config.n_queries);
     finalize_context(&mut context);
     let context_values = context.values();
 
@@ -376,11 +429,11 @@ fn run_leaf_pipeline_internal(
         // preprocessed trace (lookup tables for the circuit itself).
         let mut nv =
             circuit_cairo_verifier::verify::build_cairo_verifier_circuit(&cairo_verifier_config);
-        add_zk_blinding(&mut nv, [0; 32], CIRCUIT_FRI_CONFIG.n_queries);
+        add_zk_blinding(&mut nv, [0; 32], circuit_fri_config.n_queries);
         PreprocessedCircuit::preprocess_circuit(&mut nv)
     };
     let circuit_trace_log_size = preprocessed_circuit.params.trace_log_size;
-    let circuit_lifting = circuit_trace_log_size + CIRCUIT_FRI_CONFIG.log_blowup_factor;
+    let circuit_lifting = circuit_trace_log_size + circuit_fri_config.log_blowup_factor;
     info!(
         "Circuit trace log_size: {}, lifting: {}",
         circuit_trace_log_size, circuit_lifting
@@ -399,7 +452,7 @@ fn run_leaf_pipeline_internal(
     let circuit_pp_polys = SimdBackend::interpolate_columns(circuit_pp_trace, &twiddles);
     let circuit_pp_tree = CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
         circuit_pp_polys,
-        CIRCUIT_FRI_CONFIG.log_blowup_factor,
+        circuit_fri_config.log_blowup_factor,
         &twiddles,
         true,
         Some(circuit_lifting),
@@ -407,8 +460,8 @@ fn run_leaf_pipeline_internal(
     );
 
     let circuit_pcs_config = PcsConfig {
-        pow_bits: 26,
-        fri_config: CIRCUIT_FRI_CONFIG,
+        pow_bits: circuit_pcs_pow_bits,
+        fri_config: circuit_fri_config,
         lifting_log_size: Some(circuit_lifting),
     };
     let circuit_config = CircuitConfig {
