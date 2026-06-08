@@ -26,29 +26,30 @@ cairo-vm = { version = "=3.2.0", features = [
     "mod_builtin",
 ] }
 
-# proving-utils sub-crates via git at v1.2.2
-cairo-program-runner-lib = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
-privacy-prove = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
-privacy-circuit-verify = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
+# proving-utils (local fork — bumped to stwo-circuits 2bf051f)
+cairo-program-runner-lib = { path = "/home/saroupille/git/proving-utils/crates/cairo-program-runner-lib" }
+privacy-prove = { path = "/home/saroupille/git/proving-utils/crates/privacy_prove" }
+privacy-circuit-verify = { path = "/home/saroupille/git/proving-utils/crates/privacy_circuit_verify" }
 
 # stwo-cairo (exact rev used by proving-utils v1.2.2)
-cairo-air = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
-stwo-cairo-adapter = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
-stwo-cairo-prover = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
-stwo-cairo-serialize = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
-stwo-cairo-common = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
+cairo-air = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
+stwo-cairo-adapter = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
+stwo-cairo-prover = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
+stwo-cairo-serialize = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
+stwo-cairo-common = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
 
-# stwo-circuits (exact rev used by proving-utils v1.2.2)
-circuit-cairo-air = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuit-prover = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuit-common = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuit-air = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+# stwo-circuits — bumped to 2bf051f to surface circuit-multiverifier
+circuit-cairo-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-prover = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-common = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
 
 # stwo core (exact rev used by proving-utils v1.2.2)
-stwo = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c", features = ["parallel", "prover"] }
+stwo = { version = "2.2.0", features = ["parallel", "prover"] }
 
 [[bin]]
 name = "tzel-prove"
@@ -69,3 +70,5 @@ opt-level = 1
 opt-level = 1
 [profile.witness-opt-1.package.privacy-prove]
 opt-level = 1
+
+[workspace]

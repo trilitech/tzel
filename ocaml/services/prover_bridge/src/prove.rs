@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     // Load the Cairo PIE
-    let pie = CairoPie::read_zip_file(&args.pie, None)?;
+    let pie = CairoPie::read_zip_file(&args.pie)?;
 
     // Run the prover
     let proof_output = if args.recursive {

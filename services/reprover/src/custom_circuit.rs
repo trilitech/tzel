@@ -50,24 +50,23 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use cairo_air::PreProcessedTraceVariant;
 use cairo_air::flat_claims::FlatClaim;
-use circuit_air::statement::INTERACTION_POW_BITS as CIRCUIT_INTERACTION_POW_BITS;
-use circuit_air::verify::CircuitConfig;
-use circuit_cairo_air::all_components::all_components;
-use circuit_cairo_air::preprocessed_columns::PREPROCESSED_COLUMNS_ORDER;
-use circuit_cairo_air::statement::MEMORY_VALUES_LIMBS;
-use circuit_cairo_air::verify::{
+use circuit_verifier::statement::INTERACTION_POW_BITS as CIRCUIT_INTERACTION_POW_BITS;
+use circuit_verifier::verify::CircuitConfig;
+use circuit_cairo_verifier::all_components::all_components;
+use circuit_cairo_verifier::preprocessed_columns::CANONICAL_SMALL_PREPROCESSED_COLUMNS;
+use circuit_cairo_verifier::statement::MEMORY_VALUES_LIMBS;
+use circuit_cairo_verifier::verify::{
     CairoVerifierConfig, build_fixed_cairo_circuit, get_preprocessed_root,
     prepare_cairo_proof_for_circuit_verifier,
 };
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use circuit_common::finalize::{add_zk_blinding, finalize_context};
 use circuit_common::preprocessed::PreprocessedCircuit;
 use circuit_prover::prover::{
     prepare_circuit_proof_for_circuit_verifier, prove_circuit_with_precompute,
 };
 use circuit_serialize::serialize::CircuitSerialize;
-use circuits_stark_verifier::empty_component::EmptyComponent;
 use circuits_stark_verifier::proof::ProofConfig;
 use privacy_circuit_verify::{compute_privacy_bootloader_output, get_privacy_bootloader_program};
 use starknet_types_core::felt::Felt;
@@ -100,20 +99,18 @@ use tracing::{Level, info, span};
 fn build_proof_config_from_enable_bits(enable_bits: &[bool]) -> ProofConfig {
     let all = all_components::<QM31>();
     assert_eq!(all.len(), enable_bits.len());
-    let components: Vec<Box<dyn circuits_stark_verifier::constraint_eval::CircuitEval<QM31>>> = all
+    let components: indexmap::IndexMap<
+        &'static str,
+        Box<dyn circuits_stark_verifier::constraint_eval::CircuitEval<QM31>>,
+    > = all
         .into_iter()
         .zip(enable_bits.iter())
-        .map(|((_name, comp), &enabled)| {
-            if enabled {
-                comp
-            } else {
-                Box::new(EmptyComponent {}) as _
-            }
-        })
+        .filter_map(|((name, comp), &enabled)| if enabled { Some((name, comp)) } else { None })
         .collect();
-    ProofConfig::from_components(
+    ProofConfig::new(
         &components,
-        PREPROCESSED_COLUMNS_ORDER.len(),
+        enable_bits.to_vec(),
+        CANONICAL_SMALL_PREPROCESSED_COLUMNS.len(),
         &CAIRO_PCS_CONFIG,
         cairo_air::verifier::INTERACTION_POW_BITS,
     )
@@ -182,23 +179,44 @@ pub struct CustomProofOutput {
     pub verify_ms: u128,
 }
 
-/// Generate a two-level recursive zero-knowledge proof.
-///
-/// This is the main entry point for proof generation. It:
-///   1. Generates a first-level Cairo AIR proof (NOT zero-knowledge)
-///   2. Dynamically detects which components are active
-///   3. Builds a circuit that verifies the Cairo proof
-///   4. Adds ZK blinding to the circuit (making it zero-knowledge)
-///   5. Proves the circuit execution with Stwo
-///   6. Verifies both proofs for correctness
-///   7. Serializes and compresses the circuit proof (~290 KB)
-/// Generate a two-level recursive ZK proof from an execution trace.
-/// Returns proof bytes (zstd-compressed), public outputs, and timing data.
-pub fn custom_recursive_prove(
+/// In-memory artifacts of a single leaf proof, ready to be fed into the
+/// aggregation harness (see [`crate::aggregate`]). The `circuit_proof` is
+/// the raw, undelivered (non-serialized) STARK proof produced by the
+/// two-level pipeline. Aggregation needs both the proof itself and the
+/// `preprocessed_circuit`/`pcs_config` that describe its shape.
+pub struct LeafArtifacts {
+    pub circuit_proof:
+        circuit_verifier::circuit_proof::CircuitProof<
+            stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleHasher,
+        >,
+    pub preprocessed_circuit: Arc<PreprocessedCircuit>,
+    pub circuit_pcs_config: PcsConfig,
+    pub output_preimage: Vec<Felt>,
+    pub cairo_prove_ms: u128,
+    pub circuit_prove_ms: u128,
+}
+
+/// Internal richer state returned by [`run_leaf_pipeline_internal`]. It
+/// holds the artifacts callers need for aggregation
+/// ([`produce_leaf_artifacts`]) plus the extra in-memory state required by
+/// [`custom_recursive_prove`] to finish the serialize + verify steps.
+struct LeafPipelineState {
+    artifacts: LeafArtifacts,
+    cairo_proof: cairo_air::CairoProof<
+        stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleHasher,
+    >,
+    circuit_proof_config: ProofConfig,
+    circuit_config: CircuitConfig,
+}
+
+/// Run the two-level proving pipeline (Cairo AIR → circuit verifier with ZK
+/// blinding). Returns the raw artifacts + the additional in-memory state
+/// needed by [`custom_recursive_prove`] to serialize and verify.
+fn run_leaf_pipeline_internal(
     prover_input: ProverInput,
     output_preimage: Vec<Felt>,
-) -> Result<CustomProofOutput> {
-    let _span = span!(Level::INFO, "custom_recursive_prove").entered();
+) -> Result<LeafPipelineState> {
+    let _span = span!(Level::INFO, "run_leaf_pipeline").entered();
     let base_column_pool = BaseColumnPool::<SimdBackend>::new();
 
     // ── Level 1: Generate Cairo AIR proof ────────────────────────────
@@ -257,6 +275,7 @@ pub fn custom_recursive_prove(
 
     let FlatClaim {
         component_enable_bits,
+        component_log_sizes,
         ..
     } = cairo_proof.claim.flatten_claim();
     info!(
@@ -283,7 +302,7 @@ pub fn custom_recursive_prove(
     // how many outputs to expect, and what the preprocessed trace root is.
 
     let bootloader_program = get_privacy_bootloader_program().map_err(|e| anyhow!("{e}"))?;
-    let mut program = vec![];
+    let mut program: Vec<[M31; MEMORY_VALUES_LIMBS]> = vec![];
     for value in bootloader_program.iter_data() {
         program.push(
             Felt252::from(value.get_int().ok_or_else(|| anyhow!("bad program data"))?).get_limbs(),
@@ -292,9 +311,10 @@ pub fn custom_recursive_prove(
     let cairo_lifting_log_size = cairo_proof_config.fri.log_evaluation_domain_size() as u32;
     let cairo_verifier_config = CairoVerifierConfig {
         proof_config: cairo_proof_config,
-        program,
+        program: Arc::from(program),
         n_outputs: 1,
         preprocessed_root: get_preprocessed_root(cairo_lifting_log_size),
+        preprocessed_trace_variant: CUSTOM_PROVER_PARAMS.preprocessed_trace,
     };
 
     // ── Transform the Cairo proof for circuit consumption ────────────
@@ -311,7 +331,12 @@ pub fn custom_recursive_prove(
     // constraints at the OODS point, verify FRI, check proof-of-work.
 
     info!("Building circuit verifier context");
-    let (public_claim, _outputs, _program) = public_data.pack_into_u32s();
+    let (mut public_claim, _outputs, _program) = public_data.pack_into_u32s();
+    // 2bf051f: build_fixed_cairo_circuit expects public_claim to also include
+    // the per-component log_sizes appended after the public data. Older
+    // (618db0a-) revisions had the verifier code pull these from the
+    // CircuitClaim; the new entry point gets them via public_claim.
+    public_claim.extend(component_log_sizes);
     let outputs = compute_output(&output_preimage);
     let mut context =
         build_fixed_cairo_circuit(&cairo_verifier_config, proof, public_claim, vec![outputs]);
@@ -346,7 +371,7 @@ pub fn custom_recursive_prove(
         // Build the circuit topology with NoValue types to get the
         // preprocessed trace (lookup tables for the circuit itself).
         let mut nv =
-            circuit_cairo_air::verify::build_cairo_verifier_circuit(&cairo_verifier_config);
+            circuit_cairo_verifier::verify::build_cairo_verifier_circuit(&cairo_verifier_config);
         add_zk_blinding(&mut nv, [0; 32], CIRCUIT_FRI_CONFIG.n_queries);
         PreprocessedCircuit::preprocess_circuit(&mut nv)
     };
@@ -384,18 +409,20 @@ pub fn custom_recursive_prove(
     };
     let circuit_config = CircuitConfig {
         config: circuit_pcs_config,
-        output_addresses: preprocessed_circuit.params.output_addresses.clone(),
-        n_blake_gates: preprocessed_circuit.params.n_blake_gates,
-        preprocessed_column_ids: preprocessed_circuit.preprocessed_trace.ids(),
+        n_outputs: preprocessed_circuit.params.n_outputs,
+        preprocessed_column_log_sizes: preprocessed_circuit.preprocessed_trace.log_sizes(),
         // The preprocessed root is the Merkle root of the circuit's own
         // preprocessed trace — it's a public parameter of the circuit.
         preprocessed_root: circuit_pp_tree.commitment.root().into(),
     };
 
     let circuit_proof_config = {
-        use circuit_air::statement::all_circuit_components;
-        ProofConfig::from_components(
-            &all_circuit_components::<QM31>(),
+        use circuit_verifier::statement::all_circuit_components;
+        let components = all_circuit_components::<QM31>();
+        let n_components = components.len();
+        ProofConfig::new(
+            &components,
+            vec![true; n_components],
             preprocessed_circuit.preprocessed_trace.ids().len(),
             &circuit_pcs_config,
             CIRCUIT_INTERACTION_POW_BITS,
@@ -412,9 +439,60 @@ pub fn custom_recursive_prove(
         MaybeOwned::Borrowed(&circuit_pp_tree),
         context_values,
         circuit_config.config,
-    );
+    )
+    .map_err(|e| anyhow!("{e}"))?;
     let circuit_prove_ms = t_circuit.elapsed().as_millis();
     info!("Circuit proof generated in {}ms", circuit_prove_ms);
+
+    Ok(LeafPipelineState {
+        artifacts: LeafArtifacts {
+            circuit_proof,
+            preprocessed_circuit: Arc::new(preprocessed_circuit),
+            circuit_pcs_config,
+            output_preimage,
+            cairo_prove_ms,
+            circuit_prove_ms,
+        },
+        cairo_proof,
+        circuit_proof_config,
+        circuit_config,
+    })
+}
+
+/// Run the leaf pipeline and return only the artifacts callers need for
+/// aggregation. The intermediate cairo proof + verifier configs are
+/// dropped.
+pub fn produce_leaf_artifacts(
+    prover_input: ProverInput,
+    output_preimage: Vec<Felt>,
+) -> Result<LeafArtifacts> {
+    Ok(run_leaf_pipeline_internal(prover_input, output_preimage)?.artifacts)
+}
+
+/// Generate a two-level recursive zero-knowledge proof.
+///
+/// Internally calls [`run_leaf_pipeline_internal`] to produce the in-memory
+/// leaf artifacts, then serializes the circuit proof and runs sanity
+/// verification of both the Cairo and circuit proofs.
+pub fn custom_recursive_prove(
+    prover_input: ProverInput,
+    output_preimage: Vec<Felt>,
+) -> Result<CustomProofOutput> {
+    let LeafPipelineState {
+        artifacts,
+        cairo_proof,
+        circuit_proof_config,
+        circuit_config,
+    } = run_leaf_pipeline_internal(prover_input, output_preimage)?;
+
+    let LeafArtifacts {
+        circuit_proof,
+        preprocessed_circuit: _,
+        circuit_pcs_config: _,
+        output_preimage,
+        cairo_prove_ms,
+        circuit_prove_ms,
+    } = artifacts;
 
     // ── Serialize and compress ────────────────────────────────────────
     info!("Serializing circuit proof");
@@ -435,7 +513,7 @@ pub fn custom_recursive_prove(
     .map_err(|e| anyhow!("{e}"))?;
 
     info!("Verifying circuit proof");
-    use circuit_air::verify::verify_circuit;
+    use circuit_verifier::verify::verify_circuit;
     verify_circuit(circuit_config, proof_qm31s, circuit_public_data)
         .map_err(|e| anyhow!("circuit verify: {e}"))?;
 

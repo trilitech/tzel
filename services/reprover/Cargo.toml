@@ -12,6 +12,7 @@ anyhow = "1.0.98"
 hex = "0.4"
 clap = { version = "4", features = ["derive"] }
 itertools = { version = "0.12", default-features = false, features = ["use_alloc"] }
+indexmap = { version = "2.10.0", default-features = false, features = ["std"] }
 serde_json = "1.0"
 starknet-types-core = "=0.2.4"
 tempfile = "3.10"
@@ -22,31 +23,34 @@ zstd = "0.13"
 # cairo-vm
 cairo-vm = { version = "=3.2.0", features = ["extensive_hints", "mod_builtin"] }
 
-# proving-utils
-cairo-program-runner-lib = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
-privacy-prove = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
-privacy-circuit-verify = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
+# proving-utils (local fork — bumped to stwo-circuits 2bf051f)
+cairo-program-runner-lib = { path = "/home/saroupille/git/proving-utils/crates/cairo-program-runner-lib" }
+privacy-prove = { path = "/home/saroupille/git/proving-utils/crates/privacy_prove" }
+privacy-circuit-verify = { path = "/home/saroupille/git/proving-utils/crates/privacy_circuit_verify" }
 
 serde = { version = "1.0", features = ["derive"] }
 tzel-core = { path = "../../core" }
 
 # stwo cairo (same revs as proving-utils v1.2.2)
-cairo-air = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
-stwo-cairo-adapter = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
-stwo-cairo-prover = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
-stwo-cairo-serialize = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
-stwo-cairo-common = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }
-stwo = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c", features = ["parallel", "prover"] }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c" }
+cairo-air = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
+stwo-cairo-adapter = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
+stwo-cairo-prover = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
+stwo-cairo-serialize = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
+stwo-cairo-common = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
+stwo = { version = "2.2.0", features = ["parallel", "prover"] }
+stwo-constraint-framework = "2.2.0"
 
-# stwo circuits (same rev as proving-utils v1.2.2)
-circuit-cairo-air = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuit-air = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuit-common = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuit-prover = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+# stwo circuits — bumped to 2bf051f to surface circuit-multiverifier
+circuit-cairo-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-common = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-prover = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
 
 [profile.release]
 opt-level = 3
+
+[workspace]

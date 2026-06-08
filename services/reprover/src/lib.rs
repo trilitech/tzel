@@ -6,6 +6,7 @@
 //! - `compute_executable_program_hash(executable_path)` → bootloader-authenticated program hash
 //! - `CustomProofOutput` struct with proof data and timing
 
+pub mod aggregate;
 pub mod custom_circuit;
 
 use std::fs::read_to_string;

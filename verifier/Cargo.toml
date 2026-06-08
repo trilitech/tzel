@@ -16,15 +16,16 @@ starknet-types-core = { version = "=0.2.4", default-features = false, features =
 tzel-core = { path = "../core" }
 zstd = "0.13"
 
-stwo = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c", default-features = false }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c", default-features = false }
-circuit-air = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
+stwo = { version = "2.2.0", default-features = false }
+stwo-constraint-framework = { version = "2.2.0", default-features = false }
+circuit-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-cairo-program-runner-lib = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
+cairo-program-runner-lib = { path = "/home/saroupille/git/proving-utils/crates/cairo-program-runner-lib" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2.17", features = ["custom"] }
