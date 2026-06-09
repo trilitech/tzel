@@ -239,7 +239,7 @@ let test_hash_commit () =
   let v = Tzel.Felt.of_u64 1000 in
   let rcm = Tzel.Felt.of_u64 42 in
   let ot = Tzel.Felt.of_u64 99 in
-  let cm = Tzel.Hash.hash_commit d v rcm ot in
+  let cm = Tzel.Hash.hash_commit d v Tzel.Felt.zero rcm ot in
   Alcotest.(check bool) "non-zero" true (not (Tzel.Felt.is_zero cm))
 
 let test_hash_commit_uses_only_low_u64_bytes () =
@@ -254,16 +254,17 @@ let test_hash_commit_uses_only_low_u64_bytes () =
   for i = 8 to 31 do
     Bytes.set_uint8 noisy_v i 0xFF
   done;
-  let cm_canonical = Tzel.Hash.hash_commit d canonical_v rcm ot in
-  let cm_noisy = Tzel.Hash.hash_commit d noisy_v rcm ot in
+  let cm_canonical = Tzel.Hash.hash_commit d canonical_v Tzel.Felt.zero rcm ot in
+  let cm_noisy = Tzel.Hash.hash_commit d noisy_v Tzel.Felt.zero rcm ot in
   Alcotest.(check bool) "high bytes ignored" true
     (Bytes.equal cm_canonical cm_noisy);
 
-  let buf = Bytes.make 128 '\x00' in
+  let buf = Bytes.make 160 '\x00' in
   Bytes.blit d 0 buf 0 32;
   Bytes.blit canonical_v 0 buf 32 8;
-  Bytes.blit rcm 0 buf 64 32;
-  Bytes.blit ot 0 buf 96 32;
+  (* [64..96) asset slot stays zero: ASSET_TEZ *)
+  Bytes.blit rcm 0 buf 96 32;
+  Bytes.blit ot 0 buf 128 32;
   let expected = Tzel.Hash.hash_personalized "cmmtSP__" buf in
   Alcotest.(check bool) "matches canonical rust layout" true
     (Bytes.equal cm_canonical expected)
@@ -316,7 +317,9 @@ let test_hash_commit_u64_max_cross_impl_fixture () =
   done;
   Alcotest.(check bool) "fixture value layout" true
     (Bytes.equal value_felt expected_v);
-  let actual = Tzel.Hash.hash_commit d_j value_felt rcm owner_tag in
+  (* asset = Felt.zero (ASSET_TEZ), mirroring the Rust fixture test
+     which passes &ASSET_TEZ explicitly. *)
+  let actual = Tzel.Hash.hash_commit d_j value_felt Tzel.Felt.zero rcm owner_tag in
   Alcotest.(check bool) "u64::MAX commitment matches shared fixture" true
     (Bytes.equal actual expected_cm)
 
@@ -897,17 +900,18 @@ let test_note_determinism () =
     (Tzel.Felt.equal expected_rcm n1.rcm);
   Alcotest.(check bool) "note stores owner_tag" true
     (Tzel.Felt.equal owner_tag1 n1.owner_tag);
-  let explicit_buf = Bytes.make 128 '\x00' in
+  let explicit_buf = Bytes.make 160 '\x00' in
   let explicit_v = Tzel.Felt.of_u64 1000 in
   Bytes.blit addr.d_j 0 explicit_buf 0 32;
   Bytes.blit explicit_v 0 explicit_buf 32 8;
-  Bytes.blit n1.rcm 0 explicit_buf 64 32;
-  Bytes.blit owner_tag1 0 explicit_buf 96 32;
+  (* [64..96) asset slot stays zero: ASSET_TEZ *)
+  Bytes.blit n1.rcm 0 explicit_buf 96 32;
+  Bytes.blit owner_tag1 0 explicit_buf 128 32;
   let explicit_cm = Tzel.Hash.hash_personalized "cmmtSP__" explicit_buf in
   Alcotest.(check bool) "explicit current-layout cm matches note" true
     (Tzel.Felt.equal explicit_cm n1.cm);
   let manual_cm =
-    Tzel.Hash.hash_commit addr.d_j (Tzel.Felt.of_u64 1000) n1.rcm owner_tag1
+    Tzel.Hash.hash_commit addr.d_j (Tzel.Felt.of_u64 1000) Tzel.Felt.zero n1.rcm owner_tag1
   in
   Alcotest.(check bool) "manual cm matches note" true
     (Tzel.Felt.equal manual_cm n1.cm);

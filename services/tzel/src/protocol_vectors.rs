@@ -462,6 +462,7 @@ pub fn generate_protocol_v1_value() -> Value {
             "nonce": hex_bytes(&nonce),
             "encrypted_data": hex_bytes(&encrypted_data),
             "tag": enc.tag,
+            "outgoing_ct": hex_bytes(&enc.outgoing_ct),
             "memo_ct_hash": hex_felt(&memo_ct_hash(&enc)),
         })
     };

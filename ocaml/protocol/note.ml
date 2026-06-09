@@ -2,8 +2,11 @@
    rseed       — random per-note seed
    rcm         = H(H("rcm"), rseed)
    owner_tag   = H_owner(auth_root, auth_pub_seed, nk_tag)
-   cm          = H_commit(d_j, v, rcm, owner_tag)
-   nf          = H_nf(nk_spend, H_nf(cm, pos)) *)
+   cm          = H_commit(d_j, v, asset, rcm, owner_tag)
+   nf          = H_nf(nk_spend, H_nf(cm, pos))
+
+   This port is tez-only: notes are committed with asset = Felt.zero
+   (ASSET_TEZ). *)
 
 type t = {
   d_j : Felt.t;
@@ -17,13 +20,17 @@ type t = {
 let create (addr : Keys.address) (v : int64) (rseed : Felt.t) =
   let rcm = Hash.derive_rcm rseed in
   let owner_tag = Keys.owner_tag addr in
-  let cm = Hash.hash_commit addr.d_j (Felt.of_u64 (Int64.to_int v)) rcm owner_tag in
+  let cm =
+    Hash.hash_commit addr.d_j (Felt.of_u64 (Int64.to_int v)) Felt.zero rcm owner_tag
+  in
   { d_j = addr.d_j; v; rseed; rcm; owner_tag; cm }
 
 let create_from_parts ~d_j ~auth_root ~auth_pub_seed ~nk_tag ~v ~rseed =
   let rcm = Hash.derive_rcm rseed in
   let owner_tag = Hash.hash_owner auth_root auth_pub_seed nk_tag in
-  let cm = Hash.hash_commit d_j (Felt.of_u64 (Int64.to_int v)) rcm owner_tag in
+  let cm =
+    Hash.hash_commit d_j (Felt.of_u64 (Int64.to_int v)) Felt.zero rcm owner_tag
+  in
   { d_j; v; rseed; rcm; owner_tag; cm }
 
 (* Compute nullifier for a note at a given position *)
