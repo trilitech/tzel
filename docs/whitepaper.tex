@@ -148,8 +148,8 @@ A \emph{shielded transaction} is any transaction that creates or destroys notes.
 Transaction & Consumes & Creates \\
 \midrule
 Shield & some balance from a bridge-deposit pool keyed by a wallet-derived pubkey hash & a user note and a DAL-producer fee note \\
-Transfer & 1--7 shielded input notes & a recipient note, a change note, and a DAL-producer fee note \\
-Unshield & 1--7 shielded input notes & a public credit, an optional change note, and a DAL-producer fee note \\
+Transfer & 1--7 shielded input notes & a recipient note, up to two change notes (one per asset under the multiasset 2-accumulator design), and a DAL-producer fee note (always tez) \\
+Unshield & 1--7 shielded input notes & a public credit (to the unshielded asset), up to two change notes (asset-routed), and a DAL-producer fee note (always tez) \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -326,9 +326,10 @@ owner\_tag_j = \Hash_{\mathrm{owner}}(auth\_root_j, pub\_seed_j, nk\_tag_j),
 \]
 
 The \(asset\) field is a 32-byte tag identifying which asset class the note
-holds — \(asset = 0\) is reserved for tez, and any other felt is a future
-bridge-defined identifier (typically a hash of \((chain\_id, ticketer\_address,
-token\_id)\) or similar). The tag is preimaged inside the commitment hash,
+holds — \(ASSET\_TEZ = 0\) is reserved for tez, and FA2 assets use
+\(\Hash(\texttt{"tzel:asset:"} \| ticketer\_kt1\_address)\), so each FA2
+ticketer KT1 deterministically derives a unique L2 asset\_id (see
+§"Multiasset" for the registry semantics). The tag is preimaged inside the commitment hash,
 so two notes with identical \((d_j, v, \rcm, owner\_tag)\) but different
 assets produce different commitments — and crucially, an on-chain observer
 cannot tell from \(\cm\) which asset is encoded. The multiasset design
@@ -491,15 +492,23 @@ transfer and unshield). The signed message is the shield sighash:
 \end{multline*}
 \(asset_{new}\) and \(asset_{producer}\) are folded into the sighash
 because they are public at the L1 bridge boundary (the deposit ticket
-identifies the asset). In v1 only the tez bridge is deployed, so the
-circuit asserts \(asset_{new} = ASSET\_TEZ\); \(asset_{producer}\) is
-permanently pinned to \(ASSET\_TEZ\) (§"Multiasset" fee rationale).
-The kernel reads \(balance = \mathrm{pool}[pubkey\_hash]\), rejects unless
-\(balance \ge v_{pub} + fee + producer\_fee\), debits the pool, and
-appends both notes. Pool overfunding is fine — the surplus stays
-available for future shields. The user picks
-\((v_{pub}, fee, producer\_fee)\) at shield time, so fee revisions
-between deposit and shield are a wallet-side retry, not a stranded slot.
+identifies the asset). The circuit lets \(asset_{new}\) be any
+registered asset (the kernel re-checks it against the bridge
+registry); \(asset_{producer}\) is permanently pinned to
+\(ASSET\_TEZ\) in-circuit (§"Multiasset" fee rationale).
+The kernel reads
+\(balance = \mathrm{pool}[(asset_{new}, pubkey\_hash)]\) and rejects
+unless that pool can cover \(v_{pub} + fee\). For tez shields the
+same pool also covers \(producer\_fee\); for non-tez shields, the
+producer-fee output note is permanently tez, so the kernel debits
+\(producer\_fee\) from a SEPARATE
+\((ASSET\_TEZ, pubkey\_hash)\) pool — an FA2 shield requires the
+wallet to have both an FA2 pool AND a tez pool at the same
+pubkey\_hash (this prevents minting producer-fee tez out of
+nothing). Pool overfunding is fine — the surplus stays available
+for future shields. The user picks \((v_{pub}, fee, producer\_fee)\)
+at shield time, so fee revisions between deposit and shield are a
+wallet-side retry, not a stranded slot.
 
 \paragraph{Untrusted-prover safety.} The witness exposes the recipient's
 address fields, value, randomness, and the encrypted-note bytes. None of these
@@ -571,7 +580,9 @@ in \(\{ASSET\_TEZ, A\}\), then runs two accumulators:
 \sum_{i : asset_i = A} v_i &= \sum_{j : asset_j = A} v_j,
 \end{align*}
 
-with \(v_3 > 0\) and \(asset_3 = ASSET\_TEZ\) for the producer-fee note.
+with \(v_4 > 0\) and \(asset_4 = ASSET\_TEZ\) for the producer-fee note
+(slot 4 in the Phase~C 4-output transfer; slot 3 is the second
+change-note placeholder).
 Pure-tez transfers degenerate to the single-asset equation; the witness's
 declared \(A\) is unused and may be any felt.
 
@@ -655,9 +666,16 @@ via a 2-accumulator value-balance scheme described next.
 
 \subsection{2-accumulator balance}
 
-The Coq specification quantifies value conservation over all assets:
+The protocol specification expresses value conservation per asset:
 for every \(\alpha\), \(sum_{in}(\alpha) = sum_{out}(\alpha) + (fee\)
-if \(\alpha = tez\)). Cairo cannot iterate over felts, so the circuit
+if \(\alpha = tez\)). The Coq development under \texttt{coq/Spec/}
+defines the corresponding \(\Phi\) predicates for shield, transfer,
+and unshield (each binding the per-asset balance and the
+producer-fee tez pin) — these are intentionally aspirational specs
+at the present stage of the project; the Cairo \(\to\) Coq
+refinement theorem connecting the executable Relation to \(\Phi\)
+is future work, as documented in \texttt{coq/STATUS.md}.
+Cairo cannot iterate over felts, so the circuit
 implements this via a stronger constraint: the witness supplies one
 primary non-tez asset \(A\) per transaction, and every input/output
 asset is required to lie in \(\{ASSET\_TEZ, A\}\). Two accumulators
@@ -763,12 +781,18 @@ record only after recomputing
 
 \[
 \cm_{expected} =
-\Hash_{\mathrm{commit}}(d_j, v, \Hash(\Hash(\mathrm{TAG\_RCM}), rseed),
+\Hash_{\mathrm{commit}}(d_j, v, asset, \Hash(\Hash(\mathrm{TAG\_RCM}), rseed),
 \Hash_{\mathrm{owner}}(auth\_root_j, pub\_seed_j, nk\_tag_j))
 \]
 
-and checking \(\cm_{expected} = \cm\). Thus outgoing viewing is an accounting
-and recovery feature for the sender, not a new authorization path.
+and checking \(\cm_{expected} = \cm\). The on-chain
+\textsc{OutgoingRecoveryPlaintext} wire format does not carry
+\(asset\) (a wire-format bump would invalidate every pre-multiasset
+outgoing-recovery ciphertext on chain), so the sender's outgoing
+watcher iterates the registered-asset list and accepts the asset
+that makes \(\cm_{expected} = \cm\). Thus outgoing viewing is an
+accounting and recovery feature for the sender, not a new
+authorization path.
 
 Detection is only a filtering aid, not a correctness condition. A wallet accepts
 an incoming note only after it
@@ -780,10 +804,12 @@ an incoming note only after it
   \item recomputes \(\rcm = \Hash(\Hash(\mathrm{TAG\_RCM}), rseed)\);
   \item recomputes
         \(owner\_tag_j = \Hash_{\mathrm{owner}}(auth\_root_j, pub\_seed_j, nk\_tag_j)\);
-  \item recomputes
-        \(\cm_{expected} = \Hash_{\mathrm{commit}}(d_j, v, \rcm, owner\_tag_j)\);
-  \item accepts the note only if \(\cm_{expected}\) equals the posted
-        commitment.
+  \item iterates the registered-asset list and recomputes
+        \(\cm_{expected} = \Hash_{\mathrm{commit}}(d_j, v, asset, \rcm, owner\_tag_j)\)
+        for each candidate \(asset\) until one matches the posted
+        commitment;
+  \item accepts the note only if some candidate \(asset\) makes
+        \(\cm_{expected}\) equal the posted commitment.
 \end{enumerate}
 
 These acceptance rules matter because the proof binds the posted ciphertext
@@ -950,8 +976,8 @@ than by authorization artifacts:
 Transaction & Output note data & Approximate total \\
 \midrule
 Shield & 2 notes & about 302 KB \\
-Transfer & 3 notes & about 305 KB plus 32 bytes per input nullifier \\
-Unshield & 1--2 notes & about 299--302 KB plus 32 bytes per input nullifier \\
+Transfer & up to 4 notes (recipient + up to two change notes + producer fee) & about 305 KB plus 32 bytes per input nullifier \\
+Unshield & 1--3 notes (public credit + up to two change notes; producer fee is published separately) & about 299--302 KB plus 32 bytes per input nullifier \\
 \bottomrule
 \end{tabular}
 \end{center}

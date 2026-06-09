@@ -188,13 +188,16 @@ For circuit purposes, `d_j`, `auth_root_j`, and `nk_tag_j` matter. The ML-KEM ke
 
 ```
 rseed       — random per-note seed
-rcm         = H(H(TAG_RCM), rseed)                       — commitment randomness
-owner_tag   = H_owner(auth_root_j, pub_seed_j, nk_tag_j) — fuses the XMSS public key + nullifier binding
-cm          = H_commit(d_j, v, rcm, owner_tag)           — note commitment
-nf          = H_nf(nk_spend_j, H_nf(cm, pos))           — position-dependent nullifier
+rcm         = H(H(TAG_RCM), rseed)                              — commitment randomness
+owner_tag   = H_owner(auth_root_j, pub_seed_j, nk_tag_j)        — fuses the XMSS public key + nullifier binding
+asset_id    — 32-byte L2 asset tag (ASSET_TEZ = 0 for tez; FA2 = H("tzel:asset:" || ticketer_kt1))
+cm          = H_commit(d_j, v, asset_id, rcm, owner_tag)        — note commitment (5-ary as of canonical wire v4)
+nf          = H_nf(nk_spend_j, H_nf(cm, pos))                   — position-dependent nullifier
 ```
 
-The commitment binds to the diversified address, value, and owner tag (which fuses the auth key tree root and nullifier key material). The nullifier uses the per-address `nk_spend_j` and includes the leaf position to prevent faerie gold attacks.
+The commitment binds to the diversified address, value, **asset class**, and owner tag (which fuses the auth key tree root and nullifier key material). The nullifier uses the per-address `nk_spend_j` and includes the leaf position to prevent faerie gold attacks.
+
+**Multiasset note**: `asset_id` is hidden inside the commitment preimage — it is NOT a separate field on the wire. Two notes with identical `(d_j, v, rcm, owner_tag)` but different `asset_id` produce different commitments, but an on-chain observer cannot tell which asset a given `cm` carries. The pre-multiasset spec (canonical wire v3 and earlier) used the 4-ary commitment `H_commit(d_j, v, rcm, owner_tag)`; the v4 wire bump adds the `asset_id` slot. `ASSET_TEZ = 0x00..00` preserves backward compatibility — a tez-only deployment computes the same `cm` as it did pre-multiasset.
 
 ### Position-Dependent Nullifiers
 
@@ -205,6 +208,55 @@ nf = H_nf(nk_spend, H_nf(cm, pos))
 ```
 
 This prevents an attacker from creating two identical commitments (same d_j, v, rcm, owner_tag) that resolve to a single nullifier. With position in the nullifier, each tree insertion produces a unique nullifier even for duplicate commitments.
+
+## Multiasset
+
+Notes can carry any registered L2 asset. Tez is the default; FA2 tokens are bridged via per-asset KT1 ticketer contracts.
+
+### Asset identity
+
+The L2 `asset_id` is a 32-byte felt:
+- `ASSET_TEZ = 0x00..00` is reserved for tez.
+- FA2 assets use `asset_id = H("tzel:asset:" || ticketer_kt1_address)` (BLAKE2s-251 with the same personalization as `hash`). One FA2 ticketer KT1 maps to exactly one L2 `asset_id`; the binding is structural rather than registered, so the ticketer address alone determines the asset.
+
+The kernel composes a registered-asset list as `compose_asset_registry(tez_ticketer)` over a compile-time constant `COMPILE_TIME_FA2_BRIDGES: &[&str]`. The first entry is always the tez bridge; subsequent entries are FA2 ticketers. Defense-in-depth: `compose_asset_registry_with` skips any FA2 entry that equals the tez ticketer string, so a misconfigured registry cannot let first-match ordering mask an FA2 entry.
+
+### Per-asset 2-accumulator balance
+
+Transfer and unshield circuits prove value conservation per asset. Because Cairo cannot iterate over felts, the circuit takes a witness-declared "primary non-tez asset" `A` per transaction and pins every input and output asset to `{ASSET_TEZ, A}`. Two accumulators (`tez_in/tez_out`, `primary_in/primary_out`) close the per-asset balance:
+
+```
+tez_in = tez_out + fee  + (v_pub if asset_pub == ASSET_TEZ)
+primary_in = primary_out + (v_pub if asset_pub == A)
+```
+
+For pure-tez transactions, no input/output has `asset = A`, so `primary_in = primary_out = 0` trivially. The burned `fee` is always tez. The producer-fee output is pinned to `ASSET_TEZ` in-circuit (`asset_4 = ASSET_TEZ` in transfer; `asset_producer = ASSET_TEZ` in shield; `asset_fee = ASSET_TEZ` in unshield).
+
+A transaction therefore spans at most TWO assets: tez and the witness's primary. A 3-asset transfer (`tez + FA2_A + FA2_B`) is rejected at the per-input asset check; clients must serialize cross-asset moves as a sequence of 2-asset transactions.
+
+### FA2 bridge ticketer
+
+Each FA2 (contract, token_id) pair gets a dedicated bridge ticketer KT1 with immutable storage `(fa2_contract: address, token_id: nat)` and entrypoints:
+
+- `%mint(amount: nat, receiver: bytes, rollup: address)` — pulls `amount` of `token_id` from the caller's FA2 balance into `SELF_ADDRESS`, then mints an L2 ticket with **canonical content `(0, None)`** addressed to the rollup with payload `(receiver, ticket)`. The receiver bytes are the `deposit:<hex(pubkey_hash)>` L2 string.
+- `%burn(receiver: contract unit, ticket: ticket (pair nat (option bytes)))` — accepts only ticketer-self-minted tickets (verified via `READ_TICKET`), requires `content == (0, None)`, then calls the underlying FA2's `%transfer` to send `amount` of `storage.token_id` from `SELF_ADDRESS` to the receiver's L1 address.
+
+**Critical invariant**: the L2 ticket content is canonical `(0, None)` regardless of `storage.token_id`. The FA2 token_id binding lives in the ticketer's immutable storage; the L2 layer's asset_id derives from the ticketer's KT1 alone. Earlier drafts stuffed `storage.token_id` into the L2 ticket content, which broke bridging for any FA2 with `token_id != 0` because the kernel rejects any deposit ticket whose `content.token_id != 0` (bug #3, fixed in commit `73ad6fb`).
+
+### Deposit pool keying
+
+The kernel's deposit-pool durable store is keyed by `(asset_id, pubkey_hash)`. Path: `/tzel/v1/state/deposits/balance/<hex(asset_id)>/<hex(pubkey_hash)>`. The same `pubkey_hash` can host distinct pools for tez and an FA2 simultaneously; the bug-#2 shield split-debit explicitly relies on this.
+
+### Wire format
+
+Canonical wire `version: 4` (was `3` pre-multiasset). The commitment is 5-ary; the encrypted note payload does NOT carry `asset_id` (a wire-format bump would invalidate every pre-multiasset on-chain ciphertext). The wallet's outgoing-recovery plaintext likewise omits `asset_id`; recovery iterates the candidate registry and picks the asset whose commitment recomputes to the on-chain `cm`.
+
+### Asset removal
+
+Removing an FA2 from `COMPILE_TIME_FA2_BRIDGES` is asymmetric:
+- New deposits for that asset are rejected (sender ticketer no longer in registry).
+- Existing pools / notes for that asset remain in durable state but become unshieldable (`asset_pub` no longer in registered set ⇒ unshield refuses to dispatch the L1 burn).
+- Restoring the asset (re-adding the same KT1 string to the registry) restores spendability since the `asset_id` is structurally derived from the KT1, not registered.
 
 ## Transaction Types
 
@@ -233,100 +285,118 @@ separate resource price from the burned rollup fee above.
 
 ### Shield (public -> private)
 
-**Public outputs:** `[auth_domain, pubkey_hash, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash]`
+**Public outputs:** `[auth_domain, pubkey_hash, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash, asset_new]` (10 felts as of multiasset; was 9 in the pre-multiasset spec).
 
 `pubkey_hash` is the deposit-pool key (see [Deposit-Pool Identifiers](#deposit-pool-identifiers) below). The shield circuit additionally verifies an **in-circuit WOTS+ signature** from the recipient's auth tree, mirroring the structure used by transfer and unshield. The signature binds the entire request payload, so a delegated prover that holds the witness still cannot redirect funds, change values, or swap recipients without the wallet's spending key.
 
 **Circuit constraints:**
 1. `rcm = H(H(TAG_RCM), rseed)`
 2. `owner_tag = H_owner(auth_root, pub_seed, nk_tag)` where `auth_root`, `pub_seed`, and `nk_tag` are private inputs from the recipient's payment address
-3. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
+3. `cm_new = H_commit(d_j, v_pub, asset_new, rcm, owner_tag)`
 4. `producer_rcm = H(H(TAG_RCM), producer_rseed)`
 5. `producer_owner_tag = H_owner(producer_auth_root, producer_pub_seed, producer_nk_tag)`
-6. `cm_producer = H_commit(producer_d_j, producer_fee, producer_rcm, producer_owner_tag)`
+6. `cm_producer = H_commit(producer_d_j, producer_fee, ASSET_TEZ, producer_rcm, producer_owner_tag)` — producer-fee output is permanently tez (DAL slot publisher liquidity argument)
 7. `producer_fee > 0`
 8. `pubkey_hash = H_pubkey(auth_domain, auth_root, pub_seed, blind)` (left-fold with the `sighSP__` personalization and leading type tag `0x04`); the `blind` is a private input the wallet derives deterministically from `master_sk` per deposit
 9. WOTS+ signature verification under the recipient's auth tree: the circuit recovers the WOTS+ public-key endpoints from the signature, computes the `auth_leaf` via the L-tree, and verifies its inclusion in `auth_root`. The signed message is the shield sighash:
    ```
    sighash = fold(0x03, auth_domain, pubkey_hash, v_pub, fee, producer_fee,
-                  cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)
+                  cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash,
+                  asset_new, asset_producer)
    ```
+   `asset_new` is the recipient note's asset; `asset_producer` is always `ASSET_TEZ` (asserted in-circuit).
 
 `memo_ct_hash` and `producer_memo_ct_hash` are computed client-side as `H(ct_d || tag || ct_v || nonce || encrypted_data || outgoing_ct)` and passed into the circuit as public inputs.
 
 The L1 deposit transaction (signed by the depositor's L1 key) credits the deposit pool keyed by `pubkey_hash`. The actual `(v, fee, producer_fee, cm_recipient, cm_producer)` is chosen at *shield time*, not at deposit time, and the in-circuit WOTS+ sig is what binds it. This means the wallet must be online to sign each shield, but it also makes shielding much more flexible: the same pool can be drained over multiple shields, and the user can pick the recipient at shield time rather than committing at deposit time.
 
-**Contract / ledger checks:** proof valid (including in-circuit WOTS+ verify), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= required_tx_fee`, and the kernel's pinned public outputs (`auth_domain`, `pubkey_hash`, `v`, `fee`, `producer_fee`, `cm_new`, `cm_producer`, memo hashes) match the request fields. Consensus also requires the deposit pool keyed by `pubkey_hash` to have at least `v + fee + producer_fee` mutez.
+**Contract / ledger checks:** proof valid (including in-circuit WOTS+ verify), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= required_tx_fee`, and the kernel's pinned public outputs (`auth_domain`, `pubkey_hash`, `v`, `fee`, `producer_fee`, `cm_new`, `cm_producer`, memo hashes, `asset_new`) match the request fields. The kernel also checks that `asset_new` is in the registered-asset list (`compose_asset_registry(tez_ticketer)` over the kernel-binary's `COMPILE_TIME_FA2_BRIDGES`); shields for unregistered assets are rejected. Consensus also requires the deposit pool(s) below to be sufficiently funded.
 
-**Aggregated deposit pools.** Every L1 ticket the kernel observes for a `deposit:<hex(pubkey_hash)>` recipient credits a per-pool aggregated balance. Two tickets to the same recipient string sum into one balance — there is no per-ticket "slot" to brick. The pool is keyed by `H_pubkey(auth_domain, auth_root, pub_seed, blind)`, so:
+**Aggregated deposit pools.** Every L1 ticket the kernel observes for a `deposit:<hex(pubkey_hash)>` recipient credits a per-pool aggregated balance keyed by `(asset_id, pubkey_hash)`. The `asset_id` is determined by the L1 ticketer that minted the deposit ticket: tez ticketer → `ASSET_TEZ`; FA2 ticketer KT1 → `derive_asset_id(KT1) = H("tzel:asset:" || KT1)`. Two tickets to the same recipient string from the same ticketer sum into one balance — there is no per-ticket "slot" to brick. The same `pubkey_hash` can host distinct pools for tez and an FA2 simultaneously, which the bug-#2 fix below explicitly relies on. Properties:
 
 - A wallet that doesn't reveal its `(auth_root, pub_seed, blind)` triple is the only entity that can produce a valid WOTS+ sig under `auth_root`, and therefore the only entity that can shield against the pool.
-- Dust attackers who mirror-deposit to the same `pubkey_hash` simply add to the victim's pool balance — they pay mutez to subsidize the victim's eventual shield.
+- Dust attackers who mirror-deposit to the same `(asset_id, pubkey_hash)` simply add to the victim's pool balance — they pay L1 token to subsidize the victim's eventual shield.
 - The user can top up an existing pool by sending another L1 ticket; multiple deposits compose linearly.
 
-**Shield drains a pool by `(v + fee + producer_fee)`.** The user picks (recipient, value, fees) at shield time. The kernel:
-1. Verifies the proof (which includes the in-circuit WOTS+ sig).
-2. Pins the proof's public outputs to the request fields.
-3. Reads `balance = pool[pubkey_hash]`. Rejects if `balance < v + fee + producer_fee`.
-4. Decrements `pool[pubkey_hash]` by `v + fee + producer_fee`. If the new balance is zero, the entry is removed.
-5. Appends `cm_new` and `cm_producer` to T.
+**Shield debits one or two pools.** For a tez shield (`asset_new == ASSET_TEZ`) the kernel debits `v + fee + producer_fee` from `(ASSET_TEZ, pubkey_hash)`. For a non-tez shield (`asset_new = X`, an FA2), the kernel debits `v + fee` from `(X, pubkey_hash)` AND debits `producer_fee` from `(ASSET_TEZ, pubkey_hash)` — the producer-fee output note is permanently tez (asserted in-circuit), so the kernel must back it from the user's tez pool at the same `pubkey_hash`. **An FA2 shield therefore requires the user to have BOTH an FA2 pool AND a tez pool at the same `pubkey_hash`.** Without this split, an FA2 shield would mint `producer_fee` tez out of nothing — backed only by other users' tez deposits at unshield time. The user picks (recipient, value, fees, asset) at shield time. The kernel:
+1. Verifies the proof (which includes the in-circuit WOTS+ sig and the in-circuit `asset_producer == ASSET_TEZ` assertion).
+2. Pins the proof's public outputs to the request fields, including `asset_new`.
+3. Reads `asset_balance = pool[(asset_new, pubkey_hash)]`. Rejects if it cannot cover the asset-side debit (`v + fee + producer_fee` for tez shields, `v + fee` for FA2 shields).
+4. For FA2 shields ONLY: reads `tez_balance = pool[(ASSET_TEZ, pubkey_hash)]` and rejects if `tez_balance < producer_fee`.
+5. Decrements the asset pool by the asset-side debit. For FA2 shields, ALSO decrements the tez pool by `producer_fee`. If either new balance is zero, that entry is removed.
+6. Appends `cm_new` and `cm_producer` to the global note tree.
 
-Pool overfunding is fine: the surplus stays available for future shields. Underfunding (or congestion-driven `required_tx_fee` exceeding what the pool covers) just makes shield reject at step 3 — the user can top up via another L1 ticket and retry. The shield circuit does not commit `fee` into the pool key, so a fee revision between deposit and shield does not strand the pool.
+Pool overfunding is fine: the surplus stays available for future shields. Underfunding (or congestion-driven `required_tx_fee` exceeding what the pool covers) just makes shield reject at step 3 or 4 — the user can top up via another L1 ticket and retry. The shield circuit does not commit `fee` into the pool key, so a fee revision between deposit and shield does not strand the pool.
 
-### Transfer (N->recipient + change + producer fee, where 1 <= N <= 7)
+### Transfer (N->recipient + up to two change notes + producer fee, where 1 <= N <= 7)
 
-Consumes N private notes and creates exactly 3 new private notes: the recipient
-note, the sender's change note, and a producer-fee note for DAL inclusion. N is
-a runtime parameter, not a program parameter — the program hash is the same for
-all N.
+Consumes N private notes and creates exactly 4 new private note slots (Phase C):
 
-**Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3, memo_ct_hash_1, memo_ct_hash_2, memo_ct_hash_3]`
+| slot | purpose | asset |
+|------|---------|-------|
+| `cm_1` | recipient note | sender-chosen (either `ASSET_TEZ` or the witness-declared primary non-tez asset `A`) |
+| `cm_2` | change for `cm_1`'s asset | matches `cm_1`'s asset |
+| `cm_3` | second change (for the OTHER asset under the 2-asset balance) | matches the other asset, OR is a zero-value placeholder for pure single-asset transfers |
+| `cm_4` | producer fee | permanently `ASSET_TEZ` (DAL slot publisher liquidity argument; asserted in-circuit) |
 
-XMSS-style WOTS+ signature verification happens inside the STARK. No auth leaves, public keys, or signatures appear in the public outputs.
+`N` is a runtime parameter, not a program parameter — the program hash is the same for all N. Each input independently carries a hidden asset, but the circuit's witness pins a single "primary non-tez asset" `A` per transaction so the per-asset balance equations close over exactly two accumulators.
+
+**Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3, cm_4, memo_ct_hash_1, memo_ct_hash_2, memo_ct_hash_3, memo_ct_hash_4]` — `2 + N + 9` felts total.
+
+XMSS-style WOTS+ signature verification happens inside the STARK. No auth leaves, public keys, or signatures appear in the public outputs. The witness-declared primary asset `A` is NOT public; only the commitments are, and the commitments hide which asset each note carries.
 
 **Circuit constraints:**
 1. For each input i (0..N):
    - `rcm_i = H(H(TAG_RCM), rseed_i)`
    - `nk_tag_i = H_nktg(nk_spend_i)`
    - `owner_tag_i = H_owner(auth_root_i, pub_seed_i, nk_tag_i)`
-   - `cm_i = H_commit(d_j_i, v_i, rcm_i, owner_tag_i)`
+   - `cm_i = H_commit(d_j_i, v_i, asset_i, rcm_i, owner_tag_i)`
    - Merkle membership of `cm_i` at position `pos_i` against `root` (commitment tree)
    - `nf_i = H_nf(nk_spend_i, H_nf(cm_i, pos_i))`
+   - `asset_i ∈ {ASSET_TEZ, A}` (the witness-declared primary non-tez asset)
    - XMSS-style WOTS+ verification: the circuit computes the sighash from the public outputs, decomposes it into 128 base-4 digits + 5 checksum digits, then for each of the 133 chains recovers the final public-key endpoint with `H_chain^{w-1-digit}(sig_j, pub_seed_i, ADRS_j)`. The digits are NOT witness data — they are deterministically derived inside the circuit.
    - `auth_leaf_i = LTree(pub_seed_i, key_idx_i, pk_0, ..., pk_132)` from those recovered chain endpoints
    - Merkle membership of that exact `auth_leaf_i` at position `key_idx_i` against `auth_root_i` using the XMSS tree-node hash (auth key tree)
-2. For all three outputs:
-   - `owner_tag_out = H_owner(auth_root_out, pub_seed_out, nk_tag_out)` where `auth_root_out`, `pub_seed_out`, and `nk_tag_out` are private inputs from the recipient's payment address
-   - `cm_out = H_commit(d_j_out, v_out, rcm_out, owner_tag_out)`
-3. `v_3 > 0`
-4. `sum(v_inputs) = v_1 + v_2 + v_3 + fee` (in u128)
-5. All values are u64 (implicit range check)
+2. For each output slot k ∈ {1, 2, 3, 4}:
+   - `owner_tag_k = H_owner(auth_root_k, pub_seed_k, nk_tag_k)`
+   - `cm_k = H_commit(d_j_k, v_k, asset_k, rcm_k, owner_tag_k)`
+   - `asset_k ∈ {ASSET_TEZ, A}` (same in-pair constraint as inputs)
+3. `asset_4 = ASSET_TEZ` (producer-fee note permanently tez)
+4. `v_4 > 0`
+5. **Per-asset balance (2-accumulator).** Let `tez_in = sum_{i: asset_i = ASSET_TEZ} v_i`, `primary_in = sum_{i: asset_i = A} v_i`, and analogously `tez_out / primary_out` over the 4 output slots. The circuit asserts both
+   - `tez_in = tez_out + fee`  (the public burned fee is always tez)
+   - `primary_in = primary_out`
+6. All values are u64 (implicit range check)
 
 **Contract / ledger checks:** proof valid, `fee >= required_tx_fee`, every public nullifier is unique within the transaction, and no public nullifier has already been spent. No signature verification needed — the STARK proof proves spend authorization.
 
-### Unshield (N->withdrawal + optional change, where 1 <= N <= 7)
+### Unshield (N->withdrawal + up to two change notes + producer fee, where 1 <= N <= 7)
 
-Consumes N private notes, queues an L1 withdrawal of `v_pub` to a canonical
-Tezos recipient, and creates a producer-fee note plus an optional private
-change note.
+Consumes N private notes, queues an L1 withdrawal of `v_pub` units of `asset_pub` to a canonical Tezos recipient (the L1 burn dispatches via the bridge ticketer registered for `asset_pub`), and creates a producer-fee note plus up to two private change notes (one per asset under the 2-accumulator design).
 
-**Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, v_pub, fee, recipient_id, cm_change, memo_ct_hash_change, cm_fee, memo_ct_hash_fee]`
+**Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, v_pub, asset_pub, fee, recipient_id, cm_change, memo_ct_hash_change, cm_change_2, memo_ct_hash_change_2, cm_fee, memo_ct_hash_fee]` — `2 + N + 10` felts total.
 
-`recipient_id` is defined in [L1 Withdrawal Recipient Encoding](#l1-withdrawal-recipient-encoding); semantically it is the hash of the canonical L1 recipient string.
+`recipient_id` is defined in [L1 Withdrawal Recipient Encoding](#l1-withdrawal-recipient-encoding); semantically it is the hash of the canonical L1 recipient string. `asset_pub` is the asset of the unshielded value (`ASSET_TEZ` for a tez exit; an FA2 asset_id for an FA2 exit). The kernel dispatches the L1 burn to `ticketer_for_asset(asset_pub)` and refuses if `asset_pub` is not in the registered set.
 
-`cm_change` and `memo_ct_hash_change` are 0 if no change output.
+`cm_change` / `cm_change_2` (and their memo hashes) are 0 if their respective slot is unused. The circuit's witness flags `has_change` and `has_change_2` gate the change-slot computations.
 
 **Circuit constraints:**
-1. Same per-input verification as Transfer (including auth tree membership proof and WOTS+ signature verification)
-2. If change:
-   - `owner_tag_c = H_owner(auth_root_c, pub_seed_c, nk_tag_c)` where `auth_root_c`, `pub_seed_c`, and `nk_tag_c` are private inputs
-   - `cm_change = H_commit(d_j_c, v_change, rcm_c, owner_tag_c)`
-3. If no change: all change witness data constrained to zero (`v_change`, `d_j_change`, `rseed_change`, `auth_root_change`, `pub_seed_change`, `nk_tag_change`, `memo_ct_hash_change` = 0) to eliminate prover malleability
-4. `cm_fee = H_commit(d_j_fee, v_fee, rcm_fee, owner_tag_fee)` for the DAL producer note
-5. `v_fee > 0`
-6. `sum(v_inputs) = v_pub + v_change + v_fee + fee`
+1. Same per-input verification as Transfer (including auth tree membership proof, WOTS+ signature verification, and `asset_i ∈ {ASSET_TEZ, A}` per-input asset check where `A` is the witness-declared primary non-tez asset).
+2. `asset_pub ∈ {ASSET_TEZ, A}` (the L1-exit asset must be in the same in-pair set as inputs/outputs). The audit found a CRITICAL bug in pre-fix versions of this constraint: an unconditional `tez_out += v_pub` mistakenly routed `v_pub` to the tez accumulator regardless of `asset_pub`, allowing a tez-only input set to mint FA2 tokens on L1. The fix (commit `2003bf5`) routes `v_pub` to `tez_out` or `primary_out` based on `asset_pub`.
+3. If `has_change`:
+   - `owner_tag_c = H_owner(auth_root_c, pub_seed_c, nk_tag_c)`
+   - `cm_change = H_commit(d_j_c, v_change, asset_change, rcm_c, owner_tag_c)`
+   - `asset_change ∈ {ASSET_TEZ, A}`
+4. If `has_change_2`:
+   - Analogous for `cm_change_2`, `asset_change_2 ∈ {ASSET_TEZ, A}`.
+5. If `!has_change` (resp. `!has_change_2`): all witness data for that slot is constrained to zero to eliminate prover malleability.
+6. `cm_fee = H_commit(d_j_fee, v_fee, ASSET_TEZ, rcm_fee, owner_tag_fee)` for the DAL producer note (always tez, asserted in-circuit).
+7. `v_fee > 0`.
+8. **Per-asset balance (2-accumulator).** Let `tez_in / primary_in` be the input-side per-asset sums and `tez_out / primary_out` be the output-side per-asset sums over the change slots. The circuit asserts:
+   - `tez_in = tez_out + [asset_pub == ASSET_TEZ] * v_pub + v_fee + fee`
+   - `primary_in = primary_out + [asset_pub == A] * v_pub`
 
-**Contract / ledger checks:** proof valid, `fee >= required_tx_fee`, every public nullifier is unique within the transaction, and no public nullifier has already been spent. Verify recipient binding per [L1 Withdrawal Recipient Encoding](#l1-withdrawal-recipient-encoding), queue or emit the L1 withdrawal for `v_pub`, append `cm_change` to T (if nonzero), append `cm_fee` to T. No signature verification needed — the STARK proof proves spend authorization.
+**Contract / ledger checks:** proof valid, `fee >= required_tx_fee`, every public nullifier is unique within the transaction, no public nullifier has already been spent, `asset_pub` is in the registered-asset list. Verify recipient binding per [L1 Withdrawal Recipient Encoding](#l1-withdrawal-recipient-encoding), queue or emit the L1 withdrawal via `ticketer_for_asset(asset_pub)` for `v_pub`, append `cm_change` / `cm_change_2` to T (if their slots are used), append `cm_fee` to T. No signature verification needed — the STARK proof proves spend authorization.
 
 ## Contract Consensus Rules
 
@@ -371,7 +441,7 @@ If proofs are produced through a bootloader or recursive verifier wrapper, the v
 
 The public output list determines `N`, the number of spent inputs, and exposes exactly `nf_0..nf_{N-1}`. Because those nullifiers and their count are public, pairwise distinctness is a consensus rule rather than a private circuit constraint. The contract MUST reject a transfer or unshield if the public nullifier list contains duplicates, and MUST also reject any `nf_i` that already exists in the global on-chain nullifier set. This prevents double-spends both within one transaction and across transactions. After all validation succeeds, the contract inserts all `nf_i` into the global set. The reference rollup kernel enforces this before appending output notes, queueing the withdrawal, or inserting nullifiers.
 
-For proof-verified transactions, the ledger MUST bind `N` to the exact verified public-output vector. The single bootloader task output is a serialized Cairo array, so the ledger first validates and strips the array length prefix. The resulting Transfer vector MUST have exactly `2 + N + 7` public felts, and the resulting Unshield vector MUST have exactly `2 + N + 7` public felts. Accepting a longer vector and interpreting only a suffix is forbidden, because that would make the public input count ambiguous.
+For proof-verified transactions, the ledger MUST bind `N` to the exact verified public-output vector. The single bootloader task output is a serialized Cairo array, so the ledger first validates and strips the array length prefix. The resulting Transfer vector MUST have exactly `2 + N + 9` public felts (fee + 4 cms + 4 memo hashes), and the resulting Unshield vector MUST have exactly `2 + N + 10` public felts (v_pub + asset_pub + fee + recipient + 2× (cm,mh) for changes + 1× (cm,mh) for the fee note). Shield uses a fixed-size 10-felt vector with no `N`. Accepting a longer vector and interpreting only a suffix is forbidden, because that would make the public input count ambiguous.
 
 ### Commitment binding (all transactions with outputs)
 
@@ -383,11 +453,11 @@ For each output note, the contract MUST verify `H(posted_note_calldata) == memo_
 
 ### Shield deposit binding
 
-Bridge deposits for shielding MUST be addressed to the canonical recipient string `deposit:<hex(pubkey_hash)>` where `pubkey_hash = H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)`. Each accepted L1 ticket credits a **per-pool aggregated balance** keyed by `pubkey_hash`. Multiple tickets to the same recipient string aggregate (top-ups), and dust attackers depositing to a victim's pool simply add to the victim's balance.
+Bridge deposits for shielding MUST be addressed to the canonical recipient string `deposit:<hex(pubkey_hash)>` where `pubkey_hash = H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)`. Each accepted L1 ticket credits a **per-pool aggregated balance keyed by `(asset_id, pubkey_hash)`**, where `asset_id` is determined by the ticketer KT1 that emitted the L1 ticket (`ASSET_TEZ` for the tez bridge ticketer; `derive_asset_id(KT1)` for an FA2 bridge ticketer). Multiple tickets from the same ticketer to the same recipient string aggregate (top-ups); dust attackers depositing to a victim's pool simply add to the victim's balance.
 
-The shield proof verifies an in-circuit WOTS+ signature under the recipient's auth tree — the same signature scheme used by transfer and unshield. The signed message is the full shield sighash `fold(0x03, auth_domain, pubkey_hash, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)`, so the prover cannot redirect funds, change values, or swap recipients — only the wallet that holds the corresponding signing key in the auth tree can produce a valid shield.
+The shield proof verifies an in-circuit WOTS+ signature under the recipient's auth tree — the same signature scheme used by transfer and unshield. The signed message is the full shield sighash `fold(0x03, auth_domain, pubkey_hash, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash, asset_new, asset_producer)`, so the prover cannot redirect funds, change values, swap recipients, OR change the asset — only the wallet that holds the corresponding signing key in the auth tree can produce a valid shield.
 
-`ShieldReq` carries a `pubkey_hash: F` field selecting the deposit pool and the user-chosen `(v, fee, producer_fee, cm_recipient, cm_producer)` quadruple. The kernel MUST verify that the proof is valid, the pinned public outputs match the request fields, and the pool's balance is at least `v + fee + producer_fee`. On success the pool's balance is decremented; if it reaches zero the entry is removed.
+`ShieldReq` carries `(asset_id, pubkey_hash)` selecting the deposit pool plus the user-chosen `(v, fee, producer_fee, cm_recipient, cm_producer)` quintuple. The kernel MUST verify that the proof is valid, the pinned public outputs match the request fields (including `asset_new`), `asset_new` is in the registered-asset set, and the deposit pool(s) are sufficiently funded as described in the Shield section above (one pool for tez shields; both the FA2 pool and the tez pool at the same `pubkey_hash` for FA2 shields). On success the relevant pool(s) are debited; entries reaching zero are removed.
 
 ### Spend authorization (all spending transactions)
 
@@ -403,11 +473,15 @@ The WOTS+ signature inside the STARK binds to the transaction's public outputs. 
 
 ```
 // Transfer (type_tag = 0x01):
-sighash = fold(0x01, auth_domain, root, nf_0, ..., nf_{N-1}, fee, cm_1, cm_2, cm_3, mh_1, mh_2, mh_3)
+sighash = fold(0x01, auth_domain, root, nf_0, ..., nf_{N-1}, fee,
+               cm_1, cm_2, cm_3, cm_4, mh_1, mh_2, mh_3, mh_4)
 
 // Unshield (type_tag = 0x02):
-sighash = fold(0x02, auth_domain, root, nf_0, ..., nf_{N-1}, v_pub, fee, recipient_id, cm_change, mh_change, cm_fee, mh_fee)
+sighash = fold(0x02, auth_domain, root, nf_0, ..., nf_{N-1}, v_pub, asset_pub, fee, recipient_id,
+               cm_change, mh_change, cm_change_2, mh_change_2, cm_fee, mh_fee)
 ```
+
+**Multiasset binding**: in transfer the per-output `asset_k` is NOT folded directly into the sighash, but every `cm_k` IS — and `cm_k = H_commit(d_j_k, v_k, asset_k, rcm_k, owner_tag_k)` already binds the asset. A delegated prover with the wallet's signature on `cm_k` cannot mutate `asset_k` without invalidating the signed `cm_k`. In unshield `asset_pub` IS folded directly (it's a public-output discriminator chosen by the user at sign time). In shield both `asset_new` and `asset_producer` are folded directly (see Shield section).
 
 The fold algorithm is the sequential left fold used by the client and circuit:
 
@@ -477,8 +551,10 @@ Detection and successful memo decryption are only candidate filters. A wallet MU
 2. Decrypt the note to obtain `(v, rseed, memo)`.
 3. Recompute `rcm = H(H(TAG_RCM), rseed)`.
 4. Recompute `owner_tag = H_owner(auth_root_j, pub_seed_j, nk_tag_j)`.
-5. Recompute `cm_expected = H_commit(d_j, v, rcm, owner_tag)`.
-6. Accept the note only if `cm_expected == cm` from chain data. Otherwise reject it as malformed, non-local, or unspendable.
+5. Iterate the wallet's registered-asset list (tez first, then each compile-time FA2 entry) and recompute `cm_expected = H_commit(d_j, v, asset, rcm, owner_tag)` for each candidate `asset`. The asset that yields `cm_expected == cm` is the asset this note carries.
+6. Accept the note only if some candidate asset makes `cm_expected == cm`. Otherwise reject it as malformed, non-local, or unspendable.
+
+**Multiasset note**: the encrypted note payload does NOT carry `asset_id` — that would force a wire-format bump and a Cairo change that re-bound `mh` to `asset`. Instead the wallet re-derives `cm` against each registered asset and picks whichever matches. Cost is O(|registry|) hashes per candidate decrypt; for single-digit registries this is negligible.
 
 ## User Memo
 
@@ -520,37 +596,39 @@ outgoing_ct     —   185 bytes   ChaCha20-Poly1305(role:1 || v:8 || rseed:32 ||
 
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
-public_outputs    —  288 B     [auth_domain, pubkey_hash, v, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash] (9 x 32 bytes)
+public_outputs    —  320 B     [auth_domain, pubkey_hash, v, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash, asset_new] (10 x 32 bytes — multiasset)
 note_data         —  6.8 KB    2 output notes
                   ----------
                   ~302 KB total (in-circuit WOTS+ signature under the recipient's auth tree binds the entire request payload)
 ```
 
-### Transfer (N->recipient + change + producer fee)
+### Transfer (N->recipient + up to two change notes + producer fee)
 
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
-public_outputs    — (N+9)*32 B  [auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3, mh_1, mh_2, mh_3]
-note_data         — 10.2 KB    3 output notes
+public_outputs    — (N+11)*32 B [auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3, cm_4, mh_1, mh_2, mh_3, mh_4]
+note_data         — 13.6 KB    up to 4 output notes (recipient + up to two change + producer fee)
                   ----------
-                  ~306 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
+                  ~309 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
 ```
 
 For a typical N=2 transfer: ~306 KB total.
 
-### Unshield (N->withdrawal + optional change + producer fee)
+### Unshield (N->withdrawal + up to two change notes + producer fee)
 
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
-public_outputs    — (N+9)*32 B  [auth_domain, root, nf_0..nf_{N-1}, v_pub, fee, recipient_id, cm_change, mh_change, cm_fee, mh_fee]
-note_data         — 3.4-6.8 KB  producer fee note plus optional change note
+public_outputs    — (N+12)*32 B [auth_domain, root, nf_0..nf_{N-1}, v_pub, asset_pub, fee, recipient_id, cm_change, mh_change, cm_change_2, mh_change_2, cm_fee, mh_fee]
+note_data         — 3.4-10.2 KB up to 3 output notes (producer fee plus up to two change notes)
                   ----------
-                  ~299-303 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
+                  ~299-306 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
 ```
 
-For a typical N=2 unshield: ~300-303 KB total.
+For a typical N=2 unshield: ~300-306 KB total.
 
-For transfer and unshield public-output parsing, the verifier infers the input count as `N = total_public_output_felts - 9`. That is, after the leading `auth_domain` and `root`, the final seven felts are fixed-format outputs and the remaining middle slice is the nullifier list.
+For transfer and unshield public-output parsing, the verifier infers the input count as:
+- Transfer: `N = total_public_output_felts - 11` (subtract `auth_domain + root + fee + 4 cms + 4 mhs`).
+- Unshield: `N = total_public_output_felts - 12` (subtract `auth_domain + root + v_pub + asset_pub + fee + recipient_id + 2× (cm, mh) for changes + 1× (cm, mh) for fee`).
 
 ## Domain Separation
 

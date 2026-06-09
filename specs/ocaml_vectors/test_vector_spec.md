@@ -1,7 +1,7 @@
 # TzEL v2 — Cross-Implementation Test Vector Specification
 
-**Version:** 1  
-**Purpose:** Any independent implementation of the TzEL v2 protocol can generate and consume these vectors to verify byte-exact compatibility with the reference implementation.
+**Spec version:** 2 (multiasset; matches canonical-wire fixture v4)
+**Purpose:** Any independent implementation of the TzEL v2 protocol can generate and consume these vectors to verify byte-exact compatibility with the reference implementation. The previous spec version (1) covered canonical wire v3 and the 4-ary commitment; this version describes the v4 wire bump and the 5-ary multiasset commitment `H_commit(d_j, v, asset_id, rcm, owner_tag)`.
 
 ## Overview
 

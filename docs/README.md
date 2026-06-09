@@ -21,9 +21,16 @@ This directory is the entry point for the project documentation.
 - [ushuaianet_tutorial.md](./ushuaianet_tutorial.md)
   - step-by-step `tzel-wallet` tutorial for the Ushuaianet
     `deposit -> shield -> send -> unshield` flow, with the current burned
-    `100000` mutez rollup fee plus a private DAL-producer fee note
+    `100000` mutez rollup fee plus a private DAL-producer fee note;
+    includes a `Multiasset / FA2 Flows` section covering the `--asset`
+    CLI flag and the FA2-shield-requires-tez-pool rule
 - [wallet_detection_service.md](./wallet_detection_service.md)
-  - watch-only `tzel-wallet` flow and `tzel-detect`
+  - watch-only `tzel-wallet` flow and `tzel-detect`, including
+    multiasset note recovery (view + outgoing watch modes iterate
+    the candidate-asset registry)
+- [multiasset_deployment.md](./multiasset_deployment.md)
+  - operator-side runbook for deploying / registering / removing FA2
+    bridge ticketers and the `COMPILE_TIME_FA2_BRIDGES` kernel constant
 
 ## Wallets
 
