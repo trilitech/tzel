@@ -663,35 +663,92 @@ fn decode_rollup_message(
     bytes: &[u8],
     current_rollup: &[u8],
 ) -> Result<ParsedRollupMessage, String> {
-    let (rest, inbox) = TezosInboxMessage::<BridgeDepositPayload>::parse(bytes)
-        .map_err(|_| "invalid rollup inbox message: failed to parse TezosInboxMessage frame".to_string())?;
-    if !rest.is_empty() {
-        return Err(
-            "invalid rollup inbox message: trailing bytes after TezosInboxMessage frame".into(),
-        );
-    }
-    match inbox {
-        TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer)) => {
-            if transfer.destination.hash().as_ref().as_slice() != current_rollup {
-                Ok(ParsedRollupMessage::Ignore)
-            } else {
-                Ok(ParsedRollupMessage::Deposit(parse_bridge_deposit(
-                    transfer,
-                )?))
+    // Two-pass parse over the internal-transfer payload type.
+    //
+    // Pass 1 — `Transfer<BridgeDepositPayload>` (the bridge ticket deposit).
+    // External messages and non-Transfer internals are payload-type
+    // independent, so they are also fully handled by this pass.
+    //
+    // Pass 2 — `Transfer<MichelsonBytes>`: a kernel message forwarded by the
+    // TzEL orchestrator contract (Mode A, `TRANSFER_TOKENS bytes`).
+    //
+    // Discrimination soundness: the transfer payload is Micheline-encoded,
+    // and the two shapes differ in their very first payload byte —
+    // `BridgeDepositPayload` is a Micheline pair (tag 0x07,
+    // MICHELINE_PRIM_2_ARGS_NO_ANNOTS_TAG, the only tag the MichelsonPair
+    // reader accepts) while `MichelsonBytes` is Micheline bytes (tag 0x0A,
+    // MICHELINE_BYTES_TAG). The same input can therefore never parse under
+    // both passes: a bridge deposit is consumed by pass 1 and never reaches
+    // pass 2, and an orchestrator message fails pass 1 outright. As an
+    // independent second guard, pass 2 only yields a message if the inner
+    // bytes decode as a versioned kernel envelope (version 17u16 LE ++ tag,
+    // `decode_kernel_inbox_message`), which no Micheline pair prefix
+    // satisfies.
+    match TezosInboxMessage::<BridgeDepositPayload>::parse(bytes) {
+        Ok((rest, inbox)) => {
+            if !rest.is_empty() {
+                return Err(
+                    "invalid rollup inbox message: trailing bytes after TezosInboxMessage frame"
+                        .into(),
+                );
             }
-        }
-        TezosInboxMessage::Internal(_) => Ok(ParsedRollupMessage::Ignore),
-        TezosInboxMessage::External(payload) => {
-            match ExternalMessageFrame::parse(payload) {
-                Ok(ExternalMessageFrame::Targetted { address, contents }) => {
-                    if address.hash().as_ref().as_slice() != current_rollup {
+            match inbox {
+                TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer)) => {
+                    if transfer.destination.hash().as_ref().as_slice() != current_rollup {
                         Ok(ParsedRollupMessage::Ignore)
                     } else {
-                        decode_kernel_inbox_message(contents)
+                        Ok(ParsedRollupMessage::Deposit(parse_bridge_deposit(
+                            transfer,
+                        )?))
+                    }
+                }
+                TezosInboxMessage::Internal(_) => Ok(ParsedRollupMessage::Ignore),
+                TezosInboxMessage::External(payload) => {
+                    match ExternalMessageFrame::parse(payload) {
+                        Ok(ExternalMessageFrame::Targetted { address, contents }) => {
+                            if address.hash().as_ref().as_slice() != current_rollup {
+                                Ok(ParsedRollupMessage::Ignore)
+                            } else {
+                                decode_kernel_inbox_message(contents)
+                                    .map(ParsedRollupMessage::Kernel)
+                            }
+                        }
+                        Err(_) => Ok(ParsedRollupMessage::Ignore),
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            let (rest, inbox) = TezosInboxMessage::<MichelsonBytes>::parse(bytes).map_err(|_| {
+                "invalid rollup inbox message: failed to parse TezosInboxMessage frame".to_string()
+            })?;
+            if !rest.is_empty() {
+                return Err(
+                    "invalid rollup inbox message: trailing bytes after TezosInboxMessage frame"
+                        .into(),
+                );
+            }
+            match inbox {
+                TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer)) => {
+                    if transfer.destination.hash().as_ref().as_slice() != current_rollup {
+                        Ok(ParsedRollupMessage::Ignore)
+                    } else {
+                        // Auth model: like the external Targetted path, the
+                        // kernel does not authenticate the submitter here.
+                        // `transfer.sender` (the calling KT1, e.g. the TzEL
+                        // orchestrator) and `transfer.source` are advisory
+                        // only — authentication of the message contents
+                        // lives in the STARK proofs and in the signed
+                        // ConfigureVerifier/ConfigureBridge envelopes
+                        // checked by `apply_kernel_message`.
+                        decode_kernel_inbox_message(&transfer.payload.0)
                             .map(ParsedRollupMessage::Kernel)
                     }
                 }
-                Err(_) => Ok(ParsedRollupMessage::Ignore),
+                // Unreachable in practice: External and non-Transfer
+                // Internal shapes are payload-type independent and already
+                // succeeded (and returned) in pass 1.
+                _ => Ok(ParsedRollupMessage::Ignore),
             }
         }
     }
@@ -2305,6 +2362,43 @@ mod tests {
         assert!(read_last_result(&host).is_none());
         assert!(!host.debug.contains("invalid inbox message"));
         assert!(!host.debug.contains("transition failed"));
+    }
+
+    #[test]
+    fn applies_kernel_message_from_internal_transfer() {
+        let mut host = MockHost::default();
+        let message = signed_bridge_message(KernelBridgeConfig {
+            ticketer: sample_ticketer().into(),
+        });
+        // A copy addressed to a foreign rollup must be ignored.
+        host.inputs.push_back(InputMessage {
+            level: 1,
+            id: 0,
+            payload: encode_internal_kernel_message_for_rollup(
+                sample_other_rollup_address(),
+                &message,
+            ),
+        });
+        // The copy addressed to this rollup must dispatch through
+        // apply_kernel_message exactly like the external Targetted path.
+        host.inputs.push_back(InputMessage {
+            level: 1,
+            id: 1,
+            payload: encode_internal_kernel_message_for_rollup(sample_rollup_address(), &message),
+        });
+
+        run_with_host(&mut host);
+
+        assert!(!host.debug.contains("invalid inbox message"));
+        assert!(!host.debug.contains("transition failed"));
+        match read_last_result(&host).unwrap() {
+            KernelResult::Configured => {}
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+        let stored = host
+            .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+            .expect("bridge ticketer configured");
+        assert_eq!(stored, sample_ticketer().as_bytes());
     }
 
     #[test]
@@ -4291,6 +4385,33 @@ mod tests {
         .unwrap();
         let mut bytes = Vec::new();
         TezosInboxMessage::<MichelsonUnit>::External(framed.as_slice())
+            .serialize(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    /// Wrap an encoded `KernelInboxMessage` in an internal
+    /// `Transfer<MichelsonBytes>` inbox message — the shape produced by the
+    /// TzEL orchestrator contract in Mode A (`TRANSFER_TOKENS bytes`). The
+    /// sender deliberately differs from the bridge ticketer: the sender is
+    /// advisory on this path.
+    fn encode_internal_kernel_message_for_rollup(
+        rollup: SmartRollupAddress,
+        message: &KernelInboxMessage,
+    ) -> Vec<u8> {
+        let payload = encode_kernel_inbox_message(message).unwrap();
+        let sender = match TezosContract::from_b58check(sample_other_ticketer()).unwrap() {
+            TezosContract::Originated(kt1) => kt1,
+            TezosContract::Implicit(_) => panic!("orchestrator must be KT1"),
+        };
+        let transfer = TezosTransfer {
+            payload: MichelsonBytes(payload),
+            sender,
+            source: sample_l1_source(),
+            destination: rollup,
+        };
+        let mut bytes = Vec::new();
+        TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer))
             .serialize(&mut bytes)
             .unwrap();
         bytes
