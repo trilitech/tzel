@@ -1,4 +1,6 @@
 mod bundle;
+pub mod groth16;
+pub mod snark;
 mod verify_meta_codec;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -10,6 +12,7 @@ use tzel_core::{
 };
 
 pub use bundle::ProofBundle;
+pub use snark::{compute_expected_out_hash, verify_snark, verify_snark_with_vk};
 
 #[cfg(not(target_arch = "wasm32"))]
 use cairo_program_runner_lib::hints::compute_program_hash_chain;

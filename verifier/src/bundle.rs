@@ -44,7 +44,7 @@ fn felt252_to_m31_words(value: Felt) -> [M31; FELT252_N_WORDS] {
     })
 }
 
-fn compute_output_hash_values(output_preimage: &[Felt]) -> Vec<u32> {
+pub(crate) fn compute_output_hash_values(output_preimage: &[Felt]) -> Vec<u32> {
     let outputs = Blake2Felt252::encode_felt252_data_and_calc_blake_hash(output_preimage);
     let outputs = felt252_to_m31_words(outputs);
     let output_qm31s = pack_into_qm31s(outputs.into_iter());

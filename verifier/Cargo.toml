@@ -16,6 +16,16 @@ starknet-types-core = { version = "=0.2.4", default-features = false, features =
 tzel-core = { path = "../core" }
 zstd = "0.13"
 
+# Groth16 wrap verification (verify_snark precompile primitive). All
+# default-features=false to stay kernel/wasm-friendly. `curve` enables the
+# G1Affine/G2Affine re-exports on ark-bn254.
+ark-bn254 = { version = "0.5", default-features = false, features = ["curve"] }
+ark-ec = { version = "0.5", default-features = false }
+ark-ff = { version = "0.5", default-features = false }
+ark-groth16 = { version = "0.5", default-features = false }
+ark-serialize = { version = "0.5", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+
 stwo = { version = "2.2.0", default-features = false }
 stwo-constraint-framework = { version = "2.2.0", default-features = false }
 circuit-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
