@@ -1,5 +1,10 @@
 /// Parameterized unshield executable — takes all witness data as input.
 ///
+/// Public outputs (`2 + N + 10` felts, in order):
+///   [auth_domain, root, nf_0..nf_{N-1}, v_pub, asset_pub, fee,
+///    recipient_id, cm_change, memo_ct_hash_change,
+///    cm_change_2, memo_ct_hash_change_2, cm_fee, memo_ct_hash_fee]
+///
 /// Argument layout (flattened felt252 array):
 ///   [0]  N
 ///   [1]  auth_domain
@@ -14,10 +19,14 @@
 ///   Then per input (N times): AUTH_DEPTH auth siblings
 ///   Then per input (N times): WOTS_CHAINS sig values
 ///   Then per input (N times): asset_i (multiasset Phase B)
-///   Then change: has_change, d_j, v, rseed, auth_root, auth_pub_seed, nk_tag, memo_ct_hash,
-///        asset_change
-///   Then producer fee note: d_j, v, rseed, auth_root, auth_pub_seed, nk_tag, memo_ct_hash,
-///        asset_fee
+///   Then change_1 slot: has_change, d_j, v, rseed, auth_root,
+///        auth_pub_seed, nk_tag, memo_ct_hash, asset_change
+///   Then change_2 slot (Phase C, the second per-asset change note):
+///        has_change_2, d_j_change_2, v_change_2, rseed_change_2,
+///        auth_root_change_2, auth_pub_seed_change_2, nk_tag_change_2,
+///        memo_ct_hash_change_2, asset_change_2
+///   Then producer fee note: d_j, v, rseed, auth_root, auth_pub_seed,
+///        nk_tag, memo_ct_hash, asset_fee
 ///   Then: asset_pub, primary_non_tez_asset (multiasset Phase B)
 
 use tzel::merkle;

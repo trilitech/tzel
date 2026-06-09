@@ -1,8 +1,14 @@
 /// Parameterized shield executable — takes witness data as input.
 ///
-/// Public outputs (in order):
+/// Public outputs (10 felts, in order):
 ///   [auth_domain, pubkey_hash, v_note, fee, producer_fee,
-///    cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash]
+///    cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash,
+///    asset_new]
+///
+/// (Multiasset: `asset_new` is the 10th public output. `asset_producer`
+///  is folded into the sighash but is asserted in-circuit to equal
+///  ASSET_TEZ, so it doesn't appear as a public output — only its
+///  commitment-preimage binding does.)
 ///
 /// Argument layout (flattened felt252 array):
 ///   [auth_domain, pubkey_hash, v_note, fee, producer_fee,

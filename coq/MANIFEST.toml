@@ -52,7 +52,7 @@ coq    = ["coq/Impl/Transfer.v"]
 # multiasset balance and producer-tez pin. Bumping the SHA to
 # acknowledge re-review of the Cairo against the Spec; no Impl
 # semantic change is possible until the Impl module ships.
-sha256 = "a44f09d45489cc2e28ec1b2426cfc1ab7a89eb9ad15359fad5f84e5cb43fa1b4"
+sha256 = "3ad9ce48ecd614578e0687999060539b47daff08ffd2a4ce1f50d822caacbfa6"
 
 [[mirror]]
 cairo  = "cairo/src/shield.cairo"
@@ -61,7 +61,7 @@ coq    = ["coq/Impl/Shield.v"]
 # and `asset_producer` into the sighash and asserts
 # `asset_producer == ASSET_TEZ`. Spec/Shield.v has the matching
 # binding; Impl/Shield.v remains a stub.
-sha256 = "a3eb81c9d6d0490aef0b2e83c0bb983c4bd8e264119f437ab84534c43f9ff144"
+sha256 = "460fc3cf03b38307db29be82839d7fc58af33f51ff7529a82a96880c03e4d7e7"
 
 [[mirror]]
 cairo  = "cairo/src/unshield.cairo"
@@ -74,4 +74,4 @@ coq    = ["coq/Impl/Unshield.v"]
 # Phi has the asset_pub-bound per-asset balance; Impl/Unshield.v is
 # still a stub. SHA bumped to acknowledge re-review against the
 # post-fix Cairo.
-sha256 = "2d1c5da7d6d242c54766689f26801d19930a81e3e87517d1905c9dc7e201518d"
+sha256 = "905f7b084620887d2316bfcf8e9c62ff3ac12e6827d5e0b93ee014e3623565e1"

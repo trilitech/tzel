@@ -1,14 +1,35 @@
-/// Transfer circuit: N→2 JoinSplit (1 ≤ N ≤ 7).
+/// Transfer circuit: N→4 JoinSplit (1 ≤ N ≤ 7).
+///
+/// Phase C output layout — four output slots:
+///   slot 1 (cm_1): recipient note, asset = `asset_recipient` (witness-chosen
+///                  from {ASSET_TEZ, primary_non_tez_asset})
+///   slot 2 (cm_2): change_1 (same asset as recipient, or pure-tez refund)
+///   slot 3 (cm_3): change_2 (the OTHER asset under the 2-accumulator design;
+///                  zero-value placeholder for single-asset transfers)
+///   slot 4 (cm_4): producer-fee note (asset MUST equal ASSET_TEZ — see
+///                  Multiasset rationale in specs/rationale.md)
 ///
 /// # Public outputs
-///   [auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3,
-///    memo_ct_hash_1, memo_ct_hash_2, memo_ct_hash_3]
+///   [auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3, cm_4,
+///    memo_ct_hash_1, memo_ct_hash_2, memo_ct_hash_3, memo_ct_hash_4]
+///
+/// Length is `2 + N + 9` felts (auth_domain + root + N nullifiers + fee +
+/// 4 cms + 4 memo hashes).
+///
+/// # Multiasset constraints
+///   Every input and every output carries an asset tag in the commitment
+///   preimage. The witness declares one primary non-tez asset `A`; each
+///   input/output asset is constrained to lie in {ASSET_TEZ, A}. Two
+///   accumulators (`tez_in/tez_out`, `primary_in/primary_out`) close the
+///   per-asset balance; only the burned `fee` enters `tez_out` directly.
 ///
 /// # Spend authorization
 ///   XMSS-style WOTS+ w=4 signature verification inside the STARK.
 ///   The circuit recovers the 133 WOTS public-key endpoints from the signature,
 ///   compresses them with an XMSS L-tree, and authenticates that exact leaf under
-///   the witness `(auth_root, auth_pub_seed)` public key.
+///   the witness `(auth_root, auth_pub_seed)` public key. Asset binding to
+///   the sighash is transitive via `cm_k` (which commits to asset_k);
+///   `asset_k` itself is NOT public, only the commitments are.
 
 use tzel::blake_hash as hash;
 use tzel::{merkle, xmss_common};

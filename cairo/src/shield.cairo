@@ -1,28 +1,46 @@
-/// Shield circuit (post deposit-pool / pubkey_hash redesign).
+/// Shield circuit (post deposit-pool / pubkey_hash redesign + multiasset).
 ///
-/// # Public outputs
+/// # Public outputs (10 felts)
 ///   [auth_domain, pubkey_hash, v_note, fee, producer_fee,
-///    cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash]
+///    cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash,
+///    asset_new]
+///
+/// `asset_new` is the recipient note's L2 asset_id (ASSET_TEZ or
+/// `derive_asset_id(ticketer_kt1)` for an FA2). The producer-fee
+/// note's asset is implicit (always ASSET_TEZ, asserted in-circuit by
+/// the producer-commitment recomputation below).
 ///
 /// # Spend authorization
 ///   In-circuit XMSS-style WOTS+ signature verification under the
 ///   recipient's auth tree, mirroring the transfer / unshield circuits.
 ///   The signature signs the shield sighash:
 ///     fold(0x03, auth_domain, pubkey_hash, v_note, fee, producer_fee,
-///          cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)
+///          cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash,
+///          asset_new, asset_producer)
 ///   so a delegated prover holding the witness still cannot redirect funds,
-///   change values, or swap recipients without the wallet's signing key.
+///   change values, swap recipients, or change the asset without the
+///   wallet's signing key. `asset_producer` is folded directly into the
+///   sighash even though it's pinned to ASSET_TEZ in-circuit, to keep the
+///   sighash structure identical to a hypothetical future variant that
+///   relaxes that pin.
 ///
 /// # Constraints
 ///   owner_tag = H_owner(auth_root, auth_pub_seed, nk_tag)
-///   cm_new   = H_commit(d_j, v_note, H(rseed), owner_tag)
+///   cm_new   = H_commit(d_j, v_note, asset_new, H(rseed), owner_tag)
 ///   producer_owner_tag = H_owner(producer_auth_root, producer_auth_pub_seed,
 ///                                producer_nk_tag)
-///   cm_producer = H_commit(producer_d_j, producer_fee, H(producer_rseed),
-///                          producer_owner_tag)
+///   cm_producer = H_commit(producer_d_j, producer_fee, ASSET_TEZ,
+///                          H(producer_rseed), producer_owner_tag)
 ///   producer_fee > 0
+///   asset_producer == ASSET_TEZ   (DAL liquidity argument; see whitepaper §Multiasset)
 ///   pubkey_hash = fold(0x04, auth_domain, auth_root, auth_pub_seed, blind)
 ///   WOTS+(sighash, auth_root, auth_pub_seed, auth_idx, wots_sig, auth_siblings)
+///
+///   Note: `asset_new` is NOT asserted to equal ASSET_TEZ — Phase E.3
+///   lifted that pin. The kernel re-checks `asset_new` against its
+///   registered-asset list. An attempt to shield against an
+///   unregistered asset reaches the circuit and produces a valid
+///   proof, but the kernel rejects the resulting Shield request.
 
 use tzel::blake_hash as hash;
 use tzel::{merkle, xmss_common};

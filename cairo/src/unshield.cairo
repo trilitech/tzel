@@ -1,11 +1,40 @@
-/// Unshield circuit: N→withdrawal + optional change (1 ≤ N ≤ 7).
+/// Unshield circuit: N→withdrawal + up to two change notes + producer fee
+/// (1 ≤ N ≤ 7).
+///
+/// Phase C / multiasset output layout: a public exit of `v_pub` units of
+/// `asset_pub` to a canonical Tezos recipient (the L1 burn dispatches via
+/// the bridge ticketer registered for `asset_pub`), plus up to two
+/// change notes (one per asset under the 2-accumulator design) plus a
+/// producer-fee note (permanently tez).
 ///
 /// # Public outputs
-///   [auth_domain, root, nf_0..nf_{N-1}, v_pub, fee, recipient_id,
-///    cm_change, memo_ct_hash_change, cm_fee, memo_ct_hash_fee]
+///   [auth_domain, root, nf_0..nf_{N-1}, v_pub, asset_pub, fee, recipient_id,
+///    cm_change, memo_ct_hash_change, cm_change_2, memo_ct_hash_change_2,
+///    cm_fee, memo_ct_hash_fee]
+///
+/// Length is `2 + N + 10` felts (auth_domain + root + N nullifiers +
+/// v_pub + asset_pub + fee + recipient_id + 2×(cm,mh) for changes +
+/// 1×(cm,mh) for the producer fee).
+///
+/// # Multiasset constraints
+///   The witness declares one primary non-tez asset `A`; every input and
+///   every output (including the two optional change slots and the
+///   `asset_pub` exit asset) is constrained to lie in {ASSET_TEZ, A}.
+///   Two accumulators close the per-asset balance:
+///     tez_in     = tez_out     + [asset_pub == ASSET_TEZ] * v_pub + v_fee + fee
+///     primary_in = primary_out + [asset_pub == A]         * v_pub
+///   The producer-fee note is permanently tez (`asset_fee = ASSET_TEZ`).
+///
+///   Phase E.5 bug #1 (commit 2003bf5): an earlier version
+///   unconditionally added `v_pub` to `tez_out` regardless of
+///   `asset_pub`. That bug let a tez-only input set mint FA2 tokens on
+///   L1; the fix routes `v_pub` to the right accumulator based on
+///   `asset_pub`.
 ///
 /// # Spend authorization
 ///   XMSS-style WOTS+ w=4 signature verification inside the STARK, bound to the sighash.
+///   `asset_pub` IS folded directly into the sighash (it's a
+///   public-output discriminator chosen by the user at sign time).
 
 use tzel::blake_hash as hash;
 use tzel::{merkle, xmss_common};
