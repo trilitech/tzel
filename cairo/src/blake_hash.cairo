@@ -20,8 +20,8 @@
 /// # Note structure
 ///
 ///   owner_tag_j = H_owner(auth_root_j, pub_seed_j, nk_tag_j)
-///   cm = H_commit(d_j, v, rcm, owner_tag_j)  — commitment
-///   nf = H_nf(nk_spend_j, cm, pos)           — nullifier (position-dependent)
+///   cm = H_commit(d_j, v, asset_id, rcm, owner_tag_j)  — commitment (5-ary as of multiasset)
+///   nf = H_nf(nk_spend_j, cm, pos)                     — nullifier (position-dependent)
 ///
 /// # Domain separation
 ///

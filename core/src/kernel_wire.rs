@@ -81,12 +81,18 @@ pub struct KernelStarkProof {
     pub output_preimage: Vec<F>,
 }
 
-/// Shield message: drains `v + fee + producer_fee` mutez from the deposit
-/// pool keyed by `pubkey_hash`. Both notes are fully constructed client-side
-/// and the server has no role in fabricating them. The shield's STARK proof
-/// includes an in-circuit WOTS+ signature under the recipient's auth tree
+/// Shield message: drains the deposit pool keyed by `(asset_id,
+/// pubkey_hash)`. For tez shields the single asset pool is debited
+/// `v + fee + producer_fee`. For FA2 shields the FA2 pool is debited
+/// `v + fee` and the `(ASSET_TEZ, pubkey_hash)` pool at the same
+/// pubkey_hash is debited `producer_fee` — the producer-fee output note
+/// is permanently tez (bug-#2 fix, commit aff523a), so FA2 shields
+/// require BOTH an FA2 pool AND a tez pool at the same pubkey_hash.
+/// Both notes are fully constructed client-side and the server has no
+/// role in fabricating them. The shield's STARK proof includes an
+/// in-circuit WOTS+ signature under the recipient's auth tree
 /// (matching `pubkey_hash = H(auth_domain, auth_root, auth_pub_seed, blind)`),
-/// authorizing this specific draw.
+/// authorizing this specific draw and binding `asset_new`.
 #[derive(Debug, Clone)]
 pub struct KernelShieldReq {
     /// L2 asset_id this shield is draining. Mirror of `ShieldReq::asset_id`.

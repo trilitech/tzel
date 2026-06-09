@@ -17,25 +17,31 @@
     The sighash uses tag 0x03 to prevent cross-circuit replay
     with transfer (0x01) or unshield (0x02).
 
-    ** Multiasset note (v1 — single tez bridge).
+    ** Multiasset (Phase E lift).
 
-    Shield's L1 boundary currently exposes only the tez bridge, so
-    the deposit is always tez.  The circuit-level commitments,
-    however, are asset-tagged — both [cm_new] and [cm_producer] bind
-    an explicit asset field through [H_commit].  In v1 we pin both
-    to [asset_tez] (the only bridge), but the commitment hash
-    structure is already in place for future bridges:
+    Shield's L1 boundary exposes the tez bridge AND one bridge per
+    registered FA2 ticketer KT1 (deployment-defined via the kernel's
+    [COMPILE_TIME_FA2_BRIDGES] constant).  Both [cm_new] and
+    [cm_producer] are asset-tagged through the 5-ary [H_commit]:
 
       cm_new      = H_commit(d_j, v_note, asset_new, rcm, otag_new)
       cm_producer = H_commit(d_j', v_fee, asset_tez, rcm', otag')
 
-    For v1, [phi_shield_asset_tez] requires [asset_new = asset_tez].
-    A future "shield_asset_A" entry point would relax that constraint
-    after deploying an asset-A bridge.
+    [asset_new] is sender-chosen; the kernel re-checks it against
+    its registered-asset list (this Coq spec abstracts over the
+    registry and only models the in-circuit invariants).
+    [asset_producer] remains pinned to [asset_tez] in-circuit by
+    [phi_shield_producer_asset_tez] below, by the same liquidity
+    argument as in [Spec.Transfer]'s [phi_producer_asset_tez].
 
-    The producer fee MUST remain tez even after future bridges land,
-    by the same liquidity argument as in [Spec.Transfer]
-    ([phi_producer_asset_tez]).
+    Earlier versions of this spec included a [phi_shield_asset_tez]
+    conjunct that pinned [asset_new] to [asset_tez].  That pin was
+    lifted in Phase E.3 (Cairo commit removing the
+    [assert(asset_new == ASSET_TEZ)] in [shield.cairo::verify]) so
+    FA2 shields can produce recipient notes carrying a non-tez
+    asset.  The lemma [Phi_shield_recipient_is_tez] is therefore
+    not provable from [Phi_shield] alone — recipients can carry any
+    registered asset.
 *)
 
 From Stdlib Require Import List.
@@ -97,15 +103,16 @@ Section PhiShield.
     cm_producer = H_commit producer_d_j producer_fee_felt
                            producer_asset rcm_val otag.
 
-  (** 4. Recipient asset = tez (v1 single-bridge constraint).
+  (** 4. (Lifted in Phase E.3.) The recipient-asset = tez pin was
+      removed in commit 0c0c8b… of the multiasset branch — the
+      Cairo [shield.cairo::verify] no longer asserts
+      [asset_new == ASSET_TEZ].  The asset binding now lives in the
+      kernel's registered-asset list (modelled abstractly here).
 
-      With only the tez bridge deployed, the L1 deposit is always
-      tez and the produced [cm_new] must carry [asset = tez].
-      Remove this conjunct when a non-tez bridge is added; replace
-      with a per-bridge "deposit asset matches drained pool"
-      constraint. *)
-  Definition phi_shield_asset_tez (asset_new : Felt) : Prop :=
-    asset_new = asset_tez.
+      This stub is kept so dependent indices in [Phi_shield] don't
+      shift; it always holds. *)
+  Definition phi_shield_asset_registered (_asset_new : Felt) : Prop :=
+    True.
 
   (** 5. Producer fee asset = tez.
 
@@ -203,7 +210,7 @@ Section PhiShield.
          (so_v_felt out_producer) (so_asset out_producer)
          (so_rcm out_producer) (so_auth_root out_producer)
          (so_pub_seed out_producer) (so_nk_tag out_producer)
-    /\ phi_shield_asset_tez          (so_asset out_recipient)
+    /\ phi_shield_asset_registered   (so_asset out_recipient)
     /\ phi_shield_producer_asset_tez (so_asset out_producer)
     /\ phi_shield_producer_fee       (so_v     out_producer)
     /\ phi_shield_value_conservation
@@ -217,19 +224,11 @@ Section PhiShield.
 
   (** ** Sanity-check consequences of [Phi_shield]. *)
 
-  Lemma Phi_shield_recipient_is_tez
-      sighash auth_domain pubkey_hash tag_felt tag_pkh
-      auth_root_pkh auth_pub_seed_pkh blind
-      v_note_felt fee_felt producer_fee_felt
-      v_deposit fee r p :
-    Phi_shield sighash auth_domain pubkey_hash tag_felt tag_pkh
-               auth_root_pkh auth_pub_seed_pkh blind
-               v_note_felt fee_felt producer_fee_felt
-               v_deposit fee r p ->
-    so_asset r = asset_tez.
-  Proof.
-    unfold Phi_shield, phi_shield_asset_tez. tauto.
-  Qed.
+  (** Phase E.3 lifted the [asset_new = asset_tez] pin.  The
+      recipient-is-tez lemma no longer holds from [Phi_shield] alone;
+      the recipient asset is whatever the kernel's registered-asset
+      list permits (abstracted away from this Coq spec).  Producer
+      tez pin still holds. *)
 
   Lemma Phi_shield_producer_is_tez_positive
       sighash auth_domain pubkey_hash tag_felt tag_pkh

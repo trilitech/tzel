@@ -25,7 +25,7 @@
 ///           └── d_j = H(dsk, j)                  — diversified address
 /// ```
 ///
-/// - Commitment: `cm = H_commit(d_j, v, rcm, owner_tag)` — binds address + auth + nullifier keys
+/// - Commitment: `cm = H_commit(d_j, v, asset_id, rcm, owner_tag)` — 5-ary as of multiasset; binds address + value + asset + auth + nullifier keys
 /// - Nullifier:  `nf = H_nf(nk_spend, H_nf(cm, pos))` — position-dependent, per-address
 /// - All hashing: BLAKE2s-256, 251-bit truncated, personalized IVs
 use blake2s_simd::Params;

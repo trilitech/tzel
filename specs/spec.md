@@ -421,7 +421,7 @@ The kernel persists a signed `KernelVerifierConfig` containing:
 
 The signature covers all fields. There is no privileged rollup operator and no on-chain notion of a canonical producer-fee receiver — producer fees are paid in a permissionless market to whichever DAL slot publisher chooses to include the transaction.
 
-The producer-fee receiver is **not enforced in-circuit and not enforced on chain**. The shield / transfer / unshield circuits prove only that `cm_producer = H_commit(producer_d_j, producer_fee, producer_rcm, producer_otag)` and that the witness is internally consistent. Enforcement of "the producer note is payable to me" is the DAL slot publisher's own inclusion policy — they refuse to bundle transactions whose producer note isn't routed to them, since that note is their revenue. A wallet that targets a publisher and routes the fee elsewhere simply doesn't get included.
+The producer-fee receiver is **not enforced in-circuit and not enforced on chain**. The shield / transfer / unshield circuits prove only that `cm_producer = H_commit(producer_d_j, producer_fee, ASSET_TEZ, producer_rcm, producer_otag)` (asset pinned to tez in-circuit, see Multiasset section) and that the witness is internally consistent. Enforcement of "the producer note is payable to me" is the DAL slot publisher's own inclusion policy — they refuse to bundle transactions whose producer note isn't routed to them, since that note is their revenue. A wallet that targets a publisher and routes the fee elsewhere simply doesn't get included.
 
 ### Wallet preflight gates
 
@@ -511,7 +511,7 @@ The contract appends commitments to the tree in sequential order (each new commi
 1. User constructs the transaction, computing the WOTS+ signature over the sighash with `sk_i` for each input.
 2. User gives the prover per-input: `(nk_spend_j, auth_root_j, pub_seed_j, wots_sig_i, auth_tree_path_i, d_j, v, rseed, commitment_tree_path, pos)`, plus output data including `auth_root`, `pub_seed`, and `nk_tag` for output notes.
 3. Prover generates the STARK proof. The WOTS+ signature is verified inside the circuit.
-4. Prover returns proof to user. Public outputs contain only `[auth_domain, root, nullifiers, fee, commitments, memo hashes]` (or `[auth_domain, root, nullifiers, v_pub, fee, recipient_id, cm_change, memo_ct_hash_change, cm_fee, memo_ct_hash_fee]` for unshield) — no auth leaves, public keys, or signatures.
+4. Prover returns proof to user. Public outputs contain only `[auth_domain, root, nullifiers, fee, cm_1..cm_4, memo_ct_hash_1..memo_ct_hash_4]` for transfer (Phase C 4-output layout), or `[auth_domain, root, nullifiers, v_pub, asset_pub, fee, recipient_id, cm_change, memo_ct_hash_change, cm_change_2, memo_ct_hash_change_2, cm_fee, memo_ct_hash_fee]` for unshield — no auth leaves, public keys, or signatures.
 5. Transaction (proof + note data) submitted on-chain. No separate signatures or public keys needed.
 
 ## Detection (Fuzzy Message Detection)
@@ -797,7 +797,7 @@ This scheme is robust against the dust-bricking attack that motivated the origin
 
 #### Shield Authorization (in-circuit XMSS sig)
 
-A shield proof verifies an in-circuit WOTS+ signature under the recipient's auth tree, mirroring the structure used by transfer and unshield. The signature signs `fold(0x03, auth_domain, pubkey_hash, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)`, so it binds the entire request payload. A delegated prover with the witness still cannot redirect funds, change values, or swap recipients because they don't have access to the wallet's WOTS+ signing material.
+A shield proof verifies an in-circuit WOTS+ signature under the recipient's auth tree, mirroring the structure used by transfer and unshield. The signature signs `fold(0x03, auth_domain, pubkey_hash, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash, asset_new, asset_producer)`, so it binds the entire request payload including the chosen asset. A delegated prover with the witness still cannot redirect funds, change values, swap recipients, or change the asset because they don't have access to the wallet's WOTS+ signing material.
 
 This makes the wallet **not stateless**: each shield consumes one WOTS+ key index from the recipient's auth tree (the same index management used for transfer and unshield).
 

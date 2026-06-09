@@ -85,14 +85,21 @@ Section PhiUnshield.
       Cairo: [assert(n >= 1)] and [assert(n <= MAX_INPUTS)]. *)
   Definition phi_unshield_input_count := phi_input_count.
 
-  (** 5. Public exit asset = tez (v1 single-bridge constraint).
+  (** 5. (Lifted in Phase E.5.) The public exit asset = tez pin was
+      removed when bug #1 (Cairo unshield [v_pub] lane-routing
+      bypass) was fixed.  Pre-fix versions of the circuit
+      unconditionally added [v_pub] to [tez_out] regardless of
+      [asset_pub], which an attacker could exploit to mint FA2
+      tokens on L1 backed by other users' tez deposits.  Post-fix,
+      [asset_pub] can be any asset in [{ASSET_TEZ, A}] (the
+      witness-declared primary non-tez asset), the kernel routes
+      the L1 burn through [ticketer_for_asset(asset_pub)], and the
+      circuit routes [v_pub] to the correct lane.
 
-      With only the tez bridge deployed, L1 exits can only deliver
-      tez.  Lift this when additional bridges land; the per-bridge
-      version would require [asset_pub] to match a bridge-specific
-      whitelist. *)
-  Definition phi_unshield_exit_asset_tez (asset_pub : Felt) : Prop :=
-    asset_pub = asset_tez.
+      This stub is kept so dependent indices in [Phi_unshield] don't
+      shift; it always holds. *)
+  Definition phi_unshield_exit_asset_registered (_asset_pub : Felt) : Prop :=
+    True.
 
   (** 6. Producer fee asset = tez.  Permanent constraint. *)
   Definition phi_unshield_producer_asset_tez
@@ -215,9 +222,9 @@ Section PhiUnshield.
          (out_memo out_change_1) (out_memo out_change_2)
          (out_memo out_producer)
     (* asset / fee pins *)
-    /\ phi_unshield_exit_asset_tez       asset_pub
-    /\ phi_unshield_producer_asset_tez   (out_asset out_producer)
-    /\ phi_unshield_fee_positive         (out_v     out_producer).
+    /\ phi_unshield_exit_asset_registered asset_pub
+    /\ phi_unshield_producer_asset_tez    (out_asset out_producer)
+    /\ phi_unshield_fee_positive          (out_v     out_producer).
 
   (** ** Sanity-check consequences of [Phi_unshield]. *)
 
@@ -232,15 +239,11 @@ Section PhiUnshield.
   Proof. unfold Phi_unshield, phi_unshield_input_count,
                  phi_input_count. tauto. Qed.
 
-  Lemma Phi_unshield_exit_is_tez
-      sighash auth_domain root tag_felt fee_felt
-      v_pub_felt asset_pub recipient fee v_pub
-      inputs c1 c2 p :
-    Phi_unshield sighash auth_domain root tag_felt fee_felt
-                 v_pub_felt asset_pub recipient fee v_pub
-                 inputs c1 c2 p ->
-    asset_pub = asset_tez.
-  Proof. unfold Phi_unshield, phi_unshield_exit_asset_tez. tauto. Qed.
+  (** Phase E.5 lifted the [asset_pub = asset_tez] pin (bug #1 fix).
+      The unshield exit asset is now any registered asset; the
+      circuit's per-asset balance routes [v_pub] correctly under
+      [phi_unshield_value_conservation_2acc].  Producer tez pin
+      still holds. *)
 
   Lemma Phi_unshield_producer_is_tez_positive
       sighash auth_domain root tag_felt fee_felt

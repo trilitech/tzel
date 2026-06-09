@@ -2042,14 +2042,19 @@ pub struct PaymentAddress {
 
 /// Shield request.
 ///
-/// `pubkey_hash` identifies the deposit-balance pool to drain, computed as
-/// `H(auth_domain, auth_root, auth_pub_seed, blind)` (type tag 0x04). The
-/// kernel debits `v + fee + producer_fee` from that pool. The proof's
+/// `(asset_id, pubkey_hash)` identifies the deposit-balance pool to drain,
+/// where `pubkey_hash = H(auth_domain, auth_root, auth_pub_seed, blind)`
+/// (type tag 0x04). The kernel debits the asset pool by `v + fee` (FA2) or
+/// `v + fee + producer_fee` (tez); for FA2 shields it ALSO debits
+/// `producer_fee` from the `(ASSET_TEZ, pubkey_hash)` pool at the same
+/// pubkey_hash, because the producer-fee output note is permanently tez
+/// (bug-#2 fix, commit aff523a). FA2 shields therefore require BOTH an
+/// FA2 pool AND a tez pool at the same `pubkey_hash`. The proof's
 /// in-circuit WOTS+ signature, verified under the recipient's auth tree,
 /// binds the entire request payload (pubkey_hash, v, fee, producer_fee,
-/// output commitments, memo hashes) so a delegated prover cannot redirect
-/// funds, change values, or swap recipients without the wallet's signing
-/// key.
+/// output commitments, memo hashes, asset_new, asset_producer) so a
+/// delegated prover cannot redirect funds, change values, swap recipients,
+/// or change the asset without the wallet's signing key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShieldReq {
     /// L2 asset_id whose pool this shield is draining. The Cairo

@@ -29,7 +29,7 @@ coq    = ["coq/Impl/Hashes.v"]
 # extraction-time parameters realized against `tzel-core` (no Coq-
 # level binding to the new `asset` slot needed; the Spec/Hashes.v
 # H_commit signature already accommodates a variable-arity fold).
-sha256 = "56cac3b698a26a86b7b1950b0fa45d1e568430c2d17e0cf2d9021fc07c5ade2a"
+sha256 = "7dc803ef00006ab61e934c4a04629802567d8e0b3f7c6936468870445c10b8a6"
 
 [[mirror]]
 cairo  = "cairo/src/merkle.cairo"

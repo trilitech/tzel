@@ -902,8 +902,9 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     ledger.deposit_balances.clear();
     // Deposit balances are NOT enumerated here: the durable layout has no
     // balance index (intentionally — bounded storage), so callers that want
-    // to see a specific pool must probe `deposit_balance_path(pubkey_hash)`
-    // via `host.read_store(...)` directly.
+    // to see a specific pool must probe
+    // `deposit_balance_path(asset_id, pubkey_hash)` via `host.read_store(...)`
+    // directly. Same `pubkey_hash` may host one pool per asset.
 
     for i in 0..tree_size {
         let note_bytes =
