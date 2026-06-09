@@ -149,7 +149,28 @@ impl AggregationContext {
         // `proof.rs:294` panics with "Lifting log size must be set"). The
         // lifting equals `trace_log_size + log_blowup_factor` — same formula
         // the prover uses internally.
-        let base_internal_pcs_config = PcsConfig::default();
+        //
+        // The internal_pcs_config is the FRI config the multiverifier root
+        // proof uses. Composite soundness = min(N × leaf_bits, mv_bits, ...);
+        // for production we must align mv_bits with the desired total.
+        //
+        // Aligned with stwo-gnark-tzel's chip target shape (chip-compat):
+        //   pow_bits=10, log_blowup=1, n_queries=23, fold_step=1
+        // = 33 bits conjectured FRI soundness (Stwo's own security_bits
+        // formula). Not production-grade; sized for E2E pipeline validation
+        // against the existing 110M-constraint chip. For prod (96 bits) bump
+        // n_queries=35 + log_blowup=2 (option β per MULTIVERIFIER-REBUILD-PLAN
+        // in the stwo-gnark-tzel sibling repo) and re-Setup the chip.
+        let base_internal_pcs_config = PcsConfig {
+            pow_bits: 10,
+            fri_config: stwo::core::fri::FriConfig {
+                log_blowup_factor: 1,
+                log_last_layer_degree_bound: 0,
+                n_queries: 23,
+                fold_step: 1,
+            },
+            lifting_log_size: None,
+        };
         let internal_lifting = leaf_to_mv_preprocessed.params.trace_log_size
             + base_internal_pcs_config.fri_config.log_blowup_factor;
         let internal_pcs_config = PcsConfig {
