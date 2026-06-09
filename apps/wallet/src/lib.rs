@@ -1617,7 +1617,9 @@ fn post_json<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
         let body = resp.into_body().read_to_string().unwrap_or_default();
         return Err(format!("HTTP {}: {}", status, body));
     }
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
@@ -1648,16 +1650,30 @@ fn post_json_with_bearer<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
         let body = resp.into_body().read_to_string().unwrap_or_default();
         return Err(format!("HTTP {}: {}", status, body));
     }
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
+
+/// Maximum bytes the wallet will read from any HTTP JSON response.
+/// Bounds memory usage when fetching from an untrusted operator /
+/// rollup node — without this cap, a malicious endpoint could return
+/// a multi-GB body and OOM the wallet (especially the `tzel-detect`
+/// daemon, which polls in a background loop). 64 MiB is well above
+/// the largest legitimate feed page (which is bounded by the kernel's
+/// `MAX_DAL_PAYLOAD_BYTES`) but small enough to prevent runaway
+/// allocation.
+const HTTP_JSON_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 fn get_json<Resp: for<'de> Deserialize<'de>>(url: &str) -> Result<Resp, String> {
     let resp = ureq::get(url)
         .call()
         .map_err(|e| format!("HTTP error: {}", e))?;
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
@@ -1671,7 +1687,9 @@ fn get_json_with_bearer<Resp: for<'de> Deserialize<'de>>(
         req = req.header("Authorization", &format!("Bearer {}", token));
     }
     let resp = req.call().map_err(|e| format!("HTTP error: {}", e))?;
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
@@ -3835,7 +3853,17 @@ async fn run_detect_service(cli: DetectServiceCli) -> Result<(), String> {
         loop {
             ticker.tick().await;
             let _guard = background_state.sync_lock.lock().await;
-            let _ = run_detection_service_once(&background_state.wallet);
+            // Log errors instead of swallowing them. Earlier
+            // drafts used `let _ = ...`; a network blip or
+            // misconfiguration would leave the daemon polling
+            // silently forever, with no signal to the operator
+            // that scans were actually failing. eprintln is the
+            // simplest available sink (the daemon doesn't pull
+            // in a structured-log crate); operators can capture
+            // stderr via systemd / docker logs.
+            if let Err(err) = run_detection_service_once(&background_state.wallet) {
+                eprintln!("tzel-detect: background scan failed: {}", err);
+            }
         }
     });
 
@@ -4596,7 +4624,9 @@ fn http_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Val
         let body = resp.into_body().read_to_string().unwrap_or_default();
         return Err(format!("HTTP {}: {}", status, body));
     }
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
@@ -4616,7 +4646,9 @@ fn http_get_json(url: &str) -> Result<serde_json::Value, String> {
         let body = resp.into_body().read_to_string().unwrap_or_default();
         return Err(format!("HTTP {}: {}", status, body));
     }
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
@@ -5062,8 +5094,25 @@ fn fetch_pool_balances_http(
             continue;
         }
         if p.asset_id != ASSET_TEZ {
-            // Demo HTTP ledger is tez-only; skip FA2 probes.
-            continue;
+            // The demo HTTP ledger's /deposits/balance endpoint is
+            // tez-only by construction. Earlier drafts silently
+            // skipped non-tez entries, but that left an FA2
+            // PendingDeposit absent from the returned map. The
+            // downstream prune predicate then reads `absent → 0 →
+            // drained_on_chain = true`, so any FA2 PendingDeposit
+            // whose recipient cm had been observed in the feed got
+            // silently pruned while still funded on-chain. Refuse
+            // explicitly so the caller routes through the real
+            // rollup-node RPC (`load_pool_balances`) instead.
+            return Err(format!(
+                "cmd_scan / fetch_pool_balances_http is tez-only (the demo HTTP \
+                 ledger doesn't expose FA2 pool balances) but wallet has a \
+                 non-tez PendingDeposit (asset_id {}, pubkey_hash {}). Use \
+                 `tzel-wallet rollup-sync` instead, which routes through the \
+                 rollup-node's asset-aware RPC.",
+                hex::encode(p.asset_id),
+                hex::encode(p.pubkey_hash),
+            ));
         }
         let url = format!(
             "{}/deposits/balance?pubkey_hash={}",
@@ -7432,6 +7481,75 @@ mod tests {
         );
     }
 
+    /// Phase E.5 regression for the demo HTTP `cmd_scan` FA2 prune
+    /// hazard. `fetch_pool_balances_http` previously skipped non-tez
+    /// PendingDeposits silently — absent from the returned map. The
+    /// downstream prune predicate then reads `absent → 0 →
+    /// drained_on_chain = true`, so an FA2 PendingDeposit whose
+    /// recipient cm had been observed would be silently pruned
+    /// despite being still funded on-chain. Production
+    /// `cmd_rollup_sync` is unaffected (asset-aware RPC); the fix
+    /// makes the demo path refuse to run when any non-tez entry is
+    /// present rather than silently mis-prune.
+    #[test]
+    fn test_fetch_pool_balances_http_refuses_non_tez_pending_deposit() {
+        let pubkey_hash = felt_tag(b"fetch-pool-fa2-pkh");
+        let fa2_asset = derive_asset_id("KT1FetchPoolFA2");
+        let pending = vec![PendingDeposit {
+            asset_id: fa2_asset,
+            pubkey_hash,
+            blind: felt_tag(b"fetch-pool-fa2-blind"),
+            address_index: 0,
+            auth_domain: felt_tag(b"fetch-pool-fa2-domain"),
+            amount: 100,
+            operation_hash: None,
+            shielded_cm: None,
+        }];
+
+        // Use an unreachable ledger URL — the function must fail at
+        // the asset-check BEFORE any HTTP call.
+        let err = fetch_pool_balances_http(
+            "http://invalid.example.tzel-test:0",
+            &pending,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("tez-only") && err.contains("rollup-sync"),
+            "expected the asset-mismatch error pointing at rollup-sync; got: {}",
+            err,
+        );
+    }
+
+    /// Mirror positive case: a tez-only PendingDeposit list passes
+    /// the asset check (and will fail later at the HTTP layer because
+    /// the URL is unreachable, but it must not fail at the
+    /// asset-check step).
+    #[test]
+    fn test_fetch_pool_balances_http_accepts_tez_only() {
+        let pending = vec![PendingDeposit {
+            asset_id: ASSET_TEZ,
+            pubkey_hash: felt_tag(b"fetch-pool-tez-pkh"),
+            blind: felt_tag(b"fetch-pool-tez-blind"),
+            address_index: 0,
+            auth_domain: felt_tag(b"fetch-pool-tez-domain"),
+            amount: 100,
+            operation_hash: None,
+            shielded_cm: None,
+        }];
+
+        let err = fetch_pool_balances_http(
+            "http://invalid.example.tzel-test:0",
+            &pending,
+        )
+        .unwrap_err();
+        // Must surface an HTTP failure, NOT the asset-check error.
+        assert!(
+            !err.contains("tez-only"),
+            "tez-only pending must not trigger the asset-check error; got: {}",
+            err,
+        );
+    }
+
     #[test]
     fn test_apply_scan_feed_keeps_funded_pool_even_when_cm_observed() {
         // Defensive: a pool with a positive kernel-side balance is
@@ -8629,10 +8747,19 @@ fn cmd_bridge_deposit(
     }
 
     let submission = rollup.deposit_to_bridge(&pubkey_hash, amount)?;
+    // Match the PendingDeposit by (asset_id, pubkey_hash). Today the
+    // freshly-pushed entry above is the only one with this
+    // pubkey_hash (deposit_nonce makes pubkey_hash uniquely derived
+    // per L1 mint), so `pubkey_hash` alone would still resolve to
+    // the right entry — but every other PendingDeposit lookup in
+    // this file is keyed by (asset_id, pubkey_hash), and a future
+    // refactor that allowed pubkey_hash reuse across assets would
+    // silently regress this site otherwise. Pair-keying restores
+    // parity.
     if let Some(p) = wallet
         .pending_deposits
         .iter_mut()
-        .find(|p| p.pubkey_hash == pubkey_hash)
+        .find(|p| p.asset_id == asset_id && p.pubkey_hash == pubkey_hash)
     {
         p.operation_hash = submission.operation_hash.clone();
     }
