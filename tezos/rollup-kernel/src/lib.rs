@@ -627,14 +627,26 @@ fn applied_shield_path(client_cm: &F) -> Vec<u8> {
 /// has no live durable data).
 fn encode_withdrawal_record(record: &WithdrawalRecord) -> Vec<u8> {
     let recipient = record.recipient.as_bytes();
+    // Withdrawal recipients are b58check-validated Tezos addresses
+    // (~36 bytes) by `validate_l1_withdrawal_recipient` before this
+    // function is reached, so the length always fits in u32 in
+    // practice. An earlier draft used
+    // `u32::try_from(...).unwrap_or(u32::MAX)` which silently capped
+    // on overflow and produced a record the decoder would later
+    // reject as "length mismatch" — confusing in tests and a latent
+    // hazard if a future caller bypassed the upstream length check.
+    // Hard-assert instead so a future invariant break shows up as a
+    // panic at the encode site rather than silent data loss.
+    let recipient_len: u32 = u32::try_from(recipient.len()).expect(
+        "withdrawal recipient must fit in u32; upstream validation \
+         (validate_l1_withdrawal_recipient) caps b58check addresses \
+         at ~36 bytes, so this overflow is unreachable in practice — \
+         if you hit this panic, a bypass slipped past validation",
+    );
     let mut bytes = Vec::with_capacity(32 + 12 + recipient.len());
     bytes.extend_from_slice(&record.asset_id);
     bytes.extend_from_slice(&record.amount.to_le_bytes());
-    bytes.extend_from_slice(
-        &u32::try_from(recipient.len())
-            .unwrap_or(u32::MAX)
-            .to_le_bytes(),
-    );
+    bytes.extend_from_slice(&recipient_len.to_le_bytes());
     bytes.extend_from_slice(recipient);
     bytes
 }
@@ -724,7 +736,16 @@ fn decode_rollup_message(
                             .map(ParsedRollupMessage::Kernel)
                     }
                 }
-                Err(_) => Ok(ParsedRollupMessage::Ignore),
+                // Malformed external frame: surface as an Error
+                // rather than silently Ignore. Previously a
+                // sequencer could pad batches with garbage external
+                // frames and the kernel would treat each as Ignore,
+                // leaving `last_input_payload` stat-stamped but
+                // `last_result` pointing at a stale legitimate
+                // outcome — confusing for off-chain observers
+                // watching for the most recent operation's
+                // disposition.
+                Err(_) => Err("invalid external message frame".to_string()),
             }
         }
     }
@@ -1116,10 +1137,30 @@ fn apply_kernel_message<H: Host>(
 ) -> Result<KernelResult, String> {
     match message {
         KernelInboxMessage::ConfigureVerifier(config) => {
+            if USES_DEV_ADMIN_FALLBACK {
+                ledger.host.write_debug(
+                    "tzel-rollup-kernel: SECURITY WARNING — verifier-config \
+                     authentication is using the DEV admin key (kernel was \
+                     built with debug_assertions and no TZEL_ROLLUP_*_HEX \
+                     env vars). This kernel MUST NOT be used in production. \
+                     Rebuild with `cargo build --release` AND set the \
+                     TZEL_ROLLUP_*_HEX env vars before deploying.\n",
+                );
+            }
             authenticate_verifier_config(&config)?;
             configure_verifier(ledger, &config.config).map(|_| KernelResult::Configured)
         }
         KernelInboxMessage::ConfigureBridge(config) => {
+            if USES_DEV_ADMIN_FALLBACK {
+                ledger.host.write_debug(
+                    "tzel-rollup-kernel: SECURITY WARNING — bridge-config \
+                     authentication is using the DEV admin key (kernel was \
+                     built with debug_assertions and no TZEL_ROLLUP_*_HEX \
+                     env vars). This kernel MUST NOT be used in production. \
+                     Rebuild with `cargo build --release` AND set the \
+                     TZEL_ROLLUP_*_HEX env vars before deploying.\n",
+                );
+            }
             authenticate_bridge_config(&config)?;
             configure_bridge(ledger, &config.config).map(|_| KernelResult::Configured)
         }
@@ -1664,6 +1705,19 @@ fn apply_durable_shield_commit<H: Host>(
 
 fn process_input<H: Host>(host: &mut H, input: &InputMessage) {
     let stored_payload_len = input.payload.len().min(MAX_STORED_INPUT_PAYLOAD_BYTES);
+    // PATH_RAW_INPUT_* + PATH_LAST_INPUT_* are RAW-INBOX counters /
+    // payload mirrors. They are deliberately written for EVERY
+    // observed message, including malformed and ignored ones, so
+    // off-chain monitoring tools can see what arrived in the
+    // inbox. PATH_LAST_RESULT (set after `apply_input_message`
+    // below) is the disposition channel; observers that want to
+    // know "what was the last successfully applied operation"
+    // should read PATH_LAST_RESULT, not PATH_LAST_INPUT_PAYLOAD.
+    //
+    // Don't conflate these two purposes by reordering — a
+    // monitoring tool relying on "PATH_LAST_INPUT_PAYLOAD reflects
+    // the payload that produced the last result" would silently
+    // disagree with kernels that update them in lock-step.
     increment_u64(host, PATH_RAW_INPUT_COUNT, 1);
     increment_u64(host, PATH_RAW_INPUT_BYTES, input.payload.len() as u64);
     host.write_store(PATH_LAST_INPUT_LEVEL, &input.level.to_le_bytes());
@@ -1786,6 +1840,19 @@ fn parse_compiled_felt_hex(hex_value: &str, label: &str) -> Result<F, String> {
 fn dev_config_admin_ask() -> F {
     hash(b"tzel-dev-rollup-config-admin")
 }
+
+/// True at compile time if the kernel will fall back to the
+/// well-known dev admin key on this build. This is a compile-time
+/// constant because `option_env!` is compile-time; the runtime
+/// behavior is fully determined by what the kernel binary was
+/// linked against. Used by `apply_input_message` to emit a noisy
+/// debug-stream warning on every config message — accidentally
+/// shipping a debug-built WASM kernel to production is then loud,
+/// not silent.
+const USES_DEV_ADMIN_FALLBACK: bool = cfg!(any(test, debug_assertions))
+    && option_env!("TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX").is_none()
+    && option_env!("TZEL_ROLLUP_VERIFIER_CONFIG_ADMIN_LEAF_HEX").is_none()
+    && option_env!("TZEL_ROLLUP_BRIDGE_CONFIG_ADMIN_LEAF_HEX").is_none();
 
 fn compiled_config_admin_pub_seed() -> Result<F, String> {
     if let Some(hex_value) = option_env!("TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX") {

@@ -41,11 +41,74 @@ pub const ASSET_TEZ: F = ZERO;
 /// tez bridge keeps `asset_id = ASSET_TEZ` (ZERO) for backward
 /// compatibility with everywhere ZERO is treated as "tez" in commits
 /// and the 2-accumulator constraint.
+///
+/// SAFETY NOTE: `derive_asset_id` hashes raw bytes — if the caller
+/// passes `" KT1..."` (leading whitespace) vs `"KT1..."` they get
+/// DIFFERENT asset_ids, and any L1 deposit from the canonical
+/// ticketer wouldn't match the non-canonical registry entry. Today
+/// every production caller passes already-canonical strings
+/// (`transfer.sender.to_base58_check()`, `COMPILE_TIME_FA2_BRIDGES`
+/// constants), so this is safe. Future entry points reading
+/// ticketer strings from untrusted sources (CLI args, JSON config,
+/// env vars) MUST canonicalize via `validate_l1_ticketer_canonical`
+/// before hashing — otherwise a stranded-funds bug is one
+/// whitespace-padded paste away.
 pub fn derive_asset_id(ticketer: &str) -> F {
     let mut buf = Vec::with_capacity(11 + ticketer.len());
     buf.extend_from_slice(b"tzel:asset:");
     buf.extend_from_slice(ticketer.as_bytes());
     hash(&buf)
+}
+
+/// Validate and canonicalize an L1 ticketer string before it's used
+/// to derive an asset_id. Mirrors `validate_l1_withdrawal_recipient`
+/// for ticketers: trims whitespace, then runs the b58check parser to
+/// reject non-canonical encodings (case-mismatched, padded,
+/// truncated). Returns the canonical form on success.
+///
+/// Callers reading ticketers from UNTRUSTED sources (CLI args, JSON
+/// config, env vars, RPC responses) must run inputs through this
+/// validator before calling `derive_asset_id` or comparing against a
+/// registry. Without it, two semantically-identical-looking
+/// ticketers can produce different asset_ids and silently strand
+/// user funds.
+///
+/// Production callers that already produce canonical b58 strings
+/// (`TezosContract::to_base58_check()`, `COMPILE_TIME_FA2_BRIDGES`)
+/// do not need to call this — it's an idempotent no-op for those
+/// inputs. The defensive value is at the system boundary.
+pub fn validate_l1_ticketer_canonical(ticketer: &str) -> Result<String, String> {
+    let ticketer = ticketer.trim();
+    if ticketer.is_empty() {
+        return Err("L1 ticketer address must not be empty".into());
+    }
+    let parsed = TezosContract::from_b58check(ticketer)
+        .map_err(|_| format!("invalid L1 ticketer (b58check parse failed): {}", ticketer))?;
+    // Reject Implicit (tz1/tz2/tz3) ticketers. A ticketer mints
+    // and burns Tezos tickets, which only smart contracts (KT1) can
+    // do — Tezos's protocol-level Transfer.sender is statically
+    // typed `ContractKt1Hash`. Accepting an Implicit address here
+    // would just produce an asset_id that the kernel could never
+    // observe on the wire.
+    if !matches!(parsed, TezosContract::Originated(_)) {
+        return Err(format!(
+            "L1 ticketer must be an Originated (KT1) address; got Implicit: {}",
+            ticketer,
+        ));
+    }
+    // Re-emit via b58check to reject any encoding that parsed but
+    // doesn't round-trip exactly. This catches subtle variants the
+    // raw parser might accept but the canonical kernel-side
+    // comparison would later reject (e.g., differently-padded
+    // legacy formats).
+    let canonical = parsed.to_b58check();
+    if canonical != ticketer {
+        return Err(format!(
+            "L1 ticketer is not in canonical b58check form: got {}, canonical {}",
+            ticketer, canonical,
+        ));
+    }
+    Ok(canonical)
 }
 
 /// One registered bridge endpoint. The kernel's `BridgeConfig` carries
@@ -226,6 +289,31 @@ pub fn asset_for_ticketer<'a>(
         .find(|entry| entry.ticketer == ticketer)
         .map(|entry| &entry.asset_id)
 }
+/// Number of bits used in the cheap-detection tag attached to every
+/// note. A watcher's `detect(enc, dk_d)` performs a full ML-KEM-768
+/// decapsulation, hashes the resulting shared secret, takes
+/// `DETECT_K` bits, and constant-time-compares against the on-chain
+/// tag. ML-KEM has implicit rejection, so an invalid `ct_d` yields a
+/// deterministic pseudo-random secret rather than failing — meaning
+/// the detect tag is information-theoretically a `DETECT_K`-bit
+/// filter, not a MAC.
+///
+/// Security tradeoff:
+///   - False-positive rate per garbage note ≈ 2^-DETECT_K = 2^-10
+///     (~0.1%). A malicious operator feeding ~1024 garbage notes
+///     per scan can statistically guarantee one false positive,
+///     which forces the downstream view watcher into a full memo
+///     decryption attempt (one ML-KEM decap + one ChaCha20Poly1305
+///     verify). This is bounded paid noise, not a vulnerability.
+///   - False-negative rate = 0: a correctly-encrypted note's tag
+///     is recomputed identically and always matches.
+///   - Larger DETECT_K reduces FP rate exponentially but linearly
+///     widens the on-chain note-memo encoding. 10 bits is the
+///     deployment choice; bumping requires a wire-format change.
+///
+/// Operators should monitor for sustained elevated decap rates as a
+/// signal of feed-poisoning attempts; this constant is the
+/// expected baseline noise floor.
 pub const DETECT_K: usize = 10;
 pub const ML_KEM768_CIPHERTEXT_BYTES: usize = 1088;
 pub const NOTE_AEAD_NONCE_BYTES: usize = 12;
@@ -549,6 +637,27 @@ pub fn parse_public_balance_key(value: &str) -> Option<(&str, &str)> {
     Some((owner, label))
 }
 
+/// Validate and canonicalize an L1 withdrawal recipient address.
+///
+/// Accepts BOTH Implicit (tz1/tz2/tz3) and Originated (KT1) Tezos
+/// addresses, in their canonical b58check form. The kernel does not
+/// discriminate by address class — both are valid `to_` targets for
+/// the FA2 `%transfer` invocation that the bridge ticketer's `%burn`
+/// performs, and both are valid TRANSFER_TOKENS targets for the tez
+/// ticketer. End-to-end:
+///
+///   - **tez_bridge_ticketer**: `%burn` calls `TRANSFER_TOKENS` to
+///     send mutez to the recipient. Tezos accepts mutez transfers
+///     to any contract type (Implicit or Originated). ✓
+///   - **fa2_bridge_ticketer**: `%burn` calls the underlying FA2's
+///     `%transfer` with `to_ = recipient_address`. FA2 (TZIP-12)
+///     contracts accept transfers to any address type. ✓
+///
+/// So accepting tz1 here is not a soundness or liveness bug — the
+/// audit's behavior-clarifying note was about the kernel's lack of
+/// discrimination, not a downstream burn failure. Leading/trailing
+/// whitespace is trimmed for ergonomics; otherwise the b58check
+/// parse is the canonicalization.
 pub fn validate_l1_withdrawal_recipient(value: &str) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -2557,6 +2666,17 @@ pub fn prepare_shield<S: LedgerState>(
     }
     if req.producer_fee == 0 {
         return Err("producer fee must be greater than zero".into());
+    }
+    // Reject zero-value shields explicitly. A zero-value shield is
+    // not a vulnerability (the attacker still pays `fee +
+    // producer_fee` for the privilege), but it's noise: the resulting
+    // recipient note carries no real value, can't be spent
+    // meaningfully, and bloats the commitment tree + frontier. Most
+    // wallets enforce v > 0 client-side anyway; making the kernel
+    // refuse closes the gap so a buggy/adversarial client can't
+    // grief the durable store with paid zero-value notes.
+    if req.v == 0 {
+        return Err("shield requires non-zero v (zero-value shields are rejected)".into());
     }
     if req.client_cm == ZERO {
         return Err("shield requires non-zero client_cm".into());
@@ -7212,10 +7332,16 @@ mod tests {
         assert_eq!(asset_for_ticketer(&registry, "KT1Foo"), None);
     }
 
-    /// Edge case: a max-length ticketer string. The kernel's
-    /// MAX_ACCOUNT_ID_BYTES is 1024; ticketers near that bound must
-    /// still derive a valid asset_id and round-trip through the
-    /// registry.
+    /// Edge case: a long ticketer string. The `derive_asset_id`
+    /// helper itself is length-agnostic — it just hashes bytes.
+    /// The kernel-wire decoder caps the ticketer field at
+    /// `MAX_ACCOUNT_ID_BYTES = 128` (real Tezos addresses are 36
+    /// bytes; the headroom is for hypothetical future formats),
+    /// but the pure `derive_asset_id` path can be exercised with
+    /// any length. We test at 1024 bytes to confirm there's no
+    /// internal cap inside `derive_asset_id` that would silently
+    /// truncate or fail for long inputs — even though such
+    /// strings would be refused at the wire boundary in practice.
     #[test]
     fn test_very_long_ticketer_string_works() {
         let huge: String = std::iter::repeat('A').take(1024).collect();
@@ -7224,6 +7350,91 @@ mod tests {
         let registry = compose_asset_registry_with("KT1Tez", &[huge.clone()]);
         assert_eq!(registry.len(), 2);
         assert_eq!(asset_for_ticketer(&registry, &huge), Some(&asset_id));
+    }
+
+    /// Phase E.5 regression: `validate_l1_ticketer_canonical` must
+    /// accept canonical KT1/tz addresses verbatim, REJECT
+    /// whitespace-padded variants, and REJECT garbage. The defensive
+    /// goal is that any caller routing untrusted input through this
+    /// validator before `derive_asset_id` cannot land on a
+    /// silently-divergent asset_id (e.g. a CLI paste with a trailing
+    /// newline would otherwise hash to a different value than the
+    /// kernel's canonical string).
+    #[test]
+    fn test_validate_l1_ticketer_canonical_accepts_kt1_addresses() {
+        // KT1 (Originated) — canonical form passes round-trip.
+        let kt1 = "KT1HbQepzV1nVGg8QVznG7z4RcHseD5kwqBn";
+        assert_eq!(
+            validate_l1_ticketer_canonical(kt1).unwrap(),
+            kt1,
+        );
+    }
+
+    #[test]
+    fn test_validate_l1_ticketer_canonical_rejects_implicit_address() {
+        // tz1/tz2/tz3 are Implicit — a Tezos protocol-level Transfer
+        // cannot have an Implicit sender, so an Implicit ticketer
+        // would produce an asset_id the kernel could never observe.
+        let tz1 = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
+        let err = validate_l1_ticketer_canonical(tz1).unwrap_err();
+        assert!(
+            err.contains("Implicit"),
+            "expected Implicit-rejection error, got: {}",
+            err,
+        );
+    }
+
+    #[test]
+    fn test_validate_l1_ticketer_canonical_normalizes_surrounding_whitespace() {
+        let kt1 = "KT1HbQepzV1nVGg8QVznG7z4RcHseD5kwqBn";
+        // Leading + trailing whitespace gets trimmed (matches the
+        // ergonomics of `validate_l1_withdrawal_recipient`).
+        assert_eq!(
+            validate_l1_ticketer_canonical(&format!("  {}  ", kt1)).unwrap(),
+            kt1,
+        );
+        assert_eq!(
+            validate_l1_ticketer_canonical(&format!("{}\n", kt1)).unwrap(),
+            kt1,
+        );
+    }
+
+    #[test]
+    fn test_validate_l1_ticketer_canonical_rejects_garbage() {
+        // Empty string.
+        assert!(validate_l1_ticketer_canonical("").is_err());
+        assert!(validate_l1_ticketer_canonical("   ").is_err());
+        // Random non-Tezos string.
+        assert!(validate_l1_ticketer_canonical("not-a-tezos-address").is_err());
+        // Truncated KT1.
+        assert!(validate_l1_ticketer_canonical("KT1Hb").is_err());
+        // Wrong checksum (last char flipped).
+        assert!(
+            validate_l1_ticketer_canonical("KT1HbQepzV1nVGg8QVznG7z4RcHseD5kwqBz").is_err(),
+        );
+    }
+
+    #[test]
+    fn test_validate_l1_ticketer_canonical_preserves_derive_asset_id_outputs() {
+        // The whole point of canonicalizing: untrusted-input ticketers
+        // go through `validate_l1_ticketer_canonical` first, then
+        // `derive_asset_id` on the canonical form. The resulting
+        // asset_id MUST equal what the kernel would compute on the
+        // canonical string from L1's `to_b58check()`.
+        let raw = "  KT1HbQepzV1nVGg8QVznG7z4RcHseD5kwqBn\n";
+        let canonical = validate_l1_ticketer_canonical(raw).unwrap();
+        let asset_id_after = derive_asset_id(&canonical);
+        let asset_id_direct = derive_asset_id("KT1HbQepzV1nVGg8QVznG7z4RcHseD5kwqBn");
+        assert_eq!(asset_id_after, asset_id_direct);
+
+        // The pre-validation asset_id (raw bytes with whitespace) is
+        // DIFFERENT — exactly the stranded-funds scenario the
+        // validator is designed to prevent.
+        let asset_id_naive = derive_asset_id(raw);
+        assert_ne!(
+            asset_id_naive, asset_id_direct,
+            "non-canonical input must hash differently — confirms why the validator is needed",
+        );
     }
 
     /// Edge case: a registry of size 1 (only tez). The compose

@@ -1504,6 +1504,24 @@ fn create_private_temp_file(
 fn enforce_wallet_xmss_floor(path: &str, wallet: &WalletFile) -> Result<(), String> {
     let floor_path = wallet_xmss_floor_path(path);
     let Ok(data) = std::fs::read_to_string(&floor_path) else {
+        // Missing floor sidecar: best-effort silent pass to keep
+        // legitimate backup-restore UX working (a user restoring a
+        // wallet from cold storage genuinely has no floor file).
+        // BUT: surface a stderr warning so an operator restoring a
+        // hot wallet realizes the rollback alarm is now disabled
+        // until a fresh signing op rewrites the sidecar. Without
+        // this hint, the silent-pass would otherwise mask a stale-
+        // backup restore performed against a hot-wallet host.
+        if wallet.addr_counter > 0 {
+            eprintln!(
+                "tzel-wallet: warning — no XMSS floor sidecar at `{}`. The \
+                 stale-backup rollback alarm is disabled for this load. If \
+                 you did not just restore from a fresh seed, regenerate the \
+                 floor by running any state-mutating command (e.g. \
+                 `tzel-wallet receive`).",
+                floor_path.display(),
+            );
+        }
         return Ok(());
     };
     let floor: WalletXmssFloor =
@@ -3840,6 +3858,45 @@ pub fn tzel_detect_entry() {
 
 async fn run_detect_service(cli: DetectServiceCli) -> Result<(), String> {
     validate_detection_service_wallet(&cli.wallet)?;
+
+    // Log the watch-mode at startup. The `tzel-detect` binary
+    // intentionally supports all three watch modes (Detect / View /
+    // Outgoing — see `apply_watch_feed`), but the binary name only
+    // telegraphs the most-restricted mode. Operators reading a daemon
+    // log expecting "tzel-detect" to mean "only detect_root loaded"
+    // could be surprised when full memo decryption runs because the
+    // wallet file is actually in View mode. Surface the mode
+    // explicitly at startup so the deployed key class is visible.
+    match load_watch_wallet(&cli.wallet) {
+        Ok(WatchWalletFile::Detect { .. }) => {
+            eprintln!(
+                "tzel-detect: watch wallet `{}` loaded in DETECT mode \
+                 (cheap match-detection only; memo contents stay encrypted)",
+                cli.wallet,
+            );
+        }
+        Ok(WatchWalletFile::View { .. }) => {
+            eprintln!(
+                "tzel-detect: watch wallet `{}` loaded in VIEW mode \
+                 (memo decryption runs on this host; treat key material as confidential)",
+                cli.wallet,
+            );
+        }
+        Ok(WatchWalletFile::Outgoing { .. }) => {
+            eprintln!(
+                "tzel-detect: watch wallet `{}` loaded in OUTGOING mode \
+                 (sender-side recovery of own outgoing notes runs on this host)",
+                cli.wallet,
+            );
+        }
+        Err(_) => {
+            // validate_detection_service_wallet already passed, so a
+            // load error here would be transient (race with the
+            // watcher being rewritten). Skip the log line — the
+            // background tick loop will retry.
+        }
+    }
+
     let state = DetectServiceState {
         wallet: cli.wallet.clone(),
         sync_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),

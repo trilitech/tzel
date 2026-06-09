@@ -14,7 +14,19 @@ use tezos_data_encoding::nom::NomReader;
 pub const KERNEL_WIRE_VERSION: u16 = 17;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
-const MAX_ACCOUNT_ID_BYTES: usize = 1024;
+/// Maximum bytes the kernel-wire decoder accepts for a Tezos
+/// contract address (used in bridge-config messages, deposit
+/// recipients, withdrawal recipients).
+///
+/// Tezos addresses are 36-byte b58check strings (KT1 / tz1 / tz2 /
+/// tz3 / sr1). 128 leaves comfortable headroom for hypothetical
+/// future address formats (rollup smart-contract addresses,
+/// versioned prefixes, etc.) while keeping the kernel-decoder's
+/// untrusted-input allocation tight. The previous bound of 1024 was
+/// the audit's flagged "much too loose" value: a wire-format reader
+/// that allocates 1024 bytes per ticketer field across many config
+/// messages bloats the attack surface for malformed-input DoS.
+const MAX_ACCOUNT_ID_BYTES: usize = 128;
 const MAX_PROOF_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT_PREIMAGE_ITEMS: usize = 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
