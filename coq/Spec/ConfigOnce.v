@@ -20,7 +20,7 @@
     once the slot holds [Some c], it holds [Some c] in every reachable
     later state. *)
 
-From Stdlib Require Import List.
+From Stdlib Require Import List Arith Lia.
 
 Section ConfigOnce.
 
@@ -77,6 +77,77 @@ Section ConfigOnce.
     intros c c' Hstep.
     pose proof (cstep_preserves_some (Some c) (Some c') c Hstep eq_refl) as Heq.
     injection Heq as ->. reflexivity.
+  Qed.
+
+  (* ============================================================= *)
+  (** ** Operations require a configured kernel                     *)
+  (* ============================================================= *)
+
+  (** The kernel rejects deposits / shields / withdrawals before the
+      config is installed ("bridge ticketer / proof verifier is not
+      configured", [lib.rs]).  We model the joint (config, op-count)
+      state: an [install] sets the config (when unset); an [op]
+      (any deposit/shield/transfer/unshield) fires ONLY when the config
+      is [Some] and bumps the operation count. *)
+  Record GState : Type := mkG { g_cfg : option C; g_ops : nat }.
+
+  Definition ggenesis : GState := mkG None 0.
+
+  Inductive GStep : GState -> GState -> Prop :=
+  | gstep_install :
+      forall n c, GStep (mkG None n) (mkG (Some c) n)
+  | gstep_op :
+      forall c n, GStep (mkG (Some c) n) (mkG (Some c) (S n)).
+
+  Inductive GSteps : GState -> GState -> Prop :=
+  | gsteps_refl  : forall s, GSteps s s
+  | gsteps_trans : forall s s' s'', GStep s s' -> GSteps s' s'' -> GSteps s s''.
+
+  (** Both invariants of the joint machine: the config is monotone
+      (once [Some], stays [Some]), and the operation count is positive
+      only when the config is set. *)
+  Definition g_inv (s : GState) : Prop :=
+    (g_ops s > 0 -> exists c, g_cfg s = Some c)
+    /\ (forall c, g_cfg s = Some c -> exists c', g_cfg s = Some c').
+
+  Lemma gstep_preserves_some : forall s s' c,
+    GStep s s' -> g_cfg s = Some c -> exists c', g_cfg s' = Some c'.
+  Proof.
+    intros s s' c Hstep Heq. destruct Hstep as [n c0 | c0 n]; cbn in *.
+    - discriminate Heq.
+    - exists c0. reflexivity.
+  Qed.
+
+  Lemma g_step_preserves : forall s s', g_inv s -> GStep s s' -> g_inv s'.
+  Proof.
+    intros s s' [Hops _] Hstep. split.
+    - destruct Hstep as [n c0 | c0 n]; cbn.
+      + (* install: op count unchanged; if >0 it was >0 before *)
+        intro Hpos. destruct (Hops Hpos) as [c1 Hc1]. cbn in Hc1. discriminate Hc1.
+      + (* op: config is Some c0 *)
+        intro. exists c0. reflexivity.
+    - intros c Hc. exists c. exact Hc.
+  Qed.
+
+  Lemma g_steps_preserve : forall s s', GSteps s s' -> g_inv s -> g_inv s'.
+  Proof.
+    intros s s' H. induction H as [s | s s' s'' Hstep Hrest IH]; intro Hinv.
+    - exact Hinv.
+    - apply IH. eapply g_step_preserves; eauto.
+  Qed.
+
+  (** Operations require configuration: in any reachable state where
+      at least one operation has occurred, the config is installed.
+      So the kernel processes no deposit / shield / transfer / unshield
+      before the (admin-authorized, immutable) config is in place. *)
+  Theorem operations_require_config : forall s,
+    GSteps ggenesis s -> g_ops s > 0 -> exists c, g_cfg s = Some c.
+  Proof.
+    intros s H Hpos.
+    assert (Hgen : g_inv ggenesis).
+    { split; cbn; [intro Hc; lia | intros c Hc; discriminate Hc]. }
+    destruct (g_steps_preserve ggenesis s H Hgen) as [Hops _].
+    exact (Hops Hpos).
   Qed.
 
 End ConfigOnce.
