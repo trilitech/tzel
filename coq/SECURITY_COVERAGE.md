@@ -136,6 +136,64 @@ audit").
   notes), `Spec.MerkleFrontierCorrect.froot_fbuild_eq` (the kernel's
   O(depth) frontier read-off equals the batch root — also
   differential-validated against the production tree).
+- `Spec.TreeCapacity.capacity_invariant` (the tree never exceeds
+  `2^DEPTH` — the `append_note` capacity check) + `committed_root_correct`
+  (so the frontier proof's precondition is discharged by the kernel's own
+  check: the kernel always commits the true batch root).
+- `Spec.ValidRoots.valid_roots_genuine` (the kernel accepts membership
+  against ANY root in its valid-root set, and every such root is a
+  genuine tree root — so historical-root acceptance is safe: no forged
+  root is ever accepted, composing with `merkle_binding` and the
+  nullifier set).
+
+## Kernel config governance (verifier / bridge config)
+
+> Implicit in the threat model: the verifier and bridge configs must be
+> installed only by the admin, never swapped, and required before any
+> operation.
+
+- `Spec.ConfigAuth.config_update_unforgeable` — config updates are
+  WOTS+-signed against a compiled admin leaf; only the admin can install
+  a config (reduces to WOTS+ unforgeability).
+- `Spec.ConfigOnce.config_immutable` / `reconfigure_unchanged` — the
+  config is one-shot; once installed it is frozen (no overwrite).
+- `Spec.ConfigOnce.operations_require_config` — no deposit / shield /
+  transfer / unshield is processed before the config is installed.
+- Together: config substitution is impossible from every angle (forge
+  install, overwrite, or operate unconfigured).
+
+## Master kernel safety (joint invariants, non-interference)
+
+- `Spec.KernelSoundness.kernel_state_sound` — over a unified kernel state
+  and step relation (spend / append / configure), the safety invariants
+  hold SIMULTANEOUSLY in every reachable state: no double-spend AND every
+  valid root genuine AND current root genuine AND tree within capacity.
+  The content is non-interference — each operation preserves the
+  invariants it doesn't touch — so the per-structure proofs compose into
+  whole-system safety with no gaps. `kernel_config_frozen` carries the
+  config immutability into the joint machine.
+
+## Extraction-source soundness (Spec → Impl refinement)
+
+> The three-layer architecture: the extractable, Cairo-shaped `Impl`
+> provably discharges the abstract `Spec` safety properties (so the
+> extraction source is trustworthy and missing assertions are caught).
+
+- `Impl.Merkle.merkle_refines_spec` / `auth_refines_spec`,
+  `Impl.Wots.refines_spec` — the executable Merkle path / WOTS+ chain
+  step are the Spec definitions at the concrete hashes.
+- `Impl.Transfer.transfer_relation_sound`,
+  `Impl.Shield.shield_relation_sound`,
+  `Impl.Unshield.unshield_relation_sound` — the Cairo-shaped
+  transfer / shield / unshield relations discharge the corresponding
+  `Spec.*` value conservation and sighash / pubkey-hash bindings (the
+  `asset registered` conjunct is deliberately lifted to the kernel and
+  discharged there by `AssetRegistry`).
+- `Impl.Xmss.xmss_verify_impl_one_time_unforgeable` /
+  `xmss_ltree_injective_impl` — the extractable XMSS verifier inherits
+  the Spec one-time unforgeability and L-tree injectivity at the concrete
+  `Hash3` / `pack_adrs_chain`. All six Impl modules carry proven
+  refinement/soundness theorems.
 
 ---
 
