@@ -38,8 +38,8 @@ use tzel_core::{
         kernel_shield_req_to_host, kernel_transfer_req_to_host, kernel_unshield_req_to_host,
         kernel_verifier_config_sighash, KernelBridgeConfig, KernelDalPayloadKind,
         KernelDalPayloadPointer, KernelInboxMessage, KernelResult, KernelSignedBridgeConfig,
-        KernelSignedVerifierConfig, KernelVerifierConfig, KERNEL_BRIDGE_CONFIG_KEY_INDEX,
-        KERNEL_VERIFIER_CONFIG_KEY_INDEX,
+        KernelSignedVerifierConfig, KernelStageChunk, KernelStagedResp, KernelVerifierConfig,
+        KERNEL_BRIDGE_CONFIG_KEY_INDEX, KERNEL_VERIFIER_CONFIG_KEY_INDEX, MAX_STAGE_CHUNK_BYTES,
     },
     prepare_shield, prepare_unshield, required_tx_fee_for_private_tx_count,
     verify_wots_signature_against_leaf, EncryptedNote, Ledger, LedgerState,
@@ -120,6 +120,38 @@ const MAX_STORE_BINARY_BYTES: usize = 1024;
 const MAX_STORED_INPUT_PAYLOAD_BYTES: usize = 2048;
 const MAX_NOTE_CHUNK_BYTES: usize = 1024;
 
+// ── StageChunk staging storage (W2, docs/SNARK-SUBMISSION-DESIGN.md) ──
+//
+// Layout, all under PATH_STAGING_PREFIX + hex(sender_key):
+//   .../bytes                       u64 LE — sender's total staged bytes
+//   .../count                       u64 LE — sender's live entry count
+//   .../index/<016x slot>           u64 LE staging_id (compacted on GC)
+//   .../entry/<016x id>/meta        encoded StagingMeta (45 bytes)
+//   .../entry/<016x id>/chunk/<04x> raw chunk bytes (deleted on seal)
+//   .../entry/<016x id>/payload     sealed reassembled payload
+//
+// `sender_key = H(domain ‖ sender attribution)` — see `staging_sender_key`.
+// Deletions are best-effort empty-value writes (the WASM PVM exposes no
+// delete); every reader treats an empty value as absent.
+const PATH_STAGING_PREFIX: &[u8] = b"/tzel/v1/state/staging/";
+/// TTL (in inbox levels) after which an entry — sealed or not — is
+/// garbage-collected. GC runs lazily, scoped to the sender of each incoming
+/// `StageChunk`, so a sender's stale entries are reclaimed before its
+/// anti-spam budget is checked.
+const STAGING_TTL_LEVELS: i32 = 240;
+/// Max chunks per staging entry; caps a single reassembled payload at
+/// 64 × MAX_STAGE_CHUNK_BYTES = 249_600 bytes.
+const MAX_STAGE_CHUNKS_PER_ENTRY: u16 = 64;
+/// Max live staging entries per sender (a depth-4 batch needs ≤ 16 note
+/// payloads + a possible op-decl overflow payload; 32 leaves headroom).
+const MAX_SENDER_STAGING_ENTRIES: u64 = 32;
+/// Anti-spam bound: max total staged bytes per sender. Staging storage is
+/// attacker-fillable — the sender pays L1 gas per message, and this cap
+/// bounds the durable footprint one sender key can occupy.
+const MAX_SENDER_STAGING_BYTES: u64 = 512 * 1024;
+/// Upper bound for reading back a sealed payload.
+const MAX_STAGED_PAYLOAD_BYTES: usize = MAX_STAGE_CHUNKS_PER_ENTRY as usize * MAX_STAGE_CHUNK_BYTES;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputMessage {
     pub level: i32,
@@ -154,9 +186,39 @@ struct ParsedBridgeDeposit {
     amount: u64,
 }
 
+/// Sender attribution of an inbox message, used to scope the StageChunk
+/// staging namespace and its anti-spam budget (`(sender, staging_id)`
+/// keying per docs/SNARK-SUBMISSION-DESIGN.md). This is NOT an
+/// authentication of message contents — op authorization still lives in
+/// the proofs and signed config envelopes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InboxSender {
+    /// External `Targetted` message: the rollup inbox carries no L1 sender
+    /// for external messages, so all external submitters share a single
+    /// staging namespace and budget. A submitter who wants an isolated
+    /// namespace must go through the orchestrator (internal transfer) path.
+    External,
+    /// Internal transfer: the L1 implicit account that originated the
+    /// operation (`transfer.source`, the gas payer), base58-encoded.
+    L1Account(String),
+}
+
+/// Derive the 32-byte staging namespace key for a sender. Domain-separated
+/// so the two attribution shapes can never collide.
+fn staging_sender_key(sender: &InboxSender) -> F {
+    match sender {
+        InboxSender::External => hash(b"tzel-staging-sender:external"),
+        InboxSender::L1Account(account) => {
+            let mut preimage = b"tzel-staging-sender:l1:".to_vec();
+            preimage.extend_from_slice(account.as_bytes());
+            hash(&preimage)
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum ParsedRollupMessage {
-    Kernel(KernelInboxMessage),
+    Kernel(InboxSender, KernelInboxMessage),
     Deposit(ParsedBridgeDeposit),
     Ignore,
 }
@@ -709,8 +771,9 @@ fn decode_rollup_message(
                             if address.hash().as_ref().as_slice() != current_rollup {
                                 Ok(ParsedRollupMessage::Ignore)
                             } else {
-                                decode_kernel_inbox_message(contents)
-                                    .map(ParsedRollupMessage::Kernel)
+                                decode_kernel_inbox_message(contents).map(|message| {
+                                    ParsedRollupMessage::Kernel(InboxSender::External, message)
+                                })
                             }
                         }
                         Err(_) => Ok(ParsedRollupMessage::Ignore),
@@ -740,9 +803,14 @@ fn decode_rollup_message(
                         // only — authentication of the message contents
                         // lives in the STARK proofs and in the signed
                         // ConfigureVerifier/ConfigureBridge envelopes
-                        // checked by `apply_kernel_message`.
+                        // checked by `apply_kernel_message`. `transfer.source`
+                        // IS used as the staging-namespace key for
+                        // StageChunk/SubmitOps: it is set by the protocol
+                        // (not attacker-forgeable) and identifies who pays
+                        // the L1 gas, which is exactly the anti-spam scope.
+                        let sender = InboxSender::L1Account(transfer.source.to_b58check());
                         decode_kernel_inbox_message(&transfer.payload.0)
-                            .map(ParsedRollupMessage::Kernel)
+                            .map(|message| ParsedRollupMessage::Kernel(sender, message))
                     }
                 }
                 // Unreachable in practice: External and non-Transfer
@@ -1130,6 +1198,7 @@ fn fetch_kernel_message_from_dal<H: Host>(
 
 fn apply_kernel_message<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
+    sender: &InboxSender,
     message: KernelInboxMessage,
 ) -> Result<KernelResult, String> {
     match message {
@@ -1171,18 +1240,505 @@ fn apply_kernel_message<H: Host>(
             if matches!(nested, KernelInboxMessage::DalPointer(_)) {
                 return Err("nested DAL pointer messages are not supported".into());
             }
-            apply_kernel_message(ledger, nested)
+            apply_kernel_message(ledger, sender, nested)
         }
-        // TODO(W2): staging storage + batch apply for the DAL-free v18
-        // submission path (docs/SNARK-SUBMISSION-DESIGN.md). The wire format
-        // (W1) decodes these; the kernel state machine lands with W2.
-        KernelInboxMessage::StageChunk(_) => {
-            Err("StageChunk handling is not implemented yet (W2)".into())
-        }
+        KernelInboxMessage::StageChunk(chunk) => apply_stage_chunk(ledger, sender, &chunk),
+        // TODO(W2): batch apply for the DAL-free v18 submission path
+        // (docs/SNARK-SUBMISSION-DESIGN.md). Staged payloads are resolved via
+        // `read_sealed_staging_payload(host, &staging_sender_key(sender), ..)`
+        // and released with `discard_staging_entry` once applied.
         KernelInboxMessage::SubmitOps(_) => {
             Err("SubmitOps handling is not implemented yet (W2)".into())
         }
     }
+}
+
+// ── StageChunk staging engine (W2a) ──────────────────────────────────
+//
+// Reassembles oversized payloads (encrypted notes, large op-decl lists)
+// from ≤ 3.9 KiB inbox chunks, keyed by `(sender, staging_id)`:
+//
+// - chunks may arrive in any order; re-sending an index overwrites it
+//   (an unsealed entry can therefore always be repaired by its sender);
+// - when all `chunk_count` indices are present the payload is reassembled
+//   and `hash(payload)` is checked against the declared `payload_hash`:
+//   on a match the entry is SEALED (chunk pieces deleted, payload kept),
+//   on a mismatch the whole entry is discarded — the staging_id becomes
+//   reusable immediately;
+// - every chunk of an entry must declare the same `(chunk_count,
+//   payload_hash)` pair;
+// - per-sender bounds: ≤ MAX_SENDER_STAGING_ENTRIES live entries and
+//   ≤ MAX_SENDER_STAGING_BYTES staged bytes; expired entries (TTL
+//   STAGING_TTL_LEVELS) are GC'd lazily before the bounds are checked.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StagingMeta {
+    chunk_count: u16,
+    /// Distinct chunk indices staged so far.
+    received: u16,
+    payload_hash: F,
+    /// Inbox level at which the entry was created (TTL anchor).
+    created_level: i32,
+    /// Bytes accounted against the sender's budget for this entry: the sum
+    /// of staged chunk lengths, which equals the payload length once sealed.
+    staged_bytes: u32,
+    sealed: bool,
+}
+
+const STAGING_META_BYTES: usize = 2 + 2 + 32 + 4 + 4 + 1;
+
+fn encode_staging_meta(meta: &StagingMeta) -> [u8; STAGING_META_BYTES] {
+    let mut bytes = [0u8; STAGING_META_BYTES];
+    bytes[0..2].copy_from_slice(&meta.chunk_count.to_le_bytes());
+    bytes[2..4].copy_from_slice(&meta.received.to_le_bytes());
+    bytes[4..36].copy_from_slice(&meta.payload_hash);
+    bytes[36..40].copy_from_slice(&meta.created_level.to_le_bytes());
+    bytes[40..44].copy_from_slice(&meta.staged_bytes.to_le_bytes());
+    bytes[44] = u8::from(meta.sealed);
+    bytes
+}
+
+fn decode_staging_meta(bytes: &[u8]) -> Result<StagingMeta, String> {
+    if bytes.len() != STAGING_META_BYTES {
+        return Err(format!("bad staging meta length: {}", bytes.len()));
+    }
+    let mut payload_hash = ZERO;
+    payload_hash.copy_from_slice(&bytes[4..36]);
+    let sealed = match bytes[44] {
+        0 => false,
+        1 => true,
+        other => return Err(format!("bad staging meta sealed flag: {}", other)),
+    };
+    Ok(StagingMeta {
+        chunk_count: u16::from_le_bytes(bytes[0..2].try_into().unwrap()),
+        received: u16::from_le_bytes(bytes[2..4].try_into().unwrap()),
+        payload_hash,
+        created_level: i32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+        staged_bytes: u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+        sealed,
+    })
+}
+
+fn staging_sender_prefix(sender_key: &F) -> Vec<u8> {
+    let mut path = Vec::with_capacity(PATH_STAGING_PREFIX.len() + 64);
+    path.extend_from_slice(PATH_STAGING_PREFIX);
+    path.extend_from_slice(hex::encode(sender_key).as_bytes());
+    path
+}
+
+fn staging_bytes_path(sender_key: &F) -> Vec<u8> {
+    let mut path = staging_sender_prefix(sender_key);
+    path.extend_from_slice(b"/bytes");
+    path
+}
+
+fn staging_count_path(sender_key: &F) -> Vec<u8> {
+    let mut path = staging_sender_prefix(sender_key);
+    path.extend_from_slice(b"/count");
+    path
+}
+
+fn staging_index_slot_path(sender_key: &F, slot: u64) -> Vec<u8> {
+    let mut path = staging_sender_prefix(sender_key);
+    path.extend_from_slice(b"/index/");
+    path.extend_from_slice(format!("{:016x}", slot).as_bytes());
+    path
+}
+
+fn staging_entry_prefix(sender_key: &F, staging_id: u64) -> Vec<u8> {
+    let mut path = staging_sender_prefix(sender_key);
+    path.extend_from_slice(b"/entry/");
+    path.extend_from_slice(format!("{:016x}", staging_id).as_bytes());
+    path
+}
+
+fn staging_meta_path(sender_key: &F, staging_id: u64) -> Vec<u8> {
+    let mut path = staging_entry_prefix(sender_key, staging_id);
+    path.extend_from_slice(b"/meta");
+    path
+}
+
+fn staging_payload_path(sender_key: &F, staging_id: u64) -> Vec<u8> {
+    let mut path = staging_entry_prefix(sender_key, staging_id);
+    path.extend_from_slice(b"/payload");
+    path
+}
+
+fn staging_chunk_path(sender_key: &F, staging_id: u64, chunk_index: u16) -> Vec<u8> {
+    let mut path = staging_entry_prefix(sender_key, staging_id);
+    path.extend_from_slice(b"/chunk/");
+    path.extend_from_slice(format!("{:04x}", chunk_index).as_bytes());
+    path
+}
+
+/// Read a store value treating empty values as absent (empty writes are the
+/// WASM PVM's best-effort delete; see `debit_deposit`).
+fn read_store_nonempty<H: Host>(host: &H, path: &[u8], max_bytes: usize) -> Option<Vec<u8>> {
+    match host.read_store(path, max_bytes) {
+        Some(bytes) if !bytes.is_empty() => Some(bytes),
+        _ => None,
+    }
+}
+
+fn read_staging_meta<H: Host>(host: &H, path: &[u8]) -> Result<Option<StagingMeta>, String> {
+    match read_store_nonempty(host, path, STAGING_META_BYTES) {
+        None => Ok(None),
+        Some(bytes) => decode_staging_meta(&bytes).map(Some),
+    }
+}
+
+/// Best-effort-delete an entry's meta, payload and chunk pieces. Does NOT
+/// touch the sender's index/count/bytes accounting — callers own that.
+fn delete_staging_entry_storage<H: Host>(
+    host: &mut H,
+    sender_key: &F,
+    staging_id: u64,
+    meta: &StagingMeta,
+) {
+    for chunk_index in 0..meta.chunk_count {
+        let path = staging_chunk_path(sender_key, staging_id, chunk_index);
+        if read_store_nonempty(host, &path, 1).is_some() {
+            host.write_store(&path, &[]);
+        }
+    }
+    let payload_path = staging_payload_path(sender_key, staging_id);
+    if read_store_nonempty(host, &payload_path, 1).is_some() {
+        host.write_store(&payload_path, &[]);
+    }
+    host.write_store(&staging_meta_path(sender_key, staging_id), &[]);
+}
+
+/// Remove `staging_id` from the sender's entry index (swap-remove) and
+/// release `freed_bytes` from the sender's staged-bytes budget.
+fn release_staging_entry_accounting<H: Host>(
+    host: &mut H,
+    sender_key: &F,
+    staging_id: u64,
+    freed_bytes: u64,
+) {
+    let count_path = staging_count_path(sender_key);
+    let count = read_u64(host, &count_path).unwrap_or(0);
+    for slot in 0..count {
+        let slot_path = staging_index_slot_path(sender_key, slot);
+        let Some(bytes) = read_store_nonempty(host, &slot_path, 8) else {
+            continue;
+        };
+        if bytes.len() == 8 && u64::from_le_bytes(bytes.try_into().unwrap()) == staging_id {
+            let last_path = staging_index_slot_path(sender_key, count - 1);
+            if slot != count - 1 {
+                if let Some(last) = read_store_nonempty(host, &last_path, 8) {
+                    host.write_store(&slot_path, &last);
+                }
+            }
+            host.write_store(&last_path, &[]);
+            host.write_store(&count_path, &(count - 1).to_le_bytes());
+            break;
+        }
+    }
+    let bytes_path = staging_bytes_path(sender_key);
+    let total = read_u64(host, &bytes_path).unwrap_or(0);
+    host.write_store(
+        &bytes_path,
+        &total.saturating_sub(freed_bytes).to_le_bytes(),
+    );
+}
+
+/// Lazily garbage-collect this sender's expired staging entries (TTL in
+/// levels, sealed or not) and compact the entry index. Work is bounded by
+/// MAX_SENDER_STAGING_ENTRIES × MAX_STAGE_CHUNKS_PER_ENTRY.
+fn gc_expired_staging_entries<H: Host>(host: &mut H, sender_key: &F, current_level: i32) {
+    let count_path = staging_count_path(sender_key);
+    let count = read_u64(host, &count_path).unwrap_or(0);
+    if count == 0 {
+        return;
+    }
+
+    let mut kept: Vec<u64> = Vec::with_capacity(count.min(MAX_SENDER_STAGING_ENTRIES) as usize);
+    let mut freed: u64 = 0;
+    for slot in 0..count {
+        let Some(bytes) = read_store_nonempty(host, &staging_index_slot_path(sender_key, slot), 8)
+        else {
+            continue;
+        };
+        if bytes.len() != 8 {
+            continue; // corrupt slot: drop it
+        }
+        let staging_id = u64::from_le_bytes(bytes.try_into().unwrap());
+        match read_staging_meta(host, &staging_meta_path(sender_key, staging_id)) {
+            Ok(Some(meta)) => {
+                if current_level.saturating_sub(meta.created_level) >= STAGING_TTL_LEVELS {
+                    freed += u64::from(meta.staged_bytes);
+                    delete_staging_entry_storage(host, sender_key, staging_id, &meta);
+                } else {
+                    kept.push(staging_id);
+                }
+            }
+            // Missing or corrupt meta: the entry is unusable, drop the slot.
+            _ => {}
+        }
+    }
+
+    for (slot, staging_id) in kept.iter().enumerate() {
+        host.write_store(
+            &staging_index_slot_path(sender_key, slot as u64),
+            &staging_id.to_le_bytes(),
+        );
+    }
+    for slot in kept.len() as u64..count {
+        host.write_store(&staging_index_slot_path(sender_key, slot), &[]);
+    }
+    host.write_store(&count_path, &(kept.len() as u64).to_le_bytes());
+
+    if freed > 0 {
+        let bytes_path = staging_bytes_path(sender_key);
+        let total = read_u64(host, &bytes_path).unwrap_or(0);
+        host.write_store(&bytes_path, &total.saturating_sub(freed).to_le_bytes());
+    }
+}
+
+/// Read a SEALED staging payload, binding it to the caller-supplied
+/// `payload_hash` (the `SubmitOps` staged-note refs carry this hash, so a
+/// submitter can never be served a payload it did not commit to).
+// TODO(W2): consumed by the SubmitOps apply path.
+#[allow(dead_code)]
+fn read_sealed_staging_payload<H: Host>(
+    host: &H,
+    sender_key: &F,
+    staging_id: u64,
+    payload_hash: &F,
+) -> Result<Vec<u8>, String> {
+    let meta = read_staging_meta(host, &staging_meta_path(sender_key, staging_id))?
+        .ok_or_else(|| format!("staging entry {} does not exist", staging_id))?;
+    if !meta.sealed {
+        return Err(format!("staging entry {} is not sealed", staging_id));
+    }
+    if meta.payload_hash != *payload_hash {
+        return Err(format!(
+            "staging entry {} payload hash does not match the staged ref",
+            staging_id
+        ));
+    }
+    let payload = read_store_nonempty(
+        host,
+        &staging_payload_path(sender_key, staging_id),
+        MAX_STAGED_PAYLOAD_BYTES,
+    )
+    .ok_or_else(|| format!("staging entry {} payload is missing", staging_id))?;
+    if payload.len() != meta.staged_bytes as usize {
+        return Err(format!(
+            "staging entry {} payload length mismatch: {} != {}",
+            staging_id,
+            payload.len(),
+            meta.staged_bytes
+        ));
+    }
+    Ok(payload)
+}
+
+/// Discard a staging entry entirely (storage + index + byte accounting).
+// TODO(W2): also used by the SubmitOps apply path to release consumed refs.
+fn discard_staging_entry<H: Host>(
+    host: &mut H,
+    sender_key: &F,
+    staging_id: u64,
+    meta: &StagingMeta,
+) {
+    delete_staging_entry_storage(host, sender_key, staging_id, meta);
+    release_staging_entry_accounting(host, sender_key, staging_id, u64::from(meta.staged_bytes));
+}
+
+fn apply_stage_chunk<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    sender: &InboxSender,
+    chunk: &KernelStageChunk,
+) -> Result<KernelResult, String> {
+    // The wire decoder already enforces these; re-check defensively since
+    // staging writes durable state.
+    if chunk.chunk_count == 0 {
+        return Err("stage chunk requires chunk_count >= 1".into());
+    }
+    if chunk.chunk_index >= chunk.chunk_count {
+        return Err(format!(
+            "stage chunk index out of range: {} >= {}",
+            chunk.chunk_index, chunk.chunk_count
+        ));
+    }
+    if chunk.chunk_count > MAX_STAGE_CHUNKS_PER_ENTRY {
+        return Err(format!(
+            "stage chunk count too large: {} > {}",
+            chunk.chunk_count, MAX_STAGE_CHUNKS_PER_ENTRY
+        ));
+    }
+    if chunk.bytes.is_empty() {
+        // Empty values double as best-effort deletes in durable storage, so
+        // an empty chunk would be indistinguishable from an absent one.
+        return Err("stage chunk requires non-empty bytes".into());
+    }
+    if chunk.bytes.len() > MAX_STAGE_CHUNK_BYTES {
+        return Err(format!(
+            "stage chunk too large: {} > {}",
+            chunk.bytes.len(),
+            MAX_STAGE_CHUNK_BYTES
+        ));
+    }
+
+    let sender_key = staging_sender_key(sender);
+    let current_level = read_i32(ledger.host, PATH_LAST_INPUT_LEVEL).unwrap_or(0);
+
+    gc_expired_staging_entries(ledger.host, &sender_key, current_level);
+
+    let meta_path = staging_meta_path(&sender_key, chunk.staging_id);
+    let (mut meta, is_new_entry) = match read_staging_meta(ledger.host, &meta_path)? {
+        Some(meta) => {
+            if meta.sealed {
+                return Err(format!(
+                    "staging entry {} is already sealed",
+                    chunk.staging_id
+                ));
+            }
+            if meta.chunk_count != chunk.chunk_count {
+                return Err(format!(
+                    "staging entry {} chunk_count mismatch: {} != {}",
+                    chunk.staging_id, chunk.chunk_count, meta.chunk_count
+                ));
+            }
+            if meta.payload_hash != chunk.payload_hash {
+                return Err(format!(
+                    "staging entry {} payload_hash mismatch",
+                    chunk.staging_id
+                ));
+            }
+            (meta, false)
+        }
+        None => {
+            let entry_count = read_u64(ledger.host, &staging_count_path(&sender_key)).unwrap_or(0);
+            if entry_count >= MAX_SENDER_STAGING_ENTRIES {
+                return Err(format!(
+                    "too many staging entries for sender: {} >= {}",
+                    entry_count, MAX_SENDER_STAGING_ENTRIES
+                ));
+            }
+            (
+                StagingMeta {
+                    chunk_count: chunk.chunk_count,
+                    received: 0,
+                    payload_hash: chunk.payload_hash,
+                    created_level: current_level,
+                    staged_bytes: 0,
+                    sealed: false,
+                },
+                true,
+            )
+        }
+    };
+
+    // Re-sending an index overwrites the previous bytes (lets a sender
+    // repair a bad chunk without burning the staging_id until seal time).
+    let chunk_path = staging_chunk_path(&sender_key, chunk.staging_id, chunk.chunk_index);
+    let previous_len = read_store_nonempty(ledger.host, &chunk_path, MAX_STAGE_CHUNK_BYTES)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+
+    let bytes_path = staging_bytes_path(&sender_key);
+    let sender_bytes = read_u64(ledger.host, &bytes_path).unwrap_or(0);
+    let new_sender_bytes = sender_bytes
+        .saturating_sub(previous_len as u64)
+        .checked_add(chunk.bytes.len() as u64)
+        .ok_or_else(|| "staging byte accounting overflow".to_string())?;
+    if new_sender_bytes > MAX_SENDER_STAGING_BYTES {
+        return Err(format!(
+            "staging byte budget exceeded for sender: {} > {}",
+            new_sender_bytes, MAX_SENDER_STAGING_BYTES
+        ));
+    }
+
+    // All checks passed — commit the chunk.
+    if is_new_entry {
+        let count_path = staging_count_path(&sender_key);
+        let entry_count = read_u64(ledger.host, &count_path).unwrap_or(0);
+        ledger.host.write_store(
+            &staging_index_slot_path(&sender_key, entry_count),
+            &chunk.staging_id.to_le_bytes(),
+        );
+        ledger
+            .host
+            .write_store(&count_path, &(entry_count + 1).to_le_bytes());
+    }
+    ledger.host.write_store(&chunk_path, &chunk.bytes);
+    ledger
+        .host
+        .write_store(&bytes_path, &new_sender_bytes.to_le_bytes());
+    meta.staged_bytes = meta
+        .staged_bytes
+        .saturating_sub(previous_len as u32)
+        .saturating_add(chunk.bytes.len() as u32);
+    if previous_len == 0 {
+        meta.received += 1;
+    }
+
+    if meta.received < meta.chunk_count {
+        ledger
+            .host
+            .write_store(&meta_path, &encode_staging_meta(&meta));
+        return Ok(KernelResult::Staged(KernelStagedResp {
+            staging_id: chunk.staging_id,
+            received: meta.received,
+            chunk_count: meta.chunk_count,
+            sealed: false,
+        }));
+    }
+
+    // Final chunk: reassemble in index order and check the payload hash.
+    let mut payload = Vec::with_capacity(meta.staged_bytes as usize);
+    for chunk_index in 0..meta.chunk_count {
+        let piece = read_store_nonempty(
+            ledger.host,
+            &staging_chunk_path(&sender_key, chunk.staging_id, chunk_index),
+            MAX_STAGE_CHUNK_BYTES,
+        )
+        .ok_or_else(|| {
+            format!(
+                "staging entry {} chunk {} is missing despite received == chunk_count",
+                chunk.staging_id, chunk_index
+            )
+        })?;
+        payload.extend_from_slice(&piece);
+    }
+    if hash(&payload) != meta.payload_hash {
+        // The staged data can never seal — discard the whole entry so the
+        // staging_id is immediately reusable and the budget is released.
+        // `meta.staged_bytes` already accounts for the chunk written above,
+        // matching what `release_staging_entry_accounting` must free.
+        discard_staging_entry(ledger.host, &sender_key, chunk.staging_id, &meta);
+        return Err(format!(
+            "staging entry {} payload hash mismatch — entry discarded",
+            chunk.staging_id
+        ));
+    }
+
+    // Seal: keep the payload, drop the chunk pieces. Byte accounting is
+    // unchanged (payload length == sum of chunk lengths == staged_bytes).
+    ledger.host.write_store(
+        &staging_payload_path(&sender_key, chunk.staging_id),
+        &payload,
+    );
+    for chunk_index in 0..meta.chunk_count {
+        ledger.host.write_store(
+            &staging_chunk_path(&sender_key, chunk.staging_id, chunk_index),
+            &[],
+        );
+    }
+    meta.sealed = true;
+    ledger
+        .host
+        .write_store(&meta_path, &encode_staging_meta(&meta));
+
+    Ok(KernelResult::Staged(KernelStagedResp {
+        staging_id: chunk.staging_id,
+        received: meta.received,
+        chunk_count: meta.chunk_count,
+        sealed: true,
+    }))
 }
 
 fn prepare_unshield_outbox<H: Host>(
@@ -1634,7 +2190,9 @@ fn apply_input_message<H: Host>(host: &mut H, input: &InputMessage) -> Option<Ke
             validate_bridge_deposit(&ledger, &req)?;
             apply_deposit(&mut ledger, &req.recipient, req.amount).map(|_| KernelResult::Deposit)
         })(),
-        ParsedRollupMessage::Kernel(message) => apply_kernel_message(&mut ledger, message),
+        ParsedRollupMessage::Kernel(sender, message) => {
+            apply_kernel_message(&mut ledger, &sender, message)
+        }
     };
 
     match result {
@@ -2408,6 +2966,412 @@ mod tests {
             .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
             .expect("bridge ticketer configured");
         assert_eq!(stored, sample_ticketer().as_bytes());
+    }
+
+    // ── StageChunk staging (W2a) ──────────────────────────────────────
+
+    fn stage_chunk(
+        staging_id: u64,
+        chunk_index: u16,
+        chunk_count: u16,
+        payload_hash: F,
+        bytes: Vec<u8>,
+    ) -> KernelStageChunk {
+        KernelStageChunk {
+            staging_id,
+            chunk_index,
+            chunk_count,
+            payload_hash,
+            bytes,
+        }
+    }
+
+    fn external_stage_input(level: i32, id: i32, chunk: KernelStageChunk) -> InputMessage {
+        InputMessage {
+            level,
+            id,
+            payload: encode_external_kernel_message(&KernelInboxMessage::StageChunk(chunk)),
+        }
+    }
+
+    fn expect_staged(host: &MockHost) -> KernelStagedResp {
+        match read_last_result(host).unwrap() {
+            KernelResult::Staged(resp) => resp,
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    fn expect_error(host: &MockHost) -> String {
+        match read_last_result(host).unwrap() {
+            KernelResult::Error { message } => message,
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stages_and_seals_single_chunk_payload() {
+        let payload = vec![0xAB; 1500];
+        let payload_hash = hash(&payload);
+        let mut host = MockHost::with_inputs(vec![external_stage_input(
+            5,
+            0,
+            stage_chunk(42, 0, 1, payload_hash, payload.clone()),
+        )]);
+
+        run_with_host(&mut host);
+
+        let resp = expect_staged(&host);
+        assert_eq!(resp.staging_id, 42);
+        assert_eq!(resp.received, 1);
+        assert_eq!(resp.chunk_count, 1);
+        assert!(resp.sealed);
+
+        let sender_key = staging_sender_key(&InboxSender::External);
+        let sealed = read_sealed_staging_payload(&host, &sender_key, 42, &payload_hash).unwrap();
+        assert_eq!(sealed, payload);
+        // Chunk pieces are deleted on seal; accounting reflects the payload.
+        assert!(read_store_nonempty(&host, &staging_chunk_path(&sender_key, 42, 0), 1).is_none());
+        assert_eq!(
+            read_u64(&host, &staging_bytes_path(&sender_key)),
+            Some(payload.len() as u64)
+        );
+        assert_eq!(read_u64(&host, &staging_count_path(&sender_key)), Some(1));
+    }
+
+    #[test]
+    fn stages_multi_chunk_payload_out_of_order() {
+        let payload: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+        let chunks: Vec<Vec<u8>> = payload
+            .chunks(MAX_STAGE_CHUNK_BYTES)
+            .map(|c| c.to_vec())
+            .collect();
+        assert_eq!(chunks.len(), 3);
+        let payload_hash = hash(&payload);
+        let inputs = [2usize, 0, 1]
+            .iter()
+            .enumerate()
+            .map(|(id, &index)| {
+                external_stage_input(
+                    5,
+                    id as i32,
+                    stage_chunk(7, index as u16, 3, payload_hash, chunks[index].clone()),
+                )
+            })
+            .collect();
+        let mut host = MockHost::with_inputs(inputs);
+
+        run_with_host(&mut host);
+
+        let resp = expect_staged(&host);
+        assert_eq!(resp.received, 3);
+        assert!(resp.sealed);
+        let sender_key = staging_sender_key(&InboxSender::External);
+        assert_eq!(
+            read_sealed_staging_payload(&host, &sender_key, 7, &payload_hash).unwrap(),
+            payload
+        );
+        assert_eq!(
+            read_u64(&host, &staging_bytes_path(&sender_key)),
+            Some(payload.len() as u64)
+        );
+    }
+
+    #[test]
+    fn discards_staging_entry_on_payload_hash_mismatch() {
+        let declared_hash = hash(b"not the actual payload");
+        let mut host = MockHost::with_inputs(vec![
+            external_stage_input(1, 0, stage_chunk(9, 0, 2, declared_hash, vec![1; 100])),
+            external_stage_input(1, 1, stage_chunk(9, 1, 2, declared_hash, vec![2; 100])),
+        ]);
+
+        run_with_host(&mut host);
+
+        let message = expect_error(&host);
+        assert!(message.contains("payload hash mismatch"));
+        let sender_key = staging_sender_key(&InboxSender::External);
+        assert_eq!(read_u64(&host, &staging_bytes_path(&sender_key)), Some(0));
+        assert_eq!(read_u64(&host, &staging_count_path(&sender_key)), Some(0));
+        assert!(read_staging_meta(&host, &staging_meta_path(&sender_key, 9))
+            .unwrap()
+            .is_none());
+
+        // The staging_id is immediately reusable after the discard.
+        let payload = vec![3u8; 50];
+        let payload_hash = hash(&payload);
+        host.inputs.push_back(external_stage_input(
+            2,
+            0,
+            stage_chunk(9, 0, 1, payload_hash, payload.clone()),
+        ));
+        run_with_host(&mut host);
+        assert!(expect_staged(&host).sealed);
+        assert_eq!(
+            read_sealed_staging_payload(&host, &sender_key, 9, &payload_hash).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn rejects_stage_chunk_with_mismatched_entry_metadata() {
+        let payload_hash = hash(b"payload");
+        let mut host = MockHost::with_inputs(vec![external_stage_input(
+            1,
+            0,
+            stage_chunk(5, 0, 3, payload_hash, vec![1; 10]),
+        )]);
+        run_with_host(&mut host);
+        assert!(!expect_staged(&host).sealed);
+
+        host.inputs.push_back(external_stage_input(
+            1,
+            1,
+            stage_chunk(5, 1, 2, payload_hash, vec![2; 10]),
+        ));
+        run_with_host(&mut host);
+        assert!(expect_error(&host).contains("chunk_count mismatch"));
+
+        host.inputs.push_back(external_stage_input(
+            1,
+            2,
+            stage_chunk(5, 1, 3, hash(b"different"), vec![2; 10]),
+        ));
+        run_with_host(&mut host);
+        assert!(expect_error(&host).contains("payload_hash mismatch"));
+    }
+
+    #[test]
+    fn overwriting_unsealed_chunk_repairs_staging_entry() {
+        let part0 = vec![0xAA; 200];
+        let part1 = vec![0xBB; 100];
+        let mut payload = part0.clone();
+        payload.extend_from_slice(&part1);
+        let payload_hash = hash(&payload);
+
+        let mut host = MockHost::with_inputs(vec![
+            // Wrong bytes for index 0 first, then the repair, then the seal.
+            external_stage_input(1, 0, stage_chunk(3, 0, 2, payload_hash, vec![0xEE; 250])),
+            external_stage_input(1, 1, stage_chunk(3, 0, 2, payload_hash, part0)),
+            external_stage_input(1, 2, stage_chunk(3, 1, 2, payload_hash, part1)),
+        ]);
+
+        run_with_host(&mut host);
+
+        assert!(expect_staged(&host).sealed);
+        let sender_key = staging_sender_key(&InboxSender::External);
+        assert_eq!(
+            read_sealed_staging_payload(&host, &sender_key, 3, &payload_hash).unwrap(),
+            payload
+        );
+        // The overwritten 250-byte chunk must not leak into the accounting.
+        assert_eq!(
+            read_u64(&host, &staging_bytes_path(&sender_key)),
+            Some(payload.len() as u64)
+        );
+    }
+
+    #[test]
+    fn rejects_staging_onto_sealed_entry() {
+        let payload = vec![7u8; 30];
+        let payload_hash = hash(&payload);
+        let mut host = MockHost::with_inputs(vec![
+            external_stage_input(1, 0, stage_chunk(4, 0, 1, payload_hash, payload.clone())),
+            external_stage_input(1, 1, stage_chunk(4, 0, 1, payload_hash, payload.clone())),
+        ]);
+
+        run_with_host(&mut host);
+
+        assert!(expect_error(&host).contains("already sealed"));
+        // The sealed payload is untouched.
+        let sender_key = staging_sender_key(&InboxSender::External);
+        assert_eq!(
+            read_sealed_staging_payload(&host, &sender_key, 4, &payload_hash).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn rejects_empty_and_oversized_stage_chunks() {
+        let mut host = MockHost::with_inputs(vec![external_stage_input(
+            1,
+            0,
+            stage_chunk(1, 0, 1, hash(b""), Vec::new()),
+        )]);
+        run_with_host(&mut host);
+        assert!(expect_error(&host).contains("non-empty bytes"));
+
+        host.inputs.push_back(external_stage_input(
+            1,
+            1,
+            stage_chunk(
+                2,
+                0,
+                MAX_STAGE_CHUNKS_PER_ENTRY + 1,
+                hash(b"big"),
+                vec![1; 8],
+            ),
+        ));
+        run_with_host(&mut host);
+        assert!(expect_error(&host).contains("stage chunk count too large"));
+    }
+
+    #[test]
+    fn enforces_per_sender_staging_entry_bound() {
+        // Fill the sender's entry table with open (incomplete) entries.
+        let inputs = (0..MAX_SENDER_STAGING_ENTRIES)
+            .map(|staging_id| {
+                external_stage_input(
+                    1,
+                    staging_id as i32,
+                    stage_chunk(staging_id, 0, 2, hash(b"open"), vec![1; 8]),
+                )
+            })
+            .collect();
+        let mut host = MockHost::with_inputs(inputs);
+        run_with_host(&mut host);
+        assert!(!expect_staged(&host).sealed);
+
+        host.inputs.push_back(external_stage_input(
+            1,
+            MAX_SENDER_STAGING_ENTRIES as i32,
+            stage_chunk(MAX_SENDER_STAGING_ENTRIES, 0, 2, hash(b"open"), vec![1; 8]),
+        ));
+        run_with_host(&mut host);
+        assert!(expect_error(&host).contains("too many staging entries"));
+
+        // Adding a chunk to an EXISTING entry is still allowed at the cap
+        // (the final chunk then fails the seal hash check and discards the
+        // entry — hash(b"open") never matches the staged bytes).
+        host.inputs.push_back(external_stage_input(
+            1,
+            MAX_SENDER_STAGING_ENTRIES as i32 + 1,
+            stage_chunk(0, 1, 2, hash(b"open"), vec![1; 8]),
+        ));
+        run_with_host(&mut host);
+        assert!(expect_error(&host).contains("payload hash mismatch"));
+    }
+
+    #[test]
+    fn enforces_per_sender_staging_byte_budget() {
+        let sender_key = staging_sender_key(&InboxSender::External);
+        let mut host = MockHost::default();
+        // Pre-charge the budget to just below the cap; the next 100-byte
+        // chunk must overflow it.
+        host.write_store(
+            &staging_bytes_path(&sender_key),
+            &(MAX_SENDER_STAGING_BYTES - 50).to_le_bytes(),
+        );
+        host.inputs.push_back(external_stage_input(
+            1,
+            0,
+            stage_chunk(1, 0, 2, hash(b"x"), vec![1; 100]),
+        ));
+
+        run_with_host(&mut host);
+
+        assert!(expect_error(&host).contains("staging byte budget exceeded"));
+    }
+
+    #[test]
+    fn garbage_collects_expired_staging_entries() {
+        let sender_key = staging_sender_key(&InboxSender::External);
+        let mut host = MockHost::with_inputs(vec![external_stage_input(
+            10,
+            0,
+            stage_chunk(1, 0, 2, hash(b"first"), vec![1; 64]),
+        )]);
+        run_with_host(&mut host);
+        assert_eq!(read_u64(&host, &staging_bytes_path(&sender_key)), Some(64));
+        assert_eq!(read_u64(&host, &staging_count_path(&sender_key)), Some(1));
+
+        // One level before the TTL: the first entry survives.
+        host.inputs.push_back(external_stage_input(
+            10 + STAGING_TTL_LEVELS - 1,
+            0,
+            stage_chunk(2, 0, 2, hash(b"second"), vec![2; 32]),
+        ));
+        run_with_host(&mut host);
+        assert_eq!(read_u64(&host, &staging_count_path(&sender_key)), Some(2));
+        assert_eq!(read_u64(&host, &staging_bytes_path(&sender_key)), Some(96));
+        assert!(read_staging_meta(&host, &staging_meta_path(&sender_key, 1))
+            .unwrap()
+            .is_some());
+
+        // At the TTL: entry 1 (created at level 10) is reclaimed; entry 2
+        // (created one level before) survives.
+        host.inputs.push_back(external_stage_input(
+            10 + STAGING_TTL_LEVELS,
+            0,
+            stage_chunk(3, 0, 2, hash(b"third"), vec![3; 16]),
+        ));
+        run_with_host(&mut host);
+        assert_eq!(read_u64(&host, &staging_count_path(&sender_key)), Some(2));
+        assert_eq!(read_u64(&host, &staging_bytes_path(&sender_key)), Some(48));
+        assert!(read_staging_meta(&host, &staging_meta_path(&sender_key, 1))
+            .unwrap()
+            .is_none());
+        assert!(
+            read_store_nonempty(&host, &staging_chunk_path(&sender_key, 1, 0), 1).is_none(),
+            "expired entry's chunk pieces must be reclaimed"
+        );
+        assert!(read_staging_meta(&host, &staging_meta_path(&sender_key, 2))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn staging_namespaces_are_scoped_per_sender() {
+        let internal_payload = b"internal-payload".to_vec();
+        let internal_hash = hash(&internal_payload);
+        let external_hash = hash(b"external-eventually");
+        let mut host = MockHost::with_inputs(vec![
+            // External sender opens staging_id 7 (1 of 2 chunks).
+            external_stage_input(1, 0, stage_chunk(7, 0, 2, external_hash, vec![9; 40])),
+            // The orchestrator path seals ITS OWN staging_id 7 without
+            // touching the external entry.
+            InputMessage {
+                level: 1,
+                id: 1,
+                payload: encode_internal_kernel_message_for_rollup(
+                    sample_rollup_address(),
+                    &KernelInboxMessage::StageChunk(stage_chunk(
+                        7,
+                        0,
+                        1,
+                        internal_hash,
+                        internal_payload.clone(),
+                    )),
+                ),
+            },
+        ]);
+
+        run_with_host(&mut host);
+
+        assert!(expect_staged(&host).sealed);
+
+        let external_key = staging_sender_key(&InboxSender::External);
+        let internal_key =
+            staging_sender_key(&InboxSender::L1Account(sample_l1_source().to_b58check()));
+        assert_ne!(external_key, internal_key);
+
+        // Internal entry: sealed and readable.
+        assert_eq!(
+            read_sealed_staging_payload(&host, &internal_key, 7, &internal_hash).unwrap(),
+            internal_payload
+        );
+        // External entry: still open with 1 of 2 chunks, budget independent.
+        let external_meta = read_staging_meta(&host, &staging_meta_path(&external_key, 7))
+            .unwrap()
+            .expect("external staging entry must survive");
+        assert!(!external_meta.sealed);
+        assert_eq!(external_meta.received, 1);
+        assert_eq!(
+            read_u64(&host, &staging_bytes_path(&external_key)),
+            Some(40)
+        );
+        assert_eq!(
+            read_u64(&host, &staging_bytes_path(&internal_key)),
+            Some(internal_payload.len() as u64)
+        );
     }
 
     #[test]

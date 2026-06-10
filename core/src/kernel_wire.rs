@@ -267,6 +267,19 @@ pub enum KernelInboxMessage {
     SubmitOps(KernelSubmitOps),
 }
 
+/// Result of a successfully processed `StageChunk` message (W2 staging).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelStagedResp {
+    pub staging_id: u64,
+    /// Distinct chunk indices staged so far for this entry.
+    pub received: u16,
+    pub chunk_count: u16,
+    /// True once all chunks arrived and `hash(reassembled)` matched the
+    /// declared `payload_hash` — the entry is now referenceable by
+    /// `SubmitOps` staged-note refs.
+    pub sealed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum KernelResult {
     Configured,
@@ -274,6 +287,7 @@ pub enum KernelResult {
     Shield(ShieldResp),
     Transfer(TransferResp),
     Unshield(UnshieldResp),
+    Staged(KernelStagedResp),
     Error { message: String },
 }
 
@@ -626,6 +640,15 @@ struct WireKernelInboxEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelStagedResp {
+    staging_id: WireU64Le,
+    received: WireU16Le,
+    chunk_count: WireU16Le,
+    /// 0 = open, 1 = sealed.
+    sealed: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 #[encoding(tags = "u8")]
 enum WireKernelResult {
     #[encoding(tag = 0)]
@@ -638,6 +661,8 @@ enum WireKernelResult {
     Transfer(WireTransferResp),
     #[encoding(tag = 4)]
     Unshield(WireUnshieldResp),
+    #[encoding(tag = 5)]
+    Staged(WireKernelStagedResp),
     #[encoding(tag = 255)]
     Error(WireErrorMessage),
 }
@@ -730,6 +755,12 @@ pub fn encode_kernel_result(result: &KernelResult) -> Result<Vec<u8>, String> {
             KernelResult::Unshield(resp) => {
                 WireKernelResult::Unshield(unshield_resp_to_wire(resp)?)
             }
+            KernelResult::Staged(resp) => WireKernelResult::Staged(WireKernelStagedResp {
+                staging_id: u64_to_wire(resp.staging_id),
+                received: u16_to_wire(resp.received),
+                chunk_count: u16_to_wire(resp.chunk_count),
+                sealed: u8::from(resp.sealed),
+            }),
             KernelResult::Error { message } => WireKernelResult::Error(WireErrorMessage {
                 message: message.clone(),
             }),
@@ -755,6 +786,21 @@ pub fn decode_kernel_result(bytes: &[u8]) -> Result<KernelResult, String> {
         }
         WireKernelResult::Unshield(resp) => {
             Ok(KernelResult::Unshield(unshield_resp_from_wire(resp)?))
+        }
+        WireKernelResult::Staged(resp) => {
+            let sealed = match resp.sealed {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(format!("invalid staged result sealed flag: {}", other));
+                }
+            };
+            Ok(KernelResult::Staged(KernelStagedResp {
+                staging_id: wire_to_u64(resp.staging_id)?,
+                received: wire_to_u16(resp.received)?,
+                chunk_count: wire_to_u16(resp.chunk_count)?,
+                sealed,
+            }))
         }
         WireKernelResult::Error(err) => Ok(KernelResult::Error {
             message: err.message,
@@ -2766,6 +2812,45 @@ mod tests {
         .unwrap();
         let err = decode_kernel_result(&bytes).unwrap_err();
         assert!(err.contains("unsupported kernel result wire version"));
+    }
+
+    #[test]
+    fn kernel_result_roundtrip_preserves_staged_resp() {
+        for sealed in [false, true] {
+            let result = KernelResult::Staged(KernelStagedResp {
+                staging_id: 0x0123_4567_89AB_CDEF,
+                received: 2,
+                chunk_count: 3,
+                sealed,
+            });
+            let bytes = encode_kernel_result(&result).unwrap();
+            let decoded = decode_kernel_result(&bytes).unwrap();
+            match decoded {
+                KernelResult::Staged(resp) => {
+                    assert_eq!(resp.staging_id, 0x0123_4567_89AB_CDEF);
+                    assert_eq!(resp.received, 2);
+                    assert_eq!(resp.chunk_count, 3);
+                    assert_eq!(resp.sealed, sealed);
+                }
+                other => panic!("unexpected decoded result: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn decode_kernel_result_rejects_invalid_staged_sealed_flag() {
+        let bytes = encode_tze(&WireKernelResultEnvelope {
+            version: u16_to_wire(KERNEL_WIRE_VERSION),
+            result: WireKernelResult::Staged(WireKernelStagedResp {
+                staging_id: u64_to_wire(7),
+                received: u16_to_wire(1),
+                chunk_count: u16_to_wire(1),
+                sealed: 2,
+            }),
+        })
+        .unwrap();
+        let err = decode_kernel_result(&bytes).unwrap_err();
+        assert!(err.contains("invalid staged result sealed flag"));
     }
 
     #[test]
