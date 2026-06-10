@@ -150,7 +150,7 @@ use starknet_types_core::felt::Felt;
 use stwo::core::fields::qm31::QM31;
 use tzel_core::{parse_single_task_output_preimage, BootloaderTaskOutput, F as RawF};
 
-use crate::bundle::compute_output_hash_values;
+use crate::out_hash::compute_output_hash_values;
 use crate::groth16::{verify_groth16_wrap_with_vk, N_TREES, OUT_HASH_LANES, WRAP_VK_BYTES};
 
 /// Byte length of the `TreeRoots` segment of the proof envelope.

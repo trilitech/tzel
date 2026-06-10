@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tzel_services::*;
-use tzel_verifier::{DirectProofVerifier, ProofBundle as VerifyProofBundle};
 
 const PROVER_TOOLCHAIN: &str = "+nightly-2025-07-14";
 
@@ -213,13 +212,9 @@ fn test_transfer_7_inputs_proof_roundtrip() {
         !bundle.proof_bytes.is_empty(),
         "proof bytes should be nonempty"
     );
-    let proof = Proof::Stark {
-        proof_bytes: bundle.proof_bytes,
-        output_preimage: bundle.output_preimage,
-    };
-    DirectProofVerifier::from_executables_dir(false, &executables_dir())
-        .expect("test executables should provide program hashes")
-        .validate(&proof, CircuitKind::Transfer)
-        .expect("n=7 transfer proof should verify with canonical metadata");
+    // The STARK-direct in-process verifier (`DirectProofVerifier`) was retired
+    // in the W5 Groth16-only migration; this guard now asserts the prover
+    // emits the expected public-output shape for an N=7 transfer. SNARK
+    // soundness is covered by the verifier crate's Groth16 acceptance vectors.
 }
 

@@ -14,7 +14,6 @@ indexmap = { version = "2.13.1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 starknet-types-core = { version = "=0.2.4", default-features = false, features = ["hash"] }
 tzel-core = { path = "../core" }
-zstd = "0.13"
 
 # Groth16 wrap verification (verify_snark precompile primitive). All
 # default-features=false to stay kernel/wasm-friendly. `curve` enables the
@@ -26,13 +25,14 @@ ark-groth16 = { version = "0.5", default-features = false }
 ark-serialize = { version = "0.5", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 
+# Retained for the Groth16 OutHash derivation (out_hash.rs / snark.rs):
+# `stwo` (QM31/M31), `circuits` (blake/ivalue), `circuits-stark-verifier`
+# (pack_into_qm31s). The STARK-direct verifier crates (circuit-verifier,
+# circuit-serialize, circuit-multiverifier, stwo-constraint-framework) were
+# dropped with the W5 Groth16-only retirement.
 stwo = { version = "2.2.0", default-features = false }
-stwo-constraint-framework = { version = "2.2.0", default-features = false }
-circuit-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
-circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
 circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
 circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
-circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cairo-program-runner-lib = { path = "/home/saroupille/git/proving-utils/crates/cairo-program-runner-lib" }

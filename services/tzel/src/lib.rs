@@ -7,9 +7,22 @@ pub mod protocol_vectors;
 pub mod submit_v18;
 
 pub use tzel_core::*;
-use tzel_verifier::ProofBundle as VerifyProofBundle;
 
 use std::path::{Path, PathBuf};
+
+/// JSON envelope passed to the off-chain prover/verifier bridge: the raw
+/// proof bytes plus the bootloader `output_preimage`. Formerly
+/// `tzel_verifier::ProofBundle`, which also carried the STARK-direct
+/// `verify()` method retired in the W5 Groth16-only migration; only the
+/// serde DTO is needed here.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyProofBundle {
+    #[serde(with = "tzel_core::hex_bytes")]
+    pub proof_bytes: Vec<u8>,
+    #[serde(with = "tzel_core::hex_f_vec")]
+    pub output_preimage: Vec<F>,
+}
 
 #[derive(Debug, Clone)]
 pub struct LedgerProofVerifier {

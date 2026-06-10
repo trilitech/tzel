@@ -9,13 +9,7 @@ mod with_verifier {
     use std::{env, fs};
 
     use serde::{Deserialize, Serialize};
-    use tzel_core::{
-        kernel_wire::{
-            encode_kernel_inbox_message, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
-            KernelTransferReq, KernelUnshieldReq,
-        },
-        ProgramHashes, Proof, ShieldReq, TransferReq, UnshieldReq, F,
-    };
+    use tzel_core::{ProgramHashes, ShieldReq, TransferReq, UnshieldReq, F};
 
     #[derive(Debug, Deserialize)]
     struct VerifiedBridgeFixture {
@@ -24,7 +18,12 @@ mod with_verifier {
         program_hashes: ProgramHashes,
         bridge_ticketer: String,
         shield: ShieldReq,
+        // Retained so the checked-in fixture JSON keeps deserializing; the
+        // inline `transfer-raw` / `unshield-raw` emitters were retired (W5),
+        // so these are no longer read.
+        #[allow(dead_code)]
         transfer: TransferReq,
+        #[allow(dead_code)]
         unshield: UnshieldReq,
     }
 
@@ -42,9 +41,7 @@ mod with_verifier {
     }
 
     fn usage() -> ! {
-        eprintln!(
-            "usage:\n  verified_bridge_fixture_message metadata [fixture.json]\n  verified_bridge_fixture_message shield-raw [fixture.json]\n  verified_bridge_fixture_message transfer-raw [fixture.json]\n  verified_bridge_fixture_message unshield-raw [fixture.json]"
-        );
+        eprintln!("usage:\n  verified_bridge_fixture_message metadata [fixture.json]");
         std::process::exit(2);
     }
 
@@ -61,68 +58,6 @@ mod with_verifier {
             None => serde_json::from_str(include_str!("../../testdata/verified_bridge_flow.json"))
                 .expect("checked-in fixture should parse"),
         }
-    }
-
-    fn kernel_proof_from_fixture(proof: &Proof) -> KernelStarkProof {
-        match proof {
-            Proof::Stark {
-                proof_bytes,
-                output_preimage,
-            } => KernelStarkProof {
-                proof_bytes: proof_bytes.clone(),
-                output_preimage: output_preimage.clone(),
-            },
-            Proof::TrustMeBro => panic!("fixture should contain real Stark proofs"),
-        }
-    }
-
-    fn kernel_shield_req_from_fixture(req: &ShieldReq) -> KernelShieldReq {
-        KernelShieldReq {
-            pubkey_hash: req.pubkey_hash,
-            v: req.v,
-            fee: req.fee,
-            producer_fee: req.producer_fee,
-            proof: kernel_proof_from_fixture(&req.proof),
-            client_cm: req.client_cm,
-            client_enc: req.client_enc.clone(),
-            producer_cm: req.producer_cm,
-            producer_enc: req.producer_enc.clone(),
-        }
-    }
-
-    fn kernel_transfer_req_from_fixture(req: &TransferReq) -> KernelTransferReq {
-        KernelTransferReq {
-            root: req.root,
-            nullifiers: req.nullifiers.clone(),
-            fee: req.fee,
-            cm_1: req.cm_1,
-            cm_2: req.cm_2,
-            cm_3: req.cm_3,
-            enc_1: req.enc_1.clone(),
-            enc_2: req.enc_2.clone(),
-            enc_3: req.enc_3.clone(),
-            proof: kernel_proof_from_fixture(&req.proof),
-        }
-    }
-
-    fn kernel_unshield_req_from_fixture(req: &UnshieldReq) -> KernelUnshieldReq {
-        KernelUnshieldReq {
-            root: req.root,
-            nullifiers: req.nullifiers.clone(),
-            v_pub: req.v_pub,
-            fee: req.fee,
-            recipient: req.recipient.clone(),
-            cm_change: req.cm_change,
-            enc_change: req.enc_change.clone(),
-            cm_fee: req.cm_fee,
-            enc_fee: req.enc_fee.clone(),
-            proof: kernel_proof_from_fixture(&req.proof),
-        }
-    }
-
-    fn emit_raw_hex(message: KernelInboxMessage) {
-        let payload = encode_kernel_inbox_message(&message).expect("kernel message should encode");
-        println!("{}", hex::encode(payload));
     }
 
     fn fixture_metadata(fixture: &VerifiedBridgeFixture) -> FixtureMetadata<'_> {
@@ -158,20 +93,17 @@ mod with_verifier {
                         .expect("fixture metadata should serialize")
                 );
             }
-            "shield-raw" => {
-                emit_raw_hex(KernelInboxMessage::Shield(kernel_shield_req_from_fixture(
-                    &fixture.shield,
-                )));
-            }
-            "transfer-raw" => {
-                emit_raw_hex(KernelInboxMessage::Transfer(
-                    kernel_transfer_req_from_fixture(&fixture.transfer),
-                ));
-            }
-            "unshield-raw" => {
-                emit_raw_hex(KernelInboxMessage::Unshield(
-                    kernel_unshield_req_from_fixture(&fixture.unshield),
-                ));
+            "shield-raw" | "transfer-raw" | "unshield-raw" => {
+                // The v17 inline proof-bearing messages (Shield/Transfer/
+                // Unshield) were retired with the W5 Groth16-only kernel.
+                // STARK fixtures can no longer be replayed as inbox messages;
+                // the live path is v18 SubmitOps (Groth16 wrap + staged
+                // notes), produced by services/tzel/src/submit_v18.rs.
+                eprintln!(
+                    "{cmd}: retired — the inline STARK message path was removed (W5). \
+                     Use the v18 SubmitOps producer instead."
+                );
+                std::process::exit(1);
             }
             _ => usage(),
         }

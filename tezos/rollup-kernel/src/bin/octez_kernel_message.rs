@@ -7,12 +7,10 @@ use tzel_core::{
     auth_leaf_hash, derive_auth_pub_seed, hash,
     kernel_wire::{
         encode_kernel_inbox_message, sign_kernel_bridge_config, sign_kernel_verifier_config,
-        KernelBridgeConfig,
-        KernelInboxMessage, KernelShieldReq, KernelStarkProof, KernelUnshieldReq,
-        KernelVerifierConfig,
+        KernelBridgeConfig, KernelInboxMessage, KernelLeafSlot, KernelOpDecl, KernelOpDeclBody,
+        KernelStagedNoteRef, KernelSubmitOps, KernelTreeBinding, KernelVerifierConfig,
     },
-    EncryptedNote, ProgramHashes, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES,
-    NOTE_AEAD_NONCE_BYTES, OUTGOING_RECOVERY_CT_BYTES,
+    ProgramHashes, F,
 };
 
 fn usage() -> ! {
@@ -86,66 +84,87 @@ fn signed_verifier_message(
     )
 }
 
-/// A wire-valid `KernelInboxMessage::Shield` whose cryptographic content is
-/// all zeros. It decodes successfully through `decode_kernel_inbox_message`
-/// (the encrypted notes have the exact required lengths) but is
-/// deterministically rejected by `apply_kernel_message` — on an unconfigured
-/// rollup the first failure is "proof verifier is not configured".
+/// A wire-valid v18 `KernelInboxMessage::SubmitOps` (single shield op,
+/// depth-1 binding tree) whose cryptographic content is all zeros. It decodes
+/// successfully through `decode_kernel_inbox_message` and passes the
+/// structural `validate_kernel_submit_ops`, but is deterministically rejected
+/// by `apply_kernel_message` — its declared staged-note refs name no SEALED
+/// staging entry, so `apply_submit_ops` fails before any proof check.
 ///
 /// Used by the orchestrator sandbox smoke to assert the kernel *dispatch*
 /// path (internal `Transfer<MichelsonBytes>` → `decode_kernel_inbox_message`
-/// → `apply_kernel_message`) without shipping a multi-megabyte real proof
-/// through an L1 operation.
-fn stub_encrypted_note() -> EncryptedNote {
-    EncryptedNote {
-        ct_d: vec![0u8; ML_KEM768_CIPHERTEXT_BYTES],
-        tag: 0,
-        ct_v: vec![0u8; ML_KEM768_CIPHERTEXT_BYTES],
-        nonce: vec![0u8; NOTE_AEAD_NONCE_BYTES],
-        encrypted_data: vec![0u8; ENCRYPTED_NOTE_BYTES],
-        outgoing_ct: vec![0u8; OUTGOING_RECOVERY_CT_BYTES],
-    }
-}
-
-fn stub_shield_message() -> KernelInboxMessage {
-    let stub_note = stub_encrypted_note();
-    KernelInboxMessage::Shield(KernelShieldReq {
-        pubkey_hash: [0u8; 32],
-        fee: 0,
-        v: 0,
-        producer_fee: 0,
-        proof: KernelStarkProof {
-            proof_bytes: vec![0u8; 32],
-            output_preimage: Vec::new(),
-        },
-        client_cm: [0u8; 32],
-        client_enc: stub_note.clone(),
-        producer_cm: [0u8; 32],
-        producer_enc: stub_note,
+/// → `apply_kernel_message`) without shipping a real Groth16 proof + staged
+/// notes through L1.
+fn stub_submit_ops(op: KernelOpDecl) -> KernelInboxMessage {
+    // Depth-1 binding: slot 0 = the declared op, slot 1 = a zeroed Opaque
+    // padding leaf (all-zero lanes are valid M31 values).
+    let binding = KernelTreeBinding {
+        depth: 1,
+        leaf_slots: vec![
+            KernelLeafSlot::DeclaredOp(0),
+            KernelLeafSlot::Opaque {
+                root: [0u32; 8],
+                outputs: [0u32; 8],
+            },
+        ],
+    };
+    KernelInboxMessage::SubmitOps(KernelSubmitOps {
+        ops: vec![op],
+        groth16_proof: b"kernel-test-skip-verify".to_vec(),
+        tree_roots: [[0u8; 32]; 4],
+        out_hash: [0u32; 8],
+        binding,
     })
 }
 
-/// A wire-valid `KernelInboxMessage::Unshield` with zeroed cryptographic
-/// content and no change note. With a single mandatory encrypted note it is
-/// the only user-facing TzEL request that fits under the L1 smart-rollup
-/// inbox message size cap (4096 bytes) — Shield and Transfer carry two or
-/// more notes and cannot fit. Like the stub shield, it decodes cleanly and
-/// is deterministically rejected by `apply_kernel_message` with
-/// "proof verifier is not configured" on an unconfigured rollup.
+fn stub_shield_message() -> KernelInboxMessage {
+    stub_submit_ops(KernelOpDecl {
+        output_preimage: Vec::new(),
+        // Shield expects two staged notes (client + producer); both reference
+        // a never-sealed staging entry so the apply is rejected at note
+        // resolution.
+        staged_notes: vec![
+            KernelStagedNoteRef {
+                staging_id: 0,
+                payload_hash: [0u8; 32],
+            },
+            KernelStagedNoteRef {
+                staging_id: 0,
+                payload_hash: [0u8; 32],
+            },
+        ],
+        body: KernelOpDeclBody::Shield {
+            pubkey_hash: [0u8; 32],
+            fee: 0,
+            v: 0,
+            producer_fee: 0,
+            client_cm: [0u8; 32],
+            producer_cm: [0u8; 32],
+        },
+    })
+}
+
+/// A wire-valid v18 `SubmitOps` carrying a single unshield op (no change
+/// note, one fee note). The smallest user-facing TzEL submission. Like the
+/// stub shield it decodes cleanly, passes structural validation, and is
+/// deterministically rejected by `apply_kernel_message` because its
+/// staged-note ref names no sealed entry.
 fn stub_unshield_message() -> KernelInboxMessage {
-    KernelInboxMessage::Unshield(KernelUnshieldReq {
-        root: [0u8; 32],
-        nullifiers: vec![[0u8; 32]],
-        v_pub: 0,
-        fee: 0,
-        recipient: "tz1VSUr8wwNhLAzempoch5d6hLRiTh8Cjcjb".to_string(),
-        cm_change: [0u8; 32],
-        enc_change: None,
-        cm_fee: [0u8; 32],
-        enc_fee: stub_encrypted_note(),
-        proof: KernelStarkProof {
-            proof_bytes: vec![0u8; 32],
-            output_preimage: Vec::new(),
+    stub_submit_ops(KernelOpDecl {
+        output_preimage: Vec::new(),
+        // Unshield with cm_change == 0 expects exactly one staged note (fee).
+        staged_notes: vec![KernelStagedNoteRef {
+            staging_id: 0,
+            payload_hash: [0u8; 32],
+        }],
+        body: KernelOpDeclBody::Unshield {
+            root: [0u8; 32],
+            nullifiers: vec![[0u8; 32]],
+            v_pub: 0,
+            fee: 0,
+            recipient: "tz1VSUr8wwNhLAzempoch5d6hLRiTh8Cjcjb".to_string(),
+            cm_change: [0u8; 32],
+            cm_fee: [0u8; 32],
         },
     })
 }

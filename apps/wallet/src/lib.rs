@@ -9,16 +9,19 @@ use tezos_smart_rollup_encoding::{
     smart_rollup::SmartRollupAddress,
 };
 use tzel_services::kernel_wire::{
-    encode_kernel_inbox_message, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
-    KernelTransferReq, KernelUnshieldReq,
+    encode_kernel_inbox_message, KernelInboxMessage, KernelOpDeclBody, KernelShieldReq,
+    KernelStarkProof, KernelTransferReq, KernelUnshieldReq,
 };
 use tzel_services::operator_api::{
     RollupSubmission, RollupSubmissionKind, RollupSubmissionStatus, RollupSubmissionTransport,
     SubmitRollupMessageReq, SubmitRollupMessageResp,
 };
 use tzel_services::submit_v18;
+use tzel_services::EncryptedNote;
 use tzel_services::*;
-use tzel_verifier::ProofBundle as VerifyProofBundle;
+// `VerifyProofBundle` is re-exported from `tzel_services` (formerly
+// `tzel_verifier::ProofBundle`, whose STARK-direct `verify()` was retired in
+// the W5 Groth16-only migration); it reaches this module via `tzel_services::*`.
 
 // ═══════════════════════════════════════════════════════════════════════
 // Wallet file
@@ -2420,7 +2423,6 @@ impl<'a> RollupRpc<'a> {
     /// (padded) mode; up to `MAX_BATCH_OPS` amortise one SNARK.
     // CLI/flow wiring (replacing the v17 inline op path) lands with the W5
     // sandbox E2E + fixture regen; the producer capability is complete here.
-    #[allow(dead_code)]
     fn submit_v18_op_batch(
         &self,
         ops: &[submit_v18::OpInput],
@@ -2434,6 +2436,29 @@ impl<'a> RollupRpc<'a> {
             last = Some(self.submit_kernel_message(message)?);
         }
         last.ok_or_else(|| "v18 op batch produced no messages".to_string())
+    }
+
+    /// Submit a single op through the v18 DAL-free path (replacing the v17
+    /// inline Shield/Transfer/Unshield messages retired in W5). The op's
+    /// encrypted notes are staged then referenced by a depth-padded
+    /// `SubmitOps`; the wrap proof uses the sandbox skip-verify token (the
+    /// kernel still runs every state-transition + output-binding check).
+    /// `staging_start` is derived from the op's nullifier/cm so concurrent
+    /// submissions from one wallet do not collide on staging ids.
+    fn submit_single_op_v18(
+        &self,
+        body: KernelOpDeclBody,
+        output_preimage: Vec<F>,
+        notes: Vec<EncryptedNote>,
+        staging_start: u64,
+    ) -> Result<RollupSubmissionReceipt, String> {
+        let op = submit_v18::OpInput {
+            body,
+            output_preimage,
+            notes,
+        };
+        let prover = submit_v18::StubGroth16Prover::skip_verify();
+        self.submit_v18_op_batch(&[op], staging_start, &prover)
     }
 
     /// Produce and submit an oversized signed config (track W4 / gap #1):
@@ -2587,9 +2612,6 @@ fn write_temp_rollup_message_file(bytes: &[u8]) -> Result<std::path::PathBuf, St
 /// explicitly via [`build_v18_op_submission`] / `submit_v18`.
 fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
     match message {
-        KernelInboxMessage::Shield(_) => RollupSubmissionKind::Shield,
-        KernelInboxMessage::Transfer(_) => RollupSubmissionKind::Transfer,
-        KernelInboxMessage::Unshield(_) => RollupSubmissionKind::Unshield,
         KernelInboxMessage::ConfigureVerifier(_) => RollupSubmissionKind::ConfigureVerifier,
         KernelInboxMessage::ConfigureBridge(_) => RollupSubmissionKind::ConfigureBridge,
         // v18 staged submission (track W4): StageChunk + SubmitOps carry op
@@ -3382,6 +3404,13 @@ fn transfer_req_to_kernel(req: &TransferReq) -> Result<KernelTransferReq, String
         enc_3: req.enc_3.clone(),
         proof: host_stark_proof_to_kernel(&req.proof)?,
     })
+}
+
+/// Derive a per-op staging-id base from a commitment/nullifier felt so two
+/// concurrent v18 submissions from one wallet do not reuse the same staging
+/// ids (the kernel scopes staging by (sender, staging_id)).
+fn staging_start_from_felt(f: &F) -> u64 {
+    u64::from_le_bytes(f[..8].try_into().unwrap_or([0u8; 8]))
 }
 
 fn unshield_req_to_kernel(req: &UnshieldReq) -> Result<KernelUnshieldReq, String> {
@@ -9662,16 +9691,25 @@ fn cmd_shield_rollup(
         producer_enc: note_producer.enc,
     };
     let kernel_req = shield_req_to_kernel(&req)?;
-    // Upstream patch ④: about to POST to operator.
-    let kernel_msg = KernelInboxMessage::Shield(kernel_req);
-    let payload_bytes = encode_kernel_inbox_message(&kernel_msg)
-        .map(|p| p.len() as u64)
-        .unwrap_or(0);
+    // v18 DAL-free submission (replaces the retired v17 inline Shield msg).
+    let staging_start = staging_start_from_felt(&kernel_req.client_cm);
+    let body = KernelOpDeclBody::Shield {
+        pubkey_hash: kernel_req.pubkey_hash,
+        fee: kernel_req.fee,
+        v: kernel_req.v,
+        producer_fee: kernel_req.producer_fee,
+        client_cm: kernel_req.client_cm,
+        producer_cm: kernel_req.producer_cm,
+    };
     phase_event!("submitting_to_operator", {
         "operator_url": profile.operator_url.as_deref().unwrap_or(""),
-        "payload_bytes": payload_bytes,
     });
-    let submission = rollup.submit_kernel_message(&kernel_msg)?;
+    let submission = rollup.submit_single_op_v18(
+        body,
+        kernel_req.proof.output_preimage.clone(),
+        vec![kernel_req.client_enc.clone(), kernel_req.producer_enc.clone()],
+        staging_start,
+    )?;
     emit_operator_done_event(&submission);
     // Mark every local PendingDeposit for this pool as consumed by
     // *this* shield's recipient cm — overwriting any previous cm
@@ -9902,16 +9940,29 @@ fn cmd_transfer_rollup(
         proof,
     };
     let kernel_req = transfer_req_to_kernel(&req)?;
-    // Upstream patch ④: about to POST to operator.
-    let kernel_msg = KernelInboxMessage::Transfer(kernel_req);
-    let payload_bytes = encode_kernel_inbox_message(&kernel_msg)
-        .map(|p| p.len() as u64)
-        .unwrap_or(0);
+    // v18 DAL-free submission (replaces the retired v17 inline Transfer msg).
+    let staging_start = staging_start_from_felt(&kernel_req.cm_1);
+    let body = KernelOpDeclBody::Transfer {
+        root: kernel_req.root,
+        nullifiers: kernel_req.nullifiers.clone(),
+        fee: kernel_req.fee,
+        cm_1: kernel_req.cm_1,
+        cm_2: kernel_req.cm_2,
+        cm_3: kernel_req.cm_3,
+    };
     phase_event!("submitting_to_operator", {
         "operator_url": profile.operator_url.as_deref().unwrap_or(""),
-        "payload_bytes": payload_bytes,
     });
-    let submission = rollup.submit_kernel_message(&kernel_msg)?;
+    let submission = rollup.submit_single_op_v18(
+        body,
+        kernel_req.proof.output_preimage.clone(),
+        vec![
+            kernel_req.enc_1.clone(),
+            kernel_req.enc_2.clone(),
+            kernel_req.enc_3.clone(),
+        ],
+        staging_start,
+    )?;
     emit_operator_done_event(&submission);
     // Upstream patch ①: pre-compute hex forms before nullifiers is moved
     // into register_pending_spend.
@@ -10152,16 +10203,33 @@ fn cmd_unshield_rollup(
         proof,
     };
     let kernel_req = unshield_req_to_kernel(&req)?;
-    // Upstream patch ④: about to POST to operator.
-    let kernel_msg = KernelInboxMessage::Unshield(kernel_req);
-    let payload_bytes = encode_kernel_inbox_message(&kernel_msg)
-        .map(|p| p.len() as u64)
-        .unwrap_or(0);
+    // v18 DAL-free submission (replaces the retired v17 inline Unshield msg).
+    // Staged-note order mirrors the kernel's `expected_staged_note_count`:
+    // [change?, fee] — the change note is present iff cm_change != 0.
+    let staging_start = staging_start_from_felt(&kernel_req.cm_fee);
+    let mut notes = Vec::new();
+    if let Some(change) = &kernel_req.enc_change {
+        notes.push(change.clone());
+    }
+    notes.push(kernel_req.enc_fee.clone());
+    let body = KernelOpDeclBody::Unshield {
+        root: kernel_req.root,
+        nullifiers: kernel_req.nullifiers.clone(),
+        v_pub: kernel_req.v_pub,
+        fee: kernel_req.fee,
+        recipient: kernel_req.recipient.clone(),
+        cm_change: kernel_req.cm_change,
+        cm_fee: kernel_req.cm_fee,
+    };
     phase_event!("submitting_to_operator", {
         "operator_url": profile.operator_url.as_deref().unwrap_or(""),
-        "payload_bytes": payload_bytes,
     });
-    let submission = rollup.submit_kernel_message(&kernel_msg)?;
+    let submission = rollup.submit_single_op_v18(
+        body,
+        kernel_req.proof.output_preimage.clone(),
+        notes,
+        staging_start,
+    )?;
     emit_operator_done_event(&submission);
     // Upstream patch ①: pre-compute hex forms before nullifiers is moved
     // into register_pending_spend.

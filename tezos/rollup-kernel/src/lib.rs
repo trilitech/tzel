@@ -52,31 +52,10 @@ use tzel_core::{
 };
 #[cfg(any(test, debug_assertions))]
 use tzel_core::{auth_leaf_hash, derive_auth_pub_seed};
-#[cfg(feature = "proof-verifier")]
-use tzel_verifier::DirectProofVerifier;
 
 pub const MAX_INPUT_BYTES: usize = 16 * 1024;
 pub const MAX_LEDGER_STATE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESULT_ERROR_MESSAGE_BYTES: usize = 4096;
-
-#[cfg(not(feature = "proof-verifier"))]
-#[derive(Debug, Clone)]
-struct DirectProofVerifier;
-
-#[cfg(not(feature = "proof-verifier"))]
-impl DirectProofVerifier {
-    fn from_kernel_config(_config: &KernelVerifierConfig) -> Result<Self, String> {
-        Err("kernel built without proof verifier support".into())
-    }
-
-    fn validate_kernel(
-        &self,
-        _proof: &tzel_core::kernel_wire::KernelStarkProof,
-        _circuit: tzel_core::CircuitKind,
-    ) -> Result<(), String> {
-        Err("kernel built without proof verifier support".into())
-    }
-}
 
 const PATH_RAW_INPUT_COUNT: &[u8] = b"/tzel/v1/stats/raw_input_count";
 const PATH_RAW_INPUT_BYTES: &[u8] = b"/tzel/v1/stats/raw_input_bytes";
@@ -1050,18 +1029,6 @@ fn apply_kernel_message<H: Host>(
             apply_configure_verifier(ledger, &config)
         }
         KernelInboxMessage::ConfigureBridge(config) => apply_configure_bridge(ledger, &config),
-        KernelInboxMessage::Shield(req) => {
-            validate_transition_proof(ledger.host, &req.proof, CircuitKind::Shield)?;
-            apply_validated_shield(ledger, &req).map(KernelResult::Shield)
-        }
-        KernelInboxMessage::Transfer(req) => {
-            validate_transition_proof(ledger.host, &req.proof, CircuitKind::Transfer)?;
-            apply_validated_transfer(ledger, &req).map(KernelResult::Transfer)
-        }
-        KernelInboxMessage::Unshield(req) => {
-            validate_transition_proof(ledger.host, &req.proof, CircuitKind::Unshield)?;
-            apply_validated_unshield(ledger, &req).map(KernelResult::Unshield)
-        }
         KernelInboxMessage::StageChunk(chunk) => apply_stage_chunk(ledger, sender, &chunk),
         KernelInboxMessage::SubmitOps(submit) => apply_submit_ops(ledger, sender, &submit),
         KernelInboxMessage::SubmitStagedConfig(reff) => {
@@ -1332,11 +1299,10 @@ fn verify_submit_ops_proof<H: Host>(host: &H, submit: &KernelSubmitOps) -> Resul
     verify_submit_ops_proof_strict(host, submit)
 }
 
-/// Same two-tier skip as `validate_transition_proof` (see the
-/// "Proof-verification skip path" notes below): the magic bytes skip ONLY
-/// the proof-side verification — program-hash binding + Groth16 tree walk,
-/// the v17 `validate_kernel` equivalent. The core output-binding checks
-/// still run unless the per-op `cfg(test)`-only TrustMeBro remap also
+/// Two-tier skip (sandbox/test only): the magic bytes skip ONLY the
+/// proof-side verification — program-hash binding + Groth16 tree walk.
+/// The core output-binding checks still run unless the per-op
+/// `cfg(test)`-only TrustMeBro remap also
 /// fires (it does NOT under `tzel_insecure_sandbox`, where the prover stub
 /// emits real `output_preimage`s).
 #[cfg(any(test, tzel_insecure_sandbox))]
@@ -2471,12 +2437,6 @@ fn apply_input_message<H: Host>(host: &mut H, input: &InputMessage) -> Option<Ke
     }
 }
 
-fn load_verifier<H: Host>(host: &H) -> Result<DirectProofVerifier, String> {
-    let config = read_verifier_config(host)?
-        .ok_or_else(|| "proof verifier is not configured".to_string())?;
-    DirectProofVerifier::from_kernel_config(&config)
-}
-
 fn parse_compiled_felt_hex(hex_value: &str, label: &str) -> Result<F, String> {
     let bytes = hex::decode(hex_value)
         .map_err(|e| format!("invalid {} hex in kernel build: {}", label, e))?;
@@ -2570,14 +2530,15 @@ fn authenticate_bridge_config(config: &KernelSignedBridgeConfig) -> Result<(), S
 // PURPOSE with DIFFERENT cfg gates — the sandbox skips strictly less than
 // unit tests:
 //
-//   1. `validate_transition_proof` early-returns Ok — skips ONLY the STARK
-//      crypto verify. Gated `#[cfg(any(test, tzel_insecure_sandbox))]`.
+//   1. `verify_submit_ops_proof` early-returns Ok — skips ONLY the Groth16
+//      tree-walk + program-hash binding. Gated
+//      `#[cfg(any(test, tzel_insecure_sandbox))]`.
 //   2. `host_*_req_for_transition` remap proof -> Proof::TrustMeBro — makes
 //      core apply ALSO skip the output-binding checks. Gated `#[cfg(test)]`
 //      ONLY (NOT the sandbox).
 //
 // So under `--cfg tzel_insecure_sandbox` (the CI/e2e lane), only the
-// expensive STARK math is skipped; the proof stays Proof::Stark and core
+// expensive Groth16 verify is skipped; the proof stays Proof::Stark and core
 // apply STILL runs the full output-binding checks (auth_domain / root /
 // nullifiers / fee / cm vs the real `output_preimage` the prover stub emits
 // from the bootloader). This keeps the lane catching wire/output-format
@@ -2587,7 +2548,7 @@ fn authenticate_bridge_config(config: &KernelSignedBridgeConfig) -> Result<(), S
 // `tzel_insecure_sandbox` is a cfg that NO prod/bundle build sets (and
 // `--cfg` values do not unify across the dependency graph, unlike cargo
 // features). A production kernel WASM is built `--release` without it, so it
-// gets the `cfg(not(...))` plain functions below — NO skip, full STARK
+// gets the `cfg(not(...))` plain functions below — NO skip, full Groth16
 // verification AND full binding. The cfg is set only by a sandbox/CI build
 // harness, never by a prod/bundle build.
 //
@@ -2662,29 +2623,6 @@ fn host_unshield_req_for_transition(
     host_req
 }
 
-#[cfg(not(any(test, tzel_insecure_sandbox)))]
-fn validate_transition_proof<H: Host>(
-    host: &H,
-    proof: &tzel_core::kernel_wire::KernelStarkProof,
-    circuit: tzel_core::CircuitKind,
-) -> Result<(), String> {
-    let verifier = load_verifier(host)?;
-    verifier.validate_kernel(proof, circuit)
-}
-
-#[cfg(any(test, tzel_insecure_sandbox))]
-fn validate_transition_proof<H: Host>(
-    host: &H,
-    proof: &tzel_core::kernel_wire::KernelStarkProof,
-    circuit: tzel_core::CircuitKind,
-) -> Result<(), String> {
-    if proof.proof_bytes == b"kernel-test-skip-verify" {
-        return Ok(());
-    }
-    let verifier = load_verifier(host)?;
-    verifier.validate_kernel(proof, circuit)
-}
-
 /// Install the verifier configuration. **One-shot, no reconfiguration**:
 /// once the rollup is configured, the verifier config is frozen for the
 /// life of the kernel. Deposits, shields, transfers, and unshields are
@@ -2696,9 +2634,6 @@ fn configure_verifier<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
     config: &KernelVerifierConfig,
 ) -> Result<(), String> {
-    #[cfg(feature = "proof-verifier")]
-    DirectProofVerifier::from_kernel_config(config)?;
-
     if read_verifier_config(ledger.host)?.is_some() {
         return Err("rollup verifier is already configured".into());
     }
@@ -2902,8 +2837,7 @@ mod tests {
         derive_rcm, encrypt_note_deterministic, felt_tag, hash, hash_two,
         kernel_wire::{
             encode_kernel_inbox_message, sign_kernel_bridge_config, sign_kernel_verifier_config,
-            KernelBridgeConfig, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
-            KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig,
+            KernelBridgeConfig, KernelInboxMessage, KernelVerifierConfig,
         },
         owner_tag, PaymentAddress, ProgramHashes, ShieldResp,
         TransferResp, UnshieldResp, MIN_TX_FEE, ZERO,
@@ -3653,6 +3587,65 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn unshield_op_decl(
+        root: F,
+        nullifiers: Vec<F>,
+        v_pub: u64,
+        recipient: &str,
+        cm_change: F,
+        cm_fee: F,
+        staged_notes: Vec<KernelStagedNoteRef>,
+    ) -> KernelOpDecl {
+        KernelOpDecl {
+            output_preimage: vec![],
+            staged_notes,
+            body: KernelOpDeclBody::Unshield {
+                root,
+                nullifiers,
+                v_pub,
+                fee: MIN_TX_FEE,
+                recipient: recipient.into(),
+                cm_change,
+                cm_fee,
+            },
+        }
+    }
+
+    /// Build the inbox messages that submit a SINGLE declared op through the
+    /// v18 path: one `StageChunk` per `note`, then a depth-1 `SubmitOps`
+    /// (`[DeclaredOp(0), Opaque]`) carrying `build_op(staged_refs)`. Staging
+    /// ids are derived from `id_base` so distinct tests do not collide. Mirrors
+    /// how the v17 inline Shield/Transfer/Unshield messages were submitted —
+    /// the apply logic asserted by the migrated tests is identical, only the
+    /// transport changed.
+    fn single_op_submit_inputs(
+        level: i32,
+        id_base: i32,
+        notes: &[EncryptedNote],
+        build_op: impl FnOnce(Vec<KernelStagedNoteRef>) -> KernelOpDecl,
+    ) -> Vec<InputMessage> {
+        let mut inputs = Vec::new();
+        let mut refs = Vec::with_capacity(notes.len());
+        for (i, note) in notes.iter().enumerate() {
+            let staging_id = (id_base as u64) * 16 + i as u64;
+            refs.push(staged_note_input(
+                &mut inputs,
+                level,
+                id_base + i as i32,
+                staging_id,
+                note,
+            ));
+        }
+        let op = build_op(refs);
+        inputs.push(external_submit_input(
+            level,
+            id_base + notes.len() as i32,
+            test_submit_ops(vec![op], 1, vec![KernelLeafSlot::DeclaredOp(0), opaque_slot()]),
+        ));
+        inputs
+    }
+
     /// Fund a deposit pool directly through the shared ledger logic.
     fn fund_deposit_pool(host: &mut MockHost, pubkey_hash: &F, amount: u64) {
         let mut state = DurableLedgerState::new(host).unwrap();
@@ -4245,23 +4238,15 @@ mod tests {
             )
             .unwrap();
         }
-        let shield_req = KernelShieldReq {
-            pubkey_hash,
-            fee: MIN_TX_FEE,
-            producer_fee,
-            v,
-            proof: sample_kernel_test_proof(),
-            client_cm,
-            client_enc,
-            producer_cm,
-            producer_enc,
-        };
-        let message = encode_external_kernel_message(&KernelInboxMessage::Shield(shield_req));
-        host.inputs.push_back(InputMessage {
-            level: 2,
-            id: 1,
-            payload: message,
-        });
+        host.inputs = single_op_submit_inputs(
+            2,
+            1,
+            &[client_enc, producer_enc],
+            |refs| {
+                shield_op_decl(pubkey_hash, v, producer_fee, client_cm, producer_cm, refs)
+            },
+        )
+        .into();
 
         run_with_host(&mut host);
 
@@ -4272,18 +4257,20 @@ mod tests {
         assert!(after_shield.as_ref().map(|b| b.is_empty()).unwrap_or(true));
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.tree.leaves.len(), 2);
-        match read_last_result(&host).unwrap() {
-            KernelResult::Shield(ShieldResp {
+        let results = expect_submitted(&host);
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            KernelOpResult::Shield(ShieldResp {
                 index,
                 producer_cm: result_producer_cm,
                 producer_index,
                 ..
             }) => {
-                assert_eq!(index, 0);
-                assert_eq!(result_producer_cm, producer_cm);
-                assert_eq!(producer_index, 1);
+                assert_eq!(*index, 0);
+                assert_eq!(*result_producer_cm, producer_cm);
+                assert_eq!(*producer_index, 1);
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected op result: {:?}", other),
         }
     }
 
@@ -4312,39 +4299,27 @@ mod tests {
         let nf = sample_felt(0x91);
         let root = read_ledger(&host).unwrap().tree.root();
 
-        let req = KernelTransferReq {
-            root,
-            nullifiers: vec![nf],
-            fee: MIN_TX_FEE,
-            cm_1,
-            cm_2,
-            cm_3,
-            enc_1: enc_1.clone(),
-            enc_2: enc_2.clone(),
-            enc_3: enc_3.clone(),
-            proof: sample_kernel_test_proof(),
-        };
-        let message = encode_external_kernel_message(&KernelInboxMessage::Transfer(req));
-        host.inputs.push_back(InputMessage {
-            level: 5,
-            id: 0,
-            payload: message,
-        });
+        host.inputs = single_op_submit_inputs(
+            5,
+            0,
+            &[enc_1.clone(), enc_2.clone(), enc_3.clone()],
+            |refs| transfer_op_decl(root, vec![nf], [cm_1, cm_2, cm_3], refs),
+        )
+        .into();
 
         run_with_host(&mut host);
 
-        match read_last_result(&host).unwrap() {
-            KernelResult::Transfer(TransferResp {
+        let results = expect_submitted(&host);
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            KernelOpResult::Transfer(TransferResp {
                 index_1,
                 index_2,
                 index_3,
             }) => {
-                assert_eq!((index_1, index_2, index_3), (0, 1, 2))
+                assert_eq!((*index_1, *index_2, *index_3), (0, 1, 2))
             }
-            KernelResult::Error { message } => {
-                panic!("transfer failed: {} | debug: {}", message, host.debug)
-            }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected op result: {:?}", other),
         }
 
         let ledger = read_ledger(&host).unwrap();
@@ -4376,24 +4351,13 @@ mod tests {
         let nf = sample_felt(0x93);
         let root = read_ledger(&host).unwrap().tree.root();
 
-        let req = KernelTransferReq {
-            root,
-            nullifiers: vec![nf, nf],
-            fee: MIN_TX_FEE,
-            cm_1,
-            cm_2,
-            cm_3,
-            enc_1,
-            enc_2,
-            enc_3,
-            proof: sample_kernel_test_proof(),
-        };
-        let message = encode_external_kernel_message(&KernelInboxMessage::Transfer(req));
-        host.inputs.push_back(InputMessage {
-            level: 5,
-            id: 1,
-            payload: message,
-        });
+        host.inputs = single_op_submit_inputs(
+            5,
+            1,
+            &[enc_1, enc_2, enc_3],
+            |refs| transfer_op_decl(root, vec![nf, nf], [cm_1, cm_2, cm_3], refs),
+        )
+        .into();
 
         run_with_host(&mut host);
 
@@ -4424,39 +4388,27 @@ mod tests {
         let root = read_ledger(&host).unwrap().tree.root();
         let recipient = sample_l1_receiver().to_string();
 
-        let req = KernelUnshieldReq {
-            root,
-            nullifiers: vec![nf],
-            v_pub: 33,
-            fee: MIN_TX_FEE,
-            recipient: recipient.clone(),
-            cm_change,
-            enc_change: Some(enc_change.clone()),
-            cm_fee,
-            enc_fee: enc_fee.clone(),
-            proof: sample_kernel_test_proof(),
-        };
-        let message = encode_external_kernel_message(&KernelInboxMessage::Unshield(req));
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 1,
-            payload: message,
-        });
+        host.inputs = single_op_submit_inputs(
+            6,
+            1,
+            &[enc_change.clone(), enc_fee.clone()],
+            |refs| unshield_op_decl(root, vec![nf], 33, &recipient, cm_change, cm_fee, refs),
+        )
+        .into();
 
         run_with_host(&mut host);
 
-        match read_last_result(&host).unwrap() {
-            KernelResult::Unshield(UnshieldResp {
+        let results = expect_submitted(&host);
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            KernelOpResult::Unshield(UnshieldResp {
                 change_index,
                 producer_index,
             }) => {
-                assert_eq!(change_index, Some(0));
-                assert_eq!(producer_index, 1);
+                assert_eq!(*change_index, Some(0));
+                assert_eq!(*producer_index, 1);
             }
-            KernelResult::Error { message } => {
-                panic!("unshield failed: {} | debug: {}", message, host.debug)
-            }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected op result: {:?}", other),
         }
 
         let ledger = read_ledger(&host).unwrap();
@@ -4490,24 +4442,13 @@ mod tests {
         let root = read_ledger(&host).unwrap().tree.root();
         let recipient = sample_l1_receiver().to_string();
 
-        let req = KernelUnshieldReq {
-            root,
-            nullifiers: vec![nf, nf],
-            v_pub: 33,
-            fee: MIN_TX_FEE,
-            recipient: recipient.clone(),
-            cm_change,
-            enc_change: Some(enc_change),
-            cm_fee,
-            enc_fee,
-            proof: sample_kernel_test_proof(),
-        };
-        let message = encode_external_kernel_message(&KernelInboxMessage::Unshield(req));
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 2,
-            payload: message,
-        });
+        host.inputs = single_op_submit_inputs(
+            6,
+            2,
+            &[enc_change, enc_fee],
+            |refs| unshield_op_decl(root, vec![nf, nf], 33, &recipient, cm_change, cm_fee, refs),
+        )
+        .into();
 
         run_with_host(&mut host);
 
@@ -4537,24 +4478,10 @@ mod tests {
         let nf = sample_felt(0xA4);
         let root = read_ledger(&host).unwrap().tree.root();
 
-        let req = KernelUnshieldReq {
-            root,
-            nullifiers: vec![nf],
-            v_pub: 33,
-            fee: MIN_TX_FEE,
-            recipient: "bob".into(),
-            cm_change: ZERO,
-            enc_change: None,
-            cm_fee,
-            enc_fee,
-            proof: sample_kernel_test_proof(),
-        };
-        let message = encode_external_kernel_message(&KernelInboxMessage::Unshield(req));
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 24,
-            payload: message,
-        });
+        host.inputs = single_op_submit_inputs(6, 24, &[enc_fee], |refs| {
+            unshield_op_decl(root, vec![nf], 33, "bob", ZERO, cm_fee, refs)
+        })
+        .into();
 
         run_with_host(&mut host);
 
@@ -4582,22 +4509,18 @@ mod tests {
         let cm_fee = sample_commitment(&address, 1, [0x53; 32]);
         let nf = sample_felt(0xAB);
         let root = read_ledger(&host).unwrap().tree.root();
-        let message =
-            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+        host.inputs = single_op_submit_inputs(6, 25, &[enc_fee], |refs| {
+            unshield_op_decl(
                 root,
                 vec![nf],
                 33,
                 " tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx ",
                 ZERO,
-                None,
                 cm_fee,
-                enc_fee,
-            )));
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 25,
-            payload: message,
-        });
+                refs,
+            )
+        })
+        .into();
 
         run_with_host(&mut host);
 
@@ -4611,15 +4534,17 @@ mod tests {
         );
         assert!(ledger.nullifiers.contains(&nf));
         assert_eq!(host.outputs.len(), 1);
-        match read_last_result(&host).unwrap() {
-            KernelResult::Unshield(UnshieldResp {
+        let results = expect_submitted(&host);
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            KernelOpResult::Unshield(UnshieldResp {
                 change_index,
                 producer_index,
             }) => {
-                assert_eq!(change_index, None);
-                assert_eq!(producer_index, 0);
+                assert_eq!(*change_index, None);
+                assert_eq!(*producer_index, 0);
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected op result: {:?}", other),
         }
     }
 
@@ -4637,37 +4562,37 @@ mod tests {
         let nf = sample_felt(0xA5);
         let root = read_ledger(&host).unwrap().tree.root();
 
-        let message =
-            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
-                root,
-                vec![nf],
-                33,
-                sample_l1_receiver(),
-                cm_change,
-                Some(enc_change.clone()),
-                cm_fee,
-                enc_fee.clone(),
-            )));
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 2,
-            payload: message,
-        });
+        host.inputs = single_op_submit_inputs(
+            6,
+            2,
+            &[enc_change.clone(), enc_fee.clone()],
+            |refs| {
+                unshield_op_decl(
+                    root,
+                    vec![nf],
+                    33,
+                    sample_l1_receiver(),
+                    cm_change,
+                    cm_fee,
+                    refs,
+                )
+            },
+        )
+        .into();
 
         run_with_host(&mut host);
 
-        match read_last_result(&host).unwrap() {
-            KernelResult::Unshield(UnshieldResp {
+        let results = expect_submitted(&host);
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            KernelOpResult::Unshield(UnshieldResp {
                 change_index,
                 producer_index,
             }) => {
-                assert_eq!(change_index, Some(0));
-                assert_eq!(producer_index, 1);
+                assert_eq!(*change_index, Some(0));
+                assert_eq!(*producer_index, 1);
             }
-            KernelResult::Error { message } => {
-                panic!("unshield failed: {} | debug: {}", message, host.debug)
-            }
-            other => panic!("unexpected rollup result: {:?}", other),
+            other => panic!("unexpected op result: {:?}", other),
         }
 
         let ledger = read_ledger(&host).unwrap();
@@ -4706,22 +4631,10 @@ mod tests {
         let cm_fee = sample_commitment(&address, 1, [0x31; 32]);
         let nf = sample_felt(0xA6);
         let root = read_ledger(&host).unwrap().tree.root();
-        let message =
-            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
-                root,
-                vec![nf],
-                33,
-                sample_l1_receiver(),
-                ZERO,
-                None,
-                cm_fee,
-                enc_fee,
-            )));
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 3,
-            payload: message,
-        });
+        host.inputs = single_op_submit_inputs(6, 3, &[enc_fee], |refs| {
+            unshield_op_decl(root, vec![nf], 33, sample_l1_receiver(), ZERO, cm_fee, refs)
+        })
+        .into();
 
         run_with_host(&mut host);
 
@@ -4748,22 +4661,10 @@ mod tests {
         let nf = sample_felt(0xA8);
         let root = read_ledger(&host).unwrap().tree.root();
         host.write_store(PATH_WITHDRAWAL_COUNT, &[0x01]);
-        let message =
-            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
-                root,
-                vec![nf],
-                33,
-                sample_l1_receiver(),
-                ZERO,
-                None,
-                cm_fee,
-                enc_fee,
-            )));
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 30,
-            payload: message,
-        });
+        host.inputs = single_op_submit_inputs(6, 30, &[enc_fee], |refs| {
+            unshield_op_decl(root, vec![nf], 33, sample_l1_receiver(), ZERO, cm_fee, refs)
+        })
+        .into();
 
         run_with_host(&mut host);
 
@@ -4793,22 +4694,10 @@ mod tests {
         let cm_fee = sample_commitment(&address, 1, [0x32; 32]);
         let nf = sample_felt(0xA7);
         let root = read_ledger(&host).unwrap().tree.root();
-        let message =
-            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
-                root,
-                vec![nf],
-                33,
-                "not-a-contract",
-                ZERO,
-                None,
-                cm_fee,
-                enc_fee,
-            )));
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 4,
-            payload: message,
-        });
+        host.inputs = single_op_submit_inputs(6, 4, &[enc_fee], |refs| {
+            unshield_op_decl(root, vec![nf], 33, "not-a-contract", ZERO, cm_fee, refs)
+        })
+        .into();
 
         run_with_host(&mut host);
 
@@ -4835,22 +4724,11 @@ mod tests {
         let first_enc_fee = sample_encrypted_note(&address, 1, [0x35; 32], b"dal-1");
         let first_cm_fee = sample_commitment(&address, 1, [0x35; 32]);
         let first_nf = sample_felt(0xA9);
-        let first_message =
-            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
-                read_ledger(&host).unwrap().tree.root(),
-                vec![first_nf],
-                33,
-                sample_l1_receiver(),
-                ZERO,
-                None,
-                first_cm_fee,
-                first_enc_fee,
-            )));
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 31,
-            payload: first_message,
-        });
+        let first_root = read_ledger(&host).unwrap().tree.root();
+        host.inputs = single_op_submit_inputs(6, 31, &[first_enc_fee], |refs| {
+            unshield_op_decl(first_root, vec![first_nf], 33, sample_l1_receiver(), ZERO, first_cm_fee, refs)
+        })
+        .into();
         run_with_host(&mut host);
         assert_eq!(host.outputs.len(), 1);
 
@@ -4859,22 +4737,10 @@ mod tests {
         let second_enc_fee = sample_encrypted_note(&address, 1, [0x36; 32], b"dal-2");
         let second_cm_fee = sample_commitment(&address, 1, [0x36; 32]);
         let second_nf = sample_felt(0xAA);
-        let second_message =
-            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
-                second_root,
-                vec![second_nf],
-                34,
-                sample_l1_receiver(),
-                ZERO,
-                None,
-                second_cm_fee,
-                second_enc_fee,
-            )));
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 32,
-            payload: second_message,
-        });
+        host.inputs = single_op_submit_inputs(6, 40, &[second_enc_fee], |refs| {
+            unshield_op_decl(second_root, vec![second_nf], 34, sample_l1_receiver(), ZERO, second_cm_fee, refs)
+        })
+        .into();
 
         run_with_host(&mut host);
 
@@ -4912,22 +4778,10 @@ mod tests {
         let cm_fee = sample_commitment(&address, 1, [0x33; 32]);
         let nf = sample_felt(0xA8);
         let root = read_ledger(&host).unwrap().tree.root();
-        let message =
-            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
-                root,
-                vec![nf],
-                33,
-                sample_l1_receiver(),
-                ZERO,
-                None,
-                cm_fee,
-                enc_fee,
-            )));
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 5,
-            payload: message,
-        });
+        host.inputs = single_op_submit_inputs(6, 5, &[enc_fee], |refs| {
+            unshield_op_decl(root, vec![nf], 33, sample_l1_receiver(), ZERO, cm_fee, refs)
+        })
+        .into();
 
         run_with_host(&mut host);
 
@@ -5346,23 +5200,29 @@ mod tests {
         let client_rseed = sample_felt(0x37);
         let client_enc = sample_encrypted_note(&address, 50, client_rseed, b"shield");
         let client_cm = sample_commitment(&address, 50, client_rseed);
-        let shield_req = KernelShieldReq {
-            pubkey_hash: pubkey_hash_from_label("alice"),
-            fee: MIN_TX_FEE,
-            producer_fee,
-            v: 50,
-            proof: sample_verified_kernel_proof(),
-            client_cm,
-            client_enc,
-            producer_cm,
-            producer_enc,
-        };
-        let message = encode_external_kernel_message(&KernelInboxMessage::Shield(shield_req));
-        let mut host = MockHost::with_inputs(vec![InputMessage {
-            level: 3,
-            id: 2,
-            payload: message,
-        }]);
+
+        // A v18 SubmitOps with a NON-skip proof so the apply reaches the
+        // verifier-config lookup (the skip token would short-circuit before
+        // it). The staged notes let it past `resolve_op_notes` to the proof
+        // check, which fails because no verifier is configured.
+        let mut inputs = Vec::new();
+        let client_ref = staged_note_input(&mut inputs, 3, 0, 700, &client_enc);
+        let producer_ref = staged_note_input(&mut inputs, 3, 1, 701, &producer_enc);
+        let mut submit = test_submit_ops(
+            vec![shield_op_decl(
+                pubkey_hash_from_label("alice"),
+                50,
+                producer_fee,
+                client_cm,
+                producer_cm,
+                vec![client_ref, producer_ref],
+            )],
+            1,
+            vec![KernelLeafSlot::DeclaredOp(0), opaque_slot()],
+        );
+        submit.groth16_proof = vec![0x00, 0x11, 0x22];
+        inputs.push(external_submit_input(3, 2, submit));
+        let mut host = MockHost::with_inputs(inputs);
 
         run_with_host(&mut host);
 
@@ -5401,40 +5261,35 @@ mod tests {
             auth_domain: sample_felt(0x55),
             verified_program_hashes: sample_program_hashes(),
         };
-        let mut host = MockHost::with_inputs(vec![
-            InputMessage {
-                level: 8,
-                id: 1,
-                payload: encode_external_kernel_message(&signed_verifier_message(config.clone())),
-            },
-            InputMessage {
-                level: 9,
-                id: 2,
-                payload: encode_external_kernel_message(&KernelInboxMessage::Shield(
-                    KernelShieldReq {
-                        pubkey_hash: pubkey_hash_from_label("alice"),
-                        v: 50,
-                        fee: MIN_TX_FEE,
-                        producer_fee: 1,
-                        proof: sample_verified_kernel_proof(),
-                        client_cm: sample_felt(0x71),
-                        client_enc: sample_encrypted_note(
-                            &sample_payment_address(),
-                            50,
-                            sample_felt(0x72),
-                            b"alice-recipient",
-                        ),
-                        producer_cm: sample_felt(0x73),
-                        producer_enc: sample_encrypted_note(
-                            &sample_payment_address(),
-                            1,
-                            sample_felt(0x74),
-                            b"alice-producer",
-                        ),
-                    },
-                )),
-            },
-        ]);
+        let address = sample_payment_address();
+        let client_enc = sample_encrypted_note(&address, 50, sample_felt(0x72), b"alice-recipient");
+        let producer_enc = sample_encrypted_note(&address, 1, sample_felt(0x74), b"alice-producer");
+
+        let mut inputs = vec![InputMessage {
+            level: 8,
+            id: 1,
+            payload: encode_external_kernel_message(&signed_verifier_message(config.clone())),
+        }];
+        // v18 SubmitOps with a NON-skip proof: the skip token would
+        // short-circuit, so use real bytes to reach `verify_submit_ops_tree`,
+        // which on a no-verifier build returns the "no verifier support" error.
+        let client_ref = staged_note_input(&mut inputs, 9, 2, 900, &client_enc);
+        let producer_ref = staged_note_input(&mut inputs, 9, 3, 901, &producer_enc);
+        let mut submit = test_submit_ops(
+            vec![shield_op_decl(
+                pubkey_hash_from_label("alice"),
+                50,
+                1,
+                sample_felt(0x71),
+                sample_felt(0x73),
+                vec![client_ref, producer_ref],
+            )],
+            1,
+            vec![KernelLeafSlot::DeclaredOp(0), opaque_slot()],
+        );
+        submit.groth16_proof = vec![0x00, 0x11, 0x22];
+        inputs.push(external_submit_input(9, 4, submit));
+        let mut host = MockHost::with_inputs(inputs);
 
         run_with_host(&mut host);
 
@@ -5447,32 +5302,6 @@ mod tests {
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
-    }
-
-    #[cfg(feature = "proof-verifier")]
-    #[test]
-    fn rejects_invalid_stark_proof_shape_before_transition() {
-        let config = KernelVerifierConfig {
-            auth_domain: default_auth_domain(),
-            verified_program_hashes: sample_program_hashes(),
-        };
-        let verifier = DirectProofVerifier::from_kernel_config(&config).unwrap();
-
-        let proof = KernelStarkProof {
-            proof_bytes: vec![0x00, 0x11, 0x22],
-            output_preimage: vec![[9u8; 32], [10u8; 32]],
-        };
-
-        let err = verifier
-            .validate_kernel(&proof, tzel_core::CircuitKind::Transfer)
-            .unwrap_err();
-        assert!(
-            err.contains("invalid output_preimage")
-                || err.contains("zstd decompress")
-                || err.contains("circuit verification FAILED"),
-            "unexpected verifier error: {}",
-            err
-        );
     }
 
     #[test]
@@ -5935,29 +5764,6 @@ mod tests {
         PublicKeyHash::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN").unwrap()
     }
 
-    fn sample_kernel_unshield_req(
-        root: F,
-        nullifiers: Vec<F>,
-        v_pub: u64,
-        recipient: &str,
-        cm_change: F,
-        enc_change: Option<EncryptedNote>,
-        cm_fee: F,
-        enc_fee: EncryptedNote,
-    ) -> KernelUnshieldReq {
-        KernelUnshieldReq {
-            root,
-            nullifiers,
-            v_pub,
-            fee: MIN_TX_FEE,
-            recipient: recipient.into(),
-            cm_change,
-            enc_change,
-            cm_fee,
-            enc_fee,
-            proof: sample_kernel_test_proof(),
-        }
-    }
 
     fn sample_rollup_address() -> SmartRollupAddress {
         SmartRollupAddress::from_b58check("sr1UNDWPUYVeomgG15wn5jSw689EJ4RNnVQa").unwrap()
@@ -6104,20 +5910,6 @@ mod tests {
             shield: [1u8; 32],
             transfer: [2u8; 32],
             unshield: [3u8; 32],
-        }
-    }
-
-    fn sample_kernel_test_proof() -> KernelStarkProof {
-        KernelStarkProof {
-            proof_bytes: b"kernel-test-skip-verify".to_vec(),
-            output_preimage: vec![],
-        }
-    }
-
-    fn sample_verified_kernel_proof() -> KernelStarkProof {
-        KernelStarkProof {
-            proof_bytes: vec![0x00, 0x11, 0x22],
-            output_preimage: vec![[9u8; 32], [10u8; 32]],
         }
     }
 

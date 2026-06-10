@@ -4,8 +4,7 @@ use crate::canonical_wire::{
 };
 use crate::{
     hash, wots_sign, EncryptedNote, ProgramHashes, Proof, ShieldReq, ShieldResp, TransferReq,
-    TransferResp, UnshieldReq, UnshieldResp, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES,
-    NOTE_AEAD_NONCE_BYTES, OUTGOING_RECOVERY_CT_BYTES,
+    TransferResp, UnshieldReq, UnshieldResp, F,
 };
 use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
@@ -18,21 +17,11 @@ pub const KERNEL_WIRE_VERSION: u16 = 18;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
-const MAX_PROOF_BYTES: usize = 8 * 1024 * 1024;
+/// Max felts in an op's bootloader `output_preimage` (the leaf-statement
+/// derivation input on a v18 `OpDecl`).
 const MAX_OUTPUT_PREIMAGE_ITEMS: usize = 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
-const MAX_ENCODED_NOTE_WIRE_BYTES: usize = (ML_KEM768_CIPHERTEXT_BYTES * 2)
-    + NOTE_AEAD_NONCE_BYTES
-    + ENCRYPTED_NOTE_BYTES
-    + OUTGOING_RECOVERY_CT_BYTES
-    + 32;
-const MAX_ENCODED_PROOF_WIRE_BYTES: usize =
-    MAX_PROOF_BYTES + (MAX_OUTPUT_PREIMAGE_ITEMS * 64) + 4096;
 const MAX_ENCODED_NULLIFIER_LIST_BYTES: usize = 256 * 1024;
-const MAX_TRANSFER_PAYLOAD_BYTES: usize =
-    (5 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + (3 * MAX_ENCODED_NOTE_WIRE_BYTES) + 65536;
-const MAX_UNSHIELD_PAYLOAD_BYTES: usize =
-    (4 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + (2 * MAX_ENCODED_NOTE_WIRE_BYTES) + 65536;
 
 // --- v18 DAL-free submission bounds (docs/SNARK-SUBMISSION-DESIGN.md) ---
 /// Max payload bytes carried by a single `StageChunk` (~3.9 KiB after the
@@ -250,9 +239,6 @@ pub struct KernelSubmitOps {
 pub enum KernelInboxMessage {
     ConfigureVerifier(KernelSignedVerifierConfig),
     ConfigureBridge(KernelSignedBridgeConfig),
-    Shield(KernelShieldReq),
-    Transfer(KernelTransferReq),
-    Unshield(KernelUnshieldReq),
     StageChunk(KernelStageChunk),
     SubmitOps(KernelSubmitOps),
     /// Apply a signed config (`ConfigureVerifier`/`ConfigureBridge`) that was
@@ -316,25 +302,8 @@ struct WireFeltList {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireEncodedNote {
-    #[encoding(dynamic = "MAX_ENCODED_NOTE_WIRE_BYTES", bytes)]
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireEncodedProof {
-    #[encoding(dynamic = "MAX_ENCODED_PROOF_WIRE_BYTES", bytes)]
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireEncodedFeltList {
     #[encoding(dynamic = "MAX_ENCODED_NULLIFIER_LIST_BYTES", bytes)]
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WireStarkProof {
     bytes: Vec<u8>,
 }
 
@@ -363,19 +332,6 @@ struct WireSignedKernelBridgeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireKernelShieldReq {
-    pubkey_hash: WireFelt,
-    fee: WireU64Le,
-    v: WireU64Le,
-    producer_fee: WireU64Le,
-    proof: WireEncodedProof,
-    client_cm: WireFelt,
-    client_enc: WireEncryptedNote,
-    producer_cm: WireFelt,
-    producer_enc: WireEncryptedNote,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireShieldResp {
     cm: WireFelt,
     index: WireU64Le,
@@ -384,22 +340,10 @@ struct WireShieldResp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireKernelTransferReq {
-    #[encoding(dynamic = "MAX_TRANSFER_PAYLOAD_BYTES", bytes)]
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireTransferResp {
     index_1: WireU64Le,
     index_2: WireU64Le,
     index_3: WireU64Le,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireKernelUnshieldReq {
-    #[encoding(dynamic = "MAX_UNSHIELD_PAYLOAD_BYTES", bytes)]
-    bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -583,25 +527,15 @@ struct WireAccountId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireOptionalEncodedNote {
-    note: Option<WireEncodedNote>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 #[encoding(tags = "u8")]
 enum WireKernelInboxMessage {
     #[encoding(tag = 0)]
     ConfigureVerifier(WireSignedKernelVerifierConfig),
     #[encoding(tag = 1)]
     ConfigureBridge(WireSignedKernelBridgeConfig),
-    #[encoding(tag = 2)]
-    Shield(WireKernelShieldReq),
-    #[encoding(tag = 3)]
-    Transfer(WireKernelTransferReq),
-    #[encoding(tag = 4)]
-    Unshield(WireKernelUnshieldReq),
-    // Tag 6 (DalPointer) is retired — deleted with the v17 DAL path; do
-    // not reuse.
+    // Tags 2/3/4 (inline Shield/Transfer/Unshield) are retired — deleted
+    // with the v17 inline proof-bearing path (W5 Groth16-only retirement);
+    // do not reuse. Tag 6 (DalPointer) was retired with the v17 DAL path.
     #[encoding(tag = 7)]
     StageChunk(WireKernelStageChunk),
     #[encoding(tag = 8)]
@@ -679,15 +613,6 @@ pub fn encode_kernel_inbox_message(message: &KernelInboxMessage) -> Result<Vec<u
             KernelInboxMessage::ConfigureBridge(cfg) => {
                 WireKernelInboxMessage::ConfigureBridge(signed_bridge_config_to_wire(cfg)?)
             }
-            KernelInboxMessage::Shield(req) => {
-                WireKernelInboxMessage::Shield(kernel_shield_req_to_wire(req)?)
-            }
-            KernelInboxMessage::Transfer(req) => {
-                WireKernelInboxMessage::Transfer(kernel_transfer_req_to_wire(req)?)
-            }
-            KernelInboxMessage::Unshield(req) => {
-                WireKernelInboxMessage::Unshield(kernel_unshield_req_to_wire(req)?)
-            }
             KernelInboxMessage::StageChunk(chunk) => {
                 WireKernelInboxMessage::StageChunk(kernel_stage_chunk_to_wire(chunk)?)
             }
@@ -719,15 +644,6 @@ pub fn decode_kernel_inbox_message(bytes: &[u8]) -> Result<KernelInboxMessage, S
         ),
         WireKernelInboxMessage::ConfigureBridge(cfg) => Ok(KernelInboxMessage::ConfigureBridge(
             signed_bridge_config_from_wire(cfg)?,
-        )),
-        WireKernelInboxMessage::Shield(req) => Ok(KernelInboxMessage::Shield(
-            kernel_shield_req_from_wire(req)?,
-        )),
-        WireKernelInboxMessage::Transfer(req) => Ok(KernelInboxMessage::Transfer(
-            kernel_transfer_req_from_wire(req)?,
-        )),
-        WireKernelInboxMessage::Unshield(req) => Ok(KernelInboxMessage::Unshield(
-            kernel_unshield_req_from_wire(req)?,
         )),
         WireKernelInboxMessage::StageChunk(chunk) => Ok(KernelInboxMessage::StageChunk(
             kernel_stage_chunk_from_wire(chunk)?,
@@ -866,27 +782,6 @@ where
     T: NomReader<'a>,
 {
     T::nom_read(bytes).map_err(|e| format!("tezos_data_encoding read failed: {:?}", e))
-}
-
-fn take_u32_be_len(bytes: &mut &[u8], label: &str) -> Result<usize, String> {
-    let raw = take_bytes(bytes, 4, label)?;
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(raw);
-    Ok(u32::from_be_bytes(buf) as usize)
-}
-
-fn take_bytes<'a>(bytes: &mut &'a [u8], len: usize, label: &str) -> Result<&'a [u8], String> {
-    if bytes.len() < len {
-        return Err(format!(
-            "kernel proof payload truncated while reading {}: need {} bytes, have {}",
-            label,
-            len,
-            bytes.len()
-        ));
-    }
-    let (head, tail) = bytes.split_at(len);
-    *bytes = tail;
-    Ok(head)
 }
 
 pub fn kernel_proof_to_host(proof: &KernelStarkProof) -> Proof {
@@ -1461,91 +1356,6 @@ pub fn decode_staged_note_payload(bytes: &[u8]) -> Result<EncryptedNote, String>
     encrypted_note_from_wire(wire)
 }
 
-fn kernel_proof_to_wire(proof: &KernelStarkProof) -> Result<WireStarkProof, String> {
-    if proof.proof_bytes.len() > MAX_PROOF_BYTES {
-        return Err(format!(
-            "proof too large for kernel wire: {} > {}",
-            proof.proof_bytes.len(),
-            MAX_PROOF_BYTES
-        ));
-    }
-    if proof.output_preimage.len() > MAX_OUTPUT_PREIMAGE_ITEMS {
-        return Err(format!(
-            "output_preimage too long for kernel wire: {} > {}",
-            proof.output_preimage.len(),
-            MAX_OUTPUT_PREIMAGE_ITEMS
-        ));
-    }
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(proof.proof_bytes.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(&proof.proof_bytes);
-    bytes.extend_from_slice(&(proof.output_preimage.len() as u32).to_be_bytes());
-    for felt in &proof.output_preimage {
-        bytes.extend_from_slice(felt);
-    }
-    Ok(WireStarkProof { bytes })
-}
-
-fn kernel_proof_from_wire(proof: WireStarkProof) -> Result<KernelStarkProof, String> {
-    let mut rest = proof.bytes.as_slice();
-
-    let proof_len = take_u32_be_len(&mut rest, "proof_bytes length")?;
-    if proof_len > MAX_PROOF_BYTES {
-        return Err(format!(
-            "proof too large for kernel wire: {} > {}",
-            proof_len, MAX_PROOF_BYTES
-        ));
-    }
-    let proof_bytes = take_bytes(&mut rest, proof_len, "proof_bytes")?.to_vec();
-
-    let output_preimage_len = take_u32_be_len(&mut rest, "output_preimage length")?;
-    if output_preimage_len > MAX_OUTPUT_PREIMAGE_ITEMS {
-        return Err(format!(
-            "output_preimage too long for kernel wire: {} > {}",
-            output_preimage_len, MAX_OUTPUT_PREIMAGE_ITEMS
-        ));
-    }
-    let mut output_preimage = Vec::with_capacity(output_preimage_len);
-    for _ in 0..output_preimage_len {
-        let felt_bytes = take_bytes(&mut rest, 32, "output_preimage felt")?;
-        let mut felt = [0u8; 32];
-        felt.copy_from_slice(felt_bytes);
-        output_preimage.push(felt);
-    }
-
-    if !rest.is_empty() {
-        return Err(format!(
-            "kernel proof payload left {} trailing bytes",
-            rest.len()
-        ));
-    }
-    Ok(KernelStarkProof {
-        proof_bytes,
-        output_preimage,
-    })
-}
-
-fn encoded_note_to_wire(enc: &EncryptedNote) -> Result<WireEncodedNote, String> {
-    Ok(WireEncodedNote {
-        bytes: encode_tze(&encrypted_note_to_wire(enc)?)?,
-    })
-}
-
-fn encoded_note_from_wire(wire: WireEncodedNote) -> Result<EncryptedNote, String> {
-    let inner: WireEncryptedNote = decode_tze(&wire.bytes)?;
-    encrypted_note_from_wire(inner)
-}
-
-fn encoded_proof_to_wire(proof: &KernelStarkProof) -> Result<WireEncodedProof, String> {
-    Ok(WireEncodedProof {
-        bytes: kernel_proof_to_wire(proof)?.bytes,
-    })
-}
-
-fn encoded_proof_from_wire(wire: WireEncodedProof) -> Result<KernelStarkProof, String> {
-    kernel_proof_from_wire(WireStarkProof { bytes: wire.bytes })
-}
-
 fn encoded_felt_list_to_wire(values: &[F]) -> Result<WireEncodedFeltList, String> {
     Ok(WireEncodedFeltList {
         bytes: encode_tze(&WireFeltList {
@@ -1561,34 +1371,6 @@ fn encoded_felt_list_from_wire(wire: WireEncodedFeltList) -> Result<Vec<F>, Stri
         .into_iter()
         .map(wire_to_felt)
         .collect::<Result<Vec<_>, _>>()
-}
-
-fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldReq, String> {
-    Ok(WireKernelShieldReq {
-        pubkey_hash: felt_to_wire(&req.pubkey_hash),
-        fee: u64_to_wire(req.fee),
-        v: u64_to_wire(req.v),
-        producer_fee: u64_to_wire(req.producer_fee),
-        proof: encoded_proof_to_wire(&req.proof)?,
-        client_cm: felt_to_wire(&req.client_cm),
-        client_enc: encrypted_note_to_wire(&req.client_enc)?,
-        producer_cm: felt_to_wire(&req.producer_cm),
-        producer_enc: encrypted_note_to_wire(&req.producer_enc)?,
-    })
-}
-
-fn kernel_shield_req_from_wire(wire: WireKernelShieldReq) -> Result<KernelShieldReq, String> {
-    Ok(KernelShieldReq {
-        pubkey_hash: wire_to_felt(wire.pubkey_hash)?,
-        fee: wire_to_u64(wire.fee)?,
-        v: wire_to_u64(wire.v)?,
-        producer_fee: wire_to_u64(wire.producer_fee)?,
-        proof: encoded_proof_from_wire(wire.proof)?,
-        client_cm: wire_to_felt(wire.client_cm)?,
-        client_enc: encrypted_note_from_wire(wire.client_enc)?,
-        producer_cm: wire_to_felt(wire.producer_cm)?,
-        producer_enc: encrypted_note_from_wire(wire.producer_enc)?,
-    })
 }
 
 fn shield_resp_to_wire(resp: &ShieldResp) -> Result<WireShieldResp, String> {
@@ -1679,52 +1461,6 @@ fn kernel_submit_resp_from_wire(wire: WireKernelSubmitResp) -> Result<KernelSubm
     })
 }
 
-fn kernel_transfer_req_to_wire(req: &KernelTransferReq) -> Result<WireKernelTransferReq, String> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.root))?);
-    bytes.extend_from_slice(&encode_tze(&encoded_felt_list_to_wire(&req.nullifiers)?)?);
-    bytes.extend_from_slice(&encode_tze(&u64_to_wire(req.fee))?);
-    bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.cm_1))?);
-    bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.cm_2))?);
-    bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.cm_3))?);
-    bytes.extend_from_slice(&encode_tze(&encoded_proof_to_wire(&req.proof)?)?);
-    bytes.extend_from_slice(&encode_tze(&encoded_note_to_wire(&req.enc_1)?)?);
-    bytes.extend_from_slice(&encode_tze(&encoded_note_to_wire(&req.enc_2)?)?);
-    bytes.extend_from_slice(&encode_tze(&encoded_note_to_wire(&req.enc_3)?)?);
-    Ok(WireKernelTransferReq { bytes })
-}
-
-fn kernel_transfer_req_from_wire(wire: WireKernelTransferReq) -> Result<KernelTransferReq, String> {
-    let (rest, root) = decode_tze_prefix::<WireFelt>(&wire.bytes)?;
-    let (rest, nullifiers) = decode_tze_prefix::<WireEncodedFeltList>(rest)?;
-    let (rest, fee) = decode_tze_prefix::<WireU64Le>(rest)?;
-    let (rest, cm_1) = decode_tze_prefix::<WireFelt>(rest)?;
-    let (rest, cm_2) = decode_tze_prefix::<WireFelt>(rest)?;
-    let (rest, cm_3) = decode_tze_prefix::<WireFelt>(rest)?;
-    let (rest, proof) = decode_tze_prefix::<WireEncodedProof>(rest)?;
-    let (rest, enc_1) = decode_tze_prefix::<WireEncodedNote>(rest)?;
-    let (rest, enc_2) = decode_tze_prefix::<WireEncodedNote>(rest)?;
-    let (rest, enc_3) = decode_tze_prefix::<WireEncodedNote>(rest)?;
-    if !rest.is_empty() {
-        return Err(format!(
-            "kernel transfer payload left {} trailing bytes",
-            rest.len()
-        ));
-    }
-    Ok(KernelTransferReq {
-        root: wire_to_felt(root)?,
-        nullifiers: encoded_felt_list_from_wire(nullifiers)?,
-        fee: wire_to_u64(fee)?,
-        cm_1: wire_to_felt(cm_1)?,
-        cm_2: wire_to_felt(cm_2)?,
-        cm_3: wire_to_felt(cm_3)?,
-        proof: encoded_proof_from_wire(proof)?,
-        enc_1: encoded_note_from_wire(enc_1)?,
-        enc_2: encoded_note_from_wire(enc_2)?,
-        enc_3: encoded_note_from_wire(enc_3)?,
-    })
-}
-
 fn transfer_resp_to_wire(resp: &TransferResp) -> Result<WireTransferResp, String> {
     Ok(WireTransferResp {
         index_1: u64_to_wire(
@@ -1756,60 +1492,6 @@ fn transfer_resp_from_wire(wire: WireTransferResp) -> Result<TransferResp, Strin
         index_3: wire_to_u64(wire.index_3)?
             .try_into()
             .map_err(|_| "transfer index_3 does not fit in usize".to_string())?,
-    })
-}
-
-fn kernel_unshield_req_to_wire(req: &KernelUnshieldReq) -> Result<WireKernelUnshieldReq, String> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.root))?);
-    bytes.extend_from_slice(&encode_tze(&encoded_felt_list_to_wire(&req.nullifiers)?)?);
-    bytes.extend_from_slice(&encode_tze(&u64_to_wire(req.v_pub))?);
-    bytes.extend_from_slice(&encode_tze(&u64_to_wire(req.fee))?);
-    bytes.extend_from_slice(&encode_tze(&WireAccountId {
-        value: req.recipient.clone(),
-    })?);
-    bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.cm_change))?);
-    bytes.extend_from_slice(&encode_tze(&encoded_proof_to_wire(&req.proof)?)?);
-    bytes.extend_from_slice(&encode_tze(&WireOptionalEncodedNote {
-        note: req
-            .enc_change
-            .as_ref()
-            .map(encoded_note_to_wire)
-            .transpose()?,
-    })?);
-    bytes.extend_from_slice(&encode_tze(&felt_to_wire(&req.cm_fee))?);
-    bytes.extend_from_slice(&encode_tze(&encoded_note_to_wire(&req.enc_fee)?)?);
-    Ok(WireKernelUnshieldReq { bytes })
-}
-
-fn kernel_unshield_req_from_wire(wire: WireKernelUnshieldReq) -> Result<KernelUnshieldReq, String> {
-    let (rest, root) = decode_tze_prefix::<WireFelt>(&wire.bytes)?;
-    let (rest, nullifiers) = decode_tze_prefix::<WireEncodedFeltList>(rest)?;
-    let (rest, v_pub) = decode_tze_prefix::<WireU64Le>(rest)?;
-    let (rest, fee) = decode_tze_prefix::<WireU64Le>(rest)?;
-    let (rest, recipient) = decode_tze_prefix::<WireAccountId>(rest)?;
-    let (rest, cm_change) = decode_tze_prefix::<WireFelt>(rest)?;
-    let (rest, proof) = decode_tze_prefix::<WireEncodedProof>(rest)?;
-    let (rest, enc_change) = decode_tze_prefix::<WireOptionalEncodedNote>(rest)?;
-    let (rest, cm_fee) = decode_tze_prefix::<WireFelt>(rest)?;
-    let (rest, enc_fee) = decode_tze_prefix::<WireEncodedNote>(rest)?;
-    if !rest.is_empty() {
-        return Err(format!(
-            "kernel unshield payload left {} trailing bytes",
-            rest.len()
-        ));
-    }
-    Ok(KernelUnshieldReq {
-        root: wire_to_felt(root)?,
-        nullifiers: encoded_felt_list_from_wire(nullifiers)?,
-        v_pub: wire_to_u64(v_pub)?,
-        fee: wire_to_u64(fee)?,
-        recipient: recipient.value,
-        cm_change: wire_to_felt(cm_change)?,
-        proof: encoded_proof_from_wire(proof)?,
-        enc_change: enc_change.note.map(encoded_note_from_wire).transpose()?,
-        cm_fee: wire_to_felt(cm_fee)?,
-        enc_fee: encoded_note_from_wire(enc_fee)?,
     })
 }
 
@@ -1851,7 +1533,10 @@ fn unshield_resp_from_wire(wire: WireUnshieldResp) -> Result<UnshieldResp, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DETECT_K, ZERO};
+    use crate::{
+        DETECT_K, ENCRYPTED_NOTE_BYTES, ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES,
+        OUTGOING_RECOVERY_CT_BYTES,
+    };
     use proptest::prelude::*;
 
     fn small_string(max_len: usize) -> impl Strategy<Value = String> {
@@ -1911,136 +1596,9 @@ mod tests {
             })
     }
 
-    #[test]
-    fn kernel_inbox_roundtrip_preserves_shield_request() {
-        let pubkey_hash = [0x42; 32];
-        let client_cm = [0x55; 32];
-        let message = KernelInboxMessage::Shield(KernelShieldReq {
-            pubkey_hash,
-            fee: 3,
-            v: 42,
-            producer_fee: 5,
-            proof: sample_kernel_stark_proof(),
-            client_cm,
-            client_enc: sample_encrypted_note(0x66),
-            producer_cm: [9u8; 32],
-            producer_enc: sample_encrypted_note(0x77),
-        });
-        let encoded = encode_kernel_inbox_message(&message).unwrap();
-        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
-        match decoded {
-            KernelInboxMessage::Shield(req) => {
-                assert_eq!(req.pubkey_hash, pubkey_hash);
-                assert_eq!(req.fee, 3);
-                assert_eq!(req.v, 42);
-                assert_eq!(req.producer_fee, 5);
-                assert_eq!(
-                    req.proof.proof_bytes,
-                    sample_kernel_stark_proof().proof_bytes
-                );
-                assert_eq!(req.client_cm, client_cm);
-                assert_eq!(req.client_enc.ct_d, sample_encrypted_note(0x66).ct_d);
-                assert_eq!(req.producer_cm, [9u8; 32]);
-                assert_eq!(req.producer_enc.ct_d, sample_encrypted_note(0x77).ct_d);
-            }
-            other => panic!("unexpected decoded message: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn kernel_inbox_roundtrip_preserves_binary_stark_proof() {
-        let message = KernelInboxMessage::Transfer(KernelTransferReq {
-            root: [1u8; 32],
-            nullifiers: vec![[2u8; 32], [3u8; 32]],
-            fee: 9,
-            cm_1: [4u8; 32],
-            cm_2: [5u8; 32],
-            cm_3: [6u8; 32],
-            enc_1: sample_encrypted_note(0x11),
-            enc_2: sample_encrypted_note(0x22),
-            enc_3: sample_encrypted_note(0x33),
-            proof: sample_kernel_stark_proof(),
-        });
-        let encoded = encode_kernel_inbox_message(&message).unwrap();
-        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
-        match decoded {
-            KernelInboxMessage::Transfer(req) => {
-                assert_eq!(
-                    req.proof.proof_bytes,
-                    sample_kernel_stark_proof().proof_bytes
-                );
-                assert_eq!(
-                    req.proof.output_preimage,
-                    sample_kernel_stark_proof().output_preimage
-                );
-            }
-            other => panic!("unexpected decoded message: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn encoded_note_wrapper_roundtrips() {
-        let enc = sample_encrypted_note(0x44);
-        let wire = encoded_note_to_wire(&enc).unwrap();
-        let encoded = encode_tze(&wire).unwrap();
-        let decoded_wire: WireEncodedNote = decode_tze(&encoded).unwrap();
-        let decoded = encoded_note_from_wire(decoded_wire).unwrap();
-        assert_eq!(decoded.ct_d, enc.ct_d);
-        assert_eq!(decoded.tag, enc.tag);
-        assert_eq!(decoded.ct_v, enc.ct_v);
-        assert_eq!(decoded.encrypted_data, enc.encrypted_data);
-    }
-
-    #[test]
-    fn encoded_proof_wrapper_roundtrips_for_stark() {
-        let proof = sample_kernel_stark_proof();
-        let wire = encoded_proof_to_wire(&proof).unwrap();
-        let encoded = encode_tze(&wire).unwrap();
-        let decoded_wire: WireEncodedProof = decode_tze(&encoded).unwrap();
-        let decoded = encoded_proof_from_wire(decoded_wire).unwrap();
-        assert_eq!(decoded.proof_bytes, proof.proof_bytes);
-        assert_eq!(decoded.output_preimage, proof.output_preimage);
-    }
-
-    #[test]
-    fn kernel_shield_roundtrips_for_larger_stark_proof_payloads() {
-        let proof = KernelStarkProof {
-            proof_bytes: (0..70).map(|i| (0x80u8).wrapping_add(i as u8)).collect(),
-            output_preimage: vec![[0x11; 32], [0x22; 32], [0x33; 32], [0x44; 32], [0x55; 32]],
-        };
-        let message = KernelInboxMessage::Shield(KernelShieldReq {
-            pubkey_hash: [0x42; 32],
-            fee: 2,
-            v: 7,
-            producer_fee: 4,
-            proof: proof.clone(),
-            client_cm: [0x44; 32],
-            client_enc: sample_encrypted_note(0x55),
-            producer_cm: [0x66; 32],
-            producer_enc: sample_encrypted_note(0x67),
-        });
-        let encoded = encode_kernel_inbox_message(&message).unwrap();
-        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
-        let KernelInboxMessage::Shield(decoded) = decoded else {
-            panic!("decoded wrong kernel message variant");
-        };
-        assert_eq!(decoded.proof.proof_bytes, proof.proof_bytes);
-        assert_eq!(decoded.proof.output_preimage, proof.output_preimage);
-    }
-
-    #[test]
-    fn encoded_proof_wrapper_roundtrips_for_larger_stark_proof_payloads() {
-        let proof = KernelStarkProof {
-            proof_bytes: (0..70).map(|i| (0x80u8).wrapping_add(i as u8)).collect(),
-            output_preimage: vec![[0x11; 32], [0x22; 32], [0x33; 32], [0x44; 32], [0x55; 32]],
-        };
-        let wire = encoded_proof_to_wire(&proof).unwrap();
-        let encoded = encode_tze(&wire).unwrap();
-        let decoded_wire: WireEncodedProof = decode_tze(&encoded).unwrap();
-        let decoded = encoded_proof_from_wire(decoded_wire).unwrap();
-        assert_eq!(decoded.proof_bytes, proof.proof_bytes);
-        assert_eq!(decoded.output_preimage, proof.output_preimage);
-    }
+    // The v17 inline Shield/Transfer/Unshield message roundtrips and their
+    // proof/note wrapper tests were deleted with the W5 Groth16-only
+    // retirement; v18 SubmitOps roundtrips cover the live submission path.
 
     #[test]
     fn wire_felt_list_roundtrips() {
@@ -2052,200 +1610,6 @@ mod tests {
         assert_eq!(decoded, wire);
     }
 
-    #[test]
-    fn kernel_transfer_wire_struct_roundtrips() {
-        let req = KernelTransferReq {
-            root: [1u8; 32],
-            nullifiers: vec![[2u8; 32], [3u8; 32]],
-            fee: 11,
-            cm_1: [4u8; 32],
-            cm_2: [5u8; 32],
-            cm_3: [6u8; 32],
-            enc_1: sample_encrypted_note(0x11),
-            enc_2: sample_encrypted_note(0x22),
-            enc_3: sample_encrypted_note(0x33),
-            proof: sample_kernel_stark_proof(),
-        };
-        let wire = kernel_transfer_req_to_wire(&req).unwrap();
-        let encoded = encode_tze(&wire).unwrap();
-        let decoded: WireKernelTransferReq = decode_tze(&encoded).unwrap();
-        let host = kernel_transfer_req_from_wire(decoded).unwrap();
-        assert_eq!(host.root, req.root);
-        assert_eq!(host.nullifiers, req.nullifiers);
-        assert_eq!(host.fee, req.fee);
-        assert_eq!(host.cm_1, req.cm_1);
-        assert_eq!(host.cm_2, req.cm_2);
-        assert_eq!(host.cm_3, req.cm_3);
-        assert_eq!(host.enc_1.ct_d, req.enc_1.ct_d);
-        assert_eq!(host.enc_1.tag, req.enc_1.tag);
-        assert_eq!(host.enc_1.ct_v, req.enc_1.ct_v);
-        assert_eq!(host.enc_1.encrypted_data, req.enc_1.encrypted_data);
-        assert_eq!(host.enc_2.ct_d, req.enc_2.ct_d);
-        assert_eq!(host.enc_2.tag, req.enc_2.tag);
-        assert_eq!(host.enc_2.ct_v, req.enc_2.ct_v);
-        assert_eq!(host.enc_2.encrypted_data, req.enc_2.encrypted_data);
-        assert_eq!(host.enc_3.ct_d, req.enc_3.ct_d);
-        assert_eq!(host.enc_3.tag, req.enc_3.tag);
-        assert_eq!(host.enc_3.ct_v, req.enc_3.ct_v);
-        assert_eq!(host.enc_3.encrypted_data, req.enc_3.encrypted_data);
-        assert_eq!(host.proof.proof_bytes, req.proof.proof_bytes);
-    }
-
-    #[test]
-    fn kernel_transfer_payload_fields_roundtrip_individually() {
-        let req = KernelTransferReq {
-            root: [1u8; 32],
-            nullifiers: vec![[2u8; 32], [3u8; 32]],
-            fee: 12,
-            cm_1: [4u8; 32],
-            cm_2: [5u8; 32],
-            cm_3: [6u8; 32],
-            enc_1: sample_encrypted_note(0x11),
-            enc_2: sample_encrypted_note(0x22),
-            enc_3: sample_encrypted_note(0x33),
-            proof: sample_kernel_stark_proof(),
-        };
-        let wire = kernel_transfer_req_to_wire(&req).unwrap();
-        let (rest, root) = decode_tze_prefix::<WireFelt>(&wire.bytes).unwrap();
-        assert_eq!(wire_to_felt(root).unwrap(), req.root);
-        let (rest, nullifiers) = decode_tze_prefix::<WireEncodedFeltList>(rest).unwrap();
-        let decoded_nullifiers = encoded_felt_list_from_wire(nullifiers).unwrap();
-        assert_eq!(decoded_nullifiers, req.nullifiers);
-        let (rest, fee) = decode_tze_prefix::<WireU64Le>(rest).unwrap();
-        assert_eq!(wire_to_u64(fee).unwrap(), req.fee);
-        let (rest, cm_1) = decode_tze_prefix::<WireFelt>(rest).unwrap();
-        assert_eq!(wire_to_felt(cm_1).unwrap(), req.cm_1);
-        let (rest, cm_2) = decode_tze_prefix::<WireFelt>(rest).unwrap();
-        assert_eq!(wire_to_felt(cm_2).unwrap(), req.cm_2);
-        let (rest, cm_3) = decode_tze_prefix::<WireFelt>(rest).unwrap();
-        assert_eq!(wire_to_felt(cm_3).unwrap(), req.cm_3);
-        let (rest, proof) = decode_tze_prefix::<WireEncodedProof>(rest).unwrap();
-        let decoded_proof = encoded_proof_from_wire(proof).unwrap();
-        assert_eq!(decoded_proof.proof_bytes, req.proof.proof_bytes);
-        let (rest, enc_1) = decode_tze_prefix::<WireEncodedNote>(rest).unwrap();
-        let decoded_enc_1 = encoded_note_from_wire(enc_1).unwrap();
-        assert_eq!(decoded_enc_1.ct_d, req.enc_1.ct_d);
-        let (rest, enc_2) = decode_tze_prefix::<WireEncodedNote>(rest).unwrap();
-        let decoded_enc_2 = encoded_note_from_wire(enc_2).unwrap();
-        assert_eq!(decoded_enc_2.ct_d, req.enc_2.ct_d);
-        let (rest, enc_3) = decode_tze_prefix::<WireEncodedNote>(rest).unwrap();
-        let decoded_enc_3 = encoded_note_from_wire(enc_3).unwrap();
-        assert_eq!(decoded_enc_3.ct_d, req.enc_3.ct_d);
-        assert!(rest.is_empty());
-    }
-
-    #[test]
-    fn kernel_unshield_wire_struct_roundtrips() {
-        let req = KernelUnshieldReq {
-            root: [1u8; 32],
-            nullifiers: vec![[2u8; 32]],
-            v_pub: 33,
-            fee: 4,
-            recipient: "bob".into(),
-            cm_change: [4u8; 32],
-            enc_change: Some(sample_encrypted_note(0x33)),
-            cm_fee: [5u8; 32],
-            enc_fee: sample_encrypted_note(0x44),
-            proof: sample_kernel_stark_proof(),
-        };
-        let wire = kernel_unshield_req_to_wire(&req).unwrap();
-        let encoded = encode_tze(&wire).unwrap();
-        let decoded: WireKernelUnshieldReq = decode_tze(&encoded).unwrap();
-        let host = kernel_unshield_req_from_wire(decoded).unwrap();
-        assert_eq!(host.root, req.root);
-        assert_eq!(host.nullifiers, req.nullifiers);
-        assert_eq!(host.v_pub, req.v_pub);
-        assert_eq!(host.fee, req.fee);
-        assert_eq!(host.recipient, req.recipient);
-        assert_eq!(host.cm_change, req.cm_change);
-        assert_eq!(host.cm_fee, req.cm_fee);
-        let host_change = host.enc_change.expect("missing decoded change note");
-        let req_change = req.enc_change.expect("missing original change note");
-        assert_eq!(host_change.ct_d, req_change.ct_d);
-        assert_eq!(host_change.tag, req_change.tag);
-        assert_eq!(host_change.ct_v, req_change.ct_v);
-        assert_eq!(host_change.encrypted_data, req_change.encrypted_data);
-        assert_eq!(host.enc_fee.ct_d, req.enc_fee.ct_d);
-        assert_eq!(host.enc_fee.tag, req.enc_fee.tag);
-        assert_eq!(host.enc_fee.ct_v, req.enc_fee.ct_v);
-        assert_eq!(host.enc_fee.encrypted_data, req.enc_fee.encrypted_data);
-        assert_eq!(host.proof.proof_bytes, req.proof.proof_bytes);
-    }
-
-    #[test]
-    fn kernel_inbox_roundtrip_preserves_transfer_request() {
-        let message = KernelInboxMessage::Transfer(KernelTransferReq {
-            root: [1u8; 32],
-            nullifiers: vec![[2u8; 32]],
-            fee: 5,
-            cm_1: [4u8; 32],
-            cm_2: [5u8; 32],
-            cm_3: [6u8; 32],
-            enc_1: sample_encrypted_note(0x11),
-            enc_2: sample_encrypted_note(0x22),
-            enc_3: sample_encrypted_note(0x33),
-            proof: sample_kernel_stark_proof(),
-        });
-        let encoded = encode_kernel_inbox_message(&message).unwrap();
-        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
-        match decoded {
-            KernelInboxMessage::Transfer(req) => {
-                assert_eq!(
-                    req.proof.proof_bytes,
-                    sample_kernel_stark_proof().proof_bytes
-                );
-                assert_eq!(req.root, [1u8; 32]);
-                assert_eq!(req.nullifiers, vec![[2u8; 32]]);
-                assert_eq!(req.fee, 5);
-                assert_eq!(req.cm_1, [4u8; 32]);
-                assert_eq!(req.cm_2, [5u8; 32]);
-                assert_eq!(req.cm_3, [6u8; 32]);
-                assert_eq!(req.enc_1.ct_d, sample_encrypted_note(0x11).ct_d);
-                assert_eq!(req.enc_2.ct_v, sample_encrypted_note(0x22).ct_v);
-                assert_eq!(req.enc_3.tag, sample_encrypted_note(0x33).tag);
-            }
-            other => panic!("unexpected decoded message: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn kernel_inbox_roundtrip_preserves_unshield_request() {
-        let message = KernelInboxMessage::Unshield(KernelUnshieldReq {
-            root: [1u8; 32],
-            nullifiers: vec![[2u8; 32]],
-            v_pub: 33,
-            fee: 6,
-            recipient: "bob".into(),
-            cm_change: [4u8; 32],
-            enc_change: Some(sample_encrypted_note(0x33)),
-            cm_fee: [5u8; 32],
-            enc_fee: sample_encrypted_note(0x44),
-            proof: sample_kernel_stark_proof(),
-        });
-        let encoded = encode_kernel_inbox_message(&message).unwrap();
-        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
-        match decoded {
-            KernelInboxMessage::Unshield(req) => {
-                assert_eq!(
-                    req.proof.proof_bytes,
-                    sample_kernel_stark_proof().proof_bytes
-                );
-                assert_eq!(req.root, [1u8; 32]);
-                assert_eq!(req.nullifiers, vec![[2u8; 32]]);
-                assert_eq!(req.v_pub, 33);
-                assert_eq!(req.fee, 6);
-                assert_eq!(req.recipient, "bob");
-                assert_eq!(req.cm_change, [4u8; 32]);
-                assert_eq!(req.cm_fee, [5u8; 32]);
-                assert_eq!(
-                    req.enc_change.as_ref().unwrap().encrypted_data,
-                    sample_encrypted_note(0x33).encrypted_data
-                );
-                assert_eq!(req.enc_fee.ct_d, sample_encrypted_note(0x44).ct_d);
-            }
-            other => panic!("unexpected decoded message: {:?}", other),
-        }
-    }
 
     fn sample_encrypted_note(fill: u8) -> EncryptedNote {
         EncryptedNote {
@@ -2258,157 +1622,7 @@ mod tests {
         }
     }
 
-    fn sample_kernel_stark_proof() -> KernelStarkProof {
-        KernelStarkProof {
-            proof_bytes: vec![0xaa, 0xbb, 0xcc],
-            output_preimage: vec![[7u8; 32], [8u8; 32]],
-        }
-    }
-
     proptest! {
-        #[test]
-        fn prop_kernel_shield_roundtrip_preserves_fields(
-            pubkey_hash in arb_felt(),
-            fee in any::<u64>(),
-            v in any::<u64>(),
-            producer_fee in 1u64..u64::MAX,
-            proof in arb_kernel_stark_proof(),
-            client_cm in arb_felt(),
-            client_enc in arb_encrypted_note(),
-            producer_cm in arb_felt(),
-            producer_enc in arb_encrypted_note(),
-        ) {
-            let message = KernelInboxMessage::Shield(KernelShieldReq {
-                pubkey_hash,
-                fee,
-                v,
-                producer_fee,
-                proof: proof.clone(),
-                client_cm,
-                client_enc: client_enc.clone(),
-                producer_cm,
-                producer_enc: producer_enc.clone(),
-            });
-
-            let encoded = encode_kernel_inbox_message(&message).unwrap();
-            let decoded = decode_kernel_inbox_message(&encoded).unwrap();
-            let KernelInboxMessage::Shield(req) = decoded else {
-                panic!("decoded wrong kernel message variant");
-            };
-            prop_assert_eq!(req.pubkey_hash, pubkey_hash);
-            prop_assert_eq!(req.fee, fee);
-            prop_assert_eq!(req.v, v);
-            prop_assert_eq!(req.producer_fee, producer_fee);
-            prop_assert_eq!(req.client_cm, client_cm);
-            prop_assert_eq!(&req.client_enc.ct_d, &client_enc.ct_d);
-            prop_assert_eq!(req.client_enc.tag, client_enc.tag);
-            prop_assert_eq!(&req.client_enc.ct_v, &client_enc.ct_v);
-            prop_assert_eq!(&req.client_enc.encrypted_data, &client_enc.encrypted_data);
-            prop_assert_eq!(req.producer_cm, producer_cm);
-            prop_assert_eq!(&req.producer_enc.ct_d, &producer_enc.ct_d);
-            prop_assert_eq!(req.proof.proof_bytes, proof.proof_bytes);
-            prop_assert_eq!(req.proof.output_preimage, proof.output_preimage);
-        }
-
-        #[test]
-        fn prop_kernel_transfer_roundtrip_preserves_fields(
-            root in arb_felt(),
-            nullifiers in prop::collection::vec(arb_felt(), 0..8),
-            fee in any::<u64>(),
-            cm_1 in arb_felt(),
-            cm_2 in arb_felt(),
-            cm_3 in arb_felt(),
-            enc_1 in arb_encrypted_note(),
-            enc_2 in arb_encrypted_note(),
-            enc_3 in arb_encrypted_note(),
-            proof in arb_kernel_stark_proof(),
-        ) {
-            let req = KernelTransferReq {
-                root,
-                nullifiers: nullifiers.clone(),
-                fee,
-                cm_1,
-                cm_2,
-                cm_3,
-                enc_1: enc_1.clone(),
-                enc_2: enc_2.clone(),
-                enc_3: enc_3.clone(),
-                proof: proof.clone(),
-            };
-
-            let wire = kernel_transfer_req_to_wire(&req).unwrap();
-            let decoded = kernel_transfer_req_from_wire(wire).unwrap();
-            prop_assert_eq!(decoded.root, root);
-            prop_assert_eq!(decoded.nullifiers, nullifiers);
-            prop_assert_eq!(decoded.fee, fee);
-            prop_assert_eq!(decoded.cm_1, cm_1);
-            prop_assert_eq!(decoded.cm_2, cm_2);
-            prop_assert_eq!(decoded.cm_3, cm_3);
-            prop_assert_eq!(decoded.enc_1.ct_d, enc_1.ct_d);
-            prop_assert_eq!(decoded.enc_1.tag, enc_1.tag);
-            prop_assert_eq!(decoded.enc_1.ct_v, enc_1.ct_v);
-            prop_assert_eq!(decoded.enc_1.encrypted_data, enc_1.encrypted_data);
-            prop_assert_eq!(decoded.enc_2.ct_d, enc_2.ct_d);
-            prop_assert_eq!(decoded.enc_2.tag, enc_2.tag);
-            prop_assert_eq!(decoded.enc_2.ct_v, enc_2.ct_v);
-            prop_assert_eq!(decoded.enc_2.encrypted_data, enc_2.encrypted_data);
-            prop_assert_eq!(decoded.enc_3.ct_d, enc_3.ct_d);
-            prop_assert_eq!(decoded.enc_3.tag, enc_3.tag);
-            prop_assert_eq!(decoded.enc_3.ct_v, enc_3.ct_v);
-            prop_assert_eq!(decoded.enc_3.encrypted_data, enc_3.encrypted_data);
-            prop_assert_eq!(decoded.proof.proof_bytes, proof.proof_bytes);
-            prop_assert_eq!(decoded.proof.output_preimage, proof.output_preimage);
-        }
-
-        #[test]
-        fn prop_kernel_unshield_roundtrip_preserves_fields(
-            root in arb_felt(),
-            nullifiers in prop::collection::vec(arb_felt(), 0..8),
-            v_pub in any::<u64>(),
-            fee in any::<u64>(),
-            recipient in small_string(32),
-            cm_change in arb_felt(),
-            enc_change in prop::option::of(arb_encrypted_note()),
-            cm_fee in arb_felt(),
-            enc_fee in arb_encrypted_note(),
-            proof in arb_kernel_stark_proof(),
-        ) {
-            let req = KernelUnshieldReq {
-                root,
-                nullifiers: nullifiers.clone(),
-                v_pub,
-                fee,
-                recipient: recipient.clone(),
-                cm_change,
-                enc_change: enc_change.clone(),
-                cm_fee,
-                enc_fee: enc_fee.clone(),
-                proof: proof.clone(),
-            };
-
-            let wire = kernel_unshield_req_to_wire(&req).unwrap();
-            let decoded = kernel_unshield_req_from_wire(wire).unwrap();
-            prop_assert_eq!(decoded.root, root);
-            prop_assert_eq!(decoded.nullifiers, nullifiers);
-            prop_assert_eq!(decoded.v_pub, v_pub);
-            prop_assert_eq!(decoded.fee, fee);
-            prop_assert_eq!(decoded.recipient, recipient);
-            prop_assert_eq!(decoded.cm_change, cm_change);
-            prop_assert_eq!(decoded.cm_fee, cm_fee);
-            prop_assert_eq!(decoded.enc_change.is_some(), enc_change.is_some());
-            if let (Some(actual), Some(expected)) = (decoded.enc_change.as_ref(), enc_change.as_ref()) {
-                prop_assert_eq!(&actual.ct_d, &expected.ct_d);
-                prop_assert_eq!(actual.tag, expected.tag);
-                prop_assert_eq!(&actual.ct_v, &expected.ct_v);
-                prop_assert_eq!(&actual.encrypted_data, &expected.encrypted_data);
-            }
-            prop_assert_eq!(decoded.enc_fee.ct_d, enc_fee.ct_d);
-            prop_assert_eq!(decoded.enc_fee.tag, enc_fee.tag);
-            prop_assert_eq!(decoded.enc_fee.ct_v, enc_fee.ct_v);
-            prop_assert_eq!(decoded.enc_fee.encrypted_data, enc_fee.encrypted_data);
-            prop_assert_eq!(decoded.proof.proof_bytes, proof.proof_bytes);
-            prop_assert_eq!(decoded.proof.output_preimage, proof.output_preimage);
-        }
 
         #[test]
         fn prop_kernel_result_roundtrip_preserves_payload(
@@ -2618,135 +1832,6 @@ mod tests {
             prop_assert_eq!(unshield_host.enc_fee.ct_d, enc_fee.ct_d);
         }
 
-        #[test]
-        fn prop_transfer_payload_rejects_trailing_bytes(
-            req_root in arb_felt(),
-            nullifiers in prop::collection::vec(arb_felt(), 0..6),
-            fee in any::<u64>(),
-            cm_1 in arb_felt(),
-            cm_2 in arb_felt(),
-            cm_3 in arb_felt(),
-            enc_1 in arb_encrypted_note(),
-            enc_2 in arb_encrypted_note(),
-            enc_3 in arb_encrypted_note(),
-            proof in arb_kernel_stark_proof(),
-            trailing in prop::collection::vec(any::<u8>(), 1..8),
-        ) {
-            let req = KernelTransferReq {
-                root: req_root,
-                nullifiers,
-                fee,
-                cm_1,
-                cm_2,
-                cm_3,
-                enc_1,
-                enc_2,
-                enc_3,
-                proof,
-            };
-            let mut wire = kernel_transfer_req_to_wire(&req).unwrap();
-            wire.bytes.extend_from_slice(&trailing);
-            let err = kernel_transfer_req_from_wire(wire).unwrap_err();
-            prop_assert!(err.contains("trailing bytes"));
-        }
-
-        #[test]
-        fn prop_transfer_payload_rejects_truncation(
-            req_root in arb_felt(),
-            nullifiers in prop::collection::vec(arb_felt(), 0..6),
-            fee in any::<u64>(),
-            cm_1 in arb_felt(),
-            cm_2 in arb_felt(),
-            cm_3 in arb_felt(),
-            enc_1 in arb_encrypted_note(),
-            enc_2 in arb_encrypted_note(),
-            enc_3 in arb_encrypted_note(),
-            proof in arb_kernel_stark_proof(),
-            cut in 1usize..8,
-        ) {
-            let req = KernelTransferReq {
-                root: req_root,
-                nullifiers,
-                fee,
-                cm_1,
-                cm_2,
-                cm_3,
-                enc_1,
-                enc_2,
-                enc_3,
-                proof,
-            };
-            let mut wire = kernel_transfer_req_to_wire(&req).unwrap();
-            prop_assume!(wire.bytes.len() > cut);
-            wire.bytes.truncate(wire.bytes.len() - cut);
-            let err = kernel_transfer_req_from_wire(wire).unwrap_err();
-            prop_assert!(err.contains("read failed") || err.contains("trailing bytes"));
-        }
-
-        #[test]
-        fn prop_unshield_payload_rejects_trailing_bytes(
-            req_root in arb_felt(),
-            nullifiers in prop::collection::vec(arb_felt(), 0..6),
-            v_pub in any::<u64>(),
-            fee in any::<u64>(),
-            recipient in small_string(32),
-            cm_change in arb_felt(),
-            enc_change in prop::option::of(arb_encrypted_note()),
-            cm_fee in arb_felt(),
-            enc_fee in arb_encrypted_note(),
-            proof in arb_kernel_stark_proof(),
-            trailing in prop::collection::vec(any::<u8>(), 1..8),
-        ) {
-            let req = KernelUnshieldReq {
-                root: req_root,
-                nullifiers,
-                v_pub,
-                fee,
-                recipient,
-                cm_change,
-                enc_change,
-                cm_fee,
-                enc_fee,
-                proof,
-            };
-            let mut wire = kernel_unshield_req_to_wire(&req).unwrap();
-            wire.bytes.extend_from_slice(&trailing);
-            let err = kernel_unshield_req_from_wire(wire).unwrap_err();
-            prop_assert!(err.contains("trailing bytes"));
-        }
-
-        #[test]
-        fn prop_unshield_payload_rejects_truncation(
-            req_root in arb_felt(),
-            nullifiers in prop::collection::vec(arb_felt(), 0..6),
-            v_pub in any::<u64>(),
-            fee in any::<u64>(),
-            recipient in small_string(32),
-            cm_change in arb_felt(),
-            enc_change in prop::option::of(arb_encrypted_note()),
-            cm_fee in arb_felt(),
-            enc_fee in arb_encrypted_note(),
-            proof in arb_kernel_stark_proof(),
-            cut in 1usize..8,
-        ) {
-            let req = KernelUnshieldReq {
-                root: req_root,
-                nullifiers,
-                v_pub,
-                fee,
-                recipient,
-                cm_change,
-                enc_change,
-                cm_fee,
-                enc_fee,
-                proof,
-            };
-            let mut wire = kernel_unshield_req_to_wire(&req).unwrap();
-            prop_assume!(wire.bytes.len() > cut);
-            wire.bytes.truncate(wire.bytes.len() - cut);
-            let err = kernel_unshield_req_from_wire(wire).unwrap_err();
-            prop_assert!(err.contains("read failed") || err.contains("trailing bytes"));
-        }
     }
 
     #[test]
@@ -2907,43 +1992,6 @@ mod tests {
         .unwrap();
         let err = decode_kernel_result(&bytes).unwrap_err();
         assert!(err.contains("invalid staged result sealed flag"));
-    }
-
-    #[test]
-    fn kernel_proof_to_wire_rejects_oversized_output_preimage() {
-        let proof = KernelStarkProof {
-            proof_bytes: vec![1, 2, 3],
-            output_preimage: vec![[9u8; 32]; MAX_OUTPUT_PREIMAGE_ITEMS + 1],
-        };
-        let err = kernel_proof_to_wire(&proof).unwrap_err();
-        assert!(err.contains("output_preimage too long for kernel wire"));
-    }
-
-    #[test]
-    fn kernel_proof_from_wire_rejects_trailing_metadata_bytes() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(3u32).to_be_bytes());
-        bytes.extend_from_slice(&[1, 2, 3]);
-        bytes.extend_from_slice(&(1u32).to_be_bytes());
-        bytes.extend_from_slice(&ZERO);
-        bytes.extend_from_slice(&(4u32).to_be_bytes());
-        bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        let err = kernel_proof_from_wire(WireStarkProof { bytes }).unwrap_err();
-        assert!(err.contains("trailing bytes"));
-    }
-
-    #[test]
-    fn encoded_note_to_wire_rejects_invalid_note() {
-        let err = encoded_note_to_wire(&EncryptedNote {
-            ct_d: vec![0; ML_KEM768_CIPHERTEXT_BYTES - 1],
-            tag: 0,
-            ct_v: vec![0; ML_KEM768_CIPHERTEXT_BYTES],
-            nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
-            encrypted_data: vec![0; ENCRYPTED_NOTE_BYTES],
-            outgoing_ct: vec![0; OUTGOING_RECOVERY_CT_BYTES],
-        })
-        .unwrap_err();
-        assert!(err.contains("bad ct_d length"));
     }
 
     // --- v18 StageChunk / SubmitOps ---

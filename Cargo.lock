@@ -1453,8 +1453,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7a4d3ec6524d28a329fc53654bbadc9bdd7b0431f5d65f1a56ffb28a1ee5283"
 dependencies = [
  "find-msvc-tools",
- "jobserver",
- "libc",
  "shlex",
 ]
 
@@ -1514,59 +1512,6 @@ dependencies = [
  "crypto-common 0.1.7",
  "inout",
  "zeroize",
-]
-
-[[package]]
-name = "circuit-common"
-version = "0.1.0"
-source = "git+https://github.com/starkware-libs/stwo-circuits?rev=2bf051f#2bf051f09f4d0ba1b886abb00299f2e6bdbf89b7"
-dependencies = [
- "circuits",
- "circuits-stark-verifier",
- "itertools 0.12.1",
- "rand_chacha 0.3.1",
- "stwo",
- "stwo-cairo-common",
- "stwo-constraint-framework",
-]
-
-[[package]]
-name = "circuit-multiverifier"
-version = "0.1.0"
-source = "git+https://github.com/starkware-libs/stwo-circuits?rev=2bf051f#2bf051f09f4d0ba1b886abb00299f2e6bdbf89b7"
-dependencies = [
- "circuit-common",
- "circuit-verifier",
- "circuits",
- "circuits-stark-verifier",
- "itertools 0.12.1",
- "stwo",
- "stwo-constraint-framework",
-]
-
-[[package]]
-name = "circuit-serialize"
-version = "0.1.0"
-source = "git+https://github.com/starkware-libs/stwo-circuits?rev=2bf051f#2bf051f09f4d0ba1b886abb00299f2e6bdbf89b7"
-dependencies = [
- "circuits",
- "circuits-stark-verifier",
- "stwo",
-]
-
-[[package]]
-name = "circuit-verifier"
-version = "0.1.0"
-source = "git+https://github.com/starkware-libs/stwo-circuits?rev=2bf051f#2bf051f09f4d0ba1b886abb00299f2e6bdbf89b7"
-dependencies = [
- "circuit-common",
- "circuits",
- "circuits-stark-verifier",
- "indexmap",
- "itertools 0.12.1",
- "num-traits",
- "stwo",
- "stwo-constraint-framework",
 ]
 
 [[package]]
@@ -2956,16 +2901,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jobserver"
-version = "0.1.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9afb3de4395d6b3e67a780b6de64b51c978ecf11cb9a462c66be7d4ca9039d33"
-dependencies = [
- "getrandom 0.3.4",
- "libc",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.94"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3624,12 +3559,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "pkg-config"
-version = "0.3.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "poly1305"
@@ -5726,9 +5655,6 @@ dependencies = [
  "ark-groth16",
  "ark-serialize 0.5.0",
  "cairo-program-runner-lib",
- "circuit-multiverifier",
- "circuit-serialize",
- "circuit-verifier",
  "circuits",
  "circuits-stark-verifier",
  "getrandom 0.2.17",
@@ -5739,9 +5665,7 @@ dependencies = [
  "sha2 0.10.9",
  "starknet-types-core",
  "stwo",
- "stwo-constraint-framework",
  "tzel-core",
- "zstd",
 ]
 
 [[package]]
@@ -6480,34 +6404,6 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[package]]
-name = "zstd"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
-dependencies = [
- "zstd-safe",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "7.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
-dependencies = [
- "zstd-sys",
-]
-
-[[package]]
-name = "zstd-sys"
-version = "2.0.16+zstd.1.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
-dependencies = [
- "cc",
- "pkg-config",
-]
 
 [[patch.unused]]
 name = "creusot-std"

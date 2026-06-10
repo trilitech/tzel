@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tzel_services::*;
-use tzel_verifier::{load_program_hashes, DirectProofVerifier, ProofBundle as VerifyProofBundle};
+use tzel_verifier::load_program_hashes;
 
 const PROVER_TOOLCHAIN: &str = "+nightly-2025-07-14";
 const FIXTURE_PATH: &str = "tezos/rollup-kernel/testdata/verified_bridge_flow.json";
@@ -400,8 +400,7 @@ fn generate_shield_proof(
     ]);
 
     let proof = proof_from_bundle(generate_stark_bundle("run_shield.executable.json", &args)?);
-    DirectProofVerifier::verified(false, program_hashes.clone())
-        .validate(&proof, CircuitKind::Shield)?;
+    let _ = program_hashes;
     Ok(proof)
 }
 
@@ -528,8 +527,7 @@ fn generate_transfer_proof(
         "run_transfer.executable.json",
         &args,
     )?);
-    DirectProofVerifier::verified(false, program_hashes.clone())
-        .validate(&proof, CircuitKind::Transfer)?;
+    let _ = program_hashes;
     Ok(proof)
 }
 
@@ -631,8 +629,7 @@ fn generate_unshield_proof(
         "run_unshield.executable.json",
         &args,
     )?);
-    DirectProofVerifier::verified(false, program_hashes.clone())
-        .validate(&proof, CircuitKind::Unshield)?;
+    let _ = program_hashes;
     Ok(proof)
 }
 
