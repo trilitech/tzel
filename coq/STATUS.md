@@ -1070,6 +1070,24 @@ nullifier/commitment binding.
   validate the extracted FUNCTIONS, but this is the only check that the
   relation PROPS are satisfiable, which fuzzing cannot establish.
 
+- **FULL ShieldRelation INHABITATION — airtight non-vacuity
+  (`Impl/Shield.v`):** completes the non-vacuity work. Last iteration's
+  XmssInhabited proved the XMSS conjunct satisfiable; this proves the
+  WHOLE ShieldRelation is satisfiable by a single concrete witness, so
+  shield_relation_sound : ShieldRelation -> Phi_shield is provably NOT
+  vacuously true. shield_relation_inhabited (zero admits): an honest
+  shield (outputs whose commitments are the hash of their fields, the
+  producer pinned to tez with v=1>0, the canonical pubkey-hash fold,
+  and an honest WOTS+ signature under the recipient's auth tree)
+  satisfies every conjunct at once. The construction fixes the key
+  first so the committed auth_root is the signature's own computed root
+  (no circularity). A helper lemma xmss_honest_verifies isolates the
+  XMSS-verify reasoning from the output-record construction (so the
+  conjunction proof applies it without unfolding the record poses).
+  Under the wots_digits well-formedness facts the real base-w
+  decomposition satisfies. So a modeling error making ShieldRelation
+  self-contradictory is ruled out — a check fuzzing cannot perform.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

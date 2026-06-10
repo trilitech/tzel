@@ -52,6 +52,9 @@ From Spec Require Shield.
 From Stdlib Require Import List Arith.
 Import ListNotations.
 From Spec Require Hashes.
+From Spec Require Merkle.
+From Spec Require Xmss.
+From Stdlib Require Import Lia.
 From Impl Require Transfer.
 
 (** ** The Cairo-shaped shield relation
@@ -223,6 +226,93 @@ Section ShieldRelation.
     - (* sighash completeness: definitional *)
       unfold Spec.Shield.phi_shield_sighash, s_relation_sighash.
       cbn. reflexivity.
+  Qed.
+
+  (** Helper for the non-vacuity proof below: an HONEST WOTS+/XMSS
+      signature verifies under the Cairo separated-hash verifier.  Kept
+      free of the output-record construction so the inhabitation proof
+      can [apply] it without unfolding local definitions. *)
+  Lemma xmss_honest_verifies :
+    forall (ps : Felt) (msg : list nat) (sks sib : list Felt) (leaf : Felt),
+      length msg = length sks ->
+      Forall (fun d => d <= Spec.Hashes.wots_chain_len) msg ->
+      Spec.Xmss.ltree (H_ltree_node ps 0)
+        (Spec.Xmss.gen_pk F_chain ADRS_chain ps 0 0 sks) = Some leaf ->
+      length sib = Spec.Hashes.auth_depth ->
+      Spec.Xmss.xmss_verify_cairo_sep
+        (H_tree_node ps) (H_ltree_node ps 0) F_chain ADRS_chain ps 0
+        msg (Spec.Xmss.sign F_chain ADRS_chain ps 0 0 msg sks) sib
+        (Spec.Merkle.auth_root (H_tree_node ps)
+           (Spec.Xmss.nat_to_bits Spec.Hashes.auth_depth 0) sib leaf 0 0).
+  Proof.
+    intros ps msg sks sib leaf Hlen Hbd Hleaf Hsib.
+    unfold Spec.Xmss.xmss_verify_cairo_sep.
+    rewrite (Spec.Xmss.recover_all_correct F_chain ADRS_chain ps 0 0 msg sks Hlen Hbd).
+    rewrite Hleaf.
+    unfold Spec.Xmss.auth_verify. split; [exact Hsib | split].
+    - assert (2 ^ Spec.Hashes.auth_depth <> 0) by (apply Nat.pow_nonzero; lia). lia.
+    - reflexivity.
+  Qed.
+
+  Lemma sign_len_eq :
+    forall (ps : Felt) (ki sc : nat) (digits : list nat) (sks : list Felt),
+      length digits = length sks ->
+      length (Spec.Xmss.sign F_chain ADRS_chain ps ki sc digits sks) = length digits.
+  Proof.
+    intros ps ki sc digits. revert sc.
+    induction digits as [| d ds IH]; intros sc [| sk rest] Hlen; cbn in *;
+      try discriminate Hlen; [reflexivity |].
+    f_equal. apply IH. lia.
+  Qed.
+
+  (** NON-VACUITY: a single concrete honest shield satisfies every
+      conjunct of [ShieldRelation] at once, so [shield_relation_sound]
+      is not vacuously true. *)
+  Theorem shield_relation_inhabited
+      (auth_domain blind : Felt) (sks : list Felt)
+      (Hsks_len : length sks = Spec.Hashes.wots_chains)
+      (Hsks_ne  : sks <> nil)
+      (Hwd_len  : forall sh, length (wots_digits sh) = Spec.Hashes.wots_chains)
+      (Hwd_bd   : forall sh, Forall (fun d => d <= Spec.Hashes.wots_chain_len) (wots_digits sh)) :
+    exists pubkey_hash fee auth_idx wots_sig auth_siblings r p,
+      ShieldRelation auth_domain pubkey_hash fee blind auth_idx
+                     wots_sig auth_siblings r p.
+  Proof.
+    pose (aD := auth_domain).
+    pose (sib := repeat aD Spec.Hashes.auth_depth).
+    assert (Hgpk : Spec.Xmss.gen_pk F_chain ADRS_chain aD 0 0 sks <> nil).
+    { destruct sks as [| sk rest]; [contradiction | cbn [Spec.Xmss.gen_pk]; discriminate]. }
+    destruct (Spec.Xmss.ltree_succeeds (H_ltree_node aD 0)
+                (Spec.Xmss.gen_pk F_chain ADRS_chain aD 0 0 sks) Hgpk) as [leaf Hleaf].
+    pose (ar := Spec.Merkle.auth_root (H_tree_node aD)
+                  (Spec.Xmss.nat_to_bits Spec.Hashes.auth_depth 0) sib leaf 0 0).
+    pose (r := Impl.Transfer.mkCairoOutput
+                 (H_commit aD (felt_of_nat 0) asset_tez (H_rcm aD) (H_owner ar aD aD))
+                 aD 0 aD ar aD aD aD asset_tez).
+    pose (p := Impl.Transfer.mkCairoOutput
+                 (H_commit aD (felt_of_nat 1) asset_tez (H_rcm aD) (H_owner aD aD aD))
+                 aD 1 aD aD aD aD aD asset_tez).
+    pose (pkh := relation_pubkey_hash auth_domain r blind).
+    exists pkh, 0, 0,
+      (Spec.Xmss.sign F_chain ADRS_chain aD 0 0
+         (wots_digits (s_relation_sighash auth_domain pkh 0 r p)) sks),
+      sib, r, p.
+    assert (Hdlen : length (wots_digits (s_relation_sighash auth_domain pkh 0 r p))
+                    = length sks) by (rewrite Hwd_len; exact (eq_sym Hsks_len)).
+    unfold ShieldRelation. cbv zeta.
+    refine (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ _)))))).
+    - rewrite sign_len_eq by exact Hdlen. apply Hwd_len.
+    - reflexivity.
+    - reflexivity.
+    - reflexivity.
+    - cbn. apply Nat.lt_0_succ.
+    - reflexivity.
+    - change (co_pub_seed r) with aD. change (co_auth_root r) with ar.
+      apply (xmss_honest_verifies aD
+               (wots_digits (s_relation_sighash auth_domain pkh 0 r p))
+               sks sib leaf Hdlen
+               (Hwd_bd (s_relation_sighash auth_domain pkh 0 r p)) Hleaf).
+      apply repeat_length.
   Qed.
 
 End ShieldRelation.
