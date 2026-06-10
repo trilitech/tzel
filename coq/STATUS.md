@@ -553,6 +553,23 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   - concrete corollaries: deposit/applied-shield/valid-root keys can
     never alias a nullifier path, etc.
 
+- **DEPOSIT POOL KEY INJECTIVITY (`Spec/DepositKey.v`):** complements
+  StoragePaths (cross-TYPE) with WITHIN-deposit injectivity. A pool is
+  keyed by hex(asset) ++ "/" ++ hex(pubkey) (deposit_balance_path);
+  if two distinct (asset, pubkey) pools shared a key their balances
+  would COMMINGLE in one slot (theft). Proved (zero admits):
+  - append_eq_fixed: equal-length string prefixes split an append
+    equality uniquely — the fixed-width framing lemma;
+  - deposit_key_injective: distinct (asset, pubkey) -> distinct keys,
+    given hex injective + fixed-width;
+  - GROUNDED, not assumed: a concrete byte-level hex (each byte -> two
+    nibble chars) is proved fixed-width (hexs_len) and injective
+    (hexs_inj), the latter from nibble-map injectivity (nib_inj, via a
+    left inverse over the 16 hex chars) + the fixed-width framing;
+  - deposit_key_bytes_injective: the concrete corollary for 32-byte
+    felts — distinct pools never share a durable slot, using the real
+    hex encoding, no assumed injectivity.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

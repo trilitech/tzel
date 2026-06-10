@@ -25,6 +25,7 @@ Spec/MerkleTree.v
 Spec/ShieldReplay.v
 Spec/WithdrawalRecord.v
 Spec/StoragePaths.v
+Spec/DepositKey.v
 
 Impl/Common.v
 Impl/Hashes.v
