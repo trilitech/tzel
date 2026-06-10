@@ -459,12 +459,21 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   covering TWO distinct attacks: double-spend (nullifiers) and
   shield-replay note-duplication (commitments).
 
-- **STILL OPEN (hard, deferred):** the GENERAL append-only Merkle
-  frontier correctness for arbitrary append indices (the per-level
-  frontier invariant). MerkleTree proves the first-leaf case +
-  zero-subtree; the general case (bottom-up frontier vs top-down
-  recursive root, with the bit-indexed frontier invariant) is a
-  genuine multi-step proof.
+- **GENERAL MERKLE FRONTIER CORRECTNESS (closed — `Spec/MerkleTree.v`):**
+  the previously-deferred hard item, now proved for ARBITRARY append
+  index. Key move: a top-down recursive model `tdfront d pre cm`
+  (insert cm at position length pre) that carries the prefix
+  explicitly, so the stored left-subtree roots become
+  `mroot d' (firstn (2^d') pre)` — exactly what the kernel stores as
+  branches[]. `tdfront_correct`: length pre < 2^d -> tdfront d pre cm
+  = mroot d (pre ++ [cm]). Every insertion, not just the first,
+  computes the true batch Merkle root with O(depth) state — clean
+  induction on depth with the left/right half case split (firstn/
+  skipn + mroot_nil). `mroot_nil` (recursive batch root of [] =
+  zero_hash d) ties it to the empty-subtree result. Faithfulness:
+  tdfront is the top-down form of the kernel's bottom-up frontier
+  loop (same stored data = completed-left-subtree roots, same root);
+  the loop direction is an implementation detail.
 
 ## Not done
 
