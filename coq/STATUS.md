@@ -243,10 +243,26 @@ refinement + extraction + conformance), the same shape repeats for:
     (`dune test coq_driver/test`, 15k random witnesses/run:
     10k single chain-step + 5k iterated) after the smoke vector —
     previously the harness existed but no workflow executed it.
-  Remaining: realize the FULL transfer/unshield/shield relations'
-  hash / digit / node parameters at extraction (chain-step is done)
-  and add Cairo-side `run_*` runners so the differential covers
-  whole-circuit conformance, not just the WOTS chain step.
+  COMMITMENT CONFORMANCE (this iteration):
+  - `Impl/Hashes.v`: added `Hash5` (the 5-input multiasset
+    commitment hash) + top-level `commit` + `commit_refines_spec`
+    (commit = Spec.Hashes.commitment under H_commit := Hash5,
+    mirroring Impl.Wots.refines_spec).
+  - `Impl/Extraction.v`: realizes `Hash5` => `Tzel.Hash.hash_commit`
+    and extracts `commit` alongside `xmss_chain_step`.
+  - Differential harness now covers the commitment: 10k random
+    5-felt fuzz cases (asset drawn from the FULL felt range, so the
+    multiasset binding is exercised) PLUS a non-tautological
+    golden-vector case pinning the extracted Coq `commit` to
+    `commitment_u64_max_v1.json` — the same fixture Rust core checks
+    and the cross-impl interop derives from Cairo. So the
+    commitment now has Rocq <-> OCaml <-> Cairo transitive
+    assurance, byte-for-byte against a golden value (not just
+    structural).
+  Remaining: extend the same extract-and-differential pattern to
+  the merkle root and sighash fold, then realize the FULL
+  transfer/unshield/shield relations + Cairo-side `run_*` runners
+  for whole-circuit conformance.
 
 ## Open questions / decisions deferred
 

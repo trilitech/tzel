@@ -29,6 +29,14 @@ let felt_to_hex (b : bytes) : string =
   done;
   Buffer.contents buf
 
+let felt_of_hex (s : string) : bytes =
+  assert (String.length s = 64);
+  let b = Bytes.create 32 in
+  for i = 0 to 31 do
+    Bytes.set_uint8 b i (int_of_string ("0x" ^ String.sub s (2 * i) 2))
+  done;
+  b
+
 (** The OCaml protocol port's xmss_chain_step — our reference. *)
 let port_chain_step x pub_seed key_idx chain_idx step =
   Tzel.Wots.xmss_chain_step x pub_seed key_idx chain_idx step
@@ -36,6 +44,20 @@ let port_chain_step x pub_seed key_idx chain_idx step =
 (** The Rocq-extracted xmss_chain_step — what we're testing. *)
 let extracted_chain_step x pub_seed key_idx chain_idx step =
   Tzel_wots.xmss_chain_step x pub_seed key_idx chain_idx step
+
+(** The OCaml protocol port's commitment hash — our reference.
+    [Tzel.Hash.hash_commit d v asset rcm owner_tag] is the same
+    function the cross-impl interop check pins bit-equivalent to the
+    Cairo [hash5] (and that the commitment_u64_max_v1.json fixture
+    covers), so a pass here extends the Rocq ↔ OCaml ↔ Cairo
+    transitive assurance from the WOTS chain step to the
+    multiasset note commitment — where the hidden asset tag binds. *)
+let port_commit d v asset rcm owner_tag =
+  Tzel.Hash.hash_commit d v asset rcm owner_tag
+
+(** The Rocq-extracted commitment — what we're testing. *)
+let extracted_commit d v asset rcm owner_tag =
+  Tzel_wots.commit d v asset rcm owner_tag
 
 (** QCheck generator for chain-step inputs. *)
 let gen_chain_input =
@@ -103,8 +125,65 @@ let test_multi_step =
           let expected = port_hash_chain x pub_seed key_idx chain_idx start_step n_steps in
           Bytes.equal got expected))
 
+(** Commitment differential: five independent random felts.  The
+    asset slot is drawn from the full felt range (not just 0/tez) so
+    the fuzzer exercises the multiasset binding, including the
+    aliasing edge cases the security review cared about. *)
+let gen_commit_input =
+  QCheck.Gen.(
+    let d = random_felt () in
+    let v = random_felt () in
+    let asset = random_felt () in
+    let rcm = random_felt () in
+    let otag = random_felt () in
+    return (d, v, asset, rcm, otag))
+
+let arb_commit_input =
+  QCheck.make gen_commit_input
+    ~print:(fun (d, v, a, r, o) ->
+      Printf.sprintf "d=%s v=%s asset=%s rcm=%s otag=%s"
+        (felt_to_hex d) (felt_to_hex v) (felt_to_hex a)
+        (felt_to_hex r) (felt_to_hex o))
+
+let test_commit =
+  QCheck_alcotest.to_alcotest
+    (QCheck.Test.make ~count:10000 ~name:"commit: extracted = port"
+       arb_commit_input
+       (fun (d, v, asset, rcm, otag) ->
+          let got = extracted_commit d v asset rcm otag in
+          let expected = port_commit d v asset rcm otag in
+          Bytes.equal got expected))
+
+(** Golden-vector anchor (NON-tautological).  The fuzz differential
+    above only proves the extracted [commit] preserves argument
+    order/structure vs the OCaml port (both bottom out in
+    [Tzel.Hash.hash_commit]).  This case instead pins the extracted
+    Coq [commit] to a fixed commitment value taken from
+    [specs/test_vectors/commitment_u64_max_v1.json] — the SAME
+    golden fixture the Rust core checks in
+    [test_u64_max_commitment_fixture_matches_rust_commit_layout]
+    and that the cross-impl interop check derives from the Cairo.
+    So a pass here ties the Rocq model's commitment to the
+    Cairo/Rust reference byte-for-byte, not just to the OCaml port.
+    asset = ASSET_TEZ = felt 0 (all-zero), matching the fixture. *)
+let test_commit_golden_vector () =
+  let d_j       = felt_of_hex "0100000000000000000000000000000000000000000000000000000000000000" in
+  let value     = felt_of_hex "ffffffffffffffff000000000000000000000000000000000000000000000000" in
+  let asset_tez = felt_of_hex "0000000000000000000000000000000000000000000000000000000000000000" in
+  let rcm       = felt_of_hex "2a00000000000000000000000000000000000000000000000000000000000000" in
+  let owner_tag = felt_of_hex "6300000000000000000000000000000000000000000000000000000000000000" in
+  let expected  = felt_of_hex "667d2e8f57b593ba784306116af48ea65d9b1d30e0fe6aeb055cae5395f41e05" in
+  let got = extracted_commit d_j value asset_tez rcm owner_tag in
+  Alcotest.(check bool)
+    "extracted Coq commit reproduces the Cairo/Rust golden commitment"
+    true (Bytes.equal got expected)
+
 let () =
   Alcotest.run "extraction-diff"
     [ ("xmss_chain_step",
        [ test_single_step;
-         test_multi_step ]) ]
+         test_multi_step ]);
+      ("commitment",
+       [ test_commit;
+         Alcotest.test_case "commit golden vector (Cairo/Rust-anchored)"
+           `Quick test_commit_golden_vector ]) ]

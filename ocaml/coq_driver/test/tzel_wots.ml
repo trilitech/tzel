@@ -5,6 +5,15 @@ type felt = bytes
 
 let hash3 = Tzel.Hash.hash3
 
+(** val hash5 : felt -> felt -> felt -> felt -> felt -> felt **)
+
+let hash5 = Tzel.Hash.hash_commit
+
+(** val commit : felt -> felt -> felt -> felt -> felt -> felt **)
+
+let commit =
+  hash5
+
 (** val pack_adrs_chain : int -> int -> int -> felt **)
 
 let pack_adrs_chain = (fun key_idx chain_idx step ->

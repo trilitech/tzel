@@ -70,4 +70,10 @@ Extract Constant pack_adrs_chain =>
 Extract Inductive nat => "int" [ "0" "Stdlib.succ" ]
   "(fun fO fS n -> if n=0 then fO () else fS (n-1))".
 
-Extraction "tzel_wots.ml" xmss_chain_step.
+(** Realize [Hash5] as [Tzel.Hash.hash_commit] — the 5-felt
+    commitment hash (multiasset cmmt domain).  Bit-equivalent to the
+    Cairo [hash5] under the cross-impl interop check and the
+    regenerated [commitment_u64_max_v1.json] fixture. *)
+Extract Constant Hash5 => "Tzel.Hash.hash_commit".
+
+Extraction "tzel_wots.ml" xmss_chain_step commit.
