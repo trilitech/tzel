@@ -2,9 +2,12 @@
 
     Mirror of [cairo/src/transfer.cairo].
 
-    The Cairo file implements the [N -> 3] transfer relation: spend
-    [N] (1 ≤ N ≤ 7) input notes, produce three output commitments
-    (recipient, change, producer-fee). For each input [i], it checks:
+    The Cairo file implements the [N -> 4] multiasset transfer
+    relation: spend
+    [N] (1 ≤ N ≤ 7) input notes, produce four output commitments
+    (recipient, change_1, change_2, producer-fee), every note
+    carrying a hidden asset tag inside its commitment preimage.
+    For each input [i], it checks:
     - the input note's commitment is Merkle-included in [root]
       (via [Tzel.Merkle]),
     - the published nullifier is correctly derived from the witness,
@@ -12,10 +15,15 @@
       claimed index verifies the sighash (via [Tzel.Xmss]).
 
     For each output [j ∈ {1,2,3}], it checks the commitment is
-    well-formed: [cm_j = H_commit(d_j, v_j, rcm(rseed_j), otag_j)].
+    well-formed: [cm_j = H_commit(d_j, v_j, asset_j, rcm(rseed_j),
+    otag_j)] — 5-ary, asset included.
 
-    It then checks value conservation:
-    [sum_in = v_1 + v_2 + v_3 + fee].
+    It then checks per-asset value conservation via the
+    two-accumulator scheme (witness-declared primary non-tez asset,
+    per-entry {tez, primary} gate, separate lane equations
+    [tez_in = tez_out + fee] and [primary_in = primary_out]) —
+    see the [TwoAccumulator] section below, which proves this
+    strategy implies [Spec.Transfer.phi_value_conservation].
 
     The sighash binds every public output, so a malicious prover
     cannot redirect outputs without re-signing.
@@ -37,8 +45,11 @@
     asserts. The interesting case is when the proof DOESN'T drop out:
     that's where a missing assert lives.
 
-    Status: safety predicate defined in [Spec.Transfer];
-    implementation-side refinement pending.
+    Status: safety predicate defined in [Spec.Transfer]; the
+    value-conservation leg of the refinement is PROVED below
+    ([two_accumulator_conservation]); the full Cairo-shaped
+    [TransferRelation] record (Merkle + nullifier + XMSS legs)
+    and the assembled [Relation -> Phi] theorem are pending.
 *)
 
 From Common Require Import Felt.

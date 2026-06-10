@@ -3,11 +3,15 @@
     Mirror of [cairo/src/unshield.cairo].
 
     Unshield consumes [N] (1 ≤ N ≤ 7) input notes, emits an L1 outbox
-    transfer of [v_pub] mutez to a tz/KT1 recipient, optionally creates
-    a private change note, and creates a producer-fee note. The
+    transfer of [v_pub] units of [asset_pub] to a tz/KT1 recipient
+    (the kernel routes the burn through the ticketer registered for
+    [asset_pub]; tez exits go out as mutez), creates up to two
+    private change notes (one per asset lane under the
+    two-accumulator design), and creates a producer-fee note
+    (pinned to tez). The
     structure mirrors transfer for the input side (Merkle inclusion
     + nullifier + WOTS+ verification per input) but the outputs differ:
-    one public exit, optional change, one producer fee.
+    one public exit, two optional change slots, one producer fee.
 
     Soundness target:
 
@@ -17,8 +21,9 @@
 
     where [Phi_unshield pub] enumerates the per-input authenticity
     obligations from transfer, plus output well-formedness and the
-    value-balance equation [sum_in = v_pub + fee + producer_fee
-    + (v_change if has_change else 0)].
+    per-asset balance: for every asset [a],
+    [sum_in(a) = sum_out(a) + v_pub·[a = asset_pub] + fee·[a = tez]]
+    ([Spec.Unshield.phi_unshield_value_conservation]).
 
     The L1-side authorization (that the outbox transfer is honored
     by the kernel and L1) is a kernel-level property, not in scope
@@ -26,8 +31,11 @@
     is bound to the specific recipient and amount published as
     public outputs," which the sighash already captures.
 
-    Status: safety predicate defined in [Spec.Unshield];
-    implementation-side refinement pending.
+    Status: safety predicate defined in [Spec.Unshield]; the
+    value-conservation leg of the refinement is PROVED below
+    ([unshield_two_accumulator_conservation]); the full
+    Cairo-shaped [UnshieldRelation] and assembled [Relation -> Phi]
+    theorem are pending.
 *)
 
 From Common Require Import Felt.

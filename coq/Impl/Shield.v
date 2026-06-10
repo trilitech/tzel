@@ -2,9 +2,15 @@
 
     Mirror of [cairo/src/shield.cairo].
 
-    Shield drains some balance from a deposit pool keyed by
-    [pubkey_hash = H(0x04, auth_domain, auth_root, auth_pub_seed,
-    blind)] and produces two private notes (recipient + producer-fee).
+    Shield drains balance from kernel-side deposit pools keyed by
+    [(asset_id, pubkey_hash)] where [pubkey_hash = H(0x04,
+    auth_domain, auth_root, auth_pub_seed, blind)], and produces two
+    private notes (recipient + producer-fee).  Multiasset makes the
+    drain DUAL-POOL: a non-tez shield debits [v_note + fee] from the
+    FA2 pool and [producer_fee] from the same pubkey_hash's tez pool
+    (the producer note is pinned to tez); a tez shield collapses
+    both into one debit.  See
+    [Spec.Shield.phi_shield_value_conservation].
     The Cairo circuit verifies an in-circuit WOTS+ signature against
     the recipient's auth tree, binding every public output (including
     the deposit pool key, both output commitments, and both memo
@@ -18,9 +24,9 @@
 
     where [Phi_shield pub] enumerates: [pubkey_hash] commits to the
     recipient's auth tree (so only that auth tree's holder can drain),
-    the in-circuit signature covers every public output, the drained
-    amount equals [v_note + fee + producer_fee], and both output
-    commitments are well-formed.
+    the in-circuit signature covers every public output, the dual-pool
+    debits balance per [phi_shield_value_conservation], and both
+    output commitments are well-formed.
 
     The interesting wrinkle here vs transfer/unshield: shield has no
     nullifier — it's the entry point. The L1 ticket landing on the

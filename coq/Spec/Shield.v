@@ -44,7 +44,7 @@
     registered asset.
 *)
 
-From Stdlib Require Import List.
+From Stdlib Require Import List Arith Lia.
 Import ListNotations.
 From Common Require Import Felt.
 From Spec Require Import Hashes.
@@ -127,22 +127,51 @@ Section PhiShield.
   Definition phi_shield_producer_fee (producer_fee : nat) : Prop :=
     producer_fee > 0.
 
-  (** 7. Value conservation against the L1 deposit.
+  (** 7. Value conservation against the deposit pools (dual-pool).
 
-      The L1 ticket carries [v_deposit] mutez of tez.  The circuit's
-      private outputs plus the public fee must equal the drained
-      amount:
+      Shield drains kernel-side deposit pools keyed by
+      [(asset_id, pubkey_hash)].  The producer-fee note is pinned to
+      tez (conjunct 5), so a non-tez shield needs TWO debits — the
+      kernel's [prepare_durable_shield_commit] implements exactly
+      this split:
 
-        v_deposit = v_note + v_producer + fee_public
+      - [asset_new = tez]: one pool, one equation.
+          [debit_asset_pool = v_note + v_producer + fee],
+          and no separate tez debit ([debit_tez_pool = 0]).
+      - [asset_new ≠ tez]: the FA2 pool funds the note and the
+          public fee; the SAME pubkey_hash's tez pool funds the
+          producer note.
+          [debit_asset_pool = v_note + fee]  and
+          [debit_tez_pool = v_producer].
 
-      In v1 every asset involved is tez, so this is a single
-      equation.  For future non-tez bridges, the L1 deposit would
-      be denominated in asset A and the producer-fee / public-fee
-      paths would need a separate tez source (see whitepaper
-      §"Multiasset deposits" — TBW). *)
+      Without the second debit, an FA2 shield would mint
+      [v_producer] tez in the commitment tree out of nothing (the
+      producer note is a tez note no pool paid for).  This was
+      PR #36 review-attention item 2. *)
   Definition phi_shield_value_conservation
-      (v_deposit v_note v_producer fee : nat) : Prop :=
-    v_deposit = v_note + v_producer + fee.
+      (asset_new : Felt)
+      (debit_asset_pool debit_tez_pool : nat)
+      (v_note v_producer fee : nat) : Prop :=
+    if Felt_eq_dec asset_new asset_tez
+    then debit_asset_pool = v_note + v_producer + fee
+         /\ debit_tez_pool = 0
+    else debit_asset_pool = v_note + fee
+         /\ debit_tez_pool = v_producer.
+
+  (** Whatever the asset, the TOTAL debited across both pools equals
+      the total value leaving into notes + the public fee — the
+      headline "no value minted by shield" consequence. *)
+  Lemma phi_shield_value_conservation_total
+      (asset_new : Felt) (debit_asset_pool debit_tez_pool : nat)
+      (v_note v_producer fee : nat) :
+    phi_shield_value_conservation asset_new
+      debit_asset_pool debit_tez_pool v_note v_producer fee ->
+    debit_asset_pool + debit_tez_pool = v_note + v_producer + fee.
+  Proof.
+    unfold phi_shield_value_conservation.
+    destruct (Felt_eq_dec asset_new asset_tez) as [_ | _];
+      intros [H1 H2]; lia.
+  Qed.
 
   (** 8. Sighash completeness.
 
@@ -174,7 +203,8 @@ Section PhiShield.
 
       Shield has no inputs (entry point) and two output slots
       (recipient note + producer-fee note).  The public side is
-      the L1 deposit ([v_deposit], drained via pubkey_hash). *)
+      the dual-pool drain ([debit_asset_pool] / [debit_tez_pool],
+      keyed by [(asset, pubkey_hash)]). *)
 
   Record ShieldOutput : Type := mkShieldOut {
     so_cm        : Felt;
@@ -194,7 +224,7 @@ Section PhiShield.
       (sighash auth_domain pubkey_hash tag_felt tag_pkh
        auth_root_pkh auth_pub_seed_pkh blind
        v_note_felt fee_felt producer_fee_felt : Felt)
-      (v_deposit fee : nat)
+      (debit_asset_pool debit_tez_pool fee : nat)
       (* witness — two output slots *)
       (out_recipient out_producer : ShieldOutput)
     : Prop :=
@@ -214,7 +244,9 @@ Section PhiShield.
     /\ phi_shield_producer_asset_tez (so_asset out_producer)
     /\ phi_shield_producer_fee       (so_v     out_producer)
     /\ phi_shield_value_conservation
-         v_deposit (so_v out_recipient) (so_v out_producer) fee
+         (so_asset out_recipient)
+         debit_asset_pool debit_tez_pool
+         (so_v out_recipient) (so_v out_producer) fee
     /\ phi_shield_sighash
          sighash tag_felt auth_domain pubkey_hash
          v_note_felt fee_felt producer_fee_felt
@@ -234,11 +266,11 @@ Section PhiShield.
       sighash auth_domain pubkey_hash tag_felt tag_pkh
       auth_root_pkh auth_pub_seed_pkh blind
       v_note_felt fee_felt producer_fee_felt
-      v_deposit fee r p :
+      debit_asset_pool debit_tez_pool fee r p :
     Phi_shield sighash auth_domain pubkey_hash tag_felt tag_pkh
                auth_root_pkh auth_pub_seed_pkh blind
                v_note_felt fee_felt producer_fee_felt
-               v_deposit fee r p ->
+               debit_asset_pool debit_tez_pool fee r p ->
     so_asset p = asset_tez /\ so_v p > 0.
   Proof.
     unfold Phi_shield, phi_shield_producer_asset_tez,
@@ -246,18 +278,24 @@ Section PhiShield.
     tauto.
   Qed.
 
+  (** Total conservation: regardless of the recipient asset, the
+      sum of pool debits equals the value leaving into the two
+      notes plus the public fee.  Specializes per-branch via
+      [phi_shield_value_conservation] directly. *)
   Lemma Phi_shield_balance
       sighash auth_domain pubkey_hash tag_felt tag_pkh
       auth_root_pkh auth_pub_seed_pkh blind
       v_note_felt fee_felt producer_fee_felt
-      v_deposit fee r p :
+      debit_asset_pool debit_tez_pool fee r p :
     Phi_shield sighash auth_domain pubkey_hash tag_felt tag_pkh
                auth_root_pkh auth_pub_seed_pkh blind
                v_note_felt fee_felt producer_fee_felt
-               v_deposit fee r p ->
-    v_deposit = so_v r + so_v p + fee.
+               debit_asset_pool debit_tez_pool fee r p ->
+    debit_asset_pool + debit_tez_pool = so_v r + so_v p + fee.
   Proof.
-    unfold Phi_shield, phi_shield_value_conservation. tauto.
+    unfold Phi_shield. intros H.
+    destruct H as [_ [_ [_ [_ [_ [_ [Hcons _]]]]]]].
+    exact (phi_shield_value_conservation_total _ _ _ _ _ _ Hcons).
   Qed.
 
 End PhiShield.
