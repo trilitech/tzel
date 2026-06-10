@@ -1,7 +1,8 @@
 # Rocq model — current status
 
-Snapshot of where the formalization stands as of branch `coq-model`,
-commit pending. Pause here; main-branch PR review takes priority.
+Snapshot of where the formalization stands as of branch `coq-proofs`
+(continuation of `coq-model`, which is fully contained in `multiasset`;
+this branch sits on top of `multiasset`).
 
 ## Architecture (recommended by team expert)
 
@@ -129,6 +130,23 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   + `ltree_succeeds` + auth-path hypothesis.
 - **Sighash + nullifier definitions:** `sighash_fold` with
   composition proof, `commitment`, `nullifier` (position-dependent).
+- **Two-accumulator conservation (transfer + unshield):**
+  `Impl/Transfer.v` `two_accumulator_conservation` — the Cairo
+  balance strategy (witness-declared `primary_non_tez_asset`, per-
+  entry `{tez, primary}` gate, separate tez / primary accumulator
+  equations) implies the abstract per-asset
+  `Spec.Transfer.phi_value_conservation` for EVERY asset, including
+  ones absent from the transaction. `acc_tez` / `acc_primary`
+  mirror the Cairo routing literally (primary lane = "not tez",
+  with the gate doing the work — the proof fails without it,
+  which is the missing-assert check working as intended).
+  `Impl/Unshield.v` `unshield_two_accumulator_conservation` reuses
+  it with the public exit modeled as a prepended `(asset_pub,
+  v_pub)` output entry; its `Hgate_exit` hypothesis is precisely
+  the Phase E.5 bug-#1 fix (`assert(asset_pub ∈ {tez, primary})`)
+  — the corollary is not derivable without it. This closes the
+  value-conservation leg of the `Relation -> Phi` refinement for
+  both spending circuits (PR #36 review-attention item 1).
 
 ## Not done
 
@@ -169,6 +187,14 @@ refinement + extraction + conformance), the same shape repeats for:
   the protocol-level safety properties; the Spec proofs force the
   `*Relation pub wit -> Phi pub` chain to close on actual Coq
   assertions, which is the missing-assertion check.
+  STATUS: the value-conservation leg is DONE for transfer and
+  unshield (see two-accumulator entries above). Remaining: define
+  the Cairo-shaped `TransferRelation` / `UnshieldRelation` /
+  `ShieldRelation` records assembling ALL the circuit checks
+  (Merkle inclusion + nullifier + XMSS legs via `Spec.Merkle` /
+  `Spec.Xmss`, commitment well-formedness, sighash fold, the
+  accumulator equations), then prove `Relation -> Phi` by
+  conjunct assembly.
 
 ## Open questions / decisions deferred
 
