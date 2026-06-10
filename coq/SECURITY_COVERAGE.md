@@ -301,10 +301,13 @@ rests on three independent mechanisms, not on trust:
    the implementation computes.
 3. **Systematic assertion cross-check** (manual, documented): every
    assertion in the three Cairo circuits, every check in the Michelson
-   bridge contract, and the kernel's deposit/config/capacity/valid-root
-   gates were enumerated and matched to a relation conjunct or a
-   theorem.  This found exactly one omission — the per-input `wots_sig`
-   length assert — now modeled (`input_checks`).  Confirmed faithful:
+   bridge contract, the kernel's deposit/config/capacity/valid-root
+   gates, AND the kernel apply-path commits (shield dual-pool balances +
+   `client_cm` replay + asset-registered; unshield/transfer nullifier
+   freshness + root snapshot) were enumerated and matched to a relation
+   conjunct or a theorem.  This found exactly one omission — the
+   per-input `wots_sig` length assert — now modeled (`input_checks`).
+   Confirmed faithful:
    the asset gates, 2-accumulator balance, producer-tez pin, nullifier,
    merkle membership, in-circuit XMSS, change-slot-absent zeroing
    (`asset = 0 = ASSET_TEZ`), and the deposit accept gates
