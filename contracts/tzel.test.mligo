@@ -51,8 +51,10 @@ let base_ledger : TzEL.ledger = {
   program_hashes = { shield = prog_shield ; transfer = prog_transfer ; unshield = prog_unshield } ;
   bridge_ticketer = ticketer ;
   blake_table ;
+  blake_mrkl = (Map.empty : TzEL.M.blake_mrkl) ;
+  zero_hashes = (Map.empty : (nat, bytes) map) ;
   commitment_root = 0x00 ; commitment_size = 0n ;
-  frontier = ([] : bytes list) ;
+  frontier = (Map.empty : TzEL.M.frontier) ;
   notes = (Big_map.empty : (nat,bytes) big_map) ;
   nullifiers = (Big_map.empty : (bytes,unit) big_map) ;
   roots = (Big_map.literal [ (valid_root, ()) ] : (bytes,unit) big_map) ;

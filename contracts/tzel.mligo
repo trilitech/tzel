@@ -18,7 +18,9 @@
    Michelson operation, the rollup-era emit-before-mutate hazard vanishes. *)
 
 #include "out_hash.mligo"
+#include "merkle.mligo"
 module O = OutHash
+module M = Merkle
 
 (* ── storage (arch §2.1) ─────────────────────────────────────────────── *)
 
@@ -42,12 +44,14 @@ type ledger = {
   auth_domain     : bytes ;                 (* 32B — domain-separates this ledger *)
   program_hashes  : program_hashes ;
   bridge_ticketer : address ;              (* KT1 minting/burning XTZ tickets *)
-  blake_table     : O.blake_table ;        (* BLAKE2S seam (prototype only) *)
+  blake_table     : O.blake_table ;        (* BLAKE2S (OutHash) seam (prototype only) *)
+  blake_mrkl      : M.blake_mrkl ;         (* BLAKE2S(mrklSP__) seam (prototype only) *)
+  zero_hashes     : (nat, bytes) map ;     (* zero_hashes[0..DEPTH], empty-subtree nodes *)
 
   (* shielded ledger *)
   commitment_root : bytes ;
   commitment_size : nat ;
-  frontier        : bytes list ;           (* DEPTH frontier nodes *)
+  frontier        : M.frontier ;           (* level -> filled frontier node (DEPTH=48) *)
   notes           : (nat, bytes) big_map ;  (* index -> encrypted note payload *)
   nullifiers      : (bytes, unit) big_map ;
   roots           : (bytes, unit) big_map ;
@@ -95,6 +99,7 @@ type configure_param = {
   program_hashes : program_hashes ;
   ticketer       : address ;
   blake_table    : O.blake_table ;
+  blake_mrkl     : M.blake_mrkl ;
 }
 
 (* ── Layer-1 VERIFY_SNARK seam (arch §1.1) ───────────────────────────────
@@ -176,23 +181,34 @@ let insert_nullifiers (l : ledger) (nfs : bytes list) : ledger =
       l.nullifiers nfs in
   { l with nullifiers }
 
-(* Append commitments: store enc notes at the running index and bump size.
-   (Frontier/root recomputation is a Merkle-append; modelled as a hash fold
-   placeholder here — the tree shape is orthogonal to the binding derisk.) *)
+(* Append commitments: REAL incremental Merkle frontier (merkle.mligo, mirroring
+   kernel append_note). Each commitment is appended at the running tree index;
+   the frontier slots, root and size advance exactly as the Rust kernel. The
+   enc_notes are stored at the matching leaf index (1:1 with commitments).
+   The new root is snapshotted into the valid-roots set + fifo history. *)
 let append_commitments (l : ledger) (cms : bytes list) (enc_notes : bytes list) : ledger =
-  let (notes, size) =
-    List.fold_left
-      (fun ((m, i : (nat, bytes) big_map * nat), en : ((nat, bytes) big_map * nat) * bytes) ->
-        (Big_map.add i en m, i + 1n))
-      (l.notes, l.commitment_size) enc_notes in
-  (* new root = blake2s(old_root ‖ each commitment) — placeholder fold;
-     real impl walks the frontier. *)
-  let tbl = l.blake_table in
-  let new_root =
-    List.fold_left (fun (acc, cm : bytes * bytes) -> O.blake2s tbl (Bytes.concat acc cm))
-      l.commitment_root cms in
+  let tbl = l.blake_mrkl in
+  let zh = l.zero_hashes in
+  (* fold over (commitment, enc_note) pairs, threading frontier/root/size/notes.
+     The two lists must be 1:1 (one note per new commitment). *)
+  let rec go
+      (frontier : M.frontier) (root : bytes) (size : nat)
+      (notes : (nat, bytes) big_map)
+      (cs : bytes list) (es : bytes list)
+      : M.frontier * bytes * nat * (nat, bytes) big_map =
+    match cs, es with
+    | [], [] -> (frontier, root, size, notes)
+    | cm :: cs, en :: es ->
+        let notes = Big_map.add size en notes in
+        let (frontier, root, size) = M.append_one tbl zh frontier size cm in
+        go frontier root size notes cs es
+    | _, _ -> (failwith "TzEL: commitment/enc_note count mismatch" :
+                 M.frontier * bytes * nat * (nat, bytes) big_map)
+  in
+  let (frontier, new_root, size, notes) =
+    go l.frontier l.commitment_root l.commitment_size l.notes cms enc_notes in
   let roots = Big_map.add new_root () l.roots in
-  { l with notes ; commitment_size = size ;
+  { l with frontier ; notes ; commitment_size = size ;
            commitment_root = new_root ;
            roots ; roots_fifo = new_root :: l.roots_fifo }
 
@@ -203,12 +219,23 @@ let configure (cfg : configure_param) (s : storage) : operation list * storage =
   let { l ; held } = s in
   let () = if Tezos.get_sender () <> l.admin then failwith "TzEL: not admin" else () in
   let () = if l.configured then failwith "TzEL: already configured" else () in
+  (* re-derive zero_hashes + the empty-tree root from the supplied mrkl table,
+     and reset the commitment tree to empty (configure is write-once admin). *)
+  let zero_hashes = M.zero_hashes cfg.blake_mrkl in
+  let empty_root = M.empty_root zero_hashes in
   let l = { l with configured = true ;
                    verifier_vk = cfg.vk ;
                    auth_domain = cfg.auth_domain ;
                    program_hashes = cfg.program_hashes ;
                    bridge_ticketer = cfg.ticketer ;
-                   blake_table = cfg.blake_table } in
+                   blake_table = cfg.blake_table ;
+                   blake_mrkl = cfg.blake_mrkl ;
+                   zero_hashes ;
+                   frontier = (Map.empty : M.frontier) ;
+                   commitment_size = 0n ;
+                   commitment_root = empty_root ;
+                   roots = Big_map.add empty_root () l.roots ;
+                   roots_fifo = empty_root :: l.roots_fifo } in
   ([] : operation list), { l ; held }
 
 (* %deposit — bridge ticketer delivers (pubkey_hash, ticket); join into held,

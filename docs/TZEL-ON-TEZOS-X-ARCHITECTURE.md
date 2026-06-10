@@ -72,16 +72,27 @@ Tezos X wants a single blessed wrap circuit.
 ### 1.2 `BLAKE2S` (required for the binding)
 
 ```
-BLAKE2S :: bytes -> bytes   -- 32-byte digest
+BLAKE2S :: bytes      -- personalization (8 bytes; empty = none)
+        -> bytes      -- data
+        -> bytes      -- 32-byte digest
 ```
 
 TzEL's proof-to-operation binding (below) is a BLAKE2s chain (the chip's
 `OutHash` and the multiverifier fold use BLAKE2s over M31 lanes, not
-BLAKE2b). The contract needs it to re-derive `OutHash` and walk the
-aggregation tree. Trivial addition next to the existing BLAKE2b/Keccak
-instructions. (If absent, the alternative is folding the whole binding
-into a fatter, TzEL-specific `VERIFY_SNARK` — rejected here to keep the
-primitive generic.)
+BLAKE2b). The contract also maintains the note commitment Merkle tree,
+whose `hash_merkle` is BLAKE2s **personalized** with `"mrklSP__"`
+(domain separation; `core/src/lib.rs:208`). So the instruction must take
+an 8-byte **personalization** parameter (the blake2s parameter-block
+field — *not* a prefix of the data; plain BLAKE2b/Keccak can't express
+it). Empty personalization = standard BLAKE2s (used by the OutHash
+`blake_qm31`).
+
+Scope note: TzEL uses several personalizations (`mrklSP__`, `nulfSP__`,
+`cmmtSP__`, …), but the **contract** only needs `mrklSP__` (the tree) and
+the empty one (OutHash). The others — nullifier/commitment derivation —
+live *inside the proof*; the contract receives those values and only
+checks set-membership/uniqueness, never recomputes them. Trivial addition
+next to the existing BLAKE2b/Keccak instructions.
 
 ### 1.3 `VERIFY_STARK` (future / optional)
 

@@ -29,10 +29,20 @@ module OutHash = struct
      compiler's optimizer throw `Z.Overflow` (Z.to_int on the literal) at
      `ligo compile contract` time — a toolchain quirk, see Phase-1 report.
      The bytes form is pushed and converted by the Michelson `NAT` op, so the
-     optimizer never folds it. The 2^63 threshold is handled byte-wise
-     (`felt_is_small`) for the same reason. *)
-  let stark_p : nat =
-    nat 0x0800000000000011000000000000000000000000000000000000000000000001
+     standard optimizer never folds it. The 2^63 threshold is handled byte-wise
+     (`felt_is_small`) for the same reason.
+
+     SECOND quirk (origination / lltz codegen): `Test.originate` routes the
+     contract through the experimental lltz backend, whose `convert_constant`
+     constant-FOLDS a module-level `nat 0x..<32-byte>` (or even
+     `nat (Bytes.concat ..)`) binding and then calls `Z.to_int` on the 251-bit
+     value — `Z.Overflow`. Wrapping it in a `unit -> nat` THUNK stops lltz from
+     treating it as a foldable constant binding: the bytes are concatenated and
+     NAT'd at run time. The produced Michelson is equivalent. *)
+  let stark_p (() : unit) : nat =
+    nat (Bytes.concat
+           0x08000000000000110000000000000000
+           0x00000000000000000000000000000001)
 
   (* ── BLAKE2S SEAM (Layer-1 primitive `BLAKE2S :: bytes -> bytes`) ─────
      STUB. LIGO/Michelson has BLAKE2B but no BLAKE2S today. The real deploy
@@ -132,7 +142,7 @@ module OutHash = struct
      the value fed to felt252_to_m31_words). *)
   let digest_le_to_felt (digest_le : bytes) : nat =
     let v = nat (reverse_bytes digest_le) in   (* LE bytes -> nat *)
-    v mod stark_p
+    v mod (stark_p ())
 
   (* ── STAGE 1b: felt252_to_m31_words — 28 x 9-bit limbs (out_hash.rs:24) ──
      The reference reads 4 little-endian u64 limbs; limb `index` is 9 bits
