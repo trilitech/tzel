@@ -393,6 +393,29 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   nullifiers/commitments; here they make the cross-layer asset
   routing provably unambiguous.
 
+- **KERNEL DOUBLE-SPEND PREVENTION (`Spec/KernelNullifier.v`):**
+  models the kernel's durable nullifier set
+  (has_nullifier/insert_nullifier + the within-batch "duplicate
+  nullifier" reject) and proves the consensus-critical no-double-spend
+  at the KERNEL boundary, complementing circuit nullifier_binding. A
+  tx with nullifiers nfs is acceptable iff NoDup nfs (no within-tx
+  dup) AND none already in the spent set; on accept all are inserted.
+  Proved (zero admits):
+  - reachable_nodup: the spent set is duplicate-free in every
+    reachable state — no nullifier ever recorded by two transactions;
+  - respend_rejected: a tx presenting an already-spent nullifier
+    cannot step (rejected);
+  - spent_is_permanent / once_spent_forever_blocked: the set only
+    grows; once spent, no future state accepts a re-spend;
+  - note_spent_at_most_once (composition): with the circuit
+    nullifier-of-note map, each note can be consumed at most once
+    across the whole history — circuit binding (nullifier identifies
+    the note) + kernel dedup (each nullifier accepted once) =
+    end-to-end no-double-spend;
+  - distinct_notes_distinct_nullifiers: under binding-injectivity,
+    distinct notes never collide, so spending one never falsely
+    blocks another.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
