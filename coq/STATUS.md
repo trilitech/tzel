@@ -1140,6 +1140,25 @@ nullifier/commitment binding.
   and ASSET_TEZ=0 so co_asset=asset_tez is faithful), the producer-tez
   pin, conservation, gates, nullifier, merkle, xmss are all captured.
 
+- **WOTS+ CHECKSUM HYPOTHESIS REALIZED (`Spec/WotsChecksum.v`):** the
+  unforgeability theorems (wots_one_time_unforgeable / xmss / config)
+  take the checksum well-formedness `base4_val cs = checksum msg` as a
+  HYPOTHESIS — it is the load-bearing fact (raising any message digit
+  lowers the checksum, so a forward-only attacker can't advance the
+  checksum chains). Previously assumed; now PROVED to be realized by
+  the actual decomposition the Cairo computes
+  (blake_hash.cairo: the 5 checksum digits are the base-4 encoding of
+  sum(3 - digit[i])). checksum_hypothesis_realized (zero admits): for
+  any valid 128-digit message, base4_val (base4_encode5 (checksum msg))
+  = checksum msg, where base4_encode5 mirrors the Cairo's `cs & 3; cs
+  >>= 2` five times. Built from base4_val_encode5 (5-base-4-digit
+  round-trip for values < 4^5; the top digit is n/256 in {0..3}, not 0)
+  and checksum_bound (checksum <= 3*128 = 384 < 1024). So the
+  unforgeability premise is non-vacuous and faithful to the circuit's
+  checksum construction (which is also SHA-drift-pinned). Found by a
+  faithfulness probe: the checksum is security-critical but its
+  computation was not connected to the security proof.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

@@ -8,6 +8,7 @@ Spec/Hashes.v
 Spec/Merkle.v
 Spec/Wots.v
 Spec/Xmss.v
+Spec/WotsChecksum.v
 Spec/XmssInhabited.v
 Spec/ConfigAuth.v
 Spec/ConfigOnce.v
