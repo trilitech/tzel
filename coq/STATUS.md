@@ -850,6 +850,26 @@ nullifier/commitment binding.
   level-dependent padding zh lv, and full sublists make the base drop
   out). Zero admits.
 
+- **FRONTIER->MROOT BRIDGE (`Spec/MerkleBridge.v`):** the
+  mathematical heart of why the O(depth) frontier read-off is correct.
+  The bridge lemma relates ONE level-step of the bottom-up combination
+  to the top-down mroot: mroot (zh lv)(S d') X =
+  mroot (zh (S lv)) d' (ppair lv X) (length X <= 2^(S d')), where
+  ppair pairs adjacent nodes padding an odd tail with zh lv. So each
+  branches[] level corresponds to exactly one mroot level. Proved
+  (zero admits) on top of build_level_mroot + mroot_app_zeros +
+  mroot_base_irrelevant:
+  - build_level_app_even: build_level distributes over an even prefix;
+  - build_level_pad (the crux): build_level of X + zh-padding splits
+    into ppair lv X then a run of zh(S lv), via 2-step (parity)
+    strong induction;
+  - bridge: assembles them — pad to a full level, drop one level
+    (build_level_mroot), swap base (base-irrelevant on the now-full
+    list), then peel the padding.
+  REMAINING: fold bridge over the whole frontier (froot_correct) to
+  get froot (fbuild leaves) = mroot d leaves — mechanical given the
+  bridge, the frep structure (MerkleFrontier), and mroot_app_z0.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

@@ -26,6 +26,7 @@ Spec/AssetRegistry.v
 Spec/KernelNullifier.v
 Spec/MerkleTree.v
 Spec/MerkleFrontier.v
+Spec/MerkleBridge.v
 Spec/ShieldReplay.v
 Spec/WithdrawalRecord.v
 Spec/StoragePaths.v
