@@ -155,13 +155,36 @@ audit").
 - `Spec.Hashes.nullifier_position_distinct` (faerie-gold: the same note
   value at distinct positions has distinct nullifiers).
 
-## Bridge / Michelson contract
+## Bridge / Michelson contract (fa2_bridge_ticketer.tz)
 
-- `Spec.BridgeTicketer.fully_collateralized` (custody = outstanding
-  tickets, exactly), `Spec.BridgeBurn.custody_decrease_authentic`
-  (a foreign ticket cannot drain custody — the `ticketer == SELF` check),
+- **Collateralization (dynamic):** `Spec.BridgeTicketer.fully_collateralized`
+  (custody = outstanding tickets, *exactly*, as a state-machine
+  invariant preserved by every mint/burn `BStep`),
+  `ticket_redeemable` (any amount ≤ outstanding tickets is ≤ custody —
+  every ticket is always redeemable).
+- **Burn authentication:** `Spec.BridgeBurn.custody_decrease_authentic`
+  (a foreign ticket cannot drain custody — the `ticketer == SELF`
+  check), `foreign_ticket_rejected` / `forwarded_ticket_rejected`
+  (only SELF-minted tickets burn).
+- **Canonical ticket content** (the documented `ticket.content.token_id
+  == 0` design — the asset is bound to the ticketer KT1 address, not
+  the content): `Spec.BridgeBurn.nonzero_token_rejected` /
+  `metadata_rejected` AND `Spec.KernelDeposit.nonzero_token_rejected` /
+  `metadata_rejected` — a ticket with a non-zero `token_id` or any
+  metadata is rejected on BOTH the L1 burn and the L2 deposit, so no
+  content-based asset confusion across the round-trip.
+- **Deposit anti-spoofing:**
   `Spec.KernelDeposit.credit_requires_owning_ticketer` (only the
-  registered ticketer can credit a pool).
+  registered ticketer can credit a pool),
+  `unregistered_sender_rejected`.
+- **Routing bijection:** `Spec.AssetRegistry.fa2_routes_correctly` (a
+  registered FA2 asset's deposit and withdrawal routes are mutual
+  inverses), `deposit_withdraw_roundtrip` / `withdraw_deposit_roundtrip`.
+- **Round-trip solvency:** `Spec.EndToEnd(Multi).withdrawal_honored`
+  (any L2-note value is ≤ L1 custody — every withdrawal can be
+  honored), `no_stranded_l1` (custody ≤ pool + notes — no L1 funds
+  unclaimable), `roundtrip_solvency` (out ≤ in over the full deposit →
+  shield → unshield → exit lifecycle), per asset.
 
 ## Storage / serialization foundations
 
