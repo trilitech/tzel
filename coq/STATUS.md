@@ -104,8 +104,14 @@ nullifier/commitment binding.
   pubkey recovery using `Wots.iter`), `recover_endpoint_correct`
   (recovery is correct — corollary of `Wots.recover_correct`).
   `xmss_verify` predicate combining recovery → L-tree → auth path.
-- **`Spec/Transfer.v` / `Spec/Shield.v` / `Spec/Unshield.v`:** stubs
-  with intent docs explaining what each will model.
+- **`Spec/Transfer.v` / `Spec/Shield.v` / `Spec/Unshield.v`:** (this
+  early "stub" description is SUPERSEDED) — now full circuit relations
+  with proven theorems: per-asset value conservation, batch
+  no-inflation (`batch_value_conservation`,
+  `batch_unshield_value_conservation`), and sighash non-malleability
+  (`transfer_sighash_binds` / `shield_sighash_binds` /
+  `unshield_sighash_binds`). See also the unified
+  `GrandConservation.grand_conservation`.
 - **`Impl/Common.v`:** placeholder for impl-side shared declarations.
 - **`Impl/Hashes.v`:** declares `Hash3` and `Hash4` parameters
   (concrete, will be realized at extraction).
@@ -120,8 +126,14 @@ nullifier/commitment binding.
   `reflexivity`.
 - **`Impl/Xmss.v`:** instantiates `Spec.Xmss` L-tree and recovery
   with concrete hash parameters (`Hash4` + `pack_adrs_ltree`,
-  `Hash3` + `pack_adrs_chain`).  Soundness proofs pending.
-- **`Impl/{Transfer,Shield,Unshield}.v`:** stubs with intent docs.
+  `Hash3` + `pack_adrs_chain`).  (Earlier "soundness proofs pending"
+  is SUPERSEDED — `Spec.Xmss` now has `ltree_injective`,
+  `xmss_verify_unique_leaf`, `xmss_soundness_reduces_to_wots`,
+  `wots_one_time_unforgeable`, and the assembled
+  `xmss_one_time_unforgeable`.)
+- **`Impl/{Transfer,Shield,Unshield}.v`:** extractable refinements of
+  the corresponding `Spec` relations (the earlier "stubs with intent
+  docs" is superseded).
 - **`Spec/Wots.v` chain-step lemmas:** `iter_succ`,
   `iter_compose`, and `recover_correct` proved.  `recover_correct`
   states that chaining a signature element forward by the remaining
@@ -474,8 +486,9 @@ nullifier/commitment binding.
     batch root (via the left-spine = fold_levels of a leaf + empty
     padding) is the non-trivial correctness letting the kernel commit
     notes without storing the whole tree.
-  Future work: extend frontier correctness to arbitrary append
-  indices (the general frontier invariant).
+  (UPDATE: the arbitrary-append-index general case, originally listed
+  here as future work, has since been PROVED — see the General Merkle
+  Frontier Correctness entry below: `tdfront_correct`.)
 
 - **SHIELD REPLAY PROTECTION (`Spec/ShieldReplay.v`):** the kernel
   records each applied shield's client_cm (applied_shield_path /
@@ -907,11 +920,17 @@ refinement + extraction + conformance), the same shape repeats for:
 ## Open questions / decisions deferred
 
 1. **Whether to formalize XMSS unforgeability or axiomatize it.**
-   Light path: state the standard XMSS unforgeability theorem as a
-   parameter, leaning on the published Hülsing et al. proofs. Heavy
-   path: re-derive in Rocq from PRF/PRE/SM-DSPR axioms. Light is
-   the obvious starting point; heavy is a separate research-grade
-   undertaking we may never need.
+   RESOLVED — formalized, not axiomatized. `wots_one_time_unforgeable`
+   proves WOTS+ one-time unforgeability structurally for the
+   forward-only attacker model (`forward_forge_element` + checksum
+   `wots_no_dominance`), and `xmss_one_time_unforgeable` assembles it
+   with the XMSS reduction (`xmss_soundness_reduces_to_wots`) into the
+   top-level statement. This is neither the "light" parameter path nor
+   the full game-based PRF/PRE/SM-DSPR re-derivation: the single
+   remaining cryptographic assumption is preimage resistance of the
+   chain hash (which is what makes "forward-only" the attacker's whole
+   move set), stated as an explicit local hypothesis — never a global
+   axiom.
 
 2. **mathcomp dependency.** Not yet pulled in. Will likely want
    `mathcomp-ssreflect` for tactic ergonomics when proofs grow;
