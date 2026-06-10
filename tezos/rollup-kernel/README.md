@@ -140,6 +140,41 @@ verifier). See `scripts/octez_orchestrator_sandbox_smoke.sh` and
 `tezos/TZEL_ORCHESTRATOR_README.md` §6 for the Mode A size/typing limits it
 documents.
 
+```bash
+TZEL_RUN_V18_SANDBOX=1 \
+  cargo test -p tzel-rollup-kernel --test octez_v18_sandbox -- --ignored --nocapture
+# or run the harness directly:
+scripts/octez_v18_sandbox_smoke.sh
+```
+
+The v18 smoke (no DAL node, no `ligo`, no orchestrator) drives the DAL-free
+submission protocol (`docs/SNARK-SUBMISSION-DESIGN.md`) — `StageChunk`,
+`SubmitOps`, `SubmitStagedConfig` — by injecting *external Targetted* inbox
+messages with `octez-client send smart rollup message`. The kernel WASM is
+built `--no-default-features` (no `tzel-verifier`) with `TZEL_INSECURE_SANDBOX=1`
+so the `kernel-test-skip-verify` Groth16 token fires in-rollup; the harness
+greps the artifact for the `TZEL_INSECURE_SANDBOX_PROOF_SKIP` canary as a
+build-time gate. The skip token bypasses only the Groth16 tree walk +
+program-hash binding — the kernel's core output-binding still runs and is
+satisfied by the fixture's real `output_preimage`, so a green run is a genuine
+durable APPLY, not a TrustMeBro pass. Message wire bytes are produced by the
+`octez_kernel_message v18-*` subcommands (`v18-stage-note`, `v18-submit-shield`,
+`v18-stage-config-verifier`, `v18-stage-raw`, `v18-submit-staged-config`,
+`v18-fixture-meta`, `v18-payload-hash`).
+
+> KNOWN BLOCKER (kernel storage layer, NOT the v18 harness): on the real Octez
+> rollup runtime the kernel's `WasmHost::read_store`/`write_store`
+> (src/lib.rs ~2760) issue a SINGLE raw `store_read`/`store_write`, which the
+> PVM caps at `MAX_FILE_CHUNK_SIZE = 2048` bytes per call. `apply_stage_chunk`
+> writes each chunk's `bytes` (≈3.4 KiB per encrypted note, ≈4.9 KiB per signed
+> config envelope) in one `write_store`, so the write silently fails and the
+> seal-time reassembly reports `staging entry N chunk K is missing`. The
+> in-process `bridge_flow.rs` tests miss this because `TestHost` is a HashMap
+> with no per-call size cap. The fix lives in kernel src (loop both helpers
+> over `MAX_FILE_CHUNK_SIZE`, or use the SDK `store_read_all`/`store_write_all`)
+> — out of scope here. Until then every v18 staging scenario reaches the kernel
+> and dispatches correctly but cannot SEAL a multi-KiB chunk on real Octez.
+
 The DAL smoke requires `octez-dal-node` in addition to the normal sandbox
 dependencies. It spins up a local node, baker, DAL node, rollup node, and
 publishes both the signed config messages and the checked-in verified shield
