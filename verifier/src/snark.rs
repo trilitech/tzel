@@ -165,6 +165,65 @@ const ENVELOPE_HEADER_BYTES: usize = TREE_ROOTS_BYTES + OUT_HASH_BYTES;
 /// `crates/circuits/src/context.rs:20`): `QM31(0, 0, 1, 0)`.
 const U_VALUE_LANES: [u32; 4] = [0, 0, 1, 0];
 
+// ── Pinned circuit-identity constants (per-TzEL-release) ────────────────
+//
+// The aggregation-tree verification walk (`verify_snark_tree`) needs the
+// preprocessed roots of the circuits at each tree level — protocol
+// constants pinned per TzEL release, exactly like the embedded wrap VK
+// (`src/wrap_vk.bin`): they change together whenever the circuit stack is
+// regenerated (`docs/SNARK-SUBMISSION-DESIGN.md`, "Open points").
+//
+// Values captured from the REAL fixture aggregation tree
+// (`testdata/mv_root_children.json`, 2026-06-10 mv-target cycle) and
+// pinned against it by `pinned_circuit_roots_match_golden_fixture`. The
+// leaf root is identical across op kinds (shield and transfer leaves in
+// the fixture carry the same root: the leaf circuit verifies the privacy
+// bootloader, whatever Cairo task it ran).
+
+/// Preprocessed root of the LEAF circuit (`HashValue<QM31>` as 8 M31
+/// lanes) — the identity every `MvLeafSlot::Declared` leaf is bound to.
+pub const LEAF_CIRCUIT_ROOT_LANES: [u32; 8] = [
+    260776853, 1309242768, 1145090100, 1598670544, 369006849, 883527537, 842476743, 1550035524,
+];
+
+/// Preprocessed root of the level-1 multiverifier circuit (`leaf_to_mv`,
+/// verifies two leaf proofs).
+pub const LEAF_TO_MV_CIRCUIT_ROOT_LANES: [u32; 8] = [
+    1329128718, 79407594, 317031791, 1097889202, 829834258, 737675984, 793553350, 583776393,
+];
+
+/// Preprocessed root of the level-≥2 multiverifier circuit (`mv_to_mv`,
+/// verifies two mv proofs).
+pub const MV_TO_MV_CIRCUIT_ROOT_LANES: [u32; 8] = [
+    458569739, 49239620, 177702544, 1105661487, 705003098, 653641141, 1137855028, 1375486617,
+];
+
+/// The pinned per-level internal preprocessed roots for a tree of `depth`
+/// levels, bottom-up — the `internal_preprocessed_root_lanes` argument of
+/// [`verify_snark_tree`] / [`derive_mv_root_publics`]: `leaf_to_mv` at
+/// level 1, `mv_to_mv` at every level ≥ 2
+/// (`docs/SNARK-SUBMISSION-DESIGN.md`, verification walk step 3).
+///
+/// NOTE: depth 2 is golden-validated end to end
+/// (`mv_root_children.json`); the uniform `mv_to_mv` root at levels ≥ 3
+/// follows from the mv circuit verifying two mv proofs regardless of
+/// level, per the design doc — re-pin against a deeper fixture when one
+/// is captured.
+pub fn pinned_internal_root_lanes(depth: u8) -> Result<Vec<[u32; 8]>, String> {
+    if depth == 0 || depth >= 32 {
+        return Err(format!("mv tree depth must be in 1..32, got {depth}"));
+    }
+    Ok((1..=depth)
+        .map(|level| {
+            if level == 1 {
+                LEAF_TO_MV_CIRCUIT_ROOT_LANES
+            } else {
+                MV_TO_MV_CIRCUIT_ROOT_LANES
+            }
+        })
+        .collect())
+}
+
 /// Decoded `proof_bytes` envelope (public inputs + raw gnark proof).
 #[derive(Debug)]
 pub struct SnarkProofEnvelope<'a> {
@@ -641,6 +700,73 @@ pub fn verify_snark_tree_with_vk(
 mod tests {
     use super::*;
     use stwo::core::fields::qm31::QM31;
+
+    /// The pinned circuit-identity constants must stay byte-identical to
+    /// the golden fixture tree (`testdata/mv_root_children.json`) — when
+    /// the circuit stack is regenerated and the fixture re-captured, this
+    /// test forces the constants (and the TzEL release pin) to follow.
+    #[test]
+    fn pinned_circuit_roots_match_golden_fixture() {
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mv_root_children.json")).unwrap();
+        let lanes8 = |v: &serde_json::Value| -> [u32; 8] {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| u32::try_from(x.as_u64().unwrap()).unwrap())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap()
+        };
+        let node = |label: &str| -> serde_json::Value {
+            doc["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["label"] == label)
+                .unwrap_or_else(|| panic!("{label} node in mv_root_children.json"))
+                .clone()
+        };
+
+        // Leaf circuit identity: identical for shield (leaf_to_mv_0) and
+        // transfer (leaf_to_mv_1) leaves, left and right.
+        for label in ["leaf_to_mv_0", "leaf_to_mv_1"] {
+            let n = node(label);
+            for side in ["left", "right"] {
+                assert_eq!(
+                    lanes8(&n[side]["preprocessed_root_lanes"]),
+                    LEAF_CIRCUIT_ROOT_LANES,
+                    "{label}.{side} leaf circuit root"
+                );
+            }
+        }
+        assert_eq!(
+            lanes8(&node("leaf_to_mv_0")["parent_preprocessed_root_lanes"]),
+            LEAF_TO_MV_CIRCUIT_ROOT_LANES,
+        );
+        assert_eq!(
+            lanes8(&node("mv_to_mv_root")["parent_preprocessed_root_lanes"]),
+            MV_TO_MV_CIRCUIT_ROOT_LANES,
+        );
+    }
+
+    #[test]
+    fn pinned_internal_root_lanes_levels() {
+        assert!(pinned_internal_root_lanes(0).is_err());
+        assert_eq!(
+            pinned_internal_root_lanes(1).unwrap(),
+            vec![LEAF_TO_MV_CIRCUIT_ROOT_LANES]
+        );
+        assert_eq!(
+            pinned_internal_root_lanes(4).unwrap(),
+            vec![
+                LEAF_TO_MV_CIRCUIT_ROOT_LANES,
+                MV_TO_MV_CIRCUIT_ROOT_LANES,
+                MV_TO_MV_CIRCUIT_ROOT_LANES,
+                MV_TO_MV_CIRCUIT_ROOT_LANES
+            ]
+        );
+    }
 
     /// Leaf-fixture cross-check of the **outer** OutHash stage (stage 2):
     /// the sprint 3.4b leaf shape sidecar

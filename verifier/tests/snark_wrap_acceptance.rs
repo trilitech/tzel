@@ -469,6 +469,31 @@ fn verify_snark_tree_accepts_real_proof_all_declared() {
     assert_eq!(root_ov, tree.expected_root.output_lanes);
 }
 
+/// POSITIVE, kernel wiring shape (W2b): the same tree-mode happy path but
+/// with the PINNED per-release circuit-identity constants
+/// (`LEAF_CIRCUIT_ROOT_LANES` + `pinned_internal_root_lanes`) instead of
+/// fixture-loaded ones — exactly the constants the rollup kernel's
+/// `verify_submit_ops_tree` passes. Proves the pinned constants accept
+/// the real mv-target proof end to end.
+#[test]
+fn verify_snark_tree_accepts_real_proof_with_pinned_constants() {
+    use tzel_verifier::snark::{
+        pinned_internal_root_lanes, LEAF_CIRCUIT_ROOT_LANES,
+    };
+    let envelope = fixture_envelope(PROOF_BIN);
+    let leaves = fixture_junction_leaves();
+    let tree = fixture_tree();
+    let internal = pinned_internal_root_lanes(2).expect("depth 2");
+    let root_ov = verify_snark_tree(
+        &envelope,
+        LEAF_CIRCUIT_ROOT_LANES,
+        &internal,
+        &all_declared_slots(&leaves),
+    )
+    .expect("pinned-constant tree-mode happy path");
+    assert_eq!(root_ov, tree.expected_root.output_lanes);
+}
+
 /// POSITIVE, single-op style: declare each op once and pad its duplicate
 /// slot as `Opaque` (junction lanes supplied as-is) — the design's
 /// "batch of 1" submission shape.

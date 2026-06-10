@@ -57,6 +57,9 @@ const M31_LANE_LIMIT: u32 = (1 << 31) - 1;
 const TREE_ROOTS_COUNT: usize = 4;
 const MAX_STAGED_NOTE_LIST_BYTES: usize = 4096;
 const MAX_LEAF_SLOT_LIST_BYTES: usize = 4096;
+/// `SubmitOps` result list: ≤ MAX_BATCH_OPS per-op results (largest is a
+/// shield resp: tag + 2 × (felt + u64) = 81 bytes; 128 gives headroom).
+const MAX_SUBMIT_RESULT_LIST_BYTES: usize = MAX_BATCH_OPS * 128;
 const MAX_OP_DECL_LIST_BYTES: usize = MAX_BATCH_OPS
     * ((MAX_OUTPUT_PREIMAGE_ITEMS * 32) + MAX_ENCODED_NULLIFIER_LIST_BYTES + 8192);
 
@@ -280,6 +283,23 @@ pub struct KernelStagedResp {
     pub sealed: bool,
 }
 
+/// Per-op outcome of a `SubmitOps` batch, in `ops[]` order.
+#[derive(Debug, Clone)]
+pub enum KernelOpResult {
+    Shield(ShieldResp),
+    Transfer(TransferResp),
+    Unshield(UnshieldResp),
+}
+
+/// Result of a fully applied `SubmitOps` batch (W2b): one entry per
+/// declared op, in declaration order. A batch that fails part-way
+/// reports `KernelResult::Error` instead (see the kernel's
+/// `apply_submit_ops` for the fail-stop semantics).
+#[derive(Debug, Clone)]
+pub struct KernelSubmitResp {
+    pub results: Vec<KernelOpResult>,
+}
+
 #[derive(Debug, Clone)]
 pub enum KernelResult {
     Configured,
@@ -288,6 +308,7 @@ pub enum KernelResult {
     Transfer(TransferResp),
     Unshield(UnshieldResp),
     Staged(KernelStagedResp),
+    Submitted(KernelSubmitResp),
     Error { message: String },
 }
 
@@ -650,6 +671,23 @@ struct WireKernelStagedResp {
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 #[encoding(tags = "u8")]
+enum WireKernelOpResult {
+    #[encoding(tag = 0)]
+    Shield(WireShieldResp),
+    #[encoding(tag = 1)]
+    Transfer(WireTransferResp),
+    #[encoding(tag = 2)]
+    Unshield(WireUnshieldResp),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelSubmitResp {
+    #[encoding(dynamic = "MAX_SUBMIT_RESULT_LIST_BYTES")]
+    results: Vec<WireKernelOpResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+#[encoding(tags = "u8")]
 enum WireKernelResult {
     #[encoding(tag = 0)]
     Configured,
@@ -663,6 +701,8 @@ enum WireKernelResult {
     Unshield(WireUnshieldResp),
     #[encoding(tag = 5)]
     Staged(WireKernelStagedResp),
+    #[encoding(tag = 6)]
+    Submitted(WireKernelSubmitResp),
     #[encoding(tag = 255)]
     Error(WireErrorMessage),
 }
@@ -761,6 +801,9 @@ pub fn encode_kernel_result(result: &KernelResult) -> Result<Vec<u8>, String> {
                 chunk_count: u16_to_wire(resp.chunk_count),
                 sealed: u8::from(resp.sealed),
             }),
+            KernelResult::Submitted(resp) => {
+                WireKernelResult::Submitted(kernel_submit_resp_to_wire(resp)?)
+            }
             KernelResult::Error { message } => WireKernelResult::Error(WireErrorMessage {
                 message: message.clone(),
             }),
@@ -802,6 +845,9 @@ pub fn decode_kernel_result(bytes: &[u8]) -> Result<KernelResult, String> {
                 sealed,
             }))
         }
+        WireKernelResult::Submitted(resp) => Ok(KernelResult::Submitted(
+            kernel_submit_resp_from_wire(resp)?,
+        )),
         WireKernelResult::Error(err) => Ok(KernelResult::Error {
             message: err.message,
         }),
@@ -1207,7 +1253,10 @@ fn validate_kernel_op_decl(index: usize, op: &KernelOpDecl) -> Result<(), String
     Ok(())
 }
 
-fn validate_kernel_submit_ops(submit: &KernelSubmitOps) -> Result<(), String> {
+/// Structural invariants of a `SubmitOps` message, enforced on BOTH wire
+/// encode and decode, and re-run defensively by the kernel apply path
+/// (which may be handed an in-memory value in tests).
+pub fn validate_kernel_submit_ops(submit: &KernelSubmitOps) -> Result<(), String> {
     if submit.ops.is_empty() {
         return Err("submit-ops requires at least one op".into());
     }
@@ -1521,6 +1570,29 @@ fn encrypted_note_from_wire(wire: WireEncryptedNote) -> Result<EncryptedNote, St
     Ok(enc)
 }
 
+/// Canonical byte form of ONE encrypted note carried by a staged entry
+/// (`docs/SNARK-SUBMISSION-DESIGN.md`): each `KernelStagedNoteRef` of a
+/// `SubmitOps` op names a sealed staging entry whose payload is exactly
+/// one note in this encoding. Producers (wallet/operator, track W4) stage
+/// `encode_staged_note_payload(note)`; the kernel resolves refs with
+/// [`decode_staged_note_payload`].
+pub fn encode_staged_note_payload(enc: &EncryptedNote) -> Result<Vec<u8>, String> {
+    encode_tze(&encrypted_note_to_wire(enc)?)
+}
+
+/// Inverse of [`encode_staged_note_payload`]; rejects trailing bytes so a
+/// staged entry cannot smuggle data past the note.
+pub fn decode_staged_note_payload(bytes: &[u8]) -> Result<EncryptedNote, String> {
+    let (rest, wire) = decode_tze_prefix::<WireEncryptedNote>(bytes)?;
+    if !rest.is_empty() {
+        return Err(format!(
+            "staged note payload left {} trailing bytes",
+            rest.len()
+        ));
+    }
+    encrypted_note_from_wire(wire)
+}
+
 fn kernel_proof_to_wire(proof: &KernelStarkProof) -> Result<WireStarkProof, String> {
     if proof.proof_bytes.len() > MAX_PROOF_BYTES {
         return Err(format!(
@@ -1678,6 +1750,64 @@ fn shield_resp_from_wire(wire: WireShieldResp) -> Result<ShieldResp, String> {
         producer_index: wire_to_u64(wire.producer_index)?
             .try_into()
             .map_err(|_| "shield producer_index does not fit in usize".to_string())?,
+    })
+}
+
+fn kernel_submit_resp_to_wire(resp: &KernelSubmitResp) -> Result<WireKernelSubmitResp, String> {
+    if resp.results.is_empty() || resp.results.len() > MAX_BATCH_OPS {
+        return Err(format!(
+            "submit result count out of range: {} not in 1..={}",
+            resp.results.len(),
+            MAX_BATCH_OPS
+        ));
+    }
+    Ok(WireKernelSubmitResp {
+        results: resp
+            .results
+            .iter()
+            .map(|result| {
+                Ok(match result {
+                    KernelOpResult::Shield(resp) => {
+                        WireKernelOpResult::Shield(shield_resp_to_wire(resp)?)
+                    }
+                    KernelOpResult::Transfer(resp) => {
+                        WireKernelOpResult::Transfer(transfer_resp_to_wire(resp)?)
+                    }
+                    KernelOpResult::Unshield(resp) => {
+                        WireKernelOpResult::Unshield(unshield_resp_to_wire(resp)?)
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    })
+}
+
+fn kernel_submit_resp_from_wire(wire: WireKernelSubmitResp) -> Result<KernelSubmitResp, String> {
+    if wire.results.is_empty() || wire.results.len() > MAX_BATCH_OPS {
+        return Err(format!(
+            "submit result count out of range: {} not in 1..={}",
+            wire.results.len(),
+            MAX_BATCH_OPS
+        ));
+    }
+    Ok(KernelSubmitResp {
+        results: wire
+            .results
+            .into_iter()
+            .map(|result| {
+                Ok(match result {
+                    WireKernelOpResult::Shield(resp) => {
+                        KernelOpResult::Shield(shield_resp_from_wire(resp)?)
+                    }
+                    WireKernelOpResult::Transfer(resp) => {
+                        KernelOpResult::Transfer(transfer_resp_from_wire(resp)?)
+                    }
+                    WireKernelOpResult::Unshield(resp) => {
+                        KernelOpResult::Unshield(unshield_resp_from_wire(resp)?)
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
     })
 }
 
@@ -2835,6 +2965,100 @@ mod tests {
                 other => panic!("unexpected decoded result: {:?}", other),
             }
         }
+    }
+
+    #[test]
+    fn kernel_result_roundtrip_preserves_submit_resp() {
+        let result = KernelResult::Submitted(KernelSubmitResp {
+            results: vec![
+                KernelOpResult::Shield(ShieldResp {
+                    cm: [0x21; 32],
+                    index: 4,
+                    producer_cm: [0x22; 32],
+                    producer_index: 5,
+                }),
+                KernelOpResult::Transfer(TransferResp {
+                    index_1: 6,
+                    index_2: 7,
+                    index_3: 8,
+                }),
+                KernelOpResult::Unshield(UnshieldResp {
+                    change_index: None,
+                    producer_index: 9,
+                }),
+            ],
+        });
+        let bytes = encode_kernel_result(&result).unwrap();
+        match decode_kernel_result(&bytes).unwrap() {
+            KernelResult::Submitted(resp) => {
+                assert_eq!(resp.results.len(), 3);
+                match &resp.results[0] {
+                    KernelOpResult::Shield(shield) => {
+                        assert_eq!(shield.cm, [0x21; 32]);
+                        assert_eq!(shield.index, 4);
+                        assert_eq!(shield.producer_index, 5);
+                    }
+                    other => panic!("unexpected op result 0: {:?}", other),
+                }
+                match &resp.results[1] {
+                    KernelOpResult::Transfer(transfer) => {
+                        assert_eq!(
+                            (transfer.index_1, transfer.index_2, transfer.index_3),
+                            (6, 7, 8)
+                        );
+                    }
+                    other => panic!("unexpected op result 1: {:?}", other),
+                }
+                match &resp.results[2] {
+                    KernelOpResult::Unshield(unshield) => {
+                        assert_eq!(unshield.change_index, None);
+                        assert_eq!(unshield.producer_index, 9);
+                    }
+                    other => panic!("unexpected op result 2: {:?}", other),
+                }
+            }
+            other => panic!("unexpected decoded result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn encode_kernel_result_rejects_empty_or_oversized_submit_resp() {
+        let empty = KernelResult::Submitted(KernelSubmitResp { results: vec![] });
+        assert!(encode_kernel_result(&empty)
+            .unwrap_err()
+            .contains("submit result count out of range"));
+
+        let oversized = KernelResult::Submitted(KernelSubmitResp {
+            results: vec![
+                KernelOpResult::Transfer(TransferResp {
+                    index_1: 0,
+                    index_2: 1,
+                    index_3: 2,
+                });
+                MAX_BATCH_OPS + 1
+            ],
+        });
+        assert!(encode_kernel_result(&oversized)
+            .unwrap_err()
+            .contains("submit result count out of range"));
+    }
+
+    #[test]
+    fn staged_note_payload_roundtrip_and_trailing_rejection() {
+        let note = sample_encrypted_note(0x3D);
+        let encoded = encode_staged_note_payload(&note).unwrap();
+        let decoded = decode_staged_note_payload(&encoded).unwrap();
+        // EncryptedNote has no PartialEq; byte-identical re-encoding is
+        // an equivalent round-trip witness.
+        assert_eq!(encode_staged_note_payload(&decoded).unwrap(), encoded);
+
+        let mut trailing = encoded.clone();
+        trailing.push(0x00);
+        assert!(decode_staged_note_payload(&trailing)
+            .unwrap_err()
+            .contains("trailing bytes"));
+
+        assert!(decode_staged_note_payload(&encoded[..encoded.len() - 1]).is_err());
     }
 
     #[test]

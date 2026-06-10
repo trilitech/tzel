@@ -34,16 +34,20 @@ use tzel_core::{
     default_auth_domain, hash, hash_merkle,
     kernel_wire::{
         decode_kernel_inbox_message, decode_kernel_result, decode_kernel_verifier_config,
-        encode_kernel_result, encode_kernel_verifier_config, kernel_bridge_config_sighash,
-        kernel_shield_req_to_host, kernel_transfer_req_to_host, kernel_unshield_req_to_host,
-        kernel_verifier_config_sighash, KernelBridgeConfig, KernelDalPayloadKind,
-        KernelDalPayloadPointer, KernelInboxMessage, KernelResult, KernelSignedBridgeConfig,
-        KernelSignedVerifierConfig, KernelStageChunk, KernelStagedResp, KernelVerifierConfig,
-        KERNEL_BRIDGE_CONFIG_KEY_INDEX, KERNEL_VERIFIER_CONFIG_KEY_INDEX, MAX_STAGE_CHUNK_BYTES,
+        decode_staged_note_payload, encode_kernel_result, encode_kernel_verifier_config,
+        kernel_bridge_config_sighash, kernel_shield_req_to_host, kernel_transfer_req_to_host,
+        kernel_unshield_req_to_host, kernel_verifier_config_sighash, validate_kernel_submit_ops,
+        KernelBridgeConfig, KernelDalPayloadKind, KernelDalPayloadPointer, KernelInboxMessage,
+        KernelOpDecl, KernelOpDeclBody, KernelOpResult, KernelResult,
+        KernelShieldReq, KernelSignedBridgeConfig, KernelSignedVerifierConfig, KernelStageChunk,
+        KernelStagedResp, KernelStarkProof, KernelSubmitOps, KernelSubmitResp, KernelTransferReq,
+        KernelUnshieldReq, KernelVerifierConfig, KERNEL_BRIDGE_CONFIG_KEY_INDEX,
+        KERNEL_VERIFIER_CONFIG_KEY_INDEX, MAX_STAGE_CHUNK_BYTES,
     },
     prepare_shield, prepare_unshield, required_tx_fee_for_private_tx_count,
-    verify_wots_signature_against_leaf, EncryptedNote, Ledger, LedgerState,
-    ShieldResp, UnshieldResp, WithdrawalRecord, DEPTH, F, ZERO,
+    validate_single_task_program_hash, verify_wots_signature_against_leaf, CircuitKind,
+    EncryptedNote, Ledger, LedgerState, ShieldResp, TransferResp, UnshieldResp, WithdrawalRecord,
+    DEPTH, F, ZERO,
 };
 #[cfg(any(test, debug_assertions))]
 use tzel_core::{auth_leaf_hash, derive_auth_pub_seed};
@@ -1211,29 +1215,16 @@ fn apply_kernel_message<H: Host>(
             configure_bridge(ledger, &config.config).map(|_| KernelResult::Configured)
         }
         KernelInboxMessage::Shield(req) => {
-            validate_transition_proof(ledger.host, &req.proof, tzel_core::CircuitKind::Shield)?;
-            let req = host_shield_req_for_transition(&req);
-            let prepared = prepare_shield(ledger, &req)?;
-            let commit = prepare_durable_shield_commit(ledger, &prepared)?;
-            Ok(KernelResult::Shield(apply_durable_shield_commit(
-                ledger, commit,
-            )))
+            validate_transition_proof(ledger.host, &req.proof, CircuitKind::Shield)?;
+            apply_validated_shield(ledger, &req).map(KernelResult::Shield)
         }
         KernelInboxMessage::Transfer(req) => {
-            validate_transition_proof(ledger.host, &req.proof, tzel_core::CircuitKind::Transfer)?;
-            let req = host_transfer_req_for_transition(&req);
-            apply_transfer(ledger, &req).map(KernelResult::Transfer)
+            validate_transition_proof(ledger.host, &req.proof, CircuitKind::Transfer)?;
+            apply_validated_transfer(ledger, &req).map(KernelResult::Transfer)
         }
         KernelInboxMessage::Unshield(req) => {
-            validate_transition_proof(ledger.host, &req.proof, tzel_core::CircuitKind::Unshield)?;
-            let req = host_unshield_req_for_transition(&req);
-            let prepared = prepare_unshield(ledger, &req)?;
-            let outbox = prepare_unshield_outbox(ledger, &prepared)?;
-            let commit = prepare_durable_unshield_commit(ledger, &prepared)?;
-            ledger.host.write_output(&outbox)?;
-            Ok(KernelResult::Unshield(apply_durable_unshield_commit(
-                ledger, commit,
-            )))
+            validate_transition_proof(ledger.host, &req.proof, CircuitKind::Unshield)?;
+            apply_validated_unshield(ledger, &req).map(KernelResult::Unshield)
         }
         KernelInboxMessage::DalPointer(pointer) => {
             let nested = fetch_kernel_message_from_dal(ledger.host, &pointer)?;
@@ -1243,14 +1234,391 @@ fn apply_kernel_message<H: Host>(
             apply_kernel_message(ledger, sender, nested)
         }
         KernelInboxMessage::StageChunk(chunk) => apply_stage_chunk(ledger, sender, &chunk),
-        // TODO(W2): batch apply for the DAL-free v18 submission path
-        // (docs/SNARK-SUBMISSION-DESIGN.md). Staged payloads are resolved via
-        // `read_sealed_staging_payload(host, &staging_sender_key(sender), ..)`
-        // and released with `discard_staging_entry` once applied.
-        KernelInboxMessage::SubmitOps(_) => {
-            Err("SubmitOps handling is not implemented yet (W2)".into())
+        KernelInboxMessage::SubmitOps(submit) => apply_submit_ops(ledger, sender, &submit),
+    }
+}
+
+/// Apply a shield request whose proof has ALREADY been verified (v17
+/// single-op STARK path, or per-op inside a verified `SubmitOps` batch).
+/// The core prepare still runs the full output-binding checks (the
+/// `output_preimage` fields vs the request publics).
+fn apply_validated_shield<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    req: &KernelShieldReq,
+) -> Result<ShieldResp, String> {
+    let req = host_shield_req_for_transition(req);
+    let prepared = prepare_shield(ledger, &req)?;
+    let commit = prepare_durable_shield_commit(ledger, &prepared)?;
+    Ok(apply_durable_shield_commit(ledger, commit))
+}
+
+/// See [`apply_validated_shield`].
+fn apply_validated_transfer<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    req: &KernelTransferReq,
+) -> Result<TransferResp, String> {
+    let req = host_transfer_req_for_transition(req);
+    apply_transfer(ledger, &req)
+}
+
+/// See [`apply_validated_shield`].
+fn apply_validated_unshield<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    req: &KernelUnshieldReq,
+) -> Result<UnshieldResp, String> {
+    let req = host_unshield_req_for_transition(req);
+    let prepared = prepare_unshield(ledger, &req)?;
+    let outbox = prepare_unshield_outbox(ledger, &prepared)?;
+    let commit = prepare_durable_unshield_commit(ledger, &prepared)?;
+    ledger.host.write_output(&outbox)?;
+    Ok(apply_durable_unshield_commit(ledger, commit))
+}
+
+// ── SubmitOps batch apply (W2b, docs/SNARK-SUBMISSION-DESIGN.md) ─────
+//
+// N declared ops bound to ONE Groth16-wrapped mv-root proof. The binding
+// chain per declared op:
+//   op.output_preimage ──(leaf↔mv junction)──▶ leaf output lanes
+//     ──(pairwise blake folds, pinned circuit roots)──▶ root publics
+//     ──(OutHash equation)──▶ Groth16 public inputs        [verifier crate]
+//   op.output_preimage ──(program-hash check)──▶ configured circuit
+//   op.output_preimage ──(core output-binding)──▶ declared public fields
+// so no declared op the proof does not cover can be applied, and the
+// declared fields cannot diverge from what was proven.
+
+fn op_circuit_kind(body: &KernelOpDeclBody) -> CircuitKind {
+    match body {
+        KernelOpDeclBody::Shield { .. } => CircuitKind::Shield,
+        KernelOpDeclBody::Transfer { .. } => CircuitKind::Transfer,
+        KernelOpDeclBody::Unshield { .. } => CircuitKind::Unshield,
+    }
+}
+
+/// Staged-note refs an op must carry, mirroring the v17 inline notes:
+/// shield `[client_enc, producer_enc]`, transfer `[enc_1, enc_2, enc_3]`,
+/// unshield `[enc_change?, enc_fee]` (change note present iff
+/// `cm_change != 0`, matching the core `prepare_unshield` invariant).
+fn expected_staged_note_count(body: &KernelOpDeclBody) -> usize {
+    match body {
+        KernelOpDeclBody::Shield { .. } => 2,
+        KernelOpDeclBody::Transfer { .. } => 3,
+        KernelOpDeclBody::Unshield { cm_change, .. } => {
+            if *cm_change == ZERO {
+                1
+            } else {
+                2
+            }
         }
     }
+}
+
+/// Resolve one op's staged-note refs against this sender's SEALED staging
+/// entries. Each ref names an entry whose payload must be exactly one
+/// note in the `encode_staged_note_payload` form; `payload_hash` binds
+/// the read to what the submitter committed to at staging time.
+fn resolve_op_notes<H: Host>(
+    host: &H,
+    sender_key: &F,
+    op_index: usize,
+    op: &KernelOpDecl,
+) -> Result<Vec<EncryptedNote>, String> {
+    let expected = expected_staged_note_count(&op.body);
+    if op.staged_notes.len() != expected {
+        return Err(format!(
+            "batch op {} ({}) declares {} staged note refs, expected {}",
+            op_index,
+            op_circuit_kind(&op.body).name(),
+            op.staged_notes.len(),
+            expected
+        ));
+    }
+    op.staged_notes
+        .iter()
+        .enumerate()
+        .map(|(ref_index, staged)| {
+            let payload =
+                read_sealed_staging_payload(host, sender_key, staged.staging_id, &staged.payload_hash)
+                    .map_err(|e| format!("batch op {} staged note {}: {}", op_index, ref_index, e))?;
+            decode_staged_note_payload(&payload)
+                .map_err(|e| format!("batch op {} staged note {}: {}", op_index, ref_index, e))
+        })
+        .collect()
+}
+
+/// Verify the batch's Groth16 wrap against the binding tree: declared
+/// leaves re-derived from their `output_preimage`s, opaque lanes taken
+/// as-is, pinned per-release circuit-identity constants at every level,
+/// root bound to the proof's `TreeRoots[0]` + `OutHash`, Groth16 on the
+/// envelope publics. Pure WASM-side crypto (blake2s + BN254 pairing).
+#[cfg(feature = "proof-verifier")]
+fn verify_submit_ops_tree(submit: &KernelSubmitOps) -> Result<(), String> {
+    use tzel_core::kernel_wire::KernelLeafSlot;
+    use tzel_verifier::snark::{
+        pinned_internal_root_lanes, verify_snark_tree, MvLeafSlot, MvNodePublics,
+        LEAF_CIRCUIT_ROOT_LANES,
+    };
+
+    // Slot indices are validated by `validate_kernel_submit_ops` before
+    // this is reached.
+    let slots: Vec<MvLeafSlot<'_>> = submit
+        .binding
+        .leaf_slots
+        .iter()
+        .map(|slot| match slot {
+            KernelLeafSlot::DeclaredOp(index) => MvLeafSlot::Declared {
+                output_preimage: submit.ops[usize::from(*index)].output_preimage.as_slice(),
+            },
+            KernelLeafSlot::Opaque { root, outputs } => MvLeafSlot::Opaque(MvNodePublics {
+                preprocessed_root_lanes: *root,
+                output_lanes: *outputs,
+            }),
+        })
+        .collect();
+
+    // Reassemble the verifier's proof envelope:
+    // TreeRoots (4 × 32 B) ‖ OutHash (8 × u32 LE) ‖ raw gnark proof.
+    let mut proof_bytes =
+        Vec::with_capacity(4 * 32 + 8 * 4 + submit.groth16_proof.len());
+    for root in &submit.tree_roots {
+        proof_bytes.extend_from_slice(root);
+    }
+    for lane in &submit.out_hash {
+        proof_bytes.extend_from_slice(&lane.to_le_bytes());
+    }
+    proof_bytes.extend_from_slice(&submit.groth16_proof);
+
+    let internal_roots = pinned_internal_root_lanes(submit.binding.depth)?;
+    verify_snark_tree(
+        &proof_bytes,
+        LEAF_CIRCUIT_ROOT_LANES,
+        &internal_roots,
+        &slots,
+    )
+    .map(|_root_output_lanes| ())
+}
+
+#[cfg(not(feature = "proof-verifier"))]
+fn verify_submit_ops_tree(_submit: &KernelSubmitOps) -> Result<(), String> {
+    Err("kernel built without proof verifier support".into())
+}
+
+/// Strict batch proof verification:
+/// 1. the rollup verifier must be configured;
+/// 2. every declared op's `output_preimage` must parse as a single-task
+///    bootloader output whose program hash IS the configured circuit
+///    executable for the op's declared kind;
+/// 3. the Groth16 wrap + binding-tree walk must accept
+///    ([`verify_submit_ops_tree`]).
+fn verify_submit_ops_proof_strict<H: Host>(
+    host: &H,
+    submit: &KernelSubmitOps,
+) -> Result<(), String> {
+    let config = read_verifier_config(host)?
+        .ok_or_else(|| "proof verifier is not configured".to_string())?;
+    for (index, op) in submit.ops.iter().enumerate() {
+        let kind = op_circuit_kind(&op.body);
+        validate_single_task_program_hash(
+            &op.output_preimage,
+            kind.expected_program_hash(&config.verified_program_hashes),
+        )
+        .map_err(|e| format!("batch op {} ({}): {}", index, kind.name(), e))?;
+    }
+    verify_submit_ops_tree(submit)
+}
+
+#[cfg(not(any(test, tzel_insecure_sandbox)))]
+fn verify_submit_ops_proof<H: Host>(host: &H, submit: &KernelSubmitOps) -> Result<(), String> {
+    verify_submit_ops_proof_strict(host, submit)
+}
+
+/// Same two-tier skip as `validate_transition_proof` (see the
+/// "Proof-verification skip path" notes below): the magic bytes skip ONLY
+/// the proof-side verification — program-hash binding + Groth16 tree walk,
+/// the v17 `validate_kernel` equivalent. The core output-binding checks
+/// still run unless the per-op `cfg(test)`-only TrustMeBro remap also
+/// fires (it does NOT under `tzel_insecure_sandbox`, where the prover stub
+/// emits real `output_preimage`s).
+#[cfg(any(test, tzel_insecure_sandbox))]
+fn verify_submit_ops_proof<H: Host>(host: &H, submit: &KernelSubmitOps) -> Result<(), String> {
+    if submit.groth16_proof == b"kernel-test-skip-verify" {
+        return Ok(());
+    }
+    verify_submit_ops_proof_strict(host, submit)
+}
+
+/// Apply one declared op of a verified batch through the SAME core paths
+/// as its v17 single-op message. The synthetic per-op proof carries the
+/// batch Groth16 bytes purely as a token: production code never reads
+/// `proof_bytes` past this point (binding checks use `output_preimage`
+/// only), and the `cfg(test)` TrustMeBro remap keys on the magic bytes
+/// exactly as on the v17 path. `notes.len()` was checked by
+/// [`resolve_op_notes`].
+fn apply_declared_op<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    op: &KernelOpDecl,
+    notes: &[EncryptedNote],
+    groth16_proof: &[u8],
+) -> Result<KernelOpResult, String> {
+    let proof = KernelStarkProof {
+        proof_bytes: groth16_proof.to_vec(),
+        output_preimage: op.output_preimage.clone(),
+    };
+    match &op.body {
+        KernelOpDeclBody::Shield {
+            pubkey_hash,
+            fee,
+            v,
+            producer_fee,
+            client_cm,
+            producer_cm,
+        } => {
+            let req = KernelShieldReq {
+                pubkey_hash: *pubkey_hash,
+                fee: *fee,
+                v: *v,
+                producer_fee: *producer_fee,
+                proof,
+                client_cm: *client_cm,
+                client_enc: notes[0].clone(),
+                producer_cm: *producer_cm,
+                producer_enc: notes[1].clone(),
+            };
+            apply_validated_shield(ledger, &req).map(KernelOpResult::Shield)
+        }
+        KernelOpDeclBody::Transfer {
+            root,
+            nullifiers,
+            fee,
+            cm_1,
+            cm_2,
+            cm_3,
+        } => {
+            let req = KernelTransferReq {
+                root: *root,
+                nullifiers: nullifiers.clone(),
+                fee: *fee,
+                cm_1: *cm_1,
+                cm_2: *cm_2,
+                cm_3: *cm_3,
+                enc_1: notes[0].clone(),
+                enc_2: notes[1].clone(),
+                enc_3: notes[2].clone(),
+                proof,
+            };
+            apply_validated_transfer(ledger, &req).map(KernelOpResult::Transfer)
+        }
+        KernelOpDeclBody::Unshield {
+            root,
+            nullifiers,
+            v_pub,
+            fee,
+            recipient,
+            cm_change,
+            cm_fee,
+        } => {
+            let (enc_change, enc_fee) = if *cm_change == ZERO {
+                (None, notes[0].clone())
+            } else {
+                (Some(notes[0].clone()), notes[1].clone())
+            };
+            let req = KernelUnshieldReq {
+                root: *root,
+                nullifiers: nullifiers.clone(),
+                v_pub: *v_pub,
+                fee: *fee,
+                recipient: recipient.clone(),
+                cm_change: *cm_change,
+                enc_change,
+                cm_fee: *cm_fee,
+                enc_fee,
+                proof,
+            };
+            apply_validated_unshield(ledger, &req).map(KernelOpResult::Unshield)
+        }
+    }
+}
+
+/// Apply a v18 `SubmitOps` batch (`docs/SNARK-SUBMISSION-DESIGN.md`,
+/// track W2b): N declared ops bound to ONE Groth16-wrapped mv-root proof.
+/// A batch of size 1 IS the single-op mode.
+///
+/// Phases:
+/// 1. structural re-validation (the wire decoder already enforces these
+///    invariants; re-run defensively since this writes durable state);
+/// 2. staged-note resolution: lazy per-sender GC first (same TTL
+///    semantics as `StageChunk`), then every ref must name a SEALED entry
+///    of THIS sender whose payload hash matches the ref and decodes as
+///    exactly one encrypted note;
+/// 3. batch proof verification ([`verify_submit_ops_proof`]);
+/// 4. sequential per-op apply in `ops[]` order, EXACTLY as N v17
+///    single-op messages: each op is prepared against the state left by
+///    its predecessors (an op CAN spend output of a batch predecessor
+///    once its root is snapshotted; cross-op double-spends are caught
+///    because op k's nullifiers are durably inserted before op k+1 is
+///    prepared);
+/// 5. release the consumed staged entries (deduped — several ops may
+///    share an entry).
+///
+/// FAIL-STOP, NOT ATOMIC: the `Host` interface has no rollback, and
+/// preparing every op against the pre-state before committing any would
+/// be UNSOUND (two ops spending the same nullifier would both pass). If
+/// op k fails, ops 0..k stay applied, ops k.. are not attempted, and the
+/// whole message reports `KernelResult::Error` naming the failed op. The
+/// applied prefix cannot be replayed (nullifier set / applied-shield
+/// marks), and staged entries are only discarded after the WHOLE batch
+/// applied — a failed batch keeps every referenced entry sealed, so the
+/// operator can resubmit the remaining suffix as a new batch.
+fn apply_submit_ops<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    sender: &InboxSender,
+    submit: &KernelSubmitOps,
+) -> Result<KernelResult, String> {
+    validate_kernel_submit_ops(submit)?;
+
+    let sender_key = staging_sender_key(sender);
+    let current_level = read_i32(ledger.host, PATH_LAST_INPUT_LEVEL).unwrap_or(0);
+    gc_expired_staging_entries(ledger.host, &sender_key, current_level);
+    let resolved_notes = submit
+        .ops
+        .iter()
+        .enumerate()
+        .map(|(index, op)| resolve_op_notes(ledger.host, &sender_key, index, op))
+        .collect::<Result<Vec<_>, String>>()?;
+
+    verify_submit_ops_proof(ledger.host, submit)?;
+
+    let mut results = Vec::with_capacity(submit.ops.len());
+    for (index, (op, notes)) in submit.ops.iter().zip(&resolved_notes).enumerate() {
+        let result =
+            apply_declared_op(ledger, op, notes, &submit.groth16_proof).map_err(|e| {
+                format!(
+                    "batch op {} failed ({} of {} ops already applied; \
+                     fail-stop, applied prefix kept, staged entries kept): {}",
+                    index,
+                    results.len(),
+                    submit.ops.len(),
+                    e
+                )
+            })?;
+        results.push(result);
+    }
+
+    let mut discarded: Vec<u64> = Vec::new();
+    for op in &submit.ops {
+        for staged in &op.staged_notes {
+            if discarded.contains(&staged.staging_id) {
+                continue;
+            }
+            if let Ok(Some(meta)) =
+                read_staging_meta(ledger.host, &staging_meta_path(&sender_key, staged.staging_id))
+            {
+                discard_staging_entry(ledger.host, &sender_key, staged.staging_id, &meta);
+            }
+            discarded.push(staged.staging_id);
+        }
+    }
+
+    Ok(KernelResult::Submitted(KernelSubmitResp { results }))
 }
 
 // ── StageChunk staging engine (W2a) ──────────────────────────────────
@@ -1499,8 +1867,6 @@ fn gc_expired_staging_entries<H: Host>(host: &mut H, sender_key: &F, current_lev
 /// Read a SEALED staging payload, binding it to the caller-supplied
 /// `payload_hash` (the `SubmitOps` staged-note refs carry this hash, so a
 /// submitter can never be served a payload it did not commit to).
-// TODO(W2): consumed by the SubmitOps apply path.
-#[allow(dead_code)]
 fn read_sealed_staging_payload<H: Host>(
     host: &H,
     sender_key: &F,
@@ -1536,7 +1902,6 @@ fn read_sealed_staging_payload<H: Host>(
 }
 
 /// Discard a staging entry entirely (storage + index + byte accounting).
-// TODO(W2): also used by the SubmitOps apply path to release consumed refs.
 fn discard_staging_entry<H: Host>(
     host: &mut H,
     sender_key: &F,
@@ -3372,6 +3737,606 @@ mod tests {
             read_u64(&host, &staging_bytes_path(&internal_key)),
             Some(internal_payload.len() as u64)
         );
+    }
+
+    // ── SubmitOps batch apply (W2b) ───────────────────────────────────
+
+    use tzel_core::kernel_wire::{
+        encode_staged_note_payload, KernelLeafSlot, KernelStagedNoteRef, KernelTreeBinding,
+    };
+
+    fn felt_u64(v: u64) -> F {
+        let mut f = ZERO;
+        f[..8].copy_from_slice(&v.to_le_bytes());
+        f
+    }
+
+    fn opaque_slot() -> KernelLeafSlot {
+        KernelLeafSlot::Opaque {
+            root: [1; 8],
+            outputs: [2; 8],
+        }
+    }
+
+    /// Stage one note as a single-chunk entry; returns the SubmitOps ref.
+    fn staged_note_input(
+        inputs: &mut Vec<InputMessage>,
+        level: i32,
+        id: i32,
+        staging_id: u64,
+        note: &EncryptedNote,
+    ) -> KernelStagedNoteRef {
+        let payload = encode_staged_note_payload(note).unwrap();
+        let payload_hash = hash(&payload);
+        inputs.push(external_stage_input(
+            level,
+            id,
+            stage_chunk(staging_id, 0, 1, payload_hash, payload),
+        ));
+        KernelStagedNoteRef {
+            staging_id,
+            payload_hash,
+        }
+    }
+
+    /// A SubmitOps message with the magic skip proof (mirrors
+    /// `sample_kernel_test_proof` for the v17 paths).
+    fn test_submit_ops(
+        ops: Vec<KernelOpDecl>,
+        depth: u8,
+        leaf_slots: Vec<KernelLeafSlot>,
+    ) -> KernelSubmitOps {
+        KernelSubmitOps {
+            ops,
+            groth16_proof: b"kernel-test-skip-verify".to_vec(),
+            tree_roots: [[0u8; 32]; 4],
+            out_hash: [0u32; 8],
+            binding: KernelTreeBinding { depth, leaf_slots },
+        }
+    }
+
+    fn external_submit_input(level: i32, id: i32, submit: KernelSubmitOps) -> InputMessage {
+        InputMessage {
+            level,
+            id,
+            payload: encode_external_kernel_message(&KernelInboxMessage::SubmitOps(submit)),
+        }
+    }
+
+    fn shield_op_decl(
+        pubkey_hash: F,
+        v: u64,
+        producer_fee: u64,
+        client_cm: F,
+        producer_cm: F,
+        staged_notes: Vec<KernelStagedNoteRef>,
+    ) -> KernelOpDecl {
+        KernelOpDecl {
+            output_preimage: vec![],
+            staged_notes,
+            body: KernelOpDeclBody::Shield {
+                pubkey_hash,
+                fee: MIN_TX_FEE,
+                v,
+                producer_fee,
+                client_cm,
+                producer_cm,
+            },
+        }
+    }
+
+    fn transfer_op_decl(
+        root: F,
+        nullifiers: Vec<F>,
+        cms: [F; 3],
+        staged_notes: Vec<KernelStagedNoteRef>,
+    ) -> KernelOpDecl {
+        KernelOpDecl {
+            output_preimage: vec![],
+            staged_notes,
+            body: KernelOpDeclBody::Transfer {
+                root,
+                nullifiers,
+                fee: MIN_TX_FEE,
+                cm_1: cms[0],
+                cm_2: cms[1],
+                cm_3: cms[2],
+            },
+        }
+    }
+
+    /// Fund a deposit pool directly through the shared ledger logic.
+    fn fund_deposit_pool(host: &mut MockHost, pubkey_hash: &F, amount: u64) {
+        let mut state = DurableLedgerState::new(host).unwrap();
+        apply_deposit(&mut state, &deposit_recipient_string(pubkey_hash), amount).unwrap();
+    }
+
+    fn expect_submitted(host: &MockHost) -> Vec<KernelOpResult> {
+        match read_last_result(host).unwrap() {
+            KernelResult::Submitted(resp) => resp.results,
+            KernelResult::Error { message } => {
+                panic!("submit failed: {} | debug: {}", message, host.debug)
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn applies_submit_ops_batch_of_one_shield() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+
+        let address = sample_payment_address();
+        let (v, producer_fee) = (50u64, 1u64);
+        let client_enc = sample_encrypted_note(&address, v, sample_felt(0x61), b"sub");
+        let client_cm = sample_commitment(&address, v, sample_felt(0x61));
+        let producer_enc = sample_encrypted_note(&address, producer_fee, sample_felt(0x62), b"fee");
+        let producer_cm = sample_commitment(&address, producer_fee, sample_felt(0x62));
+        let pubkey_hash = pubkey_hash_from_label("submit-alice");
+        fund_deposit_pool(&mut host, &pubkey_hash, v + producer_fee + MIN_TX_FEE);
+
+        let mut inputs = Vec::new();
+        let client_ref = staged_note_input(&mut inputs, 2, 0, 7, &client_enc);
+        let producer_ref = staged_note_input(&mut inputs, 2, 1, 8, &producer_enc);
+        inputs.push(external_submit_input(
+            2,
+            2,
+            test_submit_ops(
+                vec![shield_op_decl(
+                    pubkey_hash,
+                    v,
+                    producer_fee,
+                    client_cm,
+                    producer_cm,
+                    vec![client_ref.clone(), producer_ref],
+                )],
+                1,
+                vec![KernelLeafSlot::DeclaredOp(0), opaque_slot()],
+            ),
+        ));
+        host.inputs = inputs.into();
+
+        run_with_host(&mut host);
+
+        let results = expect_submitted(&host);
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            KernelOpResult::Shield(resp) => {
+                assert_eq!(resp.cm, client_cm);
+                assert_eq!(resp.index, 0);
+                assert_eq!(resp.producer_cm, producer_cm);
+                assert_eq!(resp.producer_index, 1);
+            }
+            other => panic!("unexpected op result: {:?}", other),
+        }
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.tree.leaves, vec![client_cm, producer_cm]);
+        // Pool fully drained.
+        let balance = host.read_store(&deposit_balance_path(&pubkey_hash), 8);
+        assert!(balance.as_ref().map(|b| b.is_empty()).unwrap_or(true));
+        // Both staged entries consumed: storage, index, and accounting.
+        let sender_key = staging_sender_key(&InboxSender::External);
+        assert_eq!(read_u64(&host, &staging_count_path(&sender_key)), Some(0));
+        assert_eq!(read_u64(&host, &staging_bytes_path(&sender_key)), Some(0));
+        assert!(
+            read_sealed_staging_payload(&host, &sender_key, 7, &client_ref.payload_hash).is_err()
+        );
+    }
+
+    #[test]
+    fn applies_submit_ops_mixed_batch_sequentially() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+
+        let address = sample_payment_address();
+        let (v, producer_fee) = (50u64, 1u64);
+        let client_enc = sample_encrypted_note(&address, v, sample_felt(0x63), b"sub");
+        let client_cm = sample_commitment(&address, v, sample_felt(0x63));
+        let producer_enc = sample_encrypted_note(&address, producer_fee, sample_felt(0x64), b"fee");
+        let producer_cm = sample_commitment(&address, producer_fee, sample_felt(0x64));
+        let pubkey_hash = pubkey_hash_from_label("submit-bob");
+        fund_deposit_pool(&mut host, &pubkey_hash, v + producer_fee + MIN_TX_FEE);
+
+        // The transfer consumes a PRE-batch root (still valid after the
+        // shield snapshots new ones).
+        let pre_batch_root = read_ledger(&host).unwrap().tree.root();
+        let t_encs = [
+            sample_encrypted_note(&address, 11, [0x71; 32], b"one"),
+            sample_encrypted_note(&address, 12, [0x72; 32], b"two"),
+            sample_encrypted_note(&address, 1, [0x73; 32], b"fee"),
+        ];
+        let t_cms = [
+            sample_commitment(&address, 11, [0x71; 32]),
+            sample_commitment(&address, 12, [0x72; 32]),
+            sample_commitment(&address, 1, [0x73; 32]),
+        ];
+        let nf = sample_felt(0x95);
+
+        let mut inputs = Vec::new();
+        let shield_refs = vec![
+            staged_note_input(&mut inputs, 3, 0, 11, &client_enc),
+            staged_note_input(&mut inputs, 3, 1, 12, &producer_enc),
+        ];
+        let transfer_refs = vec![
+            staged_note_input(&mut inputs, 3, 2, 13, &t_encs[0]),
+            staged_note_input(&mut inputs, 3, 3, 14, &t_encs[1]),
+            staged_note_input(&mut inputs, 3, 4, 15, &t_encs[2]),
+        ];
+        inputs.push(external_submit_input(
+            3,
+            5,
+            test_submit_ops(
+                vec![
+                    shield_op_decl(
+                        pubkey_hash,
+                        v,
+                        producer_fee,
+                        client_cm,
+                        producer_cm,
+                        shield_refs,
+                    ),
+                    transfer_op_decl(pre_batch_root, vec![nf], t_cms, transfer_refs),
+                ],
+                2,
+                vec![
+                    KernelLeafSlot::DeclaredOp(0),
+                    KernelLeafSlot::DeclaredOp(1),
+                    opaque_slot(),
+                    opaque_slot(),
+                ],
+            ),
+        ));
+        host.inputs = inputs.into();
+
+        run_with_host(&mut host);
+
+        let results = expect_submitted(&host);
+        assert_eq!(results.len(), 2);
+        assert!(matches!(&results[0], KernelOpResult::Shield(resp) if resp.index == 0));
+        match &results[1] {
+            KernelOpResult::Transfer(resp) => {
+                // Applied AFTER the shield's two notes.
+                assert_eq!((resp.index_1, resp.index_2, resp.index_3), (2, 3, 4));
+            }
+            other => panic!("unexpected op result: {:?}", other),
+        }
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.tree.leaves.len(), 5);
+        assert!(ledger.nullifiers.contains(&nf));
+        let sender_key = staging_sender_key(&InboxSender::External);
+        assert_eq!(read_u64(&host, &staging_count_path(&sender_key)), Some(0));
+        assert_eq!(read_u64(&host, &staging_bytes_path(&sender_key)), Some(0));
+    }
+
+    #[test]
+    fn submit_ops_rejects_missing_staged_ref_before_any_state_change() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+
+        let address = sample_payment_address();
+        let submit = test_submit_ops(
+            vec![shield_op_decl(
+                pubkey_hash_from_label("nobody"),
+                50,
+                1,
+                sample_commitment(&address, 50, sample_felt(0x65)),
+                sample_commitment(&address, 1, sample_felt(0x66)),
+                vec![
+                    KernelStagedNoteRef {
+                        staging_id: 404,
+                        payload_hash: [0xAB; 32],
+                    },
+                    KernelStagedNoteRef {
+                        staging_id: 405,
+                        payload_hash: [0xAC; 32],
+                    },
+                ],
+            )],
+            1,
+            vec![KernelLeafSlot::DeclaredOp(0), opaque_slot()],
+        );
+        host.inputs
+            .push_back(external_submit_input(4, 0, submit));
+
+        run_with_host(&mut host);
+
+        let message = expect_error(&host);
+        assert!(message.contains("batch op 0 staged note 0"));
+        assert!(message.contains("does not exist"));
+        assert!(read_ledger(&host).unwrap().tree.leaves.is_empty());
+    }
+
+    #[test]
+    fn submit_ops_rejects_wrong_staged_note_count_for_op_kind() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+
+        let address = sample_payment_address();
+        let note = sample_encrypted_note(&address, 1, sample_felt(0x67), b"one");
+        let mut inputs = Vec::new();
+        let only_ref = staged_note_input(&mut inputs, 5, 0, 21, &note);
+        inputs.push(external_submit_input(
+            5,
+            1,
+            test_submit_ops(
+                vec![shield_op_decl(
+                    pubkey_hash_from_label("short"),
+                    50,
+                    1,
+                    sample_commitment(&address, 50, sample_felt(0x68)),
+                    sample_commitment(&address, 1, sample_felt(0x69)),
+                    vec![only_ref],
+                )],
+                1,
+                vec![KernelLeafSlot::DeclaredOp(0), opaque_slot()],
+            ),
+        ));
+        host.inputs = inputs.into();
+
+        run_with_host(&mut host);
+
+        let message = expect_error(&host);
+        assert!(message.contains("declares 1 staged note refs, expected 2"));
+    }
+
+    #[test]
+    fn submit_ops_fail_stop_keeps_applied_prefix_and_staged_entries() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+
+        let address = sample_payment_address();
+        let (v, producer_fee) = (50u64, 1u64);
+        let client_enc = sample_encrypted_note(&address, v, sample_felt(0x6A), b"sub");
+        let client_cm = sample_commitment(&address, v, sample_felt(0x6A));
+        let producer_enc = sample_encrypted_note(&address, producer_fee, sample_felt(0x6B), b"fee");
+        let producer_cm = sample_commitment(&address, producer_fee, sample_felt(0x6B));
+        let pubkey_hash = pubkey_hash_from_label("submit-carol");
+        fund_deposit_pool(&mut host, &pubkey_hash, v + producer_fee + MIN_TX_FEE);
+
+        let pre_batch_root = read_ledger(&host).unwrap().tree.root();
+        let t_encs = [
+            sample_encrypted_note(&address, 11, [0x74; 32], b"one"),
+            sample_encrypted_note(&address, 12, [0x75; 32], b"two"),
+            sample_encrypted_note(&address, 1, [0x76; 32], b"fee"),
+        ];
+        let t_cms = [
+            sample_commitment(&address, 11, [0x74; 32]),
+            sample_commitment(&address, 12, [0x75; 32]),
+            sample_commitment(&address, 1, [0x76; 32]),
+        ];
+        let nf = sample_felt(0x97);
+
+        let mut inputs = Vec::new();
+        let shield_refs = vec![
+            staged_note_input(&mut inputs, 6, 0, 31, &client_enc),
+            staged_note_input(&mut inputs, 6, 1, 32, &producer_enc),
+        ];
+        let transfer_refs = vec![
+            staged_note_input(&mut inputs, 6, 2, 33, &t_encs[0]),
+            staged_note_input(&mut inputs, 6, 3, 34, &t_encs[1]),
+            staged_note_input(&mut inputs, 6, 4, 35, &t_encs[2]),
+        ];
+        let shield_client_ref = shield_refs[0].clone();
+        inputs.push(external_submit_input(
+            6,
+            5,
+            test_submit_ops(
+                vec![
+                    shield_op_decl(
+                        pubkey_hash,
+                        v,
+                        producer_fee,
+                        client_cm,
+                        producer_cm,
+                        shield_refs,
+                    ),
+                    // Duplicate public nullifiers: rejected by the core
+                    // transfer checks AFTER the shield already applied.
+                    transfer_op_decl(pre_batch_root, vec![nf, nf], t_cms, transfer_refs),
+                ],
+                2,
+                vec![
+                    KernelLeafSlot::DeclaredOp(0),
+                    KernelLeafSlot::DeclaredOp(1),
+                    opaque_slot(),
+                    opaque_slot(),
+                ],
+            ),
+        ));
+        host.inputs = inputs.into();
+
+        run_with_host(&mut host);
+
+        let message = expect_error(&host);
+        assert!(message.contains("batch op 1 failed (1 of 2 ops already applied"));
+        assert!(message.contains("duplicate nullifier"));
+
+        // Fail-stop: the shield prefix stays applied…
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.tree.leaves, vec![client_cm, producer_cm]);
+        assert!(ledger.nullifiers.is_empty());
+        // …and NO staged entry was discarded (all 5 still live and the
+        // shield's notes still sealed-readable for a resubmission).
+        let sender_key = staging_sender_key(&InboxSender::External);
+        assert_eq!(read_u64(&host, &staging_count_path(&sender_key)), Some(5));
+        assert!(read_sealed_staging_payload(
+            &host,
+            &sender_key,
+            31,
+            &shield_client_ref.payload_hash
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn submit_ops_discards_shared_staged_entry_once() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+
+        let address = sample_payment_address();
+        let (v, producer_fee) = (50u64, 1u64);
+        let client_enc_1 = sample_encrypted_note(&address, v, sample_felt(0x6C), b"one");
+        let client_cm_1 = sample_commitment(&address, v, sample_felt(0x6C));
+        let client_enc_2 = sample_encrypted_note(&address, v, sample_felt(0x6D), b"two");
+        let client_cm_2 = sample_commitment(&address, v, sample_felt(0x6D));
+        let producer_enc = sample_encrypted_note(&address, producer_fee, sample_felt(0x6E), b"fee");
+        let producer_cm = sample_commitment(&address, producer_fee, sample_felt(0x6E));
+        let pubkey_hash = pubkey_hash_from_label("submit-dave");
+        fund_deposit_pool(
+            &mut host,
+            &pubkey_hash,
+            2 * (v + producer_fee + MIN_TX_FEE),
+        );
+
+        let mut inputs = Vec::new();
+        let client_ref_1 = staged_note_input(&mut inputs, 7, 0, 41, &client_enc_1);
+        let client_ref_2 = staged_note_input(&mut inputs, 7, 1, 42, &client_enc_2);
+        // ONE producer-note entry shared by both shields.
+        let shared_ref = staged_note_input(&mut inputs, 7, 2, 43, &producer_enc);
+        inputs.push(external_submit_input(
+            7,
+            3,
+            test_submit_ops(
+                vec![
+                    shield_op_decl(
+                        pubkey_hash,
+                        v,
+                        producer_fee,
+                        client_cm_1,
+                        producer_cm,
+                        vec![client_ref_1, shared_ref.clone()],
+                    ),
+                    shield_op_decl(
+                        pubkey_hash,
+                        v,
+                        producer_fee,
+                        client_cm_2,
+                        producer_cm,
+                        vec![client_ref_2, shared_ref],
+                    ),
+                ],
+                1,
+                vec![KernelLeafSlot::DeclaredOp(0), KernelLeafSlot::DeclaredOp(1)],
+            ),
+        ));
+        host.inputs = inputs.into();
+
+        run_with_host(&mut host);
+
+        let results = expect_submitted(&host);
+        assert_eq!(results.len(), 2);
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.tree.leaves.len(), 4);
+        // The shared entry is released exactly once: counters reach zero
+        // without underflow artifacts.
+        let sender_key = staging_sender_key(&InboxSender::External);
+        assert_eq!(read_u64(&host, &staging_count_path(&sender_key)), Some(0));
+        assert_eq!(read_u64(&host, &staging_bytes_path(&sender_key)), Some(0));
+    }
+
+    #[test]
+    fn submit_ops_without_magic_bytes_enforces_program_hash_binding() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+
+        let address = sample_payment_address();
+        let note_client = sample_encrypted_note(&address, 50, sample_felt(0x6F), b"one");
+        let note_producer = sample_encrypted_note(&address, 1, sample_felt(0x70), b"two");
+
+        // Single-task bootloader preimage [n_tasks=1, task_output_size=2,
+        // program_hash] with a hash that is NOT the configured shield one.
+        let wrong_hash_preimage = vec![felt_u64(1), felt_u64(2), [9u8; 32]];
+
+        let mut inputs = Vec::new();
+        let refs = vec![
+            staged_note_input(&mut inputs, 8, 0, 51, &note_client),
+            staged_note_input(&mut inputs, 8, 1, 52, &note_producer),
+        ];
+        let mut op = shield_op_decl(
+            pubkey_hash_from_label("strict"),
+            50,
+            1,
+            sample_commitment(&address, 50, sample_felt(0x6F)),
+            sample_commitment(&address, 1, sample_felt(0x70)),
+            refs,
+        );
+        op.output_preimage = wrong_hash_preimage;
+        let mut submit = test_submit_ops(
+            vec![op],
+            1,
+            vec![KernelLeafSlot::DeclaredOp(0), opaque_slot()],
+        );
+        // NOT the magic bytes: the strict verification path must run.
+        submit.groth16_proof = vec![0xAA; 388];
+        inputs.push(external_submit_input(8, 2, submit));
+        host.inputs = inputs.into();
+
+        run_with_host(&mut host);
+
+        let message = expect_error(&host);
+        assert!(
+            message.contains("unexpected circuit program hash"),
+            "got: {}",
+            message
+        );
+        assert!(read_ledger(&host).unwrap().tree.leaves.is_empty());
+    }
+
+    #[test]
+    fn submit_ops_without_magic_bytes_reaches_groth16_verification() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+
+        let address = sample_payment_address();
+        let note_client = sample_encrypted_note(&address, 50, sample_felt(0x77), b"one");
+        let note_producer = sample_encrypted_note(&address, 1, sample_felt(0x78), b"two");
+
+        // Correct program hash (sample shield hash = [1; 32]); the strict
+        // path must then fail INSIDE Groth16 wrap verification (garbage
+        // proof bytes), proving the tree-verify callsite is wired.
+        let preimage = vec![felt_u64(1), felt_u64(2), sample_program_hashes().shield];
+
+        let mut inputs = Vec::new();
+        let refs = vec![
+            staged_note_input(&mut inputs, 9, 0, 61, &note_client),
+            staged_note_input(&mut inputs, 9, 1, 62, &note_producer),
+        ];
+        let mut op = shield_op_decl(
+            pubkey_hash_from_label("strict-2"),
+            50,
+            1,
+            sample_commitment(&address, 50, sample_felt(0x77)),
+            sample_commitment(&address, 1, sample_felt(0x78)),
+            refs,
+        );
+        op.output_preimage = preimage;
+        let mut submit = test_submit_ops(
+            vec![op],
+            1,
+            vec![KernelLeafSlot::DeclaredOp(0), opaque_slot()],
+        );
+        submit.groth16_proof = vec![0xAA; 388];
+        inputs.push(external_submit_input(9, 2, submit));
+        host.inputs = inputs.into();
+
+        run_with_host(&mut host);
+
+        let message = expect_error(&host);
+        #[cfg(feature = "proof-verifier")]
+        assert!(
+            message.contains("groth16") || message.contains("snark proof envelope"),
+            "got: {}",
+            message
+        );
+        #[cfg(not(feature = "proof-verifier"))]
+        assert!(
+            message.contains("without proof verifier support"),
+            "got: {}",
+            message
+        );
+        assert!(read_ledger(&host).unwrap().tree.leaves.is_empty());
     }
 
     #[test]
