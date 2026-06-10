@@ -730,6 +730,26 @@ nullifier/commitment binding.
   Merkle.merkle_binding/auth_binding via node_injective, so injective_4
   is a superseded generic helper, not a gap.)
 
+- **FULL XMSS ONE-TIME UNFORGEABILITY (`Spec/Xmss.v`):** assembled the
+  top-level signature-scheme security. xmss_soundness_reduces_to_wots
+  proved the REDUCTION (two XMSS sigs verifying against the same
+  leaf/root recover the same WOTS endpoints) but stopped there; its
+  header claimed WOTS+ unforgeability was "axiomatized, we don't prove
+  it". That was OUT OF DATE — wots_one_time_unforgeable proves it
+  structurally (forward-only attacker + checksum no-dominance). Added
+  (zero admits):
+  - xmss_one_time_unforgeable: two signatures verifying against the
+    SAME deployed XMSS key, where the second is a forward-only forgery
+    (digits componentwise >=), (a) recover the same WOTS+ public key
+    AND (b) sign the same message. So a forward-only forger cannot,
+    against a fixed XMSS leaf, produce a signature for any message
+    other than the one signed. Composes xmss_soundness_reduces_to_wots
+    (same key) with wots_one_time_unforgeable (same message), bridged
+    by recover_all_length.
+  Also corrected the two stale comments claiming the WOTS+
+  unforgeability is axiomatized — it is proven (the only crypto
+  assumption is chain-hash preimage resistance, made explicit).
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

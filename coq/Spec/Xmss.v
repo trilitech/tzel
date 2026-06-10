@@ -483,10 +483,16 @@ Section XmssVerify.
          endpoints, which under WOTS unforgeability implies
          knowledge of the secret key.
 
-      Piece (2) requires the WOTS+ one-time unforgeability axiom
-      from the literature (Hülsing et al. 2017).  We state it as
-      a hypothesis — axiomatizing it rather than proving it from
-      PRF/SPR, per the "light path" in STATUS.md. *)
+      Piece (2) is the WOTS+ one-time unforgeability.  Rather than
+      axiomatize it from the literature (Hülsing et al. 2017), it is
+      proved STRUCTURALLY below as [wots_one_time_unforgeable] for the
+      forward-only attacker model (a no-secret attacker can only walk
+      chains forward — [Wots.forward_forge_element] — which only
+      increases digits, and [wots_no_dominance] then forces the
+      message unchanged).  The full assembled result is
+      [xmss_one_time_unforgeable] at the end of this file. The only
+      cryptographic assumption is preimage resistance of the chain
+      hash (what makes "forward-only" the attacker's whole move set). *)
 
   (** Given that verification succeeds, the recovered leaf is
       uniquely determined: any other leaf that verifies against
@@ -534,13 +540,13 @@ End XmssVerify.
     (a) They recover the same L-tree leaf (from [auth_binding]).
     (b) They recover the same WOTS+ endpoints (from [ltree_injective]).
 
-    The final step — "same endpoints implies same secret key" — is
-    the WOTS+ one-time unforgeability property from Hülsing et al.
-    We don't prove it; it would require a game-based reduction to
-    PRF/second-preimage-resistance of BLAKE2s.  Instead, we
-    establish the mechanical fact that XMSS soundness reduces to
-    WOTS+ unforgeability: any break of XMSS implies a break of
-    WOTS+. *)
+    This theorem establishes the mechanical reduction (any break of
+    XMSS implies a break of WOTS+: same endpoints).  The final step —
+    "a forward-only forgery against the same endpoints signs the same
+    message" — is [wots_one_time_unforgeable] below, proved
+    structurally (not the game-based PRF/SPR reduction, but the
+    forward-only + checksum argument).  The two are assembled into the
+    top-level [xmss_one_time_unforgeable] at the end of this file. *)
 
 Theorem xmss_soundness_reduces_to_wots
     (F : Felt -> Felt -> Felt -> Felt)
@@ -1042,4 +1048,79 @@ Proof.
     rewrite Hdiv, Nat.mul_0_r, Nat.add_0_l in Heq.
     rewrite Heq. apply Nat.mod_upper_bound. exact Hpos.
   - apply Nat.div_small.
+Qed.
+
+(* ================================================================ *)
+(** ** Full XMSS one-time unforgeability (assembled)                 *)
+(* ================================================================ *)
+
+(** Assembles the two halves into the top-level signature-scheme
+    security statement.
+
+    NOTE: the [xmss_soundness_reduces_to_wots] header above states the
+    WOTS+ one-time unforgeability is "axiomatized... we don't prove
+    it".  That is now OUT OF DATE: [wots_one_time_unforgeable] (above)
+    proves it STRUCTURALLY for the forward-only attacker model — an
+    attacker with no secret can only walk chains forward
+    ([Wots.forward_forge_element]), which only increases digits, and
+    the checksum no-dominance ([wots_no_dominance]) then forces the
+    message to be unchanged.  The only cryptographic assumption is
+    preimage resistance (what makes "forward-only" the whole move
+    set).
+
+    This theorem composes that with the XMSS reduction: two signatures
+    that both verify against the SAME deployed XMSS key
+    ([key_idx]/[auth_root_val]), where the second is a forward-only
+    forgery of the first (digits componentwise >=), satisfy:
+
+    (a) they recover the SAME WOTS+ public key
+        ([xmss_soundness_reduces_to_wots]), and
+    (b) they sign the SAME message ([wots_one_time_unforgeable]).
+
+    So a forward-only forger cannot, against a fixed XMSS leaf,
+    produce a signature for any message other than the one signed. *)
+Theorem xmss_one_time_unforgeable
+    (F : Felt -> Felt -> Felt -> Felt)
+    (ADRS_chain : nat -> nat -> nat -> Felt)
+    (H_node : nat -> nat -> Felt -> Felt -> Felt)
+    (pub_seed : Felt) (key_idx : nat)
+    (msg1 cs1 msg2 cs2 : list nat) (sig1 sig2 : list Felt)
+    (auth_bits : list bool) (auth_siblings : list Felt)
+    (auth_root_val : Felt) :
+  node_injective H_node ->
+  length auth_bits = length auth_siblings ->
+  length (msg1 ++ cs1) = length sig1 ->
+  length (msg2 ++ cs2) = length sig2 ->
+  length msg1 = length msg2 ->
+  length cs1 = length cs2 ->
+  Forall (fun d => d <= 3) msg1 -> Forall (fun d => d <= 3) msg2 ->
+  Forall (fun d => d <= 3) cs1 -> Forall (fun d => d <= 3) cs2 ->
+  base4_val cs1 = checksum msg1 -> base4_val cs2 = checksum msg2 ->
+  xmss_verify F ADRS_chain H_node pub_seed key_idx
+    (msg1 ++ cs1) sig1 auth_bits auth_siblings auth_root_val ->
+  xmss_verify F ADRS_chain H_node pub_seed key_idx
+    (msg2 ++ cs2) sig2 auth_bits auth_siblings auth_root_val ->
+  (* the forgery walks chains forward only => every digit increased *)
+  Forall2 (fun d2 d1 => d2 >= d1) msg2 msg1 ->
+  Forall2 (fun d2 d1 => d2 >= d1) cs2 cs1 ->
+  (* (a) same WOTS+ public key, and (b) same message *)
+  recover_all F ADRS_chain pub_seed key_idx 0 (msg1 ++ cs1) sig1
+    = recover_all F ADRS_chain pub_seed key_idx 0 (msg2 ++ cs2) sig2
+  /\ msg1 = msg2.
+Proof.
+  intros Hinj Hauth Hs1 Hs2 Hmlen Hclen Hm1 Hm2 Hc1 Hc2 Hcs1 Hcs2 Hv1 Hv2 Hmge Hcge.
+  assert (Hlenrec :
+    length (recover_all F ADRS_chain pub_seed key_idx 0 (msg1 ++ cs1) sig1)
+    = length (recover_all F ADRS_chain pub_seed key_idx 0 (msg2 ++ cs2) sig2)).
+  { rewrite (recover_all_length F ADRS_chain pub_seed key_idx 0 (msg1 ++ cs1) sig1 Hs1).
+    rewrite (recover_all_length F ADRS_chain pub_seed key_idx 0 (msg2 ++ cs2) sig2 Hs2).
+    rewrite !length_app. lia. }
+  split.
+  - exact (xmss_soundness_reduces_to_wots F ADRS_chain H_node pub_seed key_idx
+             (msg1 ++ cs1) (msg2 ++ cs2) sig1 sig2
+             auth_bits auth_siblings auth_root_val
+             Hinj Hauth Hv1 Hv2 Hlenrec).
+  - symmetry.
+    apply (wots_one_time_unforgeable msg1 msg2 cs1 cs2
+             Hmlen Hm1 Hm2 Hc1 Hc2 Hcs1 Hcs2 Hmge Hcge).
 Qed.
