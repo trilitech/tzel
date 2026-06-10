@@ -81,6 +81,25 @@ let port_sighash_fold acc fields =
 let extracted_sighash_fold acc fields =
   Tzel_wots.sighash_fold0 acc fields
 
+(** OCaml port reference for the commitment-tree path computation.
+    [Tzel.Merkle.root_from_path ~depth leaf pos path] walks from the
+    leaf using the LSB-first bits of [pos] and the sibling array —
+    exactly Coq [merkle_root]'s fold.  [pos] is reconstructed from
+    the bool list (bit d = bits[d]). *)
+let pos_of_bits bits =
+  List.fold_left (fun (acc, d) b ->
+    ((if b then acc lor (1 lsl d) else acc), d + 1)) (0, 0) bits
+  |> fst
+
+let port_merkle_root bits siblings leaf =
+  let depth = List.length bits in
+  Tzel.Merkle.root_from_path ~depth leaf (pos_of_bits bits)
+    (Array.of_list siblings)
+
+(** The Rocq-extracted commitment-tree root computation. *)
+let extracted_merkle_root bits siblings leaf =
+  Tzel_wots.merkle_compute_root bits siblings leaf
+
 (** QCheck generator for chain-step inputs. *)
 let gen_chain_input =
   QCheck.Gen.(
@@ -277,6 +296,58 @@ let test_sighash_golden_vector () =
     "extracted Coq sighash_fold reproduces the Rust/Cairo golden result"
     true (Bytes.equal (extracted_sighash_fold i0 [i1; i2]) expected)
 
+(** Merkle-root differential: a random depth (0..16), a random leaf,
+    and parallel random bit / sibling lists of that depth.  Membership
+    proofs gate spending, so this pins the extracted Coq commitment-
+    tree fold (left/right ordering and the mrkl-domain hash) against
+    the port's root_from_path, which the cross-impl interop check
+    pins to the Cairo merkle::verify. *)
+let gen_merkle_input =
+  QCheck.Gen.(
+    let* depth = 0 -- 16 in
+    let leaf = random_felt () in
+    let* bits = list_size (return depth) bool in
+    let siblings = List.map (fun _ -> random_felt ())
+                     (List.init depth (fun i -> i)) in
+    return (bits, siblings, leaf))
+
+let arb_merkle_input =
+  QCheck.make gen_merkle_input
+    ~print:(fun (bits, _sibs, leaf) ->
+      Printf.sprintf "depth=%d leaf=%s" (List.length bits) (felt_to_hex leaf))
+
+let test_merkle_root =
+  QCheck_alcotest.to_alcotest
+    (QCheck.Test.make ~count:10000 ~name:"merkle_root: extracted = port"
+       arb_merkle_input
+       (fun (bits, siblings, leaf) ->
+          Bytes.equal (extracted_merkle_root bits siblings leaf)
+                      (port_merkle_root bits siblings leaf)))
+
+(** Golden anchor: protocol_v1.json's merkle[0] is depth 3 over
+    leaves [1;2;3;4] with a fixed Rust-generated root.  We take the
+    port's auth_path for leaf 0 (value 1) and assert the EXTRACTED
+    Coq merkle fold reproduces that golden root — anchoring the Coq
+    computation to the Rust/Cairo root value (the path is port-
+    derived; the root is the external reference). *)
+let test_merkle_golden_vector () =
+  let leaves = List.map felt_of_hex
+    [ "0100000000000000000000000000000000000000000000000000000000000000";
+      "0200000000000000000000000000000000000000000000000000000000000000";
+      "0300000000000000000000000000000000000000000000000000000000000000";
+      "0400000000000000000000000000000000000000000000000000000000000000" ] in
+  let root = felt_of_hex
+    "2bd1d23e7be6c29e43d75d662dfdbe0e3f79807b974b339a594b951cee18e406" in
+  let depth = 3 in
+  let pos = 0 in
+  let path = Tzel.Merkle.auth_path ~depth leaves pos in
+  let bits = List.init depth (fun d -> (pos lsr d) land 1 = 1) in
+  let leaf0 = List.nth leaves 0 in
+  let got = extracted_merkle_root bits (Array.to_list path) leaf0 in
+  Alcotest.(check bool)
+    "extracted Coq merkle fold reaches the Rust/Cairo golden root"
+    true (Bytes.equal got root)
+
 let () =
   Alcotest.run "extraction-diff"
     [ ("xmss_chain_step",
@@ -293,4 +364,8 @@ let () =
       ("sighash_fold",
        [ test_sighash_fold;
          Alcotest.test_case "sighash golden vector (Cairo/Rust-anchored)"
-           `Quick test_sighash_golden_vector ]) ]
+           `Quick test_sighash_golden_vector ]);
+      ("merkle_root",
+       [ test_merkle_root;
+         Alcotest.test_case "merkle golden vector (Cairo/Rust-anchored)"
+           `Quick test_merkle_golden_vector ]) ]

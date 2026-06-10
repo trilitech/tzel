@@ -47,3 +47,29 @@ let pack_adrs_chain = (fun key_idx chain_idx step ->
 
 let xmss_chain_step x pub_seed key_idx chain_idx step =
   hash3 pub_seed (pack_adrs_chain key_idx chain_idx step) x
+
+(** val merkle_step :
+    (felt -> felt -> felt) -> bool -> felt -> felt -> felt **)
+
+let merkle_step h bit current sibling =
+  if bit then h sibling current else h current sibling
+
+(** val merkle_root :
+    (felt -> felt -> felt) -> bool list -> felt list -> felt -> felt **)
+
+let rec merkle_root h bits siblings leaf =
+  match bits with
+  | [] -> leaf
+  | b::bs ->
+    (match siblings with
+     | [] -> leaf
+     | s::ss -> merkle_root h bs ss (merkle_step h b leaf s))
+
+(** val hash2_merkle : felt -> felt -> felt **)
+
+let hash2_merkle = Tzel.Hash.hash_merkle
+
+(** val merkle_compute_root : bool list -> felt list -> felt -> felt **)
+
+let merkle_compute_root bits siblings leaf =
+  merkle_root hash2_merkle bits siblings leaf

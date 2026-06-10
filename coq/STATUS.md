@@ -320,9 +320,24 @@ refinement + extraction + conformance), the same shape repeats for:
   now constrain a computation shown byte-equal to the Cairo's.
   Differential suite is now 8 cases: chain step x2, commit
   fuzz+golden, nullifier fuzz+golden, sighash fuzz+golden.
-  Remaining: merkle-root differential, then realize the FULL
-  transfer/unshield/shield relations + Cairo-side `run_*` runners
-  for whole-circuit conformance.
+  MERKLE-ROOT CONFORMANCE (this iteration): the last security-
+  critical primitive (membership = spend authorization) is now
+  differentially tested. Realized `Hash2_merkle =>
+  Tzel.Hash.hash_merkle`, mapped Coq `bool` => native OCaml bool,
+  extracted `merkle_compute_root : bool list -> felt list -> felt
+  -> felt`. Differential: 10k random fuzz (random depth 0..16,
+  parallel bit/sibling lists) vs the port's
+  `Tzel.Merkle.root_from_path` (cross-impl pinned to Cairo
+  merkle::verify) + a golden anchor reaching protocol_v1.json
+  merkle[0]'s Rust-generated root via the port's auth_path.
+  ALL FIVE security-critical primitives now have Rocq <-> OCaml
+  <-> Cairo conformance (golden-anchored where a direct fixture
+  exists): WOTS chain step, commitment, nullifier, sighash fold,
+  merkle root. Differential suite = 10 cases.
+  Remaining: realize the FULL transfer/unshield/shield relations +
+  Cairo-side `run_*` runners for whole-circuit (assembled-relation)
+  conformance — the primitives are all covered; the assembly is not
+  yet run end-to-end against Cairo.
 
 ## Open questions / decisions deferred
 

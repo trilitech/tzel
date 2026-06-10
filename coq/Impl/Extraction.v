@@ -35,6 +35,7 @@ From Stdlib Require Extraction.
 From Common Require Import Felt.
 From Impl Require Import Hashes.
 From Impl Require Import Wots.
+From Impl Require Import Merkle.
 
 Extraction Language OCaml.
 
@@ -75,6 +76,10 @@ Extract Inductive nat => "int" [ "0" "Stdlib.succ" ]
     ordinary OCaml lists to [sighash_fold]. *)
 Extract Inductive list => "list" [ "[]" "(::)" ].
 
+(** Map Coq [bool] to OCaml's native [bool] so the merkle path bits
+    extract as ordinary booleans. *)
+Extract Inductive bool => "bool" [ "true" "false" ].
+
 (** Realize [Hash5] as [Tzel.Hash.hash_commit] — the 5-felt
     commitment hash (multiasset cmmt domain).  Bit-equivalent to the
     Cairo [hash5] under the cross-impl interop check and the
@@ -89,4 +94,9 @@ Extract Constant Hash_nf => "Tzel.Hash.hash_nf".
     2-input hash). *)
 Extract Constant Hash_sighash => "Tzel.Hash.hash_sighash".
 
-Extraction "tzel_wots.ml" xmss_chain_step commit nullifier sighash_fold.
+(** Realize [Hash2_merkle] as [Tzel.Hash.hash_merkle] (mrkl-domain
+    2-input hash) for the commitment-tree path computation. *)
+Extract Constant Hash2_merkle => "Tzel.Hash.hash_merkle".
+
+Extraction "tzel_wots.ml"
+  xmss_chain_step commit nullifier sighash_fold merkle_compute_root.
