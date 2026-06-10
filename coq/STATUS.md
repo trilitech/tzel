@@ -870,6 +870,26 @@ nullifier/commitment binding.
   get froot (fbuild leaves) = mroot d leaves — mechanical given the
   bridge, the frep structure (MerkleFrontier), and mroot_app_z0.
 
+- **O(depth) FRONTIER READ-OFF CORRECT — CAPSTONE
+  (`Spec/MerkleFrontierCorrect.v`):** the previously-deferred hard
+  item, now CLOSED. Reading the root off the kernel's O(depth)
+  frontier state equals the true batch Merkle root of all notes.
+  froot_fbuild_eq: length leaves < 2^d -> length (fbuild leaves) <= d
+  -> froot d (fbuild leaves) 0 z0 = mroot d leaves. So the kernel
+  commits the correct commitment-tree root using only O(depth)
+  storage, never the full leaf array. Proved (zero admits):
+  - froot_correct: the heart — folds the per-level MerkleBridge.bridge
+    over the whole frontier, using fbuild_frep (the frontier
+    faithfully represents the notes) and the ppair snoc computations,
+    by induction on the frontier with per-level length bounds;
+  - froot_nil_eq, ppair_even_snoc, ppair_even2, pairup_bl: connecting
+    lemmas. The depth bound length (fbuild leaves) <= d is an explicit
+    structural precondition (the binary-counter frontier of < 2^d
+    notes has at most d slots), everything else proved.
+  Completes the multi-iteration incremental-Merkle arc: fbuild_frep ->
+  root_of_mroot -> padding invariance -> base independence -> bridge ->
+  froot_correct, all zero-admit.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
