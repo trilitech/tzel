@@ -682,6 +682,22 @@ nullifier/commitment binding.
   full stack composes: circuit no-inflation (any op mix) -> kernel
   conservation -> per-asset L1<->L2 collateralization.
 
+- **MULTIASSET COMMITMENT BINDING (`Spec/Hashes.v`):** closes a real
+  gap — injective_5 was defined but unused, and the asset-substitution
+  soundness was only described in comments, not proven. Added:
+  - commitment_binding: under injective_5 H_commit, a commitment binds
+    ALL five fields (d_j, v, asset, rcm, owner_tag) — equal cms arise
+    only from identical notes (the note-integrity root of trust);
+  - commitment_binds_asset: equal cms have the same asset — a note
+    committed under one asset can NEVER be presented as a different
+    asset, ruling out the asset-substitution attack (spending a cheap
+    note as an expensive asset) that Spec.Shield flags as a hazard;
+  - commitment_binds_value: equal cms have the same value (no per-note
+    amount inflation by re-presenting a different value).
+  This is the multiasset analogue of nullifier_binding, and the
+  per-note counterpart to the aggregate value conservation: each note
+  is welded to its asset and amount by its commitment.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

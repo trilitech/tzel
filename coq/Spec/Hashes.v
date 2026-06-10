@@ -287,6 +287,55 @@ Section Nullifier.
   Definition commitment (d_j v asset rcm owner_tag : Felt) : Felt :=
     H_commit d_j v asset rcm owner_tag.
 
+  (** Under collision resistance of [H_commit] (modeled as 5-ary
+      injectivity), a commitment BINDS all five fields: equal
+      commitments only arise from the same
+      [(d_j, v, asset, rcm, owner_tag)].  This is the note-integrity
+      root of trust — a commitment in the tree determines, uniquely,
+      the note it represents. *)
+  Theorem commitment_binding (Hinj : injective_5 H_commit)
+      (d v asset rcm owner d' v' asset' rcm' owner' : Felt) :
+    commitment d v asset rcm owner = commitment d' v' asset' rcm' owner' ->
+    d = d' /\ v = v' /\ asset = asset' /\ rcm = rcm' /\ owner = owner'.
+  Proof. unfold commitment. apply Hinj. Qed.
+
+  (** ** Multiasset soundness: the commitment binds its ASSET.
+
+      Two notes with the same commitment have the same asset.  Since
+      spending/unshielding a note proves membership of its commitment
+      in the tree and re-derives that commitment from the presented
+      fields, a note committed under one asset can NEVER be presented
+      as a different asset.  This is exactly what rules out the
+      "asset substitution" attack (the [Spec.Shield] hazard: spending
+      a cheap-asset note as an expensive asset) — the asset is welded
+      to the commitment, with no separate asset nullifier needed. *)
+  Corollary commitment_binds_asset (Hinj : injective_5 H_commit)
+      (d v asset rcm owner d' v' asset' rcm' owner' : Felt) :
+    commitment d v asset rcm owner = commitment d' v' asset' rcm' owner' ->
+    asset = asset'.
+  Proof.
+    intro Heq.
+    destruct (commitment_binding Hinj d v asset rcm owner
+                                 d' v' asset' rcm' owner' Heq)
+      as [_ [_ [Ha _]]].
+    exact Ha.
+  Qed.
+
+  (** Likewise the commitment binds its VALUE: a note's amount cannot
+      be changed without changing its commitment (no per-note value
+      inflation by re-presenting a different amount). *)
+  Corollary commitment_binds_value (Hinj : injective_5 H_commit)
+      (d v asset rcm owner d' v' asset' rcm' owner' : Felt) :
+    commitment d v asset rcm owner = commitment d' v' asset' rcm' owner' ->
+    v = v'.
+  Proof.
+    intro Heq.
+    destruct (commitment_binding Hinj d v asset rcm owner
+                                 d' v' asset' rcm' owner' Heq)
+      as [_ [Hv _]].
+    exact Hv.
+  Qed.
+
   (** Nullifier: [nf = H_nf(nk_spend, H_nf(cm, pos))].
       Position-dependent to prevent faerie-gold attacks. *)
   Definition nullifier (nk_spend cm pos : Felt) : Felt :=
