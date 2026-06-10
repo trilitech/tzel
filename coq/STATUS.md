@@ -716,6 +716,20 @@ nullifier/commitment binding.
   auth_root (owner_tag_binding) — so the commitment pins amount,
   asset, AND who may spend.
 
+- **FAERIE-GOLD RESISTANCE (`Spec/Hashes.v`):** the nullifier's
+  position-dependence (nf = H_nf(nk, H_nf(cm, pos))) is documented as
+  preventing faerie-gold attacks but was only in comments. Added
+  nullifier_position_distinct (corollary of nullifier_binding): the
+  same note value (same nk, same cm) at two DISTINCT positions yields
+  DISTINCT nullifiers. So an attacker re-committing a victim's cm at a
+  different position creates an INDEPENDENT note — spending it neither
+  nullifies nor locks the victim's original. Documented defense, now a
+  theorem.
+  (Note: injective_4 / Hash4 audited — Hash4 is the level/position-
+  indexed Merkle/XMSS node hash whose binding is already captured by
+  Merkle.merkle_binding/auth_binding via node_injective, so injective_4
+  is a superseded generic helper, not a gap.)
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

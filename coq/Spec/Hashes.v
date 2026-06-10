@@ -421,6 +421,29 @@ Section Nullifier.
     auto.
   Qed.
 
+  (** ** Faerie-gold resistance (position-dependence)
+
+      The nullifier is position-dependent:
+      [nf = H_nf(nk_spend, H_nf(cm, pos))].  A consequence of
+      [nullifier_binding] is that the SAME note value (same spending
+      key [nk], same commitment [cm]) at two DISTINCT tree positions
+      yields DISTINCT nullifiers.
+
+      So an attacker who re-commits a victim's note value [cm] at a
+      different position creates an INDEPENDENT note: it has a
+      different nullifier, so spending the attacker's copy neither
+      nullifies nor locks the victim's original.  This is the
+      "faerie-gold" defense the [pos] binding provides — described in
+      the protocol notes, now a theorem. *)
+  Corollary nullifier_position_distinct (Hinj : injective_2 H_nf)
+      (nk cm pos pos' : Felt) :
+    pos <> pos' -> nullifier nk cm pos <> nullifier nk cm pos'.
+  Proof.
+    intros Hne Heq.
+    destruct (nullifier_binding Hinj nk cm pos nk cm pos' Heq) as [_ [_ Hp]].
+    exact (Hne Hp).
+  Qed.
+
   (** ** Batch double-spend prevention
 
       A SPEND DESCRIPTOR is the [(nk_spend, cm, pos)] triple a single
