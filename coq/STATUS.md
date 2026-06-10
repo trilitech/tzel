@@ -1106,6 +1106,22 @@ nullifier/commitment binding.
   true. Two of the three circuit relations (shield, unshield) now have
   full inhabitation; transfer remains.
 
+- **FULL TransferRelation INHABITATION — non-vacuity arc COMPLETE
+  (`Impl/Transfer.v`):** the last of the three circuit relations.
+  transfer_relation_inhabited (zero admits): a single concrete honest
+  transfer (one tez input spending a tree note, three zero-value tez
+  outputs, a tez producer note v=1, balanced 2-accumulator) satisfies
+  all 13 conjuncts of TransferRelation. So ALL THREE circuit-relation
+  soundness theorems (transfer/shield/unshield_relation_sound) are now
+  provably NOT vacuously true — the entire circuit-relation soundness
+  layer is non-vacuous. The pattern (key fixed first to break the
+  signature circularity, t_xmss_honest helper isolating the XMSS
+  reasoning, `change` to reduce pose projections, one Felt_eq_dec case
+  split for the accumulators) transferred cleanly from unshield and
+  compiled first try. Combined with Spec/XmssInhabited
+  (xmss_cairo_sep_inhabited), the relations are non-vacuous on both
+  the shared crypto core and as whole relations.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

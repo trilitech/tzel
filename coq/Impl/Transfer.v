@@ -268,6 +268,7 @@ End TwoAccumulator.
     in [Spec.Merkle] / [Spec.Xmss]. *)
 
 From Spec Require Merkle Xmss Hashes.
+From Stdlib Require Import Lia.
 
 Section TransferRelation.
 
@@ -501,6 +502,118 @@ Section TransferRelation.
       exact Hprod_tez.
     - (* producer fee positive *)
       exact Hfee_pos.
+  Qed.
+
+  Lemma t_xmss_honest :
+    forall (ps : Felt) (msg : list nat) (sks sib : list Felt) (leaf : Felt),
+      length msg = length sks ->
+      Forall (fun d => d <= Spec.Hashes.wots_chain_len) msg ->
+      Spec.Xmss.ltree (H_ltree_node ps 0)
+        (Spec.Xmss.gen_pk F_chain ADRS_chain ps 0 0 sks) = Some leaf ->
+      length sib = Spec.Hashes.auth_depth ->
+      Spec.Xmss.xmss_verify_cairo_sep
+        (H_tree_node ps) (H_ltree_node ps 0) F_chain ADRS_chain ps 0
+        msg (Spec.Xmss.sign F_chain ADRS_chain ps 0 0 msg sks) sib
+        (Spec.Merkle.auth_root (H_tree_node ps)
+           (Spec.Xmss.nat_to_bits Spec.Hashes.auth_depth 0) sib leaf 0 0).
+  Proof.
+    intros ps msg sks sib leaf Hlen Hbd Hleaf Hsib.
+    unfold Spec.Xmss.xmss_verify_cairo_sep.
+    rewrite (Spec.Xmss.recover_all_correct F_chain ADRS_chain ps 0 0 msg sks Hlen Hbd).
+    rewrite Hleaf.
+    unfold Spec.Xmss.auth_verify. split; [exact Hsib | split].
+    - assert (2 ^ Spec.Hashes.auth_depth <> 0) by (apply Nat.pow_nonzero; lia). lia.
+    - reflexivity.
+  Qed.
+
+  (** NON-VACUITY: a single concrete honest transfer satisfies every
+      conjunct of [TransferRelation] at once, so [transfer_relation_sound]
+      is not vacuously true.  One tez input, three zero-value tez change
+      notes, a tez producer note (v=1), balanced 2-accumulator. *)
+  Theorem transfer_relation_inhabited
+      (auth_domain primary z : Felt) (sks : list Felt)
+      (Hsks_len : length sks = Spec.Hashes.wots_chains)
+      (Hsks_ne : sks <> nil)
+      (Hwd_len : forall sh, length (wots_digits sh) = Spec.Hashes.wots_chains)
+      (Hwd_bd : forall sh, Forall (fun d => d <= Spec.Hashes.wots_chain_len) (wots_digits sh)) :
+    exists root fee inputs o1 o2 o3 o4,
+      TransferRelation auth_domain root fee primary inputs o1 o2 o3 o4.
+  Proof.
+    pose (sib := repeat z Spec.Hashes.auth_depth).
+    assert (Hgpk : Spec.Xmss.gen_pk F_chain ADRS_chain z 0 0 sks <> nil).
+    { destruct sks; [contradiction | cbn [Spec.Xmss.gen_pk]; discriminate]. }
+    destruct (Spec.Xmss.ltree_succeeds (H_ltree_node z 0)
+                (Spec.Xmss.gen_pk F_chain ADRS_chain z 0 0 sks) Hgpk) as [leaf Hleaf].
+    pose (ar := Spec.Merkle.auth_root (H_tree_node z)
+                  (Spec.Xmss.nat_to_bits Spec.Hashes.auth_depth 0) sib leaf 0 0).
+    pose (icm := H_commit z (felt_of_nat 1) asset_tez (H_rcm z) (H_owner ar z (H_nktag z))).
+    pose (root := Spec.Merkle.merkle_root H_merkle
+                    (Spec.Xmss.nat_to_bits Spec.Hashes.tree_depth 0)
+                    (repeat z Spec.Hashes.tree_depth) icm).
+    pose (inf := Spec.Hashes.nullifier H_nf z icm (felt_of_nat 0)).
+    pose (oz := mkCairoOutput
+                  (H_commit z (felt_of_nat 0) asset_tez (H_rcm z) (H_owner z z z))
+                  z 0 z z z z z asset_tez).
+    pose (op := mkCairoOutput
+                  (H_commit z (felt_of_nat 1) asset_tez (H_rcm z) (H_owner z z z))
+                  z 1 z z z z z asset_tez).
+    pose (sh := relation_sighash auth_domain root (inf :: nil) 0 oz oz oz op).
+    pose (inp := mkCairoInput
+                   inf z ar z 0 z 1 z 0 asset_tez
+                   (repeat z Spec.Hashes.tree_depth) sib
+                   (Spec.Xmss.sign F_chain ADRS_chain z 0 0 (wots_digits sh) sks)).
+    exists root, 0, (inp :: nil), oz, oz, oz, op.
+    assert (Hdlen : length (wots_digits sh) = length sks)
+      by (rewrite Hwd_len; exact (eq_sym Hsks_len)).
+    unfold TransferRelation. cbv zeta.
+    refine (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ _)))))))))))).
+    - cbn [length]. lia.
+    - reflexivity.
+    - apply Forall_cons; [| apply Forall_nil].
+      unfold input_checks.
+      refine (conj _ (conj _ (conj _ _))).
+      + left. reflexivity.
+      + unfold Spec.Xmss.merkle_verify. split; [| split].
+        * change (ci_merkle_siblings inp) with (repeat z Spec.Hashes.tree_depth).
+          apply repeat_length.
+        * assert (2 ^ Spec.Hashes.tree_depth <> 0) by (apply Nat.pow_nonzero; lia).
+          change (ci_pos inp) with 0. lia.
+        * reflexivity.
+      + change (ci_pub_seed inp) with z.
+        change (ci_auth_idx inp) with 0.
+        change (ci_auth_root inp) with ar.
+        change (ci_auth_siblings inp) with sib.
+        change (ci_wots_sig inp) with
+          (Spec.Xmss.sign F_chain ADRS_chain z 0 0 (wots_digits sh) sks).
+        apply (t_xmss_honest z (wots_digits sh) sks sib leaf Hdlen (Hwd_bd sh) Hleaf).
+        unfold sib. apply repeat_length.
+      + reflexivity.
+    - left; reflexivity.
+    - left; reflexivity.
+    - left; reflexivity.
+    - reflexivity.
+    - reflexivity.
+    - reflexivity.
+    - reflexivity.
+    - cbn. lia.
+    - change (map ci_asset (inp :: nil)) with (asset_tez :: @nil Felt);
+      change (map ci_v (inp :: nil)) with (1 :: @nil nat);
+      change (co_asset oz) with asset_tez;
+      change (co_v oz) with 0;
+      change (co_asset op) with asset_tez;
+      change (co_v op) with 1.
+      cbn [acc_tez].
+      destruct (Felt.Felt_eq_dec asset_tez asset_tez) as [_ | Hne];
+        [lia | exfalso; apply Hne; reflexivity].
+    - change (map ci_asset (inp :: nil)) with (asset_tez :: @nil Felt);
+      change (map ci_v (inp :: nil)) with (1 :: @nil nat);
+      change (co_asset oz) with asset_tez;
+      change (co_v oz) with 0;
+      change (co_asset op) with asset_tez;
+      change (co_v op) with 1.
+      cbn [acc_primary].
+      destruct (Felt.Felt_eq_dec asset_tez asset_tez) as [_ | Hne];
+        [lia | exfalso; apply Hne; reflexivity].
   Qed.
 
 End TransferRelation.
