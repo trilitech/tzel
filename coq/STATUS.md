@@ -262,6 +262,29 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   model's `nat` arithmetic provably coincides with the real bounded
   (u128 / field) arithmetic under the circuit's range + count bounds.
 
+- **KERNEL POOL SOLVENCY (`Spec/KernelPool.v`) — NEW SCOPE:** the
+  first proof about the rollup KERNEL (not the circuits). Models the
+  per-pool deposit accounting in tezos/rollup-kernel/src/lib.rs
+  (`credit_deposit` = checked_add rejecting u64 overflow;
+  `debit_deposit` = rejects when balance < amount) as a state machine
+  over (balance, credited, debited). Proves:
+  - `pool_invariant_reachable`: every reachable pool satisfies
+    balance = credited - debited AND debited <= credited;
+  - `kernel_solvency`: hence debited <= credited always — no
+    sequence of deposits + shields can shield out more of a pool than
+    was deposited (the kernel-side complement of circuit no-inflation;
+    `Print Assumptions` = just the abstract u64 ceiling);
+  - `balance_never_negative`: balance = credited - debited (the
+    `current < amount -> Err` underflow guard IS the debit
+    precondition);
+  - `credit_overflow_rejected`: a positive credit breaching the u64
+    ceiling takes no step (mirrors checked_add -> None; the false
+    amt=0 case was caught and excluded by a positivity hypothesis).
+  Pools are path-keyed so distinct (asset, pubkey_hash) pools are
+  independent — single-pool captures the accounting; per-asset
+  aggregate is the independent sum. Faithfulness is by transcription
+  of credit/debit_deposit (validated by reading the kernel).
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
