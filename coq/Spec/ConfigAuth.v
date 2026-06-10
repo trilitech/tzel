@@ -20,7 +20,7 @@
 From Stdlib Require Import List Arith Lia.
 Import ListNotations.
 From Common Require Import Felt.
-From Spec Require Import Hashes Xmss.
+From Spec Require Import Hashes Xmss WotsChecksum.
 
 (** A config update authenticates iff its WOTS+ signature, recovered
     over the config's sighash digits, L-tree-compresses to the
@@ -82,3 +82,42 @@ Proof.
     apply (wots_one_time_unforgeable msg1 msg2 cs1 cs2
              Hmlen Hm1 Hm2 Hc1 Hc2 Hcs1 Hcs2 Hmge Hcge).
 Qed.
+
+
+(** The concrete-checksum discharge for CONFIG governance — the third
+    and last of the unforgeability theorems.  An attacker cannot
+    authenticate a config update for a different message under the
+    Cairo's real checksum encoding: two config authentications under the
+    admin leaf, related by a forward-only forgery, are of the same
+    config sighash.  All checksum premises discharged. *)
+Theorem config_update_concrete_checksum
+    (F : Felt -> Felt -> Felt -> Felt) (ADRS : nat -> nat -> nat -> Felt)
+    (H_node : nat -> nat -> Felt -> Felt -> Felt) (pub_seed : Felt) (key_idx : nat)
+    (msg1 msg2 : list nat) (sig1 sig2 : list Felt) (leaf : Felt) :
+  Hashes.node_injective H_node ->
+  length (msg1 ++ base4_encode5 (checksum msg1)) = length sig1 ->
+  length (msg2 ++ base4_encode5 (checksum msg2)) = length sig2 ->
+  length msg1 = 128 -> length msg2 = 128 ->
+  Forall (fun d => d <= 3) msg1 -> Forall (fun d => d <= 3) msg2 ->
+  config_authenticates F ADRS H_node pub_seed key_idx
+    (msg1 ++ base4_encode5 (checksum msg1)) sig1 leaf ->
+  config_authenticates F ADRS H_node pub_seed key_idx
+    (msg2 ++ base4_encode5 (checksum msg2)) sig2 leaf ->
+  Forall2 (fun d2 d1 => d2 >= d1) msg2 msg1 ->
+  Forall2 (fun d2 d1 => d2 >= d1)
+    (base4_encode5 (checksum msg2)) (base4_encode5 (checksum msg1)) ->
+  msg1 = msg2.
+Proof.
+  intros Hni Hs1 Hs2 Hl1 Hl2 Hb1 Hb2 Ha1 Ha2 Hm Hc.
+  pose proof (config_update_unforgeable F ADRS H_node pub_seed key_idx
+    msg1 (base4_encode5 (checksum msg1)) msg2 (base4_encode5 (checksum msg2))
+    sig1 sig2 leaf
+    Hni Hs1 Hs2 (eq_trans Hl1 (eq_sym Hl2))
+    (eq_trans (base4_encode5_length _) (eq_sym (base4_encode5_length _)))
+    Hb1 Hb2 (base4_encode5_bound _) (base4_encode5_bound _)
+    (checksum_hypothesis_realized msg1 Hl1 Hb1)
+    (checksum_hypothesis_realized msg2 Hl2 Hb2)
+    Ha1 Ha2 Hm Hc) as [_ Hmsg].
+  exact Hmsg.
+Qed.
+
