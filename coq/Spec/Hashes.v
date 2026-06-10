@@ -149,6 +149,79 @@ Section SighashFold.
     - simpl. apply IH.
   Qed.
 
+  (** ** Malleability resistance (transaction-binding)
+
+      Under collision resistance of [H_sighash] (modeled as
+      [injective_2], a Section hypothesis per this file's
+      convention), the fold is INJECTIVE on equal-length field
+      lists: if two runs from accumulators [acc], [acc'] over
+      same-length field lists yield the same sighash, then the
+      starting accumulators AND every field coincide.
+
+      Protocol meaning: a WOTS+ signature is computed over the
+      sighash, and the sighash folds (type tag :: all public
+      outputs).  This lemma says no two DISTINCT public-output
+      tuples of the same shape can share a sighash — so an attacker
+      cannot alter any signed field (recipient, amount, asset
+      commitment, nullifier, memo, …) without invalidating the
+      signature.  This is the formal core of "sign what you see".
+
+      The equal-length hypothesis is necessary, not incidental: a
+      hash output [H_sighash acc x] could happen to equal a raw
+      accumulator [acc'] of a shorter run, so different-length
+      folds are NOT separated by injectivity alone.  Every circuit's
+      sighash folds a FIXED-length field list (the public-output
+      arity is structural), so the hypothesis always holds at the
+      use site. *)
+  Lemma sighash_fold_injective (Hinj : injective_2 H_sighash) :
+    forall (xs ys : list Felt) (acc acc' : Felt),
+      length xs = length ys ->
+      sighash_fold acc xs = sighash_fold acc' ys ->
+      acc = acc' /\ xs = ys.
+  Proof.
+    induction xs as [| x xr IH]; intros [| y yr] acc acc' Hlen Heq;
+      try discriminate.
+    - (* both empty: the fold is the accumulator *)
+      split; [exact Heq | reflexivity].
+    - (* both cons: peel one field via the IH, then invert the hash *)
+      simpl in Heq.
+      injection Hlen as Hlen'.
+      destruct (IH yr (H_sighash acc x) (H_sighash acc' y) Hlen' Heq)
+        as [Hhash Htail].
+      destruct (Hinj _ _ _ _ Hhash) as [Hacc Hx].
+      split; [exact Hacc | now subst].
+  Qed.
+
+  (** Specialization actually used by the per-circuit sighash
+      predicates: the type tag is a fixed prefix, so two transactions
+      that sign the same sighash and have the same number of public
+      fields publish the SAME fields. *)
+  Corollary sighash_binds_fields (Hinj : injective_2 H_sighash) :
+    forall (tag : Felt) (xs ys : list Felt),
+      length xs = length ys ->
+      sighash_fold tag xs = sighash_fold tag ys ->
+      xs = ys.
+  Proof.
+    intros tag xs ys Hlen Heq.
+    now destruct (sighash_fold_injective Hinj xs ys tag tag Hlen Heq).
+  Qed.
+
+  (** Utility: equal-length prefixes of equal concatenations match. *)
+  Lemma app_eq_len_l (xs xs' ys ys' : list Felt) :
+    length xs = length xs' ->
+    xs ++ ys = xs' ++ ys' ->
+    xs = xs' /\ ys = ys'.
+  Proof.
+    revert xs'.
+    induction xs as [| x xr IH]; intros [| x' xr'] Hlen Heq;
+      try discriminate.
+    - split; [reflexivity | exact Heq].
+    - simpl in Heq. injection Heq as Hx Hrest.
+      injection Hlen as Hlen'.
+      destruct (IH xr' Hlen' Hrest) as [Hxr Hys].
+      split; [now subst | exact Hys].
+  Qed.
+
 End SighashFold.
 
 (* ================================================================ *)

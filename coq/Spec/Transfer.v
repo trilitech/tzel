@@ -506,3 +506,74 @@ Section BatchConservation.
   Qed.
 
 End BatchConservation.
+
+(** ** Transfer non-malleability (signature binds the whole tx)
+
+    Assembles [Spec.Hashes.sighash_binds_fields] +
+    [app_eq_len_l] over the transfer sighash layout: two accepted
+    transfers that share a sighash AND have the same input count
+    publish byte-identical public outputs — auth_domain, root, every
+    nullifier, the fee, all four output commitments, and all four
+    memo hashes.
+
+    Since the WOTS+ signature is computed over the sighash, this is
+    the formal "sign what you see" guarantee for transfer: a relayer
+    holding a valid (sighash, signature) pair cannot alter ANY public
+    field — redirect an output, change an amount, swap an asset
+    commitment, drop or add a nullifier — without producing a
+    different sighash, which the signature no longer authorizes. *)
+
+Section TransferMalleability.
+
+  Variable H_sighash : Felt -> Felt -> Felt.
+
+  Theorem transfer_sighash_binds
+      (Hinj : Hashes.injective_2 H_sighash)
+      (sighash tag auth_domain auth_domain' root root' : Felt)
+      (nfs nfs' : list Felt)
+      (fee fee' : Felt)
+      (cm1 cm2 cm3 cm4 cm1' cm2' cm3' cm4' : Felt)
+      (m1 m2 m3 m4 m1' m2' m3' m4' : Felt) :
+    length nfs = length nfs' ->
+    phi_sighash_complete H_sighash sighash tag auth_domain root
+      nfs fee cm1 cm2 cm3 cm4 m1 m2 m3 m4 ->
+    phi_sighash_complete H_sighash sighash tag auth_domain' root'
+      nfs' fee' cm1' cm2' cm3' cm4' m1' m2' m3' m4' ->
+    auth_domain = auth_domain' /\ root = root' /\ nfs = nfs'
+    /\ fee = fee'
+    /\ cm1 = cm1' /\ cm2 = cm2' /\ cm3 = cm3' /\ cm4 = cm4'
+    /\ m1 = m1' /\ m2 = m2' /\ m3 = m3' /\ m4 = m4'.
+  Proof.
+    intros Hlen H1 H2.
+    unfold phi_sighash_complete in H1, H2.
+    (* collapse the nested fold into a single fold over the full
+       field list *)
+    rewrite <- Hashes.sighash_fold_app in H1, H2.
+    (* same sighash on both sides *)
+    assert (Heq :
+      Hashes.sighash_fold H_sighash tag
+        ((auth_domain :: root :: nfs)
+         ++ [fee; cm1; cm2; cm3; cm4; m1; m2; m3; m4])
+      = Hashes.sighash_fold H_sighash tag
+        ((auth_domain' :: root' :: nfs')
+         ++ [fee'; cm1'; cm2'; cm3'; cm4'; m1'; m2'; m3'; m4'])).
+    { rewrite <- H1, <- H2. reflexivity. }
+    (* equal-length full field lists *)
+    assert (Hlenfull :
+      length ((auth_domain :: root :: nfs)
+              ++ [fee; cm1; cm2; cm3; cm4; m1; m2; m3; m4])
+      = length ((auth_domain' :: root' :: nfs')
+              ++ [fee'; cm1'; cm2'; cm3'; cm4'; m1'; m2'; m3'; m4'])).
+    { rewrite !length_app. simpl. rewrite Hlen. reflexivity. }
+    (* injectivity of the fold gives full-list equality *)
+    pose proof (Hashes.sighash_binds_fields H_sighash Hinj tag _ _ Hlenfull Heq)
+      as Hfields.
+    (* peel the two leading cons, then split prefix / suffix *)
+    simpl in Hfields. injection Hfields as Had Hroot Hrest.
+    destruct (Hashes.app_eq_len_l nfs nfs' _ _ Hlen Hrest)
+      as [Hnfs Htail].
+    injection Htail as Hfee Hc1 Hc2 Hc3 Hc4 Hm1 Hm2 Hm3 Hm4.
+    repeat split; assumption.
+  Qed.
+
+End TransferMalleability.

@@ -148,6 +148,26 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   value-conservation leg of the `Relation -> Phi` refinement for
   both spending circuits (PR #36 review-attention item 1).
 
+- **Malleability resistance / signature binding (this iteration):**
+  - `Spec/Hashes.v` `sighash_fold_injective`: under H_sighash
+    collision resistance, the fold is injective on EQUAL-LENGTH
+    field lists (same sighash + same length => same accumulators and
+    same fields). The equal-length hypothesis is shown necessary,
+    not incidental (a hash output can alias a raw shorter-run
+    accumulator); every circuit's sighash folds a fixed-length
+    field list so it always holds. Plus `sighash_binds_fields`
+    (same-tag specialization) and `app_eq_len_l` (prefix-split
+    utility).
+  - `Spec/Transfer.v` `transfer_sighash_binds`: assembles those over
+    the transfer sighash layout — two accepted transfers sharing a
+    sighash AND input count publish byte-identical public outputs
+    (auth_domain, root, every nullifier, fee, all four cms, all four
+    memo hashes). Since the WOTS+ signature is over the sighash,
+    this is the formal "sign what you see" guarantee: a relayer
+    cannot alter any public field without invalidating the
+    signature. Same pattern applies to unshield/shield (their
+    sighash predicates have the same fold shape).
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
