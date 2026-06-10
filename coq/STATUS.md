@@ -588,6 +588,25 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   asset_pub, fee); proof mirrors the transfer batch induction with
   the extra per-asset v_pub term summed via list_sum.
 
+- **BRIDGE BURN-SIDE AUTHENTICATION (`Spec/BridgeBurn.v`):** discharges
+  the assumption behind BridgeTicketer's abstract burn guard (amount
+  <= outstanding) by modeling the Michelson %burn entrypoint's real
+  authentication (fa2_bridge_ticketer.tz): after READ_TICKET it checks
+  ticketer == SELF_ADDRESS, metadata == None, token_id == 0 before
+  releasing FA2. Security content: a foreign ticket (minted by a
+  DIFFERENT contract) can NEVER drain this bridge's custody — without
+  the ticketer==SELF check anyone could mint their own ticket and burn
+  it here. Proved (zero admits):
+  - foreign_ticket_rejected / nonzero_token_rejected /
+    metadata_rejected: each malformed/foreign ticket fails accept_burn;
+  - accept_burn_authentic: an accepted burn is of a SELF-minted ticket;
+  - custody_decrease_authentic: in the refined bridge state machine,
+    any single step that REDUCES custody was a burn of an authentic
+    (ticketer=SELF) ticket — a foreign ticket cannot reduce custody;
+  - reachable_collateralized: collateralization (custody=outstanding)
+    holds in every reachable state, now with the burn guard GROUNDED
+    in the real %burn authentication rather than assumed.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
