@@ -268,21 +268,49 @@ Michelson (the least-certain part of the feasibility study).
 
 ---
 
-## Open design decisions
+## Resolved design decisions (2026-06-10)
 
-1. **vk: contract-pinned (rotatable by admin/governance) or protocol
-   constant (one blessed wrap circuit)?** Contract-pinned is more flexible
-   and matches the permissionless-precompile philosophy; protocol-constant
-   is simpler but couples wrap-circuit upgrades to amendments.
-2. **Primitive abstraction level**: thin generic `VERIFY_SNARK` +
-   `BLAKE2S` (this memo, keeps the runtime generic) vs a fat TzEL-specific
-   verify that bundles the OutHash binding (avoids needing BLAKE2s in
-   Michelson but pollutes the runtime with app semantics). Recommend thin.
-3. **Batched submission** (one proof, many ops via the multiverifier tree)
-   — v1 single-op or v2? Single-op is simpler (depth-1 tree, one fold);
-   batching amortises prove cost but needs the contract to walk a deeper
-   blake tree.
-4. **Withdrawal (L2→L1)**: on Tezos X a Michelson contract emitting value
-   to L1 — does it use the native bridge/ticket burn directly, and is
-   atomicity (emit-before-mutate) expressible in Michelson, or does it need
-   a runtime affordance?
+1. **vk placement → contract-pinned.** The wrap vk lives in the TzEL
+   contract storage, set by an admin/governance entrypoint. Circuit
+   upgrades (soundness bump, stwo-circuits revision) rotate the vk via a
+   contract operation, with no protocol amendment. Keeps `VERIFY_SNARK`
+   generic (it verifies any Groth16 against a caller-supplied vk).
+
+2. **Primitive abstraction → thin `VERIFY_SNARK` + `BLAKE2S`.** The runtime
+   stays generic; the OutHash binding lives in the contract. `BLAKE2S` is a
+   plain `bytes -> bytes` instruction.
+   **Caveat to derisk in the prototype:** the binding is not just a
+   blake2s-of-bytes. The chip's OutHash packs field elements into M31/QM31
+   lanes (felt252 → 28 × 9-bit limbs → `pack_into_qm31s`) around the blake
+   calls. The contract must reimplement that lane packing in Michelson
+   (bit manipulation on `nat`/`bytes`). If that proves too gnarly in LIGO,
+   the fallback is a slightly higher-level primitive (e.g. an OutHash
+   helper) — to be decided empirically once the contract exists.
+
+3. **Submission → single-op v1, architected for batch.** v1 is one op per
+   proof (depth-1 aggregation tree: one real leaf + padding, one blake
+   fold). The contract's binding walk and the wire are designed so depth-d
+   batching (one proof, many ops) drops in later without a redesign —
+   `verify_snark_tree` already handles arbitrary depth. Support both
+   eventually; ship single-op first.
+
+4. **Withdrawal & value custody → native Michelson tickets, atomic.**
+   The TzEL contract custodies escrowed XTZ as a Michelson **ticket**
+   (minted by `tez_bridge_ticketer.tz`'s `%mint`, 1 mutez = 1 unit),
+   split/joined per operation:
+   - **deposit / shield-in**: user calls `ticketer.%mint(pubkey_hash,
+     tzel_contract)` with XTZ → the contract's `%deposit` receives
+     `(pair bytes (ticket …))`, credits `deposits[pubkey_hash]`, joins the
+     ticket into its held balance.
+   - **withdrawal / unshield-out**: the contract `SPLIT_TICKET`s a `v_pub`
+     ticket and `TRANSFER_TOKENS` it to `ticketer.%burn(recipient, ticket)`,
+     which releases XTZ to the L1 recipient.
+   The rollup's emit-before-mutate hazard (the H1 atomicity bug) **vanishes**:
+   in Michelson the storage update and the emitted internal operations are
+   one atomic operation — any failure reverts everything. No runtime
+   affordance beyond the standard ticket instructions (`TICKET`,
+   `SPLIT_TICKET`, `JOIN_TICKETS`, `READ_TICKET`), which MIR supports.
+
+These four are settled; the prototype (LIGO contract + stubbed verify)
+can proceed. The one empirical unknown is decision 2's M31-lane packing in
+Michelson — the first thing the prototype validates.
