@@ -224,6 +224,22 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   closing that (carry a nullifier set in the Step state, prove
   consumed notes fresh) is the next tightening.
 
+- **SEAM CLOSED — `Spec/LedgerNf.v`:** the faithful no-inflation
+  model. Append-only `committed`; spending MARKS a nullifier in a
+  growing `spent` set (nothing deleted); live value DERIVED (a
+  committed note counts iff its nullifier is unspent). Settle
+  consumes only under membership (`Permutation committed (consumed
+  ++ rest)`) + freshness (consumed nfs unspent); `wf` carries NoDup
+  committed-nfs (= nullifier_binding) + spent ⊆ committed_nfs + NoDup
+  spent. Re-proves `reachable_conserved` and `no_inflation`, adds
+  `no_double_spend`. `Print Assumptions no_inflation` = Felt +
+  Felt_eq_dec only (no CR axiom; CR enters only via the wf
+  invariant). `note_sum_is_sum_at` bridges to the circuits'
+  phi_value_conservation. Consumption is now DERIVED from membership
+  + freshness + uniqueness, not modeled. Documents the nat/overflow
+  idealization (faithful given Cairo u64 range checks + u128
+  accumulator headroom).
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
