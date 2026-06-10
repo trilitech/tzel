@@ -198,11 +198,34 @@ refinement + extraction + conformance), the same shape repeats for:
   variant of `xmss_verify_cairo` (the original conflates the
   L-tree and auth-tree node hashes, which the Cairo separates by
   ADRS tag and key_idx slot — the relation uses the faithful one).
-  Remaining: the parallel `UnshieldRelation` (conservation leg
-  already proved) and `ShieldRelation` (no inputs; dual-pool
-  conservation already modeled in `Spec.Shield`), then the
-  realization of the relation's hash/digit parameters at
-  extraction for the differential harness.
+  UNSHIELD IS DONE — `Impl/Unshield.v` `UnshieldRelation` +
+  `unshield_relation_sound`, reusing transfer's `input_checks`
+  verbatim (the Cairo input loops are identical), modeling the
+  optional change slots faithfully (`change_slot_checks` mirrors
+  `change_commitment_or_zero`'s publish-0-and-zero-assert-all
+  semantics) and the exit-folded accumulator equations.  Two spec
+  fixes fell out of writing it: `Spec/Unshield.v`'s per-output
+  well-formedness was TOO STRONG (it demanded commitment
+  well-formedness of absent slots, which publish literal 0 — now
+  `phi_unshield_change_slot` is present-or-absent, with
+  `phi_unshield_change_absent` capturing the zero-pinning), and
+  `phi_unshield_sighash`'s field order grouped cms-then-memos
+  while the Cairo INTERLEAVES (cm, memo) pairs — binding-
+  equivalent, but a byte-level model<->circuit differential would
+  have flagged it (now matches the circuit exactly).
+  SHIELD IS DONE — `Impl/Shield.v` `ShieldRelation` +
+  `shield_relation_sound`.  No inputs / Merkle / nullifiers; the
+  relation binds pubkey_hash, the recipient note's owner_tag, and
+  the WOTS+ verification to the SAME (auth_root, auth_pub_seed).
+  The dual-pool conservation conjunct is kernel-side (the circuit
+  never sees pool balances), so the soundness theorem takes the
+  debit equations as an explicit hypothesis in
+  `phi_shield_value_conservation`'s exact shape — the seam where
+  a future kernel model plugs in.
+  Remaining: realization of the relations' hash / digit / node
+  parameters at extraction (the `Impl/Extraction.v` pattern) and
+  the QCheck2 differential harness against Cairo runners — the
+  "fuzzing" half of model<->circuit conformance.
 
 ## Open questions / decisions deferred
 

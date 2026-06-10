@@ -49,6 +49,14 @@ Section PhiUnshield.
   (** Canonical tez asset tag. *)
   Variable asset_tez : Felt.
 
+  (** The published placeholder for an ABSENT change slot.  Cairo's
+      [change_commitment_or_zero] returns literal felt [0] (and
+      zero-asserts every witness field) when [has_change] is false.
+      Realized as 0 — the same value [asset_tez] is realized at, but
+      kept a separate symbol: one is an asset tag, the other a
+      published "no commitment here" marker. *)
+  Variable felt_zero : Felt.
+
   (** 1. Per-asset value conservation.
 
       Inputs: parallel lists [(input_assets, input_values)].
@@ -115,6 +123,32 @@ Section PhiUnshield.
       (cm d_j v asset rcm owner_tag : Felt) : Prop :=
     cm = H_commit d_j v asset rcm owner_tag.
 
+  (** 7c. Absent change slot.  Cairo's [change_commitment_or_zero]
+      publishes [cm = 0] when [has_change] is false and asserts the
+      slot is pinned empty: value 0, memo hash 0, every witness
+      field 0.  Protocol meaning: an "absent" slot cannot smuggle
+      value ([v = 0] makes it contribute nothing to any per-asset
+      sum) and cannot deliver a memo.  The asset field is the felt
+      0 = ASSET_TEZ (the Cairo constant), recorded here as
+      [asset_tez] so the conservation predicate stays well-typed
+      over the slot.
+
+      Note the published 0 is NOT a commitment: soundness of the
+      "0-cm is never a real note" reading rests on [H_commit] never
+      hitting 0, a preimage-style side condition on the hash family
+      (kernel-side it is enforced structurally: a zero [cm_change]
+      is skipped, never inserted into the tree). *)
+  Definition phi_unshield_change_absent
+      (cm memo asset : Felt) (v : nat) : Prop :=
+    cm = felt_zero /\ memo = felt_zero /\ asset = asset_tez /\ v = 0.
+
+  (** A change slot is either present (well-formed commitment) or
+      absent (zero-pinned).  The producer slot has no absent form. *)
+  Definition phi_unshield_change_slot
+      (cm d_j v_felt asset rcm owner_tag memo : Felt) (v : nat) : Prop :=
+    phi_unshield_output_wellformed cm d_j v_felt asset rcm owner_tag
+    \/ phi_unshield_change_absent cm memo asset v.
+
   (** 7b. Input commitment well-formedness (per input).  Same as
       [Spec.Transfer.phi_input_wellformed]; included here for
       symmetry of the Phi assembly.  Binds each input's witness
@@ -139,7 +173,14 @@ Section PhiUnshield.
 
       Missing [recipient] would allow redirecting the L1 exit.
       Missing [asset_pub] would allow swapping the exit asset
-      after signing (when multi-bridge lands). *)
+      after signing (when multi-bridge lands).
+
+      Field ORDER follows the Cairo fold exactly: the (cm, memo)
+      pairs are INTERLEAVED per slot ([cm_change, mh_change,
+      cm_change_2, mh_change_2, cm_fee, mh_fee]) — an earlier
+      draft of this predicate grouped all cms before all memos,
+      which is binding-equivalent but would fail a byte-level
+      model<->circuit differential. *)
   Definition phi_unshield_sighash
       (sighash tag_felt auth_domain root : Felt)
       (nullifiers : list Felt)
@@ -150,8 +191,9 @@ Section PhiUnshield.
                 (sighash_fold H_sighash tag_felt
                    (auth_domain :: root :: nullifiers))
                 [v_pub_felt; asset_pub; fee_felt; recipient;
-                 cm_change_1; cm_change_2; cm_producer;
-                 memo_change_1; memo_change_2; memo_producer].
+                 cm_change_1; memo_change_1;
+                 cm_change_2; memo_change_2;
+                 cm_producer; memo_producer].
 
   (** 9. Input list well-formedness (parallel asset / value lists). *)
   Definition phi_unshield_input_lists_parallel
@@ -205,11 +247,22 @@ Section PhiUnshield.
     /\ Forall (fun i =>
          phi_unshield_nullifier H_nf
            (in_nf i) (in_nk_spend i) (in_cm i) (in_pos i)) inputs
-    (* per-output *)
-    /\ Forall (fun o =>
-         phi_unshield_output_wellformed
-           (out_cm o) (out_d_j o) (out_v_felt o) (out_asset o)
-           (out_rcm o) (out_otag o)) outputs
+    (* per-output: producer is mandatory; the two change slots are
+       present-or-absent (Cairo [change_commitment_or_zero]) *)
+    /\ phi_unshield_output_wellformed
+         (out_cm out_producer) (out_d_j out_producer)
+         (out_v_felt out_producer) (out_asset out_producer)
+         (out_rcm out_producer) (out_otag out_producer)
+    /\ phi_unshield_change_slot
+         (out_cm out_change_1) (out_d_j out_change_1)
+         (out_v_felt out_change_1) (out_asset out_change_1)
+         (out_rcm out_change_1) (out_otag out_change_1)
+         (out_memo out_change_1) (out_v out_change_1)
+    /\ phi_unshield_change_slot
+         (out_cm out_change_2) (out_d_j out_change_2)
+         (out_v_felt out_change_2) (out_asset out_change_2)
+         (out_rcm out_change_2) (out_otag out_change_2)
+         (out_memo out_change_2) (out_v out_change_2)
     (* balance — per-asset with public exit and tez fee *)
     /\ phi_unshield_value_conservation
          input_assets input_values output_assets output_values
@@ -276,7 +329,8 @@ Section PhiUnshield.
         + (if Felt_eq_dec a asset_tez then fee   else 0).
   Proof.
     unfold Phi_unshield, phi_unshield_value_conservation.
-    intros H a. destruct H as [_ [_ [_ [_ [_ [_ [Hbal _]]]]]]].
+    intros H a.
+    destruct H as [_ [_ [_ [_ [_ [_ [_ [_ [Hbal _]]]]]]]]].
     apply Hbal.
   Qed.
 
