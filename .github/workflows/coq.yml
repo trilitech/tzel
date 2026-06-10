@@ -83,7 +83,8 @@ jobs:
         # links tzel. rocq-prover provides Rocq 9 and the extraction
         # plugin.
         run: |
-          opam install -y dune alcotest cstruct ctypes ctypes-foreign hex \
+          opam install -y dune alcotest qcheck-core qcheck-alcotest \
+                          cstruct ctypes ctypes-foreign hex \
                           mirage-crypto yojson digestif rocq-prover
 
       - name: Build ML-KEM native library
