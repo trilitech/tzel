@@ -66,6 +66,10 @@ Definition tree_depth : nat := 48.
 Definition injective_2 (H : Felt -> Felt -> Felt) : Prop :=
   forall a b c d, H a b = H c d -> a = c /\ b = d.
 
+Definition injective_3 (H : Felt -> Felt -> Felt -> Felt) : Prop :=
+  forall a1 a2 a3 b1 b2 b3,
+    H a1 a2 a3 = H b1 b2 b3 -> a1 = b1 /\ a2 = b2 /\ a3 = b3.
+
 Definition injective_4 (H : Felt -> Felt -> Felt -> Felt -> Felt) : Prop :=
   forall a1 a2 a3 a4 b1 b2 b3 b4,
     H a1 a2 a3 a4 = H b1 b2 b3 b4 ->
@@ -282,6 +286,7 @@ Section Nullifier.
 
   Variable H_commit : Felt -> Felt -> Felt -> Felt -> Felt -> Felt.
   Variable H_nf : Felt -> Felt -> Felt.
+  Variable H_owner : Felt -> Felt -> Felt -> Felt.
 
   (** Note commitment: [cm = H_commit(d_j, v, asset, rcm, owner_tag)]. *)
   Definition commitment (d_j v asset rcm owner_tag : Felt) : Felt :=
@@ -334,6 +339,48 @@ Section Nullifier.
                                  d' v' asset' rcm' owner' Heq)
       as [_ [Hv _]].
     exact Hv.
+  Qed.
+
+  (** ** Spending-authority binding
+
+      The owner tag welds a note to a spending authority:
+      [owner_tag = H_owner(auth_root, pub_seed, nk_tag)] (see
+      [Spec.Shield]).  [auth_root] is the root of the spender's
+      authorization Merkle tree — only its holder can produce the
+      witnesses a spend requires. *)
+  Definition owner_tag (auth_root pub_seed nk_tag : Felt) : Felt :=
+    H_owner auth_root pub_seed nk_tag.
+
+  (** Under collision resistance of [H_owner], the owner tag binds the
+      authorization root, the pub seed, and the nk tag. *)
+  Theorem owner_tag_binding (Hinj : injective_3 H_owner)
+      (ar ps nk ar' ps' nk' : Felt) :
+    owner_tag ar ps nk = owner_tag ar' ps' nk' ->
+    ar = ar' /\ ps = ps' /\ nk = nk'.
+  Proof. unfold owner_tag. apply Hinj. Qed.
+
+  (** ** The full chain: a commitment binds its spending authority.
+
+      Composing [commitment_binding] (the commitment binds its
+      owner_tag field) with [owner_tag_binding] (the owner_tag binds
+      its auth_root): two notes with the same commitment, whose owner
+      tags are well-formed, have the SAME authorization root.  So a
+      note's spending authority is welded to its commitment — a note
+      committed to one auth tree can never be spent under a different
+      one (no authority substitution). *)
+  Theorem commitment_binds_auth_root
+      (Hc : injective_5 H_commit) (Ho : injective_3 H_owner)
+      (d v asset rcm ar ps nk d' v' asset' rcm' ar' ps' nk' : Felt) :
+    commitment d v asset rcm (owner_tag ar ps nk)
+    = commitment d' v' asset' rcm' (owner_tag ar' ps' nk') ->
+    ar = ar'.
+  Proof.
+    intro Heq.
+    destruct (commitment_binding Hc d v asset rcm (owner_tag ar ps nk)
+                                 d' v' asset' rcm' (owner_tag ar' ps' nk') Heq)
+      as [_ [_ [_ [_ Hotag]]]].
+    destruct (owner_tag_binding Ho ar ps nk ar' ps' nk' Hotag) as [Har _].
+    exact Har.
   Qed.
 
   (** Nullifier: [nf = H_nf(nk_spend, H_nf(cm, pos))].

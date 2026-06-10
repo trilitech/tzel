@@ -698,6 +698,24 @@ nullifier/commitment binding.
   per-note counterpart to the aggregate value conservation: each note
   is welded to its asset and amount by its commitment.
 
+- **SPENDING-AUTHORITY BINDING (`Spec/Hashes.v`):** continues the
+  commitment-binding work to the spending authority. owner_tag =
+  H_owner(auth_root, pub_seed, nk_tag) (Spec.Shield); auth_root is the
+  root of the spender's authorization Merkle tree. Added (zero admits;
+  injective_3 was missing, now defined):
+  - owner_tag_binding: under injective_3 H_owner, the owner tag binds
+    auth_root, pub_seed, nk_tag;
+  - commitment_binds_auth_root: composing commitment_binding (cm binds
+    its owner_tag field) with owner_tag_binding (owner_tag binds
+    auth_root) — two notes with the same cm have the SAME
+    authorization root. A note's spending authority is welded to its
+    commitment; a note committed to one auth tree can never be spent
+    under a different one (no authority substitution).
+  This completes the per-note integrity chain: cm binds
+  value/asset/owner_tag (commitment_binding), and owner_tag binds the
+  auth_root (owner_tag_binding) — so the commitment pins amount,
+  asset, AND who may spend.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
