@@ -512,6 +512,25 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
     assumption is preimage resistance (what makes "forward-only" the
     attacker's whole move set), stated explicitly.
 
+- **WITHDRAWAL-RECORD SERIALIZATION SAFETY (`Spec/WithdrawalRecord.v`):**
+  models the kernel's durable withdrawal-record codec
+  (encode/decode_withdrawal_record) and proves it lossless and
+  unambiguous — a fund-safety surface (a round-trip bug would
+  misdirect a withdrawal or corrupt its amount). Wire layout exactly
+  the Rust: asset_id(32) || amount(u64 LE,8) || recipient_len(u32
+  LE,4) || recipient. Proved (zero admits, genuine byte arithmetic):
+  - from_le_le: the little-endian base-256 codec round-trips for any
+    value < 256^k (the arithmetic core, via div_mod +
+    div_lt_upper_bound);
+  - decode_encode: decode (encode r) = Some r for well-formed records
+    (32-byte asset, amount < 2^64, recipient len < 2^32) — lossless;
+  - encode_injective: distinct records have distinct encodings (no
+    durable-storage aliasing of two withdrawals);
+  - the length-prefix framing is unambiguous (decode reads exactly
+    44 + recipient_len bytes, rejects any other length).
+  Note: bounds stated as 256^8 / 256^4 (= u64 / u32) to keep them
+  symbolic — writing 2^64 in unary nat would force a cbn blowup.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
