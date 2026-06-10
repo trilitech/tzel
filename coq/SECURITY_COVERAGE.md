@@ -28,9 +28,15 @@ audit").
   `Spec.Unshield.batch_unshield_value_conservation`,
   `Spec.GrandConservation.grand_conservation` (shield+transfer+unshield,
   any order, per asset).
-- **Kernel side & L1<->L2:** `Spec.KernelLedger.no_inflation`
-  (withdrawn ≤ deposited, per asset),
-  `Spec.EndToEndMulti.l1_collateral_equals_l2_claims`
+- **Kernel side & L1<->L2:** the proven kernel invariant is actually
+  the EXACT per-asset accounting equality (stronger than mere
+  no-inflation) — `Spec.KernelLedger.invariant`:
+  `ks_dep a = ks_pool a + ks_notes a + ks_burned a + ks_wd a` holds in
+  every reachable state (`reachable_invariant`), so no asset is created
+  OR silently destroyed; every value movement is exact (deposited =
+  in-pools + in-notes + burned + withdrawn). `Spec.KernelLedger.no_inflation`
+  (withdrawn ≤ deposited, per asset) is the security-direction
+  corollary. `Spec.EndToEndMulti.l1_collateral_equals_l2_claims`
   (L1 FA2 custody = L2 claimable, every asset).
 - **Dual-pool FA2 shield — "no unbacked tez" (the second-most-flagged
   attack surface: break the dual-pool and you mint tez from nothing).**
