@@ -626,6 +626,24 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
     unification is grounded in the real per-flow relations, not a
     fresh abstraction. (Transfer is the deposit=exit=0 case.)
 
+- **MULTIASSET L1<->L2 SOLVENCY (`Spec/EndToEndMulti.v`):** generalizes
+  the EndToEnd cross-system solvency from one FA2 asset to PER-ASSET
+  (Felt -> nat state); the invariant holds for EVERY asset
+  simultaneously. So the bridge holds, for each asset independently,
+  exactly the FA2 backing that asset's L2 claims. Same value flow
+  (deposit credits custody[a]+pool[a]; shield moves pool[a]->notes[a];
+  unshield debits notes[a]+custody[a]), now keyed by asset via upd /
+  upd_other. Proved (zero admits), for all reachable states and ALL a:
+  - l1_collateral_equals_l2_claims: custody a = pool a + notes a;
+  - notes_backed_by_l1: notes a <= custody a (every live note of every
+    asset redeemable); no_stranded_l1; withdrawal_honored;
+  - roundtrip_solvency: out a <= in a (withdrawn <= deposited) per
+    asset.
+  The L2 pool/note movements are exactly the circuit ops whose value
+  conservation GrandConservation.grand_conservation proves — so the
+  full stack composes: circuit no-inflation (any op mix) -> kernel
+  conservation -> per-asset L1<->L2 collateralization.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

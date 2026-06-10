@@ -21,6 +21,7 @@ Spec/KernelDeposit.v
 Spec/BridgeTicketer.v
 Spec/BridgeBurn.v
 Spec/EndToEnd.v
+Spec/EndToEndMulti.v
 Spec/AssetRegistry.v
 Spec/KernelNullifier.v
 Spec/MerkleTree.v
