@@ -37,8 +37,10 @@
     obligation is "the in-circuit signature binds [pubkey_hash] to a
     leaf in the recipient's auth tree."
 
-    Status: safety predicate defined in [Spec.Shield];
-    implementation-side refinement pending.
+    Status: COMPLETE. [shield_relation_sound] (below) proves the
+    Cairo-shaped [ShieldRelation] discharges
+    [Spec.Shield.phi_shield_value_conservation] and the sighash /
+    pubkey-hash bindings.
 *)
 
 From Common Require Import Felt.

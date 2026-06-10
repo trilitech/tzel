@@ -1015,6 +1015,27 @@ nullifier/commitment binding.
   The whole-system safety statement the separate invariants compose
   into.
 
+- **Impl REFINEMENT LAYER COMPLETE — XMSS stub closed
+  (`Impl/Xmss.v`):** the three-layer architecture's core artifact (the
+  extractable Cairo-shaped Impl provably discharges the Spec safety
+  properties) is now complete for EVERY module. Impl/Xmss was the last
+  genuine stub ("the most subtle module... the primary value of the
+  formalization", per its own docstring) — executable definitions but
+  no soundness theorem. Now proved (zero admits):
+  - xmss_verify_impl: the extractable verifier = Spec.Xmss.xmss_verify
+    at the concrete chain hash (Hash3 / pack_adrs_chain);
+  - xmss_ltree_injective_impl: L-tree compression injective (Spec
+    ltree_injective transferred to the concrete ltree_node_hash);
+  - xmss_verify_impl_one_time_unforgeable: the headline one-time
+    unforgeability for the actual extraction source (Spec
+    xmss_one_time_unforgeable instantiated at the concrete hashes),
+    under the local node-hash injectivity hypothesis.
+  Also corrected stale "refinement pending" docstrings in Impl/Xmss
+  and Impl/Shield (shield_relation_sound / transfer_relation_sound were
+  already proven). So all six Impl modules (Merkle, Wots, Xmss,
+  Transfer, Shield, Unshield) carry proven refinement/soundness
+  theorems — the extraction source is sound end to end.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
