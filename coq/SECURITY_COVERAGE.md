@@ -1,0 +1,162 @@
+# Security-property → Coq-theorem coverage
+
+This maps each security property documented in `specs/security.md` to the
+Coq theorem(s) that formally verify it, for the audit.  Every theorem
+listed is zero-admit and depends only on the abstract field type
+(`Felt`, `Felt_eq_dec`); all collision-resistance / injectivity premises
+are explicit local hypotheses (see `STATUS.md`, "comprehensive axiom
+audit").
+
+## Balance conservation (no inflation)
+
+> "values are u64, arithmetic in u128, circuits enforce exact
+> input/output equality … balance is per-asset: `tez_in = tez_out + fee`
+> AND `primary_in = primary_out` separately."
+
+- **Per-tx, per-asset:** `Spec.Transfer.phi_value_conservation`,
+  `Spec.Shield.phi_shield_value_conservation`,
+  `Spec.Unshield.phi_unshield_value_conservation` — each is
+  `sum_at a in = sum_at a out + (exit@a) + (fee@tez)` for *every* asset
+  `a`.  This is the per-asset accumulator semantics.
+- **The bug-#1 fix (CRITICAL):** the documented `v_pub` lane-routing bug
+  (`unshield.cairo` `2003bf5`: unconditional `tez_out += v_pub`) is
+  exactly excluded by the `(if Felt_eq_dec a asset_pub then v_pub else 0)`
+  term in `phi_unshield_value_conservation` — `v_pub` contributes only to
+  its own asset's accumulator, so a tez-only input set cannot mint FA2.
+- **Across a batch / any operation mix:**
+  `Spec.Transfer.batch_value_conservation`,
+  `Spec.Unshield.batch_unshield_value_conservation`,
+  `Spec.GrandConservation.grand_conservation` (shield+transfer+unshield,
+  any order, per asset).
+- **Kernel side & L1<->L2:** `Spec.KernelLedger.no_inflation`
+  (withdrawn ≤ deposited, per asset),
+  `Spec.EndToEndMulti.l1_collateral_equals_l2_claims`
+  (L1 FA2 custody = L2 claimable, every asset).
+
+## u64 / u128 overflow safety
+
+> "values are u64, arithmetic is carried out in u128 … exact equality."
+
+- `Spec.LedgerBounded.tx_conservation_mod_iff` (modular = true
+  conservation under the bound, for any modulus with `mx*vb < ab`,
+  covering u128 and the field), `headroom_u128` (`11 * 2^64 < 2^128`),
+  `totals_under_supply_cap`.
+- `Spec.KernelPool.credit_overflow_rejected` (the kernel's `checked_add`
+  rejects overflow; pool balance stays bounded).
+
+## Per-asset 2-accumulator constraints
+
+> "circuits take a witness-declared primary non-tez asset A and pin every
+> input/output asset to {ASSET_TEZ, A}."
+
+- Modeled directly: the `phi_*_value_conservation` predicates quantify
+  over *all* assets via `sum_at a`, which subsumes the two-accumulator
+  closure (tez and the primary asset both close; all others are 0 on both
+  sides).  `GrandConservation.grand_conservation` is the per-asset law.
+
+## Asset registry: duplicate-ticketer dedup + routing
+
+> "compose_asset_registry_with silently skips any FA2 entry equal to the
+> configured tez_ticketer … without the guard, first-match ordering
+> becomes a security property."
+
+- `Spec.AssetRegistry`: `compose` models the dedup (`dedup_fa2` skips
+  `fa2 = tez`); `deposit_withdraw_roundtrip` / `withdraw_deposit_roundtrip`
+  prove deposit routing (`asset_for_ticketer`) and withdrawal routing
+  (`ticketer_for_asset`) are proper mutual inverses — which *requires* the
+  dedup plus `derive_asset_id` injectivity and `≠ ASSET_TEZ`.  So
+  first-match ordering is provably *not* load-bearing.
+
+## Shield/transfer/unshield are signature-bound (non-malleability)
+
+> "every prover-rewritable field … is folded into the sighash and signed
+> by an in-circuit WOTS+ signature."
+
+- `Spec.Shield.shield_sighash_binds`,
+  `Spec.Transfer.transfer_sighash_binds`,
+  `Spec.Unshield.unshield_sighash_binds` — two accepted txs sharing a
+  sighash publish byte-identical public fields (recipient, amounts, asset
+  commitments, nullifiers, fee, memo hashes).  Since the WOTS+ signature
+  is over the sighash, no field can be altered without invalidating it.
+- `Spec.Hashes.replay_resistant` (cross-deployment replay via auth_domain).
+
+## WOTS+ one-time / key-reuse safety
+
+> "reusing a one-time key across two transactions can expose enough chain
+> preimages for forgery."
+
+- `Spec.Xmss.wots_one_time_unforgeable` +
+  `Spec.Xmss.xmss_one_time_unforgeable`: a forward-only forgery against a
+  fixed leaf verifies only for the *originally signed* message.  The
+  single-use safety is the contrapositive of the documented reuse hazard;
+  the only crypto assumption is chain-hash preimage resistance (explicit).
+
+## Note integrity: commitment binds its fields
+
+> (Underpins "watch wallets must iterate the candidate-asset registry
+> because cm alone doesn't reveal the asset", and rules out asset/value
+> substitution.)
+
+- `Spec.Hashes.commitment_binds_asset` (a note's asset is welded to its
+  cm — no asset substitution), `commitment_binds_value` (no per-note
+  amount inflation), `commitment_binds_auth_root` (spending authority
+  welded to cm — no authority substitution).
+
+## Double-spend / replay / faerie-gold
+
+- `Spec.KernelNullifier.reachable_nodup` / `respend_rejected`
+  (no nullifier accepted twice), `note_spent_at_most_once`
+  (composes with the circuit nullifier binding).
+- `Spec.ShieldReplay.no_duplicate_shielded_note` (a replayed shield
+  cannot mint a duplicate note).
+- `Spec.Hashes.nullifier_position_distinct` (faerie-gold: the same note
+  value at distinct positions has distinct nullifiers).
+
+## Bridge / Michelson contract
+
+- `Spec.BridgeTicketer.fully_collateralized` (custody = outstanding
+  tickets, exactly), `Spec.BridgeBurn.custody_decrease_authentic`
+  (a foreign ticket cannot drain custody — the `ticketer == SELF` check),
+  `Spec.KernelDeposit.credit_requires_owning_ticketer` (only the
+  registered ticketer can credit a pool).
+
+## Storage / serialization foundations
+
+- `Spec.StoragePaths.cross_no_collision` + per-type incomparability
+  (no nullifier/deposit/shield-cm path ever collides),
+  `Spec.DepositKey.deposit_key_bytes_injective` (distinct pools never
+  share a durable slot), `Spec.WithdrawalRecord.decode_encode`
+  (lossless withdrawal-record codec — no misdirected/corrupted exit).
+
+## Commitment tree
+
+- `Spec.Merkle.merkle_binding` / `auth_binding` (membership soundness:
+  can't forge two leaves to one root),
+  `Spec.MerkleTree.tree_root_correct` (committed root = batch root of all
+  notes), `Spec.MerkleFrontierCorrect.froot_fbuild_eq` (the kernel's
+  O(depth) frontier read-off equals the batch root — also
+  differential-validated against the production tree).
+
+---
+
+## Documented properties NOT formally verified (and why)
+
+- **`validate_l1_ticketer_canonical` (b58check canonicalization):**
+  string-level input validation (trim whitespace, require KT1, b58check
+  parse + re-emit).  This is byte/parsing-level Tezos-address handling,
+  out of scope (the Tezos b58check codec is a vendored dependency).  The
+  proofs that *use* asset ids (`AssetRegistry`) take `derive_asset_id`
+  injectivity as a hypothesis — which holds precisely *because* inputs are
+  canonicalized first; the canonicalization itself is assumed, not proved.
+- **Detection-tag false-positive rate / ML-KEM:** privacy/crypto
+  primitive, explicitly out of scope.
+- **Memo *semantic* correctness:** the spec itself states `memo_ct_hash`
+  is transport integrity, not semantic correctness; the sighash binding
+  (proved) covers the transport-integrity claim, and nothing more is
+  claimed.
+- **Kernel apply-path durable-state atomicity:** the Rust
+  `apply_durable_*_commit` functions' stateful sequencing is modeled at
+  the level of the accounting state machines (`KernelLedger`,
+  `KernelNullifier`, …), not byte-for-byte against the durable-storage
+  imperative code.  The faithfulness boundary (transcription, not
+  extraction) is stated per-module.
