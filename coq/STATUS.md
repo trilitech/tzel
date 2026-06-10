@@ -763,6 +763,18 @@ nullifier/commitment binding.
   unforgeability is axiomatized — it is proven (the only crypto
   assumption is chain-hash preimage resistance, made explicit).
 
+- **WHOLE-TREE CORRECTNESS (`Spec/MerkleTree.v`):** lifts the
+  single-append tdfront_correct to the FULL append sequence.
+  tree_root d leaves = the root after appending every leaf via the
+  frontier; tree_root_correct: tree_root d leaves = mroot d leaves
+  (length leaves <= 2^d) — the root the kernel commits after appending
+  all notes equals the batch Merkle root of all the notes. This is
+  what a membership proof trusts: the committed root faithfully
+  reflects exactly the set of committed notes. (Sequence-level
+  corollary of tdfront_correct via app_removelast_last; honest framing
+  — the hard content is tdfront_correct, this packages it for the
+  whole tree.)
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

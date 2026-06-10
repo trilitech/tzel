@@ -269,4 +269,41 @@ Section MerkleTree.
     0 < 2 ^ d -> tdfront d [] cm = mroot d [cm].
   Proof. intros d cm Hpos. exact (tdfront_correct d [] cm Hpos). Qed.
 
+  (* ============================================================= *)
+  (** ** Whole-tree correctness (the full append sequence)          *)
+  (* ============================================================= *)
+
+  (** The root of the commitment tree after appending ALL of [leaves],
+      one at a time, via the frontier.  (Appending the last leaf onto
+      the prefix of all the others; the empty tree is [zero_hash d].) *)
+  Definition tree_root (d : nat) (leaves : list Felt) : Felt :=
+    match leaves with
+    | [] => zero_hash d
+    | _ :: _ => tdfront d (removelast leaves) (last leaves z0)
+    end.
+
+  (** Lifts [tdfront_correct] (single append, any index) to the whole
+      sequence: the root the kernel commits after appending every note
+      equals the batch Merkle root of all the notes.  This is what a
+      membership proof trusts — the committed root faithfully reflects
+      exactly the set of committed notes. *)
+  Theorem tree_root_correct : forall d leaves,
+    length leaves <= 2 ^ d ->
+    tree_root d leaves = mroot d leaves.
+  Proof.
+    intros d leaves Hlen. unfold tree_root.
+    destruct leaves as [| x xs] eqn:E.
+    - symmetry. apply mroot_nil.
+    - set (l := x :: xs) in *.
+      assert (Hne : l <> []) by (unfold l; discriminate).
+      pose proof (app_removelast_last z0 Hne) as Hsplit.
+      assert (Hl1 : length l = length (removelast l) + 1).
+      { transitivity (length (removelast l ++ [last l z0])).
+        - rewrite <- Hsplit. reflexivity.
+        - rewrite length_app. cbn [length]. lia. }
+      assert (Hlenrem : length (removelast l) < 2 ^ d) by lia.
+      rewrite (tdfront_correct d (removelast l) (last l z0) Hlenrem).
+      rewrite <- Hsplit. reflexivity.
+  Qed.
+
 End MerkleTree.
