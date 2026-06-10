@@ -2559,6 +2559,11 @@ fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
         KernelInboxMessage::DalPointer(_) => {
             unreachable!("wallet should not submit raw DAL pointer messages")
         }
+        // TODO(W4): wallet-side production of the v18 DAL-free submission
+        // path (StageChunk + SubmitOps) lands with track W4.
+        KernelInboxMessage::StageChunk(_) | KernelInboxMessage::SubmitOps(_) => {
+            unreachable!("wallet does not produce v18 staged submission messages yet (W4)")
+        }
     }
 }
 

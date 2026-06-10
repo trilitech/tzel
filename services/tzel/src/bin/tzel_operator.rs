@@ -565,9 +565,13 @@ fn enforce_dal_fee_policy(
         KernelInboxMessage::Unshield(req) => {
             validate_fee_note_against_policy(policy, &req.cm_fee, &req.enc_fee, policy.amount)
         }
+        // v18 staged submission messages are inbox-only by design and never
+        // go through DAL (TODO(W4): operator-side SubmitOps production).
         KernelInboxMessage::ConfigureVerifier(_)
         | KernelInboxMessage::ConfigureBridge(_)
-        | KernelInboxMessage::DalPointer(_) => {
+        | KernelInboxMessage::DalPointer(_)
+        | KernelInboxMessage::StageChunk(_)
+        | KernelInboxMessage::SubmitOps(_) => {
             Err("operator only publishes shield, transfer, and unshield payloads to DAL".into())
         }
     }

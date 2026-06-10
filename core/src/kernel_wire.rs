@@ -11,7 +11,11 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 17;
+/// v18 adds the DAL-free submission messages (`StageChunk`, `SubmitOps`);
+/// the v17 DAL-pointer path is still encodable and is deleted in track W2.
+// TODO(W2): tezos/tzel_orchestrator.mligo pins `kernel_wire_version_le = 0x1100`
+// (v17) in its framing; bump it to 0x1200 when the kernel switches to v18-only.
+pub const KERNEL_WIRE_VERSION: u16 = 18;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
@@ -32,6 +36,29 @@ const MAX_TRANSFER_PAYLOAD_BYTES: usize =
     (5 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + (3 * MAX_ENCODED_NOTE_WIRE_BYTES) + 65536;
 const MAX_UNSHIELD_PAYLOAD_BYTES: usize =
     (4 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + (2 * MAX_ENCODED_NOTE_WIRE_BYTES) + 65536;
+
+// --- v18 DAL-free submission bounds (docs/SNARK-SUBMISSION-DESIGN.md) ---
+/// Max payload bytes carried by a single `StageChunk` (~3.9 KiB after the
+/// 4096-byte inbox framing overhead).
+pub const MAX_STAGE_CHUNK_BYTES: usize = 3900;
+/// The 1-commitment gnark wrap proof is 388 bytes; bound with headroom for
+/// VK/commitment-shape rotation.
+pub const MAX_GROTH16_PROOF_BYTES: usize = 1024;
+/// Max ops declared by one `SubmitOps` (one mv tree of depth 4).
+pub const MAX_BATCH_OPS: usize = 16;
+/// Max mv aggregation tree depth bindable by `SubmitOps` (2^4 = 16 leaves).
+pub const MAX_TREE_DEPTH: u8 = 4;
+/// Max staged-note references per declared op (shield: 2, transfer: 3,
+/// unshield: ≤ 2 — headroom for future shapes).
+pub const MAX_STAGED_NOTE_REFS_PER_OP: usize = 8;
+/// M31 values are < 2^31 - 1 (mirrors `MvNodePublics::check_m31` in
+/// verifier/src/snark.rs).
+const M31_LANE_LIMIT: u32 = (1 << 31) - 1;
+const TREE_ROOTS_COUNT: usize = 4;
+const MAX_STAGED_NOTE_LIST_BYTES: usize = 4096;
+const MAX_LEAF_SLOT_LIST_BYTES: usize = 4096;
+const MAX_OP_DECL_LIST_BYTES: usize = MAX_BATCH_OPS
+    * ((MAX_OUTPUT_PREIMAGE_ITEMS * 32) + MAX_ENCODED_NULLIFIER_LIST_BYTES + 8192);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelVerifierConfig {
@@ -133,6 +160,101 @@ pub struct KernelDalPayloadPointer {
     pub payload_hash: F,
 }
 
+/// One inbox-sized slice of an oversized payload (encrypted notes, large
+/// op-decl lists). The kernel reassembles chunks keyed by
+/// `(sender, staging_id)` and seals the entry once `hash(reassembled)`
+/// matches `payload_hash`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelStageChunk {
+    pub staging_id: u64,
+    pub chunk_index: u16,
+    pub chunk_count: u16,
+    /// Hash of the FULL reassembled payload (not of this chunk).
+    pub payload_hash: F,
+    pub bytes: Vec<u8>,
+}
+
+/// Reference to a sealed staging entry holding an op's encrypted notes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelStagedNoteRef {
+    pub staging_id: u64,
+    pub payload_hash: F,
+}
+
+/// Op-specific PUBLIC fields, mirroring the v17 request structs minus the
+/// per-op proof (covered by the batch Groth16 wrap) and minus the inline
+/// encrypted notes (carried as staged refs on [`KernelOpDecl`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KernelOpDeclBody {
+    Shield {
+        pubkey_hash: F,
+        fee: u64,
+        v: u64,
+        producer_fee: u64,
+        client_cm: F,
+        producer_cm: F,
+    },
+    Transfer {
+        root: F,
+        nullifiers: Vec<F>,
+        fee: u64,
+        cm_1: F,
+        cm_2: F,
+        cm_3: F,
+    },
+    Unshield {
+        root: F,
+        nullifiers: Vec<F>,
+        v_pub: u64,
+        fee: u64,
+        recipient: String,
+        cm_change: F,
+        cm_fee: F,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelOpDecl {
+    /// The op's bootloader output preimage (leaf-statement derivation input).
+    pub output_preimage: Vec<F>,
+    /// Sealed staging refs carrying the op's encrypted notes, in the same
+    /// order the v17 requests carried them inline.
+    pub staged_notes: Vec<KernelStagedNoteRef>,
+    pub body: KernelOpDeclBody,
+}
+
+/// One leaf of the aggregation tree binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KernelLeafSlot {
+    /// Leaf backed by `ops[index]` (re-derived from its output preimage).
+    DeclaredOp(u8),
+    /// Padding / sibling leaf: lanes supplied as-is (M31 range-checked).
+    Opaque { root: [u32; 8], outputs: [u32; 8] },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelTreeBinding {
+    /// Tree depth; the tree has 2^depth leaves.
+    pub depth: u8,
+    /// Exactly 2^depth entries, left to right.
+    pub leaf_slots: Vec<KernelLeafSlot>,
+}
+
+/// DAL-free batched submission: N declared ops bound to one mv-root Groth16
+/// wrap proof. A batch of size 1 IS the single-op mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelSubmitOps {
+    pub ops: Vec<KernelOpDecl>,
+    /// gnark wrap proof over the mv ROOT (388 bytes for the 1-commitment
+    /// shape; bounded by [`MAX_GROTH16_PROOF_BYTES`]).
+    pub groth16_proof: Vec<u8>,
+    /// Wrap public inputs: `TreeRoots[0..4]` (preprocessed root first).
+    pub tree_roots: [[u8; 32]; 4],
+    /// Wrap public inputs: `OutHash` lanes.
+    pub out_hash: [u32; 8],
+    pub binding: KernelTreeBinding,
+}
+
 #[derive(Debug, Clone)]
 pub enum KernelInboxMessage {
     ConfigureVerifier(KernelSignedVerifierConfig),
@@ -141,6 +263,8 @@ pub enum KernelInboxMessage {
     Transfer(KernelTransferReq),
     Unshield(KernelUnshieldReq),
     DalPointer(KernelDalPayloadPointer),
+    StageChunk(KernelStageChunk),
+    SubmitOps(KernelSubmitOps),
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +420,162 @@ struct WireKernelDalPayloadPointer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelStageChunk {
+    staging_id: WireU64Le,
+    chunk_index: WireU16Le,
+    chunk_count: WireU16Le,
+    payload_hash: WireFelt,
+    #[encoding(dynamic = "MAX_STAGE_CHUNK_BYTES", bytes)]
+    bytes: Vec<u8>,
+}
+
+/// 8 M31 lanes as 32 bytes of u32-LE values.
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireM31Lanes {
+    #[encoding(sized = "32", bytes)]
+    bytes: Vec<u8>,
+}
+
+/// The wrap circuit's 4 `TreeRoots`, 4 × 32 raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireTreeRoots {
+    #[encoding(sized = "128", bytes)]
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireGroth16Proof {
+    #[encoding(dynamic = "MAX_GROTH16_PROOF_BYTES", bytes)]
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelStagedNoteRef {
+    staging_id: WireU64Le,
+    payload_hash: WireFelt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelStagedNoteRefList {
+    #[encoding(dynamic = "MAX_STAGED_NOTE_LIST_BYTES")]
+    items: Vec<WireKernelStagedNoteRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireEncodedStagedNoteRefList {
+    #[encoding(dynamic = "MAX_STAGED_NOTE_LIST_BYTES", bytes)]
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelShieldOpDecl {
+    pubkey_hash: WireFelt,
+    fee: WireU64Le,
+    v: WireU64Le,
+    producer_fee: WireU64Le,
+    client_cm: WireFelt,
+    producer_cm: WireFelt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelTransferOpDecl {
+    root: WireFelt,
+    nullifiers: WireEncodedFeltList,
+    fee: WireU64Le,
+    cm_1: WireFelt,
+    cm_2: WireFelt,
+    cm_3: WireFelt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelUnshieldOpDecl {
+    root: WireFelt,
+    nullifiers: WireEncodedFeltList,
+    v_pub: WireU64Le,
+    fee: WireU64Le,
+    recipient: WireAccountId,
+    cm_change: WireFelt,
+    cm_fee: WireFelt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+#[encoding(tags = "u8")]
+enum WireKernelOpDeclBody {
+    #[encoding(tag = 0)]
+    Shield(WireKernelShieldOpDecl),
+    #[encoding(tag = 1)]
+    Transfer(WireKernelTransferOpDecl),
+    #[encoding(tag = 2)]
+    Unshield(WireKernelUnshieldOpDecl),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelOpDecl {
+    output_preimage: WireEncodedFeltList,
+    staged_notes: WireEncodedStagedNoteRefList,
+    body: WireKernelOpDeclBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelOpDeclList {
+    #[encoding(dynamic = "MAX_OP_DECL_LIST_BYTES")]
+    items: Vec<WireKernelOpDecl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireEncodedOpDeclList {
+    #[encoding(dynamic = "MAX_OP_DECL_LIST_BYTES", bytes)]
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelDeclaredOpSlot {
+    index: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelOpaqueLeaf {
+    root: WireM31Lanes,
+    outputs: WireM31Lanes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+#[encoding(tags = "u8")]
+enum WireKernelLeafSlot {
+    #[encoding(tag = 0)]
+    DeclaredOp(WireKernelDeclaredOpSlot),
+    #[encoding(tag = 1)]
+    Opaque(WireKernelOpaqueLeaf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelLeafSlotList {
+    #[encoding(dynamic = "MAX_LEAF_SLOT_LIST_BYTES")]
+    items: Vec<WireKernelLeafSlot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireEncodedLeafSlotList {
+    #[encoding(dynamic = "MAX_LEAF_SLOT_LIST_BYTES", bytes)]
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelTreeBinding {
+    depth: u8,
+    leaf_slots: WireEncodedLeafSlotList,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelSubmitOps {
+    ops: WireEncodedOpDeclList,
+    groth16_proof: WireGroth16Proof,
+    tree_roots: WireTreeRoots,
+    out_hash: WireM31Lanes,
+    binding: WireKernelTreeBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireUnshieldResp {
     change_index: Option<WireU64Le>,
     producer_index: WireU64Le,
@@ -333,6 +613,10 @@ enum WireKernelInboxMessage {
     Unshield(WireKernelUnshieldReq),
     #[encoding(tag = 6)]
     DalPointer(WireKernelDalPayloadPointer),
+    #[encoding(tag = 7)]
+    StageChunk(WireKernelStageChunk),
+    #[encoding(tag = 8)]
+    SubmitOps(WireKernelSubmitOps),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -386,6 +670,12 @@ pub fn encode_kernel_inbox_message(message: &KernelInboxMessage) -> Result<Vec<u
             KernelInboxMessage::DalPointer(pointer) => {
                 WireKernelInboxMessage::DalPointer(kernel_dal_payload_pointer_to_wire(pointer)?)
             }
+            KernelInboxMessage::StageChunk(chunk) => {
+                WireKernelInboxMessage::StageChunk(kernel_stage_chunk_to_wire(chunk)?)
+            }
+            KernelInboxMessage::SubmitOps(submit) => {
+                WireKernelInboxMessage::SubmitOps(kernel_submit_ops_to_wire(submit)?)
+            }
         },
     })
 }
@@ -417,6 +707,12 @@ pub fn decode_kernel_inbox_message(bytes: &[u8]) -> Result<KernelInboxMessage, S
         )),
         WireKernelInboxMessage::DalPointer(pointer) => Ok(KernelInboxMessage::DalPointer(
             kernel_dal_payload_pointer_from_wire(pointer)?,
+        )),
+        WireKernelInboxMessage::StageChunk(chunk) => Ok(KernelInboxMessage::StageChunk(
+            kernel_stage_chunk_from_wire(chunk)?,
+        )),
+        WireKernelInboxMessage::SubmitOps(submit) => Ok(KernelInboxMessage::SubmitOps(
+            kernel_submit_ops_from_wire(submit)?,
         )),
     }
 }
@@ -744,6 +1040,398 @@ fn kernel_dal_payload_pointer_from_wire(
         payload_hash: wire_to_felt(wire.payload_hash)?,
         payload_len: wire_to_u64(wire.payload_len)?,
     })
+}
+
+// --- v18 StageChunk / SubmitOps conversions + structural validation ---
+
+fn check_m31_lanes(what: &str, lanes: &[u32; 8]) -> Result<(), String> {
+    if let Some(lane) = lanes.iter().find(|l| **l >= M31_LANE_LIMIT) {
+        return Err(format!("{what} lane not an M31 value: {lane}"));
+    }
+    Ok(())
+}
+
+fn m31_lanes_to_wire(lanes: &[u32; 8]) -> WireM31Lanes {
+    let mut bytes = Vec::with_capacity(32);
+    for lane in lanes {
+        bytes.extend_from_slice(&lane.to_le_bytes());
+    }
+    WireM31Lanes { bytes }
+}
+
+fn wire_to_m31_lanes(wire: WireM31Lanes) -> Result<[u32; 8], String> {
+    if wire.bytes.len() != 32 {
+        return Err(format!(
+            "bad M31 lanes length: got {} bytes, expected 32",
+            wire.bytes.len()
+        ));
+    }
+    let mut lanes = [0u32; 8];
+    for (i, lane) in lanes.iter_mut().enumerate() {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(&wire.bytes[i * 4..(i + 1) * 4]);
+        *lane = u32::from_le_bytes(buf);
+    }
+    Ok(lanes)
+}
+
+fn tree_roots_to_wire(roots: &[[u8; 32]; TREE_ROOTS_COUNT]) -> WireTreeRoots {
+    let mut bytes = Vec::with_capacity(TREE_ROOTS_COUNT * 32);
+    for root in roots {
+        bytes.extend_from_slice(root);
+    }
+    WireTreeRoots { bytes }
+}
+
+fn wire_to_tree_roots(wire: WireTreeRoots) -> Result<[[u8; 32]; TREE_ROOTS_COUNT], String> {
+    if wire.bytes.len() != TREE_ROOTS_COUNT * 32 {
+        return Err(format!(
+            "bad tree_roots length: got {} bytes, expected {}",
+            wire.bytes.len(),
+            TREE_ROOTS_COUNT * 32
+        ));
+    }
+    let mut roots = [[0u8; 32]; TREE_ROOTS_COUNT];
+    for (i, root) in roots.iter_mut().enumerate() {
+        root.copy_from_slice(&wire.bytes[i * 32..(i + 1) * 32]);
+    }
+    Ok(roots)
+}
+
+fn validate_kernel_stage_chunk(chunk: &KernelStageChunk) -> Result<(), String> {
+    if chunk.chunk_count == 0 {
+        return Err("stage chunk requires chunk_count >= 1".into());
+    }
+    if chunk.chunk_index >= chunk.chunk_count {
+        return Err(format!(
+            "stage chunk index out of range: {} >= {}",
+            chunk.chunk_index, chunk.chunk_count
+        ));
+    }
+    if chunk.bytes.len() > MAX_STAGE_CHUNK_BYTES {
+        return Err(format!(
+            "stage chunk too large: {} > {}",
+            chunk.bytes.len(),
+            MAX_STAGE_CHUNK_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn kernel_stage_chunk_to_wire(chunk: &KernelStageChunk) -> Result<WireKernelStageChunk, String> {
+    validate_kernel_stage_chunk(chunk)?;
+    Ok(WireKernelStageChunk {
+        staging_id: u64_to_wire(chunk.staging_id),
+        chunk_index: u16_to_wire(chunk.chunk_index),
+        chunk_count: u16_to_wire(chunk.chunk_count),
+        payload_hash: felt_to_wire(&chunk.payload_hash),
+        bytes: chunk.bytes.clone(),
+    })
+}
+
+fn kernel_stage_chunk_from_wire(wire: WireKernelStageChunk) -> Result<KernelStageChunk, String> {
+    let chunk = KernelStageChunk {
+        staging_id: wire_to_u64(wire.staging_id)?,
+        chunk_index: wire_to_u16(wire.chunk_index)?,
+        chunk_count: wire_to_u16(wire.chunk_count)?,
+        payload_hash: wire_to_felt(wire.payload_hash)?,
+        bytes: wire.bytes,
+    };
+    validate_kernel_stage_chunk(&chunk)?;
+    Ok(chunk)
+}
+
+fn validate_kernel_op_decl(index: usize, op: &KernelOpDecl) -> Result<(), String> {
+    if op.output_preimage.len() > MAX_OUTPUT_PREIMAGE_ITEMS {
+        return Err(format!(
+            "op {} output_preimage too long: {} > {}",
+            index,
+            op.output_preimage.len(),
+            MAX_OUTPUT_PREIMAGE_ITEMS
+        ));
+    }
+    if op.staged_notes.len() > MAX_STAGED_NOTE_REFS_PER_OP {
+        return Err(format!(
+            "op {} has too many staged note refs: {} > {}",
+            index,
+            op.staged_notes.len(),
+            MAX_STAGED_NOTE_REFS_PER_OP
+        ));
+    }
+    Ok(())
+}
+
+fn validate_kernel_submit_ops(submit: &KernelSubmitOps) -> Result<(), String> {
+    if submit.ops.is_empty() {
+        return Err("submit-ops requires at least one op".into());
+    }
+    if submit.ops.len() > MAX_BATCH_OPS {
+        return Err(format!(
+            "submit-ops has too many ops: {} > {}",
+            submit.ops.len(),
+            MAX_BATCH_OPS
+        ));
+    }
+    for (index, op) in submit.ops.iter().enumerate() {
+        validate_kernel_op_decl(index, op)?;
+    }
+    if submit.groth16_proof.is_empty() {
+        return Err("submit-ops requires a non-empty groth16 proof".into());
+    }
+    if submit.groth16_proof.len() > MAX_GROTH16_PROOF_BYTES {
+        return Err(format!(
+            "submit-ops groth16 proof too large: {} > {}",
+            submit.groth16_proof.len(),
+            MAX_GROTH16_PROOF_BYTES
+        ));
+    }
+    check_m31_lanes("submit-ops out_hash", &submit.out_hash)?;
+    let binding = &submit.binding;
+    if binding.depth == 0 || binding.depth > MAX_TREE_DEPTH {
+        return Err(format!(
+            "tree binding depth out of range: {} not in 1..={}",
+            binding.depth, MAX_TREE_DEPTH
+        ));
+    }
+    let expected_slots = 1usize << binding.depth;
+    if binding.leaf_slots.len() != expected_slots {
+        return Err(format!(
+            "tree binding has {} leaf slots, expected 2^{} = {}",
+            binding.leaf_slots.len(),
+            binding.depth,
+            expected_slots
+        ));
+    }
+    let mut referenced = vec![false; submit.ops.len()];
+    for (slot_index, slot) in binding.leaf_slots.iter().enumerate() {
+        match slot {
+            KernelLeafSlot::DeclaredOp(op_index) => {
+                let op_index = *op_index as usize;
+                if op_index >= submit.ops.len() {
+                    return Err(format!(
+                        "leaf slot {} declares op {} but only {} ops are declared",
+                        slot_index,
+                        op_index,
+                        submit.ops.len()
+                    ));
+                }
+                referenced[op_index] = true;
+            }
+            KernelLeafSlot::Opaque { root, outputs } => {
+                check_m31_lanes(&format!("opaque leaf {slot_index} root"), root)?;
+                check_m31_lanes(&format!("opaque leaf {slot_index} outputs"), outputs)?;
+            }
+        }
+    }
+    if let Some(op_index) = referenced.iter().position(|r| !r) {
+        return Err(format!(
+            "declared op {} is not referenced by any leaf slot",
+            op_index
+        ));
+    }
+    Ok(())
+}
+
+fn kernel_op_decl_body_to_wire(body: &KernelOpDeclBody) -> Result<WireKernelOpDeclBody, String> {
+    Ok(match body {
+        KernelOpDeclBody::Shield {
+            pubkey_hash,
+            fee,
+            v,
+            producer_fee,
+            client_cm,
+            producer_cm,
+        } => WireKernelOpDeclBody::Shield(WireKernelShieldOpDecl {
+            pubkey_hash: felt_to_wire(pubkey_hash),
+            fee: u64_to_wire(*fee),
+            v: u64_to_wire(*v),
+            producer_fee: u64_to_wire(*producer_fee),
+            client_cm: felt_to_wire(client_cm),
+            producer_cm: felt_to_wire(producer_cm),
+        }),
+        KernelOpDeclBody::Transfer {
+            root,
+            nullifiers,
+            fee,
+            cm_1,
+            cm_2,
+            cm_3,
+        } => WireKernelOpDeclBody::Transfer(WireKernelTransferOpDecl {
+            root: felt_to_wire(root),
+            nullifiers: encoded_felt_list_to_wire(nullifiers)?,
+            fee: u64_to_wire(*fee),
+            cm_1: felt_to_wire(cm_1),
+            cm_2: felt_to_wire(cm_2),
+            cm_3: felt_to_wire(cm_3),
+        }),
+        KernelOpDeclBody::Unshield {
+            root,
+            nullifiers,
+            v_pub,
+            fee,
+            recipient,
+            cm_change,
+            cm_fee,
+        } => WireKernelOpDeclBody::Unshield(WireKernelUnshieldOpDecl {
+            root: felt_to_wire(root),
+            nullifiers: encoded_felt_list_to_wire(nullifiers)?,
+            v_pub: u64_to_wire(*v_pub),
+            fee: u64_to_wire(*fee),
+            recipient: WireAccountId {
+                value: recipient.clone(),
+            },
+            cm_change: felt_to_wire(cm_change),
+            cm_fee: felt_to_wire(cm_fee),
+        }),
+    })
+}
+
+fn kernel_op_decl_body_from_wire(wire: WireKernelOpDeclBody) -> Result<KernelOpDeclBody, String> {
+    Ok(match wire {
+        WireKernelOpDeclBody::Shield(decl) => KernelOpDeclBody::Shield {
+            pubkey_hash: wire_to_felt(decl.pubkey_hash)?,
+            fee: wire_to_u64(decl.fee)?,
+            v: wire_to_u64(decl.v)?,
+            producer_fee: wire_to_u64(decl.producer_fee)?,
+            client_cm: wire_to_felt(decl.client_cm)?,
+            producer_cm: wire_to_felt(decl.producer_cm)?,
+        },
+        WireKernelOpDeclBody::Transfer(decl) => KernelOpDeclBody::Transfer {
+            root: wire_to_felt(decl.root)?,
+            nullifiers: encoded_felt_list_from_wire(decl.nullifiers)?,
+            fee: wire_to_u64(decl.fee)?,
+            cm_1: wire_to_felt(decl.cm_1)?,
+            cm_2: wire_to_felt(decl.cm_2)?,
+            cm_3: wire_to_felt(decl.cm_3)?,
+        },
+        WireKernelOpDeclBody::Unshield(decl) => KernelOpDeclBody::Unshield {
+            root: wire_to_felt(decl.root)?,
+            nullifiers: encoded_felt_list_from_wire(decl.nullifiers)?,
+            v_pub: wire_to_u64(decl.v_pub)?,
+            fee: wire_to_u64(decl.fee)?,
+            recipient: decl.recipient.value,
+            cm_change: wire_to_felt(decl.cm_change)?,
+            cm_fee: wire_to_felt(decl.cm_fee)?,
+        },
+    })
+}
+
+fn kernel_op_decl_to_wire(op: &KernelOpDecl) -> Result<WireKernelOpDecl, String> {
+    let staged_notes = op
+        .staged_notes
+        .iter()
+        .map(|note| WireKernelStagedNoteRef {
+            staging_id: u64_to_wire(note.staging_id),
+            payload_hash: felt_to_wire(&note.payload_hash),
+        })
+        .collect::<Vec<_>>();
+    Ok(WireKernelOpDecl {
+        output_preimage: encoded_felt_list_to_wire(&op.output_preimage)?,
+        staged_notes: WireEncodedStagedNoteRefList {
+            bytes: encode_tze(&WireKernelStagedNoteRefList {
+                items: staged_notes,
+            })?,
+        },
+        body: kernel_op_decl_body_to_wire(&op.body)?,
+    })
+}
+
+fn kernel_op_decl_from_wire(wire: WireKernelOpDecl) -> Result<KernelOpDecl, String> {
+    let staged_notes: WireKernelStagedNoteRefList = decode_tze(&wire.staged_notes.bytes)?;
+    Ok(KernelOpDecl {
+        output_preimage: encoded_felt_list_from_wire(wire.output_preimage)?,
+        staged_notes: staged_notes
+            .items
+            .into_iter()
+            .map(|note| {
+                Ok(KernelStagedNoteRef {
+                    staging_id: wire_to_u64(note.staging_id)?,
+                    payload_hash: wire_to_felt(note.payload_hash)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        body: kernel_op_decl_body_from_wire(wire.body)?,
+    })
+}
+
+fn kernel_leaf_slot_to_wire(slot: &KernelLeafSlot) -> WireKernelLeafSlot {
+    match slot {
+        KernelLeafSlot::DeclaredOp(index) => {
+            WireKernelLeafSlot::DeclaredOp(WireKernelDeclaredOpSlot { index: *index })
+        }
+        KernelLeafSlot::Opaque { root, outputs } => {
+            WireKernelLeafSlot::Opaque(WireKernelOpaqueLeaf {
+                root: m31_lanes_to_wire(root),
+                outputs: m31_lanes_to_wire(outputs),
+            })
+        }
+    }
+}
+
+fn kernel_leaf_slot_from_wire(wire: WireKernelLeafSlot) -> Result<KernelLeafSlot, String> {
+    Ok(match wire {
+        WireKernelLeafSlot::DeclaredOp(slot) => KernelLeafSlot::DeclaredOp(slot.index),
+        WireKernelLeafSlot::Opaque(leaf) => KernelLeafSlot::Opaque {
+            root: wire_to_m31_lanes(leaf.root)?,
+            outputs: wire_to_m31_lanes(leaf.outputs)?,
+        },
+    })
+}
+
+fn kernel_submit_ops_to_wire(submit: &KernelSubmitOps) -> Result<WireKernelSubmitOps, String> {
+    validate_kernel_submit_ops(submit)?;
+    let ops = submit
+        .ops
+        .iter()
+        .map(kernel_op_decl_to_wire)
+        .collect::<Result<Vec<_>, _>>()?;
+    let leaf_slots = submit
+        .binding
+        .leaf_slots
+        .iter()
+        .map(kernel_leaf_slot_to_wire)
+        .collect::<Vec<_>>();
+    Ok(WireKernelSubmitOps {
+        ops: WireEncodedOpDeclList {
+            bytes: encode_tze(&WireKernelOpDeclList { items: ops })?,
+        },
+        groth16_proof: WireGroth16Proof {
+            bytes: submit.groth16_proof.clone(),
+        },
+        tree_roots: tree_roots_to_wire(&submit.tree_roots),
+        out_hash: m31_lanes_to_wire(&submit.out_hash),
+        binding: WireKernelTreeBinding {
+            depth: submit.binding.depth,
+            leaf_slots: WireEncodedLeafSlotList {
+                bytes: encode_tze(&WireKernelLeafSlotList { items: leaf_slots })?,
+            },
+        },
+    })
+}
+
+fn kernel_submit_ops_from_wire(wire: WireKernelSubmitOps) -> Result<KernelSubmitOps, String> {
+    let ops: WireKernelOpDeclList = decode_tze(&wire.ops.bytes)?;
+    let leaf_slots: WireKernelLeafSlotList = decode_tze(&wire.binding.leaf_slots.bytes)?;
+    let submit = KernelSubmitOps {
+        ops: ops
+            .items
+            .into_iter()
+            .map(kernel_op_decl_from_wire)
+            .collect::<Result<Vec<_>, _>>()?,
+        groth16_proof: wire.groth16_proof.bytes,
+        tree_roots: wire_to_tree_roots(wire.tree_roots)?,
+        out_hash: wire_to_m31_lanes(wire.out_hash)?,
+        binding: KernelTreeBinding {
+            depth: wire.binding.depth,
+            leaf_slots: leaf_slots
+                .items
+                .into_iter()
+                .map(kernel_leaf_slot_from_wire)
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+    };
+    validate_kernel_submit_ops(&submit)?;
+    Ok(submit)
 }
 
 fn program_hashes_to_wire(hashes: &ProgramHashes) -> WireProgramHashes {
@@ -2115,5 +2803,329 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("bad ct_d length"));
+    }
+
+    // --- v18 StageChunk / SubmitOps ---
+
+    fn sample_stage_chunk() -> KernelStageChunk {
+        KernelStageChunk {
+            staging_id: 0xDEAD_BEEF_0042,
+            chunk_index: 1,
+            chunk_count: 2,
+            payload_hash: [0xA5; 32],
+            bytes: vec![0x5C; 1200],
+        }
+    }
+
+    fn sample_shield_op_decl() -> KernelOpDecl {
+        KernelOpDecl {
+            output_preimage: vec![[0x11; 32], [0x12; 32], [0x13; 32]],
+            staged_notes: vec![
+                KernelStagedNoteRef {
+                    staging_id: 1,
+                    payload_hash: [0xA1; 32],
+                },
+                KernelStagedNoteRef {
+                    staging_id: 2,
+                    payload_hash: [0xA2; 32],
+                },
+            ],
+            body: KernelOpDeclBody::Shield {
+                pubkey_hash: [0x42; 32],
+                fee: 3,
+                v: 42,
+                producer_fee: 5,
+                client_cm: [0x55; 32],
+                producer_cm: [0x56; 32],
+            },
+        }
+    }
+
+    fn sample_transfer_op_decl() -> KernelOpDecl {
+        KernelOpDecl {
+            output_preimage: vec![[0x21; 32]],
+            staged_notes: vec![
+                KernelStagedNoteRef {
+                    staging_id: 3,
+                    payload_hash: [0xB1; 32],
+                },
+                KernelStagedNoteRef {
+                    staging_id: 4,
+                    payload_hash: [0xB2; 32],
+                },
+                KernelStagedNoteRef {
+                    staging_id: 5,
+                    payload_hash: [0xB3; 32],
+                },
+            ],
+            body: KernelOpDeclBody::Transfer {
+                root: [0x01; 32],
+                nullifiers: vec![[0x02; 32], [0x03; 32]],
+                fee: 9,
+                cm_1: [0x04; 32],
+                cm_2: [0x05; 32],
+                cm_3: [0x06; 32],
+            },
+        }
+    }
+
+    fn sample_unshield_op_decl() -> KernelOpDecl {
+        KernelOpDecl {
+            output_preimage: vec![[0x31; 32], [0x32; 32]],
+            staged_notes: vec![KernelStagedNoteRef {
+                staging_id: 6,
+                payload_hash: [0xC1; 32],
+            }],
+            body: KernelOpDeclBody::Unshield {
+                root: [0x07; 32],
+                nullifiers: vec![[0x08; 32]],
+                v_pub: 33,
+                fee: 6,
+                recipient: "tz1bob".into(),
+                cm_change: [0x09; 32],
+                cm_fee: [0x0A; 32],
+            },
+        }
+    }
+
+    fn opaque_leaf(seed: u32) -> KernelLeafSlot {
+        KernelLeafSlot::Opaque {
+            root: [seed; 8],
+            outputs: [seed + 1; 8],
+        }
+    }
+
+    fn sample_submit_ops_single() -> KernelSubmitOps {
+        KernelSubmitOps {
+            ops: vec![sample_shield_op_decl()],
+            groth16_proof: vec![0xC3; 388],
+            tree_roots: [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]],
+            out_hash: [7u32; 8],
+            binding: KernelTreeBinding {
+                depth: 2,
+                leaf_slots: vec![
+                    KernelLeafSlot::DeclaredOp(0),
+                    opaque_leaf(100),
+                    opaque_leaf(200),
+                    opaque_leaf(300),
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn kernel_inbox_roundtrip_preserves_stage_chunk() {
+        let chunk = sample_stage_chunk();
+        let encoded =
+            encode_kernel_inbox_message(&KernelInboxMessage::StageChunk(chunk.clone())).unwrap();
+        assert!(encoded.len() <= 4096, "stage chunk message exceeds inbox cap");
+        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
+        let KernelInboxMessage::StageChunk(decoded) = decoded else {
+            panic!("unexpected decoded message");
+        };
+        assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn kernel_inbox_roundtrip_preserves_submit_ops_single_op_depth_2() {
+        let submit = sample_submit_ops_single();
+        let encoded =
+            encode_kernel_inbox_message(&KernelInboxMessage::SubmitOps(submit.clone())).unwrap();
+        assert!(
+            encoded.len() <= 4096,
+            "single-op submit-ops must fit one inbox message, got {} bytes",
+            encoded.len()
+        );
+        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
+        let KernelInboxMessage::SubmitOps(decoded) = decoded else {
+            panic!("unexpected decoded message");
+        };
+        assert_eq!(decoded, submit);
+    }
+
+    #[test]
+    fn kernel_inbox_roundtrip_preserves_submit_ops_four_op_batch() {
+        let submit = KernelSubmitOps {
+            ops: vec![
+                sample_shield_op_decl(),
+                sample_transfer_op_decl(),
+                sample_unshield_op_decl(),
+                sample_transfer_op_decl(),
+            ],
+            groth16_proof: vec![0xD4; 388],
+            tree_roots: [[5u8; 32], [6u8; 32], [7u8; 32], [8u8; 32]],
+            out_hash: [0, 1, 2, 3, 4, 5, 6, (1 << 31) - 2],
+            binding: KernelTreeBinding {
+                depth: 2,
+                leaf_slots: vec![
+                    KernelLeafSlot::DeclaredOp(0),
+                    KernelLeafSlot::DeclaredOp(1),
+                    KernelLeafSlot::DeclaredOp(2),
+                    KernelLeafSlot::DeclaredOp(3),
+                ],
+            },
+        };
+        let encoded =
+            encode_kernel_inbox_message(&KernelInboxMessage::SubmitOps(submit.clone())).unwrap();
+        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
+        let KernelInboxMessage::SubmitOps(decoded) = decoded else {
+            panic!("unexpected decoded message");
+        };
+        assert_eq!(decoded, submit);
+    }
+
+    #[test]
+    fn stage_chunk_rejects_zero_chunk_count() {
+        let mut chunk = sample_stage_chunk();
+        chunk.chunk_index = 0;
+        chunk.chunk_count = 0;
+        let err = encode_kernel_inbox_message(&KernelInboxMessage::StageChunk(chunk)).unwrap_err();
+        assert!(err.contains("chunk_count >= 1"));
+    }
+
+    #[test]
+    fn stage_chunk_rejects_index_not_below_count() {
+        let mut chunk = sample_stage_chunk();
+        chunk.chunk_index = 2;
+        chunk.chunk_count = 2;
+        let err = encode_kernel_inbox_message(&KernelInboxMessage::StageChunk(chunk)).unwrap_err();
+        assert!(err.contains("index out of range"));
+    }
+
+    #[test]
+    fn stage_chunk_rejects_oversized_bytes() {
+        let mut chunk = sample_stage_chunk();
+        chunk.bytes = vec![0xFF; MAX_STAGE_CHUNK_BYTES + 1];
+        let err = encode_kernel_inbox_message(&KernelInboxMessage::StageChunk(chunk)).unwrap_err();
+        assert!(err.contains("stage chunk too large"));
+    }
+
+    #[test]
+    fn submit_ops_rejects_zero_ops() {
+        let mut submit = sample_submit_ops_single();
+        submit.ops.clear();
+        submit.binding.leaf_slots[0] = opaque_leaf(50);
+        let err =
+            encode_kernel_inbox_message(&KernelInboxMessage::SubmitOps(submit)).unwrap_err();
+        assert!(err.contains("at least one op"));
+    }
+
+    #[test]
+    fn submit_ops_rejects_bad_depth() {
+        for depth in [0u8, MAX_TREE_DEPTH + 1] {
+            let mut submit = sample_submit_ops_single();
+            submit.binding.depth = depth;
+            let err = encode_kernel_inbox_message(&KernelInboxMessage::SubmitOps(submit))
+                .unwrap_err();
+            assert!(err.contains("depth out of range"), "depth {depth}: {err}");
+        }
+    }
+
+    #[test]
+    fn submit_ops_rejects_leaf_slot_count_mismatch() {
+        let mut submit = sample_submit_ops_single();
+        submit.binding.leaf_slots.pop();
+        let err =
+            encode_kernel_inbox_message(&KernelInboxMessage::SubmitOps(submit)).unwrap_err();
+        assert!(err.contains("expected 2^2 = 4"));
+    }
+
+    #[test]
+    fn submit_ops_rejects_dangling_declared_op_index() {
+        let mut submit = sample_submit_ops_single();
+        submit.binding.leaf_slots[1] = KernelLeafSlot::DeclaredOp(7);
+        let err =
+            encode_kernel_inbox_message(&KernelInboxMessage::SubmitOps(submit)).unwrap_err();
+        assert!(err.contains("declares op 7"));
+    }
+
+    #[test]
+    fn submit_ops_rejects_unreferenced_op() {
+        let mut submit = sample_submit_ops_single();
+        submit.ops.push(sample_transfer_op_decl());
+        // ops[1] exists but no leaf slot declares it.
+        let err =
+            encode_kernel_inbox_message(&KernelInboxMessage::SubmitOps(submit)).unwrap_err();
+        assert!(err.contains("op 1 is not referenced"));
+    }
+
+    #[test]
+    fn submit_ops_rejects_non_m31_opaque_lane() {
+        let mut submit = sample_submit_ops_single();
+        // (1 << 31) - 1 is the first non-M31 value (boundary).
+        submit.binding.leaf_slots[2] = KernelLeafSlot::Opaque {
+            root: [0, 0, 0, (1 << 31) - 1, 0, 0, 0, 0],
+            outputs: [0u32; 8],
+        };
+        let err =
+            encode_kernel_inbox_message(&KernelInboxMessage::SubmitOps(submit)).unwrap_err();
+        assert!(err.contains("not an M31 value"));
+    }
+
+    #[test]
+    fn submit_ops_rejects_non_m31_out_hash_lane() {
+        let mut submit = sample_submit_ops_single();
+        submit.out_hash[0] = u32::MAX;
+        let err =
+            encode_kernel_inbox_message(&KernelInboxMessage::SubmitOps(submit)).unwrap_err();
+        assert!(err.contains("out_hash") && err.contains("not an M31 value"));
+    }
+
+    #[test]
+    fn submit_ops_rejects_oversized_groth16_proof() {
+        let mut submit = sample_submit_ops_single();
+        submit.groth16_proof = vec![0xEE; MAX_GROTH16_PROOF_BYTES + 1];
+        let err =
+            encode_kernel_inbox_message(&KernelInboxMessage::SubmitOps(submit)).unwrap_err();
+        assert!(err.contains("groth16 proof too large"));
+    }
+
+    #[test]
+    fn submit_ops_rejects_too_many_ops() {
+        let mut submit = sample_submit_ops_single();
+        submit.ops = vec![sample_shield_op_decl(); MAX_BATCH_OPS + 1];
+        let err =
+            encode_kernel_inbox_message(&KernelInboxMessage::SubmitOps(submit)).unwrap_err();
+        assert!(err.contains("too many ops"));
+    }
+
+    #[test]
+    fn kernel_submit_ops_from_wire_revalidates_depth() {
+        // Decode-side validation: a structurally valid wire blob with a bad
+        // depth must be rejected by `kernel_submit_ops_from_wire` too.
+        let mut wire = kernel_submit_ops_to_wire(&sample_submit_ops_single()).unwrap();
+        wire.binding.depth = 9;
+        let err = kernel_submit_ops_from_wire(wire).unwrap_err();
+        assert!(err.contains("depth out of range"));
+    }
+
+    #[test]
+    fn kernel_submit_ops_from_wire_revalidates_m31_lanes() {
+        let mut wire = kernel_submit_ops_to_wire(&sample_submit_ops_single()).unwrap();
+        let bad_lanes = WireM31Lanes {
+            bytes: vec![0xFF; 32],
+        };
+        wire.binding.leaf_slots = WireEncodedLeafSlotList {
+            bytes: encode_tze(&WireKernelLeafSlotList {
+                items: vec![
+                    WireKernelLeafSlot::DeclaredOp(WireKernelDeclaredOpSlot { index: 0 }),
+                    WireKernelLeafSlot::Opaque(WireKernelOpaqueLeaf {
+                        root: bad_lanes.clone(),
+                        outputs: bad_lanes.clone(),
+                    }),
+                    WireKernelLeafSlot::Opaque(WireKernelOpaqueLeaf {
+                        root: bad_lanes.clone(),
+                        outputs: bad_lanes.clone(),
+                    }),
+                    WireKernelLeafSlot::Opaque(WireKernelOpaqueLeaf {
+                        root: bad_lanes.clone(),
+                        outputs: bad_lanes,
+                    }),
+                ],
+            })
+            .unwrap(),
+        };
+        let err = kernel_submit_ops_from_wire(wire).unwrap_err();
+        assert!(err.contains("not an M31 value"));
     }
 }

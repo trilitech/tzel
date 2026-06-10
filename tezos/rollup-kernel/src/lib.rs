@@ -681,7 +681,7 @@ fn decode_rollup_message(
     // both passes: a bridge deposit is consumed by pass 1 and never reaches
     // pass 2, and an orchestrator message fails pass 1 outright. As an
     // independent second guard, pass 2 only yields a message if the inner
-    // bytes decode as a versioned kernel envelope (version 17u16 LE ++ tag,
+    // bytes decode as a versioned kernel envelope (KERNEL_WIRE_VERSION u16 LE ++ tag,
     // `decode_kernel_inbox_message`), which no Micheline pair prefix
     // satisfies.
     match TezosInboxMessage::<BridgeDepositPayload>::parse(bytes) {
@@ -1172,6 +1172,15 @@ fn apply_kernel_message<H: Host>(
                 return Err("nested DAL pointer messages are not supported".into());
             }
             apply_kernel_message(ledger, nested)
+        }
+        // TODO(W2): staging storage + batch apply for the DAL-free v18
+        // submission path (docs/SNARK-SUBMISSION-DESIGN.md). The wire format
+        // (W1) decodes these; the kernel state machine lands with W2.
+        KernelInboxMessage::StageChunk(_) => {
+            Err("StageChunk handling is not implemented yet (W2)".into())
+        }
+        KernelInboxMessage::SubmitOps(_) => {
+            Err("SubmitOps handling is not implemented yet (W2)".into())
         }
     }
 }
