@@ -448,3 +448,27 @@ Section MerkleTree.
   Qed.
 
 End MerkleTree.
+
+(** The empty-leaf (padding) value is IRRELEVANT for a FULL tree: a
+    depth-[d] tree with exactly [2^d] leaves never reaches the padding
+    base case, so its root does not depend on the padding value.  (A
+    free-standing lemma — it compares two padding values, so it lives
+    outside the [MerkleTree] section, which fixes one [z0].) *)
+Lemma mroot_base_irrelevant :
+  forall (Felt : Type) (H : Felt -> Felt -> Felt) (z0 z1 : Felt) d l,
+    length l = 2 ^ d ->
+    mroot Felt H z0 d l = mroot Felt H z1 d l.
+Proof.
+  intros Felt H z0 z1 d. revert z0 z1.
+  induction d as [| d IH]; intros z0 z1 l Hlen.
+  - cbn in Hlen. destruct l as [| a [| b r]]; cbn [length] in Hlen; try lia.
+    reflexivity.
+  - cbn [mroot].
+    assert (Hf : length (firstn (2 ^ d) l) = 2 ^ d).
+    { rewrite length_firstn. cbn [Nat.pow] in Hlen. lia. }
+    assert (Hs : length (skipn (2 ^ d) l) = 2 ^ d).
+    { rewrite length_skipn. cbn [Nat.pow] in Hlen. lia. }
+    rewrite (IH z0 z1 (firstn (2 ^ d) l) Hf).
+    rewrite (IH z0 z1 (skipn (2 ^ d) l) Hs).
+    reflexivity.
+Qed.

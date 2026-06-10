@@ -840,6 +840,16 @@ nullifier/commitment binding.
   z0, fold up). Composes root_of_mroot (full-tree bottom-up=top-down
   equivalence) with mroot_app_zeros (padding invariance). Zero admits.
 
+- **MERKLE FULL-TREE BASE INDEPENDENCE (`Spec/MerkleTree.v`):**
+  mroot_base_irrelevant: length l = 2^d -> mroot z0 d l = mroot z1 d l.
+  A full depth-d tree (exactly 2^d leaves) never reaches the
+  empty-leaf padding base case, so its root is independent of the
+  padding value. Clean induction (full list keeps both halves full).
+  Standalone structural fact + an ingredient toward the MerkleFrontier
+  read-off (where the frontier processes nodes at shifting levels with
+  level-dependent padding zh lv, and full sublists make the base drop
+  out). Zero admits.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
