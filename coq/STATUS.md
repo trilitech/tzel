@@ -977,6 +977,22 @@ nullifier/commitment binding.
   always commits the true Merkle root of the notes it appended. Closes
   the loop between the Merkle frontier proof and the kernel's usage.
 
+- **VALID-ROOT SET INTEGRITY (`Spec/ValidRoots.v`):** the kernel
+  accepts a membership proof against ANY root in its valid-root set
+  (has_valid_root), not just the latest. The set is seeded with the
+  genesis root and grown ONLY by snapshot_root (marks the CURRENT tree
+  root). Modeled as a (current_root, valid_set) state machine with an
+  abstract `genuine` predicate (the roots the tree legitimately
+  produces, proved correct in MerkleFrontierCorrect). Proved (zero
+  admits): valid_roots_genuine — every root in the valid set is
+  genuine. So "accept any historical root" is SAFE: no forged root is
+  ever accepted; a membership proof can only be checked against a root
+  the tree actually produced. Combined with Merkle.merkle_binding (no
+  forged path to a genuine root) and KernelNullifier (double-spend
+  prevented regardless of which root), membership is sound and
+  historical-root acceptance adds no attack. Found by reading the
+  kernel's valid-root management.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
