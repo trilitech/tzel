@@ -1,0 +1,67 @@
+{
+  "comment": "Captured by services/reprover/tests/leaf_junction_capture.rs (bootloader-only re-run of the export_mv_fixture leaves). expected_leaf_output_lanes are the REAL leaf proofs' claim.output_values (mv_root_children.json); the junction derivation pack_into_qm31s(Blake2Felt252-limbs) -> blake_qm31 was asserted equal during capture.",
+  "leaves": [
+    {
+      "expected_leaf_output_lanes": [
+        978423824,
+        1296894678,
+        337981983,
+        1090493975,
+        1318990943,
+        34913325,
+        2019415546,
+        380174573
+      ],
+      "label": "shield",
+      "output_preimage_hex": [
+        "0x1",
+        "0xb",
+        "0x3b1fa1dcace2410b8939ad32a56d1fa2ae6bb522ca8f46bda39ebbff3ecd5df",
+        "0x8",
+        "0x30d40",
+        "0x186a0",
+        "0x1",
+        "0x5da92702d26b8d8cc7b661c03bdb7ae4c90144304625ff1dd2cf68a10a931ca",
+        "0x35baa190dc16647f6ae332d9d72621502692cbce1142c91614e8242a18cb827",
+        "0x4c6e4ff4d7e0aea1c9b94e2bfe982ebbabecc7b6ed74407295f7858ea213ec",
+        "0xc005",
+        "0xc105"
+      ]
+    },
+    {
+      "expected_leaf_output_lanes": [
+        2073000406,
+        1409692151,
+        1297781539,
+        851970458,
+        866671971,
+        1790092888,
+        1205592385,
+        1316010105
+      ],
+      "label": "transfer",
+      "output_preimage_hex": [
+        "0x1",
+        "0x13",
+        "0x644494a29b93d4b1246f0a0f07613b6b5a5e5e56e7962aba47064cef02fc5bd",
+        "0x10",
+        "0xf001",
+        "0x237d37a117d4bea178d35c17cdd665a8501a77de4d8b3fee4fe8f6b1e202f41",
+        "0x224663e8c8a7926beeb9cb77c35fe42b4f58d902893b7e7d7839e151a2c3a7e",
+        "0x3cc4a61fc7e3106786b1ae4cf0776d775c997b12a6fed7d89528be5629edbed",
+        "0x11dd68c51ad38b31c8f9334a1748f056bac4a25d4171adc1a93d59346a170bb",
+        "0x339ead7747bbfed9131b7e152d7cda753083a452ce0519a346919ddf270b0da",
+        "0x48f2082fcc62e4e64bfa9e30f00eae59e3afeb72d6bbcca04520f9a4c372b20",
+        "0x1208dbb6bf523d39a949e88834fbf5ff1b2846d883c67f95b9d623337e3aceb",
+        "0x7295b35a8b9c857a6dc3c117c3cba3f8024d1cdb73aa2fb265b2625c894fea2",
+        "0x186a0",
+        "0x1853c4b279ea5232673298906adc6d51f515d845da8cbed9f656dec3102f06f",
+        "0x1d4384b8be06ea5dacf32c0cbb795147c5cae7f221caed418372b9924083ed7",
+        "0x43e6f58e626a7d3f7c8051738099b29b725289116e9f425ba6f399015d1c38b",
+        "0xd005",
+        "0xe005",
+        "0xf005"
+      ]
+    }
+  ]
+}

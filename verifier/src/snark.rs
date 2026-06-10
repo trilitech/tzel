@@ -113,6 +113,38 @@
 //! Both modes are pinned by golden vectors; mv mode additionally by the
 //! real 2026-06-10 mv-target fixture (see tests +
 //! `tests/snark_wrap_acceptance.rs`).
+//!
+//! ## The leaf↔mv junction (aggregation-tree leaves)
+//!
+//! When a privacy op is a LEAF of an aggregation tree (the production
+//! submission path, `docs/SNARK-SUBMISSION-DESIGN.md` track W3), its publics
+//! as seen by its mv PARENT derive from the op's bootloader
+//! `output_preimage` alone:
+//!
+//! ```text
+//! limbs        = Felt252(Blake2Felt252(output_preimage)).get_limbs() // 28 M31s
+//! output_qm31s = pack_into_qm31s(limbs)                              // 7 QM31s
+//! leaf.output_values = blake_m31(output_qm31s)                       // 2 QM31s
+//! leaf.preprocessed_root = protocol constant (leaf circuit identity)
+//! ```
+//!
+//! i.e. EXACTLY stage 1 of the leaf-mode derivation
+//! ([`compute_leaf_output_lanes`]) — the `CairoStatement` leaf circuit sets
+//! exactly these 2 claim outputs (stwo-circuits 2bf051f
+//! `crates/cairo_verifier/src/statement.rs:355-357`: `output_hash =
+//! blake(ctx, packed_outputs, …); set_outputs(&[output_hash.0,
+//! output_hash.1])`; the `u` anchor is enforced via the public logup sum,
+//! not listed — unlike the standalone 3-output leaf shape of
+//! `privacy_circuit_verify`). Pinned by `testdata/leaf_junction.json`:
+//! the REAL fixture leaves' bootloader preimages re-derive the leaf
+//! `claim.output_values` captured from the real proofs
+//! (`testdata/mv_root_children.json`, nodes `leaf_to_mv_*`).
+//!
+//! [`derive_mv_root_publics`] walks a whole binding tree
+//! ([`MvLeafSlot`] leaves → pairwise [`compute_mv_output_values`] folds),
+//! and [`verify_snark_tree`] is the end-to-end kernel check: declared
+//! leaves' preimages → tree walk → root publics → wrap OutHash equation →
+//! Groth16.
 
 use starknet_types_core::felt::Felt;
 use stwo::core::fields::qm31::QM31;
@@ -253,6 +285,121 @@ pub fn compute_mv_output_values(left: &MvNodePublics, right: &MvNodePublics) -> 
         }
     }
     blake_m31_lanes(&preimage)
+}
+
+/// The leaf↔mv junction, stage 1 of the leaf derivation: a leaf statement's
+/// 2 claim output values (8 M31 lanes) from its bootloader
+/// `output_preimage` — what the leaf's mv PARENT hashes as `ovX` (see the
+/// module docs, "The leaf↔mv junction"). Same chain as the first stage of
+/// [`compute_expected_out_hash`].
+pub fn compute_leaf_output_lanes(output_preimage: &[Felt]) -> [u32; 8] {
+    let lanes = compute_output_hash_values(output_preimage);
+    lanes
+        .as_slice()
+        .try_into()
+        .expect("compute_output_hash_values yields exactly 8 lanes")
+}
+
+/// A leaf's full mv-visible publics: junction-derived output lanes + the
+/// leaf circuit's preprocessed root (a per-release protocol constant — the
+/// leaf circuit's identity, NOT attacker-controlled).
+pub fn leaf_mv_publics(
+    leaf_preprocessed_root_lanes: [u32; 8],
+    output_preimage: &[Felt],
+) -> MvNodePublics {
+    MvNodePublics {
+        preprocessed_root_lanes: leaf_preprocessed_root_lanes,
+        output_lanes: compute_leaf_output_lanes(output_preimage),
+    }
+}
+
+/// One leaf slot of an aggregation-tree binding
+/// (`docs/SNARK-SUBMISSION-DESIGN.md`, `TreeBinding`).
+#[derive(Debug)]
+pub enum MvLeafSlot<'a> {
+    /// Leaf backed by a declared op: its publics are RE-DERIVED from the
+    /// op's bootloader `output_preimage` (raw 32-byte LE felts, as carried
+    /// on the wire) — the leaf↔mv junction.
+    Declared { output_preimage: &'a [RawF] },
+    /// Padding / sibling leaf: lanes supplied as-is (M31 range-checked,
+    /// never applied as an op).
+    Opaque(MvNodePublics),
+}
+
+/// Recursive aggregation-tree walk: fold `2^depth` leaf slots pairwise up
+/// to the ROOT's publics.
+///
+/// * `leaf_preprocessed_root_lanes` — the leaf circuit's preprocessed root
+///   (protocol constant), used for every `Declared` slot.
+/// * `internal_preprocessed_root_lanes` — one constant per internal level,
+///   bottom-up: `[0]` = the leaf_to_mv circuit root (level 1), last = the
+///   tree's ROOT circuit root (mv_to_mv for depth ≥ 2). `depth =
+///   internal_preprocessed_root_lanes.len()`, so `slots.len()` must be
+///   `2^depth` (≥ 2 slots).
+///
+/// Every fold is [`compute_mv_output_values`] (`parent.ov = blake_m31(rootL
+/// ‖ ovL ‖ rootR ‖ ovR)`); all supplied lanes are M31 range-checked. The
+/// returned root publics chain into [`compute_expected_out_hash_mv`] /
+/// [`verify_snark_tree`].
+pub fn derive_mv_root_publics(
+    leaf_preprocessed_root_lanes: [u32; 8],
+    internal_preprocessed_root_lanes: &[[u32; 8]],
+    slots: &[MvLeafSlot<'_>],
+) -> Result<MvNodePublics, String> {
+    let depth = internal_preprocessed_root_lanes.len();
+    if depth == 0 || depth >= 32 {
+        return Err(format!("mv tree depth must be in 1..32, got {depth}"));
+    }
+    if slots.len() != 1usize << depth {
+        return Err(format!(
+            "mv tree of depth {depth} needs {} leaf slots, got {}",
+            1usize << depth,
+            slots.len()
+        ));
+    }
+
+    let mut level: Vec<MvNodePublics> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let node = match slot {
+            MvLeafSlot::Declared { output_preimage } => {
+                let felts: Vec<Felt> = output_preimage
+                    .iter()
+                    .map(|raw| Felt::from_bytes_le(raw))
+                    .collect();
+                leaf_mv_publics(leaf_preprocessed_root_lanes, &felts)
+            }
+            MvLeafSlot::Opaque(publics) => *publics,
+        };
+        node.check_m31()?;
+        level.push(node);
+    }
+
+    for parent_root_lanes in internal_preprocessed_root_lanes {
+        if let Some(lane) = parent_root_lanes.iter().find(|l| **l >= (1 << 31) - 1) {
+            return Err(format!(
+                "internal preprocessed_root lane not an M31 value: {lane}"
+            ));
+        }
+        level = level
+            .chunks_exact(2)
+            .map(|pair| MvNodePublics {
+                preprocessed_root_lanes: *parent_root_lanes,
+                output_lanes: compute_mv_output_values(&pair[0], &pair[1]),
+            })
+            .collect();
+    }
+    debug_assert_eq!(level.len(), 1);
+    Ok(level[0])
+}
+
+/// Encode 8 M31 root lanes as the 32 raw bytes the chip carries in
+/// `TreeRoots` (each lane u32 LE — the byte form of `HashValue<QM31>`).
+pub fn root_lanes_to_bytes(lanes: &[u32; 8]) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    for (i, lane) in lanes.iter().enumerate() {
+        bytes[i * 4..(i + 1) * 4].copy_from_slice(&lane.to_le_bytes());
+    }
+    bytes
 }
 
 /// Re-derive the wrap circuit's `OutHash` for an **mv root** proof from the
@@ -409,6 +556,85 @@ pub fn verify_snark_mv_with_vk(
     }
 
     Ok(root_output_lanes)
+}
+
+/// The Option E precompile, **tree mode** — the full
+/// `docs/SNARK-SUBMISSION-DESIGN.md` verification walk: bind a
+/// Groth16-wrapped mv ROOT proof all the way down to the declared leaves'
+/// bootloader `output_preimage`s.
+///
+/// Steps:
+/// (a) Groth16 verification on the envelope publics;
+/// (b) tree walk ([`derive_mv_root_publics`]): junction-derive every
+///     `Declared` leaf from its preimage, take `Opaque` lanes as-is,
+///     fold pairwise to the root;
+/// (c) circuit-identity check: the derived root's preprocessed root must
+///     BE the proof's `TreeRoots[0]` — the wrapped statement is the
+///     expected mv circuit, not some other circuit with colliding outputs;
+/// (d) OutHash binding: `blake_m31(TreeRoots[0] ‖ root.output_values)`
+///     must equal the proof's `OutHash`.
+///
+/// On success returns the validated root output lanes. Any change to a
+/// declared leaf's preimage, an opaque slot, or a tree constant breaks
+/// (c)/(d) or the Groth16 publics.
+pub fn verify_snark_tree(
+    proof_bytes: &[u8],
+    leaf_preprocessed_root_lanes: [u32; 8],
+    internal_preprocessed_root_lanes: &[[u32; 8]],
+    slots: &[MvLeafSlot<'_>],
+) -> Result<[u32; 8], String> {
+    verify_snark_tree_with_vk(
+        proof_bytes,
+        leaf_preprocessed_root_lanes,
+        internal_preprocessed_root_lanes,
+        slots,
+        WRAP_VK_BYTES,
+    )
+}
+
+/// [`verify_snark_tree`] with an explicit gnark VK (testing / VK rotation).
+pub fn verify_snark_tree_with_vk(
+    proof_bytes: &[u8],
+    leaf_preprocessed_root_lanes: [u32; 8],
+    internal_preprocessed_root_lanes: &[[u32; 8]],
+    slots: &[MvLeafSlot<'_>],
+    vk_bytes: &[u8],
+) -> Result<[u32; 8], String> {
+    let envelope = parse_snark_proof_envelope(proof_bytes)?;
+
+    // (a) Groth16 verification on the chip's public inputs.
+    verify_groth16_wrap_with_vk(
+        envelope.gnark_proof_bytes,
+        &envelope.tree_roots,
+        &envelope.out_hash_lanes,
+        vk_bytes,
+    )
+    .map_err(|e| format!("groth16 wrap verification failed: {e}"))?;
+
+    // (b) Tree walk: leaves (junction-derived or opaque) → root publics.
+    let root = derive_mv_root_publics(
+        leaf_preprocessed_root_lanes,
+        internal_preprocessed_root_lanes,
+        slots,
+    )?;
+
+    // (c) Circuit identity: the derived root must be the proof's TreeRoots[0].
+    if root_lanes_to_bytes(&root.preprocessed_root_lanes) != envelope.tree_roots[0] {
+        return Err(
+            "mv tree root preprocessed_root does not match proof TreeRoots[0]".to_string(),
+        );
+    }
+
+    // (d) OutHash binding.
+    let expected = compute_expected_out_hash_mv(&envelope.tree_roots[0], &root.output_lanes);
+    if expected != envelope.out_hash_lanes {
+        return Err(format!(
+            "mv tree does not match proof OutHash: expected lanes {:?}, proof carries {:?}",
+            expected, envelope.out_hash_lanes
+        ));
+    }
+
+    Ok(root.output_lanes)
 }
 
 #[cfg(test)]
