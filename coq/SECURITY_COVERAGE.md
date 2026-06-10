@@ -32,6 +32,20 @@ audit").
   (withdrawn ≤ deposited, per asset),
   `Spec.EndToEndMulti.l1_collateral_equals_l2_claims`
   (L1 FA2 custody = L2 claimable, every asset).
+- **Dual-pool FA2 shield — "no unbacked tez" (the second-most-flagged
+  attack surface: break the dual-pool and you mint tez from nothing).**
+  `Spec.KernelLedger.kstep_shield_fa2` models the FA2 shield's TWO pool
+  debits explicitly: the FA2 pool funds `v_note + fee`
+  (`v_note + fee <= ks_pool A`) AND the *same pubkey_hash's tez pool*
+  funds the producer fee (`producer_fee <= ks_pool asset_tez`), moving
+  exactly `producer_fee` from the tez pool to the tez producer note. So
+  the tez producer note is BACKED by deposited tez — it cannot be
+  conjured.  `no_inflation` is the multi-step reachable-state invariant
+  (`reachable_invariant` → `step_preserves_invariant` over every step
+  *including* `kstep_shield_fa2`), so across any operation sequence the
+  tez total (pools + notes + burned + withdrawn) never exceeds tez
+  deposited.  The `producer_fee <= ks_pool asset_tez` premise is the
+  load-bearing "no unbacked tez" check, required and used.
 
 ## u64 / u128 overflow safety
 
