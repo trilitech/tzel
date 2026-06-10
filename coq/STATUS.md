@@ -1052,6 +1052,24 @@ nullifier/commitment binding.
   hash functions with no asserted properties. No surprises at any
   layer.
 
+- **NON-VACUITY of the circuit-relation soundness (`Spec/XmssInhabited.v`):**
+  guards against the "False in the hypotheses" failure mode — a
+  Relation -> Phi theorem proves nothing if Relation is unsatisfiable.
+  The circuit relations (Transfer/Shield/Unshield Relation) have one
+  non-trivially-satisfiable conjunct: the in-circuit XMSS check
+  xmss_verify_cairo_sep (gates / value equations / commitment equations
+  are satisfiable by construction). Proved (zero admits):
+  xmss_cairo_sep_inhabited — an honest signature verifies, so
+  xmss_verify_cairo_sep is INHABITED (for any well-formed message and
+  matching non-empty key, there exist a sig and auth path making it
+  hold). Built from recover_all_correct (honest sig recovers the public
+  key), ltree_succeeds (the key compresses to a leaf), and the auth path
+  to the computed root. Generalized to the separate L-tree / auth-tree
+  hashes the Cairo uses. So the relation-soundness theorems are not
+  vacuously true on their cryptographic core — the differential tests
+  validate the extracted FUNCTIONS, but this is the only check that the
+  relation PROPS are satisfiable, which fuzzing cannot establish.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
