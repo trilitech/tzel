@@ -26,15 +26,14 @@
     - [froot_empty]: the root read off an empty frontier is the
       empty-subtree root [zero_hash d].
 
-    REMAINING (honestly noted, not admitted): the final assembly
-    [froot (fbuild leaves) = mroot d leaves] — that the root read off
-    the O(depth) frontier equals the batch Merkle root — needs a
-    [froot]-vs-[mroot] bridge over [frep] with the level-offset and
-    zero-padding bookkeeping.  It is NOT stated here as an axiom.  The
-    security-relevant "committed root = batch root of all notes" is
-    already proved in [Spec.MerkleTree] ([tree_root_correct]) and
-    differentially validated against the production tree; this module
-    adds the O(depth)-state structural correctness underneath it. *)
+    The final assembly [froot (fbuild leaves) = mroot d leaves] — that
+    the root read off the O(depth) frontier equals the batch Merkle
+    root — is now COMPLETE in [Spec.MerkleFrontierCorrect]
+    ([froot_fbuild_eq]), built on the per-level bridge in
+    [Spec.MerkleBridge].  This module also proves the depth bound
+    [fbuild_length_bound] (a frontier of < 2^d notes has at most d
+    slots), which discharges the last side condition, so the capstone
+    needs only [length leaves < 2^d]. *)
 
 From Stdlib Require Import List Arith Lia.
 Import ListNotations.
@@ -207,3 +206,133 @@ Section MerkleFrontier.
   Qed.
 
 End MerkleFrontier.
+
+(* ================================================================ *)
+(** ** Frontier depth bound: a frontier of < 2^d notes fits in d slots *)
+(* ================================================================ *)
+
+Section FLen.
+  Variable Felt : Type.
+  Variable Hh : Felt -> Felt -> Felt.
+  Notation fa := (fappend Felt Hh).
+  Notation fv := (fval Felt).
+
+  (** A Some slot at the end contributes its level's weight. *)
+  Lemma fval_snoc_some : forall l lv s,
+    fv lv (l ++ Some s :: nil) = fv lv l + 2 ^ (lv + length l).
+  Proof.
+    induction l as [| slot rest IH]; intros lv s; cbn [app fval length].
+    - replace (lv + 0) with lv by lia. lia.
+    - destruct slot as [s' |]; cbn [fval].
+      + rewrite (IH (S lv) s).
+        replace (S lv + length rest) with (lv + S (length rest)) by lia. lia.
+      + rewrite (IH (S lv) s).
+        replace (S lv + length rest) with (lv + S (length rest)) by lia. lia.
+  Qed.
+
+  (** Well-formed: empty, or the last slot is Some (no trailing None).
+      This is exactly the shape [fappend] / [fbuild] produce. *)
+  Definition wf (front : list (option Felt)) : Prop :=
+    front = nil \/ exists init s, front = init ++ Some s :: nil.
+
+  Lemma fappend_nonempty : forall front x, fa front x <> nil.
+  Proof.
+    intros [| s rest] x; cbn [fappend]; [discriminate |].
+    destruct s; discriminate.
+  Qed.
+
+  Lemma wf_cons_some : forall s rest, wf (Some s :: rest) -> wf rest.
+  Proof.
+    intros s rest [Hnil | [init [s' Heq]]]; [discriminate |].
+    destruct init as [| a init'].
+    - cbn in Heq. injection Heq as _ ->. left. reflexivity.
+    - cbn in Heq. injection Heq as _ Hrest. right. exists init', s'. exact Hrest.
+  Qed.
+
+  Lemma fappend_wf : forall front x, wf front -> wf (fa front x).
+  Proof.
+    induction front as [| slot rest IH]; intros x Hwf; cbn [fappend].
+    - right. exists nil, x. reflexivity.
+    - destruct slot as [s |].
+      + (* Some s: None :: fa rest (H s x) *)
+        assert (Hwfrest : wf rest) by (apply (wf_cons_some s); exact Hwf).
+        specialize (IH (Hh s x) Hwfrest).
+        destruct IH as [Hnil | [init [s' Heq]]].
+        * exfalso. apply (fappend_nonempty rest (Hh s x)). exact Hnil.
+        * right. exists (None :: init), s'. cbn [app]. rewrite Heq. reflexivity.
+      + (* None: Some x :: rest *)
+        destruct Hwf as [Hnil | [init [s' Heq]]]; [discriminate |].
+        right.
+        destruct init as [| a init'].
+        * cbn in Heq. injection Heq as Habs _. discriminate Habs.
+        * cbn in Heq. injection Heq as _ Hr.
+          exists (Some x :: init'), s'. cbn [app]. rewrite Hr. reflexivity.
+  Qed.
+
+End FLen.
+
+Section FLen2.
+  Variable Felt : Type.
+  Variable Hh : Felt -> Felt -> Felt.
+
+  Lemma fbuild_wf : forall leaves, wf Felt (fbuild Felt Hh leaves).
+  Proof.
+    intro leaves. unfold fbuild.
+    assert (forall l front, wf Felt front -> wf Felt (fold_left (fappend Felt Hh) l front)).
+    { induction l as [| x xs IH]; intros front Hwf; cbn [fold_left].
+      - exact Hwf.
+      - apply IH. apply fappend_wf. exact Hwf. }
+    apply H. left. reflexivity.
+  Qed.
+
+  Lemma fval_fbuild : forall leaves, fval Felt 0 (fbuild Felt Hh leaves) = length leaves.
+  Proof.
+    intro leaves. unfold fbuild.
+    assert (forall l front,
+              fval Felt 0 (fold_left (fappend Felt Hh) l front)
+              = fval Felt 0 front + length l).
+    { induction l as [| x xs IH]; intros front; cbn [fold_left length].
+      - lia.
+      - rewrite IH. rewrite (fval_fappend Felt Hh front 0 x). cbn [Nat.pow]. lia. }
+    rewrite H. cbn [fval length]. reflexivity.
+  Qed.
+
+  (** A well-formed nonempty frontier has fval at least the weight of
+      its top (last) Some slot. *)
+  Lemma wf_fval_lower : forall front,
+    wf Felt front -> front <> nil ->
+    2 ^ (length front - 1) <= fval Felt 0 front.
+  Proof.
+    intros front Hwf Hne. destruct Hwf as [Hnil | [init [s Heq]]]; [contradiction |].
+    subst front. rewrite (fval_snoc_some Felt init 0 s).
+    rewrite length_app. cbn [length].
+    replace (length init + 1 - 1) with (length init) by lia.
+    cbn [Nat.add]. lia.
+  Qed.
+
+  (** THE BOUND: a binary-counter frontier of [< 2^d] notes has at
+      most [d] slots. *)
+  Lemma fbuild_length_bound : forall d leaves,
+    length leaves < 2 ^ d -> length (fbuild Felt Hh leaves) <= d.
+  Proof.
+    intros d leaves Hlen.
+    destruct (fbuild Felt Hh leaves) as [| slot rest] eqn:E.
+    - cbn [length]. lia.
+    - pose proof (wf_fval_lower (slot :: rest)) as Hlow.
+      rewrite <- E in Hlow.
+      specialize (Hlow (fbuild_wf leaves) ltac:(rewrite E; discriminate)).
+      rewrite (fval_fbuild leaves) in Hlow.
+      (* 2^(length(fbuild)-1) <= length leaves < 2^d *)
+      assert (Hlt : 2 ^ (length (fbuild Felt Hh leaves) - 1) < 2 ^ d) by lia.
+      rewrite E in Hlt. cbn [length] in Hlt |- *.
+      (* 2^(S(length rest) - 1) < 2^d -> S(length rest) <= d *)
+      assert (Hexp : length rest < d).
+      { destruct (le_lt_dec d (length rest)) as [Hge | Hlt2]; [| exact Hlt2].
+        exfalso. assert (2 ^ d <= 2 ^ (S (length rest) - 1)).
+        { apply Nat.pow_le_mono_r; [lia | lia]. }
+        lia. }
+      lia.
+  Qed.
+
+End FLen2.
+

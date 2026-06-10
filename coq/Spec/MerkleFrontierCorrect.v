@@ -133,12 +133,12 @@ Section FC.
       all notes using only O(depth) state. *)
   Theorem froot_fbuild_eq : forall d leaves,
     length leaves < 2 ^ d ->
-    length (fbuild Felt Hh leaves) <= d ->
     fr d (fbuild Felt Hh leaves) 0 z0 = mrb z0 d leaves.
   Proof.
-    intros d leaves Hlen Hfront.
+    intros d leaves Hlen.
     rewrite (froot_correct (fbuild Felt Hh leaves) d leaves 0 z0
-               (fbuild_frep Felt Hh leaves) Hfront
+               (fbuild_frep Felt Hh leaves)
+               (fbuild_length_bound Felt Hh d leaves Hlen)
                ltac:(rewrite length_app; cbn [length]; lia)).
     change (zh 0) with z0. apply mroot_app_z0. exact Hlen.
   Qed.

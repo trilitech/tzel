@@ -900,6 +900,19 @@ nullifier/commitment binding.
   PROVED and empirically VALIDATED, and the froot/fbuild model is
   confirmed faithful. Differential suite now 14 cases.
 
+- **FRONTIER DEPTH BOUND — capstone now hypothesis-free
+  (`Spec/MerkleFrontier.v`):** removed the last side condition from
+  froot_fbuild_eq. Proved fbuild_length_bound: length leaves < 2^d ->
+  length (fbuild leaves) <= d (a binary-counter frontier of < 2^d
+  notes has at most d slots). Via (zero admits): fappend_wf /
+  fbuild_wf (the frontier is well-formed — last slot Some, no trailing
+  None), fval_fbuild (fval 0 (fbuild leaves) = length leaves),
+  wf_fval_lower (wf nonempty -> 2^(length-1) <= fval, the top Some
+  contributes its level weight via fval_snoc_some), combined with pow
+  monotonicity. So froot_fbuild_eq now assumes ONLY length leaves <
+  2^d — the entire O(depth) frontier correctness is self-contained,
+  zero admits, no leftover hypotheses.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
