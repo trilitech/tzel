@@ -386,4 +386,47 @@ Section MerkleTree.
       apply build_level_mroot. exact Hlen.
   Qed.
 
+  (* ============================================================= *)
+  (** ** Zero-padding invariance                                    *)
+  (* ============================================================= *)
+
+  (** The committed root depends ONLY on the actual leaves, not on the
+      zero-padding.  Appending the padding value [z0] in the padding
+      region leaves the root unchanged — so the kernel's fixed-depth
+      tree, which treats empty positions as [z0], commits exactly the
+      notes regardless of how many empty slots remain. *)
+  Lemma mroot_app_z0 : forall d l,
+    length l < 2 ^ d -> mroot d (l ++ z0 :: nil) = mroot d l.
+  Proof.
+    induction d as [| d IH]; intros l Hlen.
+    - cbn in Hlen. assert (l = nil) by (destruct l; [reflexivity | cbn in Hlen; lia]).
+      subst l. cbn [mroot app]. reflexivity.
+    - cbn [mroot].
+      destruct (Nat.ltb_spec (length l) (2 ^ d)) as [Hlt | Hge].
+      + assert (Hle : length (l ++ z0 :: nil) <= 2 ^ d)
+          by (rewrite length_app; cbn [length]; lia).
+        rewrite (firstn_all2 _ Hle), (skipn_all2 _ Hle).
+        rewrite (firstn_all2 l) by lia. rewrite (skipn_all2 l) by lia.
+        rewrite IH by exact Hlt. reflexivity.
+      + rewrite firstn_app, skipn_app.
+        replace (2 ^ d - length l) with 0 by lia. cbn [firstn skipn app].
+        rewrite app_nil_r.
+        assert (Hrlen : length (skipn (2 ^ d) l) < 2 ^ d).
+        { rewrite length_skipn. cbn [Nat.pow] in Hlen. lia. }
+        rewrite (IH (skipn (2 ^ d) l) Hrlen). reflexivity.
+  Qed.
+
+  Lemma mroot_app_zeros : forall d k l,
+    length l + k <= 2 ^ d -> mroot d (l ++ repeat z0 k) = mroot d l.
+  Proof.
+    induction k as [| k IH]; intros l Hlen.
+    - rewrite app_nil_r. reflexivity.
+    - cbn [repeat].
+      replace (l ++ z0 :: repeat z0 k) with ((l ++ z0 :: nil) ++ repeat z0 k)
+        by (rewrite <- app_assoc; reflexivity).
+      rewrite (IH (l ++ z0 :: nil))
+        by (rewrite length_app; cbn [length]; lia).
+      apply mroot_app_z0. lia.
+  Qed.
+
 End MerkleTree.

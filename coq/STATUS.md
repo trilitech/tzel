@@ -817,6 +817,19 @@ nullifier/commitment binding.
     results proved about one (empty_subtree on root_of, tdfront/
     tree_root on mroot) transfer to the other.
 
+- **MERKLE ZERO-PADDING INVARIANCE (`Spec/MerkleTree.v`):** the
+  committed root depends ONLY on the actual leaves, not on the
+  zero-padding count. Proved (zero admits):
+  - mroot_app_z0: length l < 2^d -> mroot d (l ++ [z0]) = mroot d l
+    (appending the padding value in the padding region is a no-op),
+    by induction with the left/right-half case split;
+  - mroot_app_zeros: length l + k <= 2^d ->
+    mroot d (l ++ repeat z0 k) = mroot d l (any number of padding
+    zeros). So the kernel's fixed-depth tree — which treats empty
+    positions as z0 — commits exactly the notes regardless of how many
+    empty slots remain. (Also the remaining ingredient for the
+    MerkleFrontier froot read-off: explicit-z0 = implicit padding.)
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
