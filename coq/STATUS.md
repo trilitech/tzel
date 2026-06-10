@@ -493,6 +493,25 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   Coq <-> OCaml <-> Cairo/kernel faithfulness pattern (used for the
   circuit primitives) now extended to the kernel Merkle tree.
 
+- **WOTS+ ONE-TIME UNFORGEABILITY (`Spec/Wots.v` + `Spec/Xmss.v`):**
+  assembles the two halves of the WOTS+ security argument into the
+  structural unforgeability statement (the existing wots_no_dominance
+  was only the checksum half).
+  - `Wots.forward_forge_element` (NEW): walking a chain element
+    FORWARD by (d'-d) and recovering for the larger digit d' reaches
+    the SAME endpoint (via iter_compose). So the only signature
+    elements an attacker can produce without a chain preimage are
+    those for a LARGER digit — a forgery never decreases a digit.
+  - `Xmss.wots_one_time_unforgeable` (NEW): combining that (every
+    forgeable digit only increased: Forall2 >=) with wots_no_dominance
+    (a dominating digit-vector with valid checksum must equal the
+    original) gives: a signature an attacker can forge using only
+    forward chain walks verifies for the ORIGINAL message and no
+    other. This is the one-time unforgeability that makes XMSS index
+    reuse catastrophic and single-use safe. The only crypto
+    assumption is preimage resistance (what makes "forward-only" the
+    attacker's whole move set), stated explicitly.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

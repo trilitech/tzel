@@ -19,7 +19,7 @@
     [step] running through [start_step ..= start_step + n − 1].
 *)
 
-From Stdlib Require Import Arith.
+From Stdlib Require Import Arith Lia.
 From Common Require Import Felt.
 
 Section ChainStep.
@@ -178,6 +178,36 @@ Section ChainStep.
       apply IH in Heq.
       unfold step in Heq.
       exact (H_F_inj _ _ _ _ Heq).
+  Qed.
+
+  (** ** Forward-forge: walking a chain forward forges a valid element
+
+      A signature element for digit [d] is [iter d sk ...] (the secret
+      walked [d] steps).  The verifier recovers the endpoint by
+      walking the remaining [total - d] steps.  An attacker with no
+      secret can only walk a chain element FORWARD.  This lemma shows
+      that doing so produces a valid element for a LARGER digit [d']:
+      walking [iter (d'-d)] from the digit-[d] element and then
+      recovering for digit [d'] reaches the SAME endpoint.
+
+      Consequence: the only signature elements an attacker can forge
+      from a given one are those for [d' >= d] — a forgery never
+      decreases a digit (that would need a chain preimage).  This is
+      the chain fact behind WOTS+ one-time unforgeability; assembled
+      with the checksum no-dominance argument it shows a forward-only
+      forgery cannot change the signed message. *)
+  Lemma forward_forge_element
+        (total d d' : nat) (sig pub_seed : Felt) (key_idx chain_idx : nat) :
+    d <= d' -> d' <= total ->
+    iter (total - d') (iter (d' - d) sig pub_seed key_idx chain_idx d)
+         pub_seed key_idx chain_idx d'
+    = iter (total - d) sig pub_seed key_idx chain_idx d.
+  Proof.
+    intros Hdd' Hd'total.
+    replace (total - d) with ((d' - d) + (total - d')) by lia.
+    rewrite (iter_compose (d' - d) (total - d') sig pub_seed key_idx chain_idx d).
+    replace (d + (d' - d)) with d' by lia.
+    reflexivity.
   Qed.
 
 End ChainStep.

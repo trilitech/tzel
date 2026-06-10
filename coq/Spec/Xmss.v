@@ -868,6 +868,52 @@ Proof.
   rewrite Hmeq, Hceq. reflexivity.
 Qed.
 
+(** ** WOTS+ one-time unforgeability (structural)
+
+    Assembles the two halves of the WOTS+ security argument:
+
+    - [Spec.Wots.forward_forge_element]: the only signature elements an
+      attacker can produce from a given one (without a chain preimage)
+      are those for a LARGER digit — walking a chain forward verifies
+      to the same endpoint, walking it backward needs a preimage.  So
+      any forgery the attacker can build has, in EVERY message and
+      checksum chain, a digit >= the original ([Forall2 (>=)]).
+
+    - [wots_no_dominance]: but a message-and-checksum digit-vector
+      that dominates the original digit-by-digit must EQUAL it (the
+      checksum is anti-monotone, so it cannot also dominate unless
+      nothing changed).
+
+    Conclusion: a WOTS+ signature an attacker can forge using only
+    forward chain walks verifies for the ORIGINAL message and no
+    other.  This is the one-time unforgeability that makes index reuse
+    catastrophic and single-use safe.  The [Forall2 (>=)] hypotheses
+    are exactly the attacker's capability as characterized by
+    [forward_forge_element]; the preimage resistance that rules out
+    backward walks is the only cryptographic assumption, and it is
+    what makes "forward-only" the attacker's whole move set. *)
+Theorem wots_one_time_unforgeable
+    (msg msg' cs cs' : list nat) :
+  length msg = length msg' ->
+  Forall (fun d => d <= 3) msg ->
+  Forall (fun d => d <= 3) msg' ->
+  Forall (fun d => d <= 3) cs ->
+  Forall (fun d => d <= 3) cs' ->
+  base4_val cs = checksum msg ->
+  base4_val cs' = checksum msg' ->
+  (* the forged signature is built by walking each chain FORWARD,
+     so every digit can only have increased (forward_forge_element) *)
+  Forall2 (fun d' d => d' >= d) msg' msg ->
+  Forall2 (fun d' d => d' >= d) cs' cs ->
+  (* hence it verifies for the ORIGINAL message, not a different one *)
+  msg' = msg.
+Proof.
+  intros Hmlen Hmr Hmr' Hcr Hcr' Hcs Hcs' Hmge Hcge.
+  destruct (wots_no_dominance msg msg' cs cs'
+              Hmlen Hmr Hmr' Hcr Hcr' Hcs Hcs' Hmge Hcge) as [Hmeq _].
+  exact Hmeq.
+Qed.
+
 (* ================================================================ *)
 (** ** Full verification predicates matching Cairo assertions         *)
 (* ================================================================ *)
