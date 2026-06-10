@@ -10327,7 +10327,9 @@ fn cmd_transfer_rollup(
     // Upstream patch ①.
     let cm_1_hex = hex::encode(&note_1.cm);
     let cm_2_hex = hex::encode(&note_2.cm);
-    let cm_3_hex = hex::encode(&note_3.cm);
+    // producer_cm reports note_4 (the producer-fee note), not note_3
+    // (the change_2 tez-refund note).
+    let cm_4_hex = hex::encode(&note_4.cm);
     // `change` historically reported the tez refund. With multi-
     // asset transfers we have two refunds (primary and tez); preserve
     // the existing JSON key by reporting the primary-asset refund
@@ -10343,7 +10345,7 @@ fn cmd_transfer_rollup(
             "nullifiers" => nullifiers_hex,
             "recipient_cm" => &cm_1_hex,
             "change_cm" => &cm_2_hex,
-            "producer_cm" => &cm_3_hex,
+            "producer_cm" => &cm_4_hex,
         },
         human: "Submitted transfer of {} with fee {} + dal fee {} and change {}",
         amount, fee, profile.dal_fee, change_primary
