@@ -9,6 +9,43 @@ Written 2026-05-04 after landing the dune-driven real-hash wiring.
 
 ---
 
+> **⚠️ STATUS UPDATE (2026-06-10) — read this first.**
+>
+> This brief is the **scaffolding-phase narrative** from 2026-05-04.
+> Large parts are now obsolete and would badly *understate* the work
+> if read literally:
+>
+> - **Nothing is a "stub" anymore.** The §2 diagram's `← stub` labels
+>   are wrong. The theory is now **33 Spec modules + 7 Impl modules,
+>   zero `admit`s**, comprehensive. Every refinement theorem
+>   (`merkle_refines_spec`, `Wots.refines_spec`,
+>   `transfer/shield/unshield_relation_sound`, and the XMSS
+>   `xmss_verify_impl_one_time_unforgeable`) is **proved**.
+> - **§9 "the next concrete piece" is done.** The QCheck2/Alcotest
+>   differential harness exists (`ocaml/coq_driver/test/`, 14 cases)
+>   and Merkle path / L-tree / full XMSS / the three circuits are all
+>   proved.
+> - **§4 "you probably can't build locally" is no longer true** — the
+>   theory builds locally under `rocq` 9.0.0.
+>
+> For the *current* state read, in order: **`README.md`** (module
+> index), **`STATUS.md`** (per-module detail), **`SECURITY_COVERAGE.md`**
+> (threat-model → theorem map). The verification covers circuit
+> no-inflation, per-note binding, WOTS/XMSS one-time unforgeability,
+> double-spend/replay/faerie-gold, the full O(depth) Merkle frontier,
+> bridge collateralization + burn auth, L1↔L2 solvency, the kernel
+> config-governance/capacity/valid-root/joint-safety invariants, and
+> the complete Spec→Impl refinement — all zero-admit, on a two-axiom
+> base (`Felt` + `Felt_eq_dec`), with CR/injectivity premises as local
+> hypotheses, differentially validated and drift-pinned.
+>
+> What's still accurate below and worth keeping: **§6 gotchas**
+> (Rocq 9 `simpl`, `From Stdlib`, extraction output dir, the strict
+> no-`admit` rule), **§4 CI pipeline**, **§5 key-files table**, **§7
+> drift check**, **§8/§10 process & anti-patterns**.
+
+---
+
 ## 1. The protocol has three implementations. Don't confuse them.
 
 ```
@@ -49,20 +86,33 @@ whole point of refinement.
 docs/whitepaper.tex + specs/spec.md
             │
             ▼ (transcribe)
-        coq/Spec/Wots.v          ← step, iter, iter_succ, iter_compose, iter_S_unfold
-        coq/Spec/Hashes.v        ← stub
-        coq/Spec/Merkle.v        ← stub
-        coq/Spec/Xmss.v          ← stub
-        coq/Spec/Transfer.v      ← stub
-        coq/Spec/Shield.v        ← stub
-        coq/Spec/Unshield.v      ← stub
+        coq/Spec/Wots.v          ← WOTS+ chain; iter_compose; forward-forge
+        coq/Spec/Hashes.v        ← commitment/nullifier/sighash binding, faerie-gold
+        coq/Spec/Merkle.v        ← Merkle + auth-tree path binding (membership)
+        coq/Spec/Xmss.v          ← L-tree, WOTS+/XMSS one-time unforgeability
+        coq/Spec/Transfer.v      ← per-asset conservation + sighash non-malleability
+        coq/Spec/Shield.v        ← (ditto, shield)
+        coq/Spec/Unshield.v      ← (ditto, unshield; bug-#1 v_pub lane-routing)
+        coq/Spec/{GrandConservation,Ledger,LedgerNf,LedgerBounded}.v
+                                 ← global no-inflation; u64/u128 overflow safety
+        coq/Spec/{KernelLedger,KernelPool,KernelNullifier,ShieldReplay}.v
+                                 ← conservation; solvency; double-spend; replay
+        coq/Spec/{KernelDeposit,AssetRegistry,StoragePaths,DepositKey,WithdrawalRecord}.v
+                                 ← deposit anti-spoof; routing; path/codec integrity
+        coq/Spec/{MerkleTree,MerkleFrontier,MerkleBridge,MerkleFrontierCorrect}.v
+                                 ← O(depth) frontier read-off = batch root
+        coq/Spec/{ConfigAuth,ConfigOnce,TreeCapacity,ValidRoots,KernelSoundness}.v
+                                 ← config governance; capacity; root integrity; joint safety
+        coq/Spec/{BridgeTicketer,BridgeBurn,EndToEnd,EndToEndMulti}.v
+                                 ← collateralization; burn auth; L1<->L2 solvency
             │
-            ▼ (refine + prove refinement)
+            ▼ (refine + prove refinement — ALL proved, zero admits)
         coq/Impl/Wots.v          ← xmss_chain_step + Theorem refines_spec (reflexivity)
-        coq/Impl/Hashes.v        ← Parameter Hash3
-        coq/Impl/Common.v        ← placeholder
-        coq/Impl/{Merkle,Xmss,Transfer,Shield,Unshield}.v ← stubs
-        coq/Impl/Extraction.v    ← realizes Felt, Hash3, pack_adrs_chain, nat
+        coq/Impl/Hashes.v        ← Parameter Hash3 (realized at extraction)
+        coq/Impl/Merkle.v        ← merkle_refines_spec / auth_refines_spec
+        coq/Impl/Xmss.v          ← xmss_verify_impl_one_time_unforgeable
+        coq/Impl/{Transfer,Shield,Unshield}.v ← *_relation_sound (discharge Spec Phi)
+        coq/Impl/Extraction.v    ← realizes Felt, Hash3, pack_adrs_chain, nat, +frontier
             │
             ▼ (Rocq -> OCaml extraction)
         coq/Impl/tzel_wots.{ml,mli}  ← generated, gitignored
@@ -261,6 +311,14 @@ corresponding model update — that defeats the purpose.
   CI — see commit `b570e47`.** Don't push and walk away; wait.
 
 ## 9. The next concrete piece (what I'd start on)
+
+> **DONE (2026-06).** Everything in this section has since been built:
+> the extracted-Coq vs OCaml-port differential harness lives in
+> `ocaml/coq_driver/test/` (14 cases — chain step, commitment,
+> nullifier, sighash, Merkle path, and the O(depth) frontier root),
+> and the "more distant" items (Merkle, L-tree, full XMSS, the three
+> circuits) are all proved. Kept below for the original design
+> rationale only.
 
 **Cairo runner + QCheck2 differential.** Two pieces:
 
