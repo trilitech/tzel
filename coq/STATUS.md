@@ -1088,6 +1088,24 @@ nullifier/commitment binding.
   decomposition satisfies. So a modeling error making ShieldRelation
   self-contradictory is ruled out — a check fuzzing cannot perform.
 
+- **FULL UnshieldRelation INHABITATION (`Impl/Unshield.v`):** extends
+  the non-vacuity work to the unshield relation (the most complex — it
+  has inputs, the 2-accumulator conservation, change slots, and the
+  public exit). unshield_relation_inhabited (zero admits): a single
+  concrete honest unshield satisfies all 12 conjuncts at once — one tez
+  input spending a note that is genuinely in the tree (merkle path to
+  the computed root + honest WOTS+ spend signature + correct nullifier
+  + asset gate), both change slots absent (all-zero), a tez producer
+  note (v=1>0), the public exit pinned to tez, and a BALANCED
+  2-accumulator (input value 2 = exit 0 + changes 0 + producer 1 + fee
+  1; the primary lane is 0 since all assets are tez). The signature
+  circularity (the input's sig signs a sighash that includes its own
+  nullifier and the root) is broken by computing cm/nf/root from the
+  non-signature fields first, then signing. Helper u_xmss_honest + s
+  u_sign_len_eq. So unshield_relation_sound is provably not vacuously
+  true. Two of the three circuit relations (shield, unshield) now have
+  full inhabitation; transfer remains.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

@@ -44,6 +44,9 @@ From Impl Require Import Merkle.
 From Impl Require Import Wots.
 From Impl Require Import Xmss.
 From Spec Require Unshield.
+From Spec Require Merkle.
+From Spec Require Xmss.
+From Spec Require Hashes.
 
 From Impl Require Transfer.
 From Stdlib Require Import List Arith Lia.
@@ -360,6 +363,136 @@ Section UnshieldRelation.
       exact Hprod_tez.
     - (* producer fee positive *)
       exact Hfee_pos.
+  Qed.
+
+  Lemma u_xmss_honest :
+    forall (ps : Felt) (msg : list nat) (sks sib : list Felt) (leaf : Felt),
+      length msg = length sks ->
+      Forall (fun d => d <= Spec.Hashes.wots_chain_len) msg ->
+      Spec.Xmss.ltree (H_ltree_node ps 0)
+        (Spec.Xmss.gen_pk F_chain ADRS_chain ps 0 0 sks) = Some leaf ->
+      length sib = Spec.Hashes.auth_depth ->
+      Spec.Xmss.xmss_verify_cairo_sep
+        (H_tree_node ps) (H_ltree_node ps 0) F_chain ADRS_chain ps 0
+        msg (Spec.Xmss.sign F_chain ADRS_chain ps 0 0 msg sks) sib
+        (Spec.Merkle.auth_root (H_tree_node ps)
+           (Spec.Xmss.nat_to_bits Spec.Hashes.auth_depth 0) sib leaf 0 0).
+  Proof.
+    intros ps msg sks sib leaf Hlen Hbd Hleaf Hsib.
+    unfold Spec.Xmss.xmss_verify_cairo_sep.
+    rewrite (Spec.Xmss.recover_all_correct F_chain ADRS_chain ps 0 0 msg sks Hlen Hbd).
+    rewrite Hleaf.
+    unfold Spec.Xmss.auth_verify. split; [exact Hsib | split].
+    - assert (2 ^ Spec.Hashes.auth_depth <> 0) by (apply Nat.pow_nonzero; lia). lia.
+    - reflexivity.
+  Qed.
+
+  Lemma u_sign_len_eq :
+    forall (ps : Felt) (ki sc : nat) (digits : list nat) (sks : list Felt),
+      length digits = length sks ->
+      length (Spec.Xmss.sign F_chain ADRS_chain ps ki sc digits sks) = length digits.
+  Proof.
+    intros ps ki sc digits. revert sc.
+    induction digits as [| d ds IH]; intros sc [| sk rest] Hlen; cbn in *;
+      try discriminate Hlen; [reflexivity |].
+    f_equal. apply IH. lia.
+  Qed.
+
+  (** NON-VACUITY: a single concrete honest unshield satisfies every
+      conjunct of [UnshieldRelation] at once (1 tez input spending a
+      note in the tree, both change slots absent, a tez producer note,
+      and a balanced 2-accumulator), so [unshield_relation_sound] is
+      not vacuously true.  [primary <> asset_tez] is the standard
+      "primary is a non-tez asset" side condition. *)
+  Theorem unshield_relation_inhabited
+      (auth_domain recipient primary : Felt) (sks : list Felt)
+      (Hsks_len : length sks = Spec.Hashes.wots_chains)
+      (Hsks_ne : sks <> nil)
+      (Hwd_len : forall sh, length (wots_digits sh) = Spec.Hashes.wots_chains)
+      (Hwd_bd : forall sh, Forall (fun d => d <= Spec.Hashes.wots_chain_len) (wots_digits sh)) :
+    exists root v_pub asset_pub fee inputs has1 has2 c1 c2 p,
+      UnshieldRelation auth_domain root v_pub asset_pub fee recipient primary
+                       inputs has1 has2 c1 c2 p.
+  Proof.
+    pose (z := felt_zero).
+    pose (sib := repeat z Spec.Hashes.auth_depth).
+    assert (Hgpk : Spec.Xmss.gen_pk F_chain ADRS_chain z 0 0 sks <> nil).
+    { destruct sks; [contradiction | cbn [Spec.Xmss.gen_pk]; discriminate]. }
+    destruct (Spec.Xmss.ltree_succeeds (H_ltree_node z 0)
+                (Spec.Xmss.gen_pk F_chain ADRS_chain z 0 0 sks) Hgpk) as [leaf Hleaf].
+    pose (ar := Spec.Merkle.auth_root (H_tree_node z)
+                  (Spec.Xmss.nat_to_bits Spec.Hashes.auth_depth 0) sib leaf 0 0).
+    pose (icm := H_commit z (felt_of_nat 2) asset_tez (H_rcm z) (H_owner ar z (H_nktag z))).
+    pose (root := Spec.Merkle.merkle_root H_merkle
+                    (Spec.Xmss.nat_to_bits Spec.Hashes.tree_depth 0)
+                    (repeat z Spec.Hashes.tree_depth) icm).
+    pose (inf := Spec.Hashes.nullifier H_nf z icm (felt_of_nat 0)).
+    pose (c0 := Impl.Transfer.mkCairoOutput z z 0 z z z z z asset_tez).
+    pose (pp := Impl.Transfer.mkCairoOutput
+                  (H_commit z (felt_of_nat 1) asset_tez (H_rcm z) (H_owner z z z))
+                  z 1 z z z z z asset_tez).
+    pose (sh := u_relation_sighash auth_domain root (inf :: nil) 0 asset_tez 1 recipient c0 c0 pp).
+    pose (inp := Impl.Transfer.mkCairoInput
+                   inf z ar z 0 z 2 z 0 asset_tez
+                   (repeat z Spec.Hashes.tree_depth) sib
+                   (Spec.Xmss.sign F_chain ADRS_chain z 0 0 (wots_digits sh) sks)).
+    exists root, 0, asset_tez, 1, (inp :: nil), false, false, c0, c0, pp.
+    assert (Hdlen : length (wots_digits sh) = length sks)
+      by (rewrite Hwd_len; exact (eq_sym Hsks_len)).
+    unfold UnshieldRelation. cbv zeta.
+    refine (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ _))))))))))).
+    - (* 1 <= length inputs <= 7 *) cbn [length]. lia.
+    - (* co_asset p = tez *) reflexivity.
+    - (* change_slot_checks false c0 *) cbn [change_slot_checks]. repeat split; reflexivity.
+    - (* change_slot_checks false c0 *) cbn [change_slot_checks]. repeat split; reflexivity.
+    - (* u_output_cm_ok p *) reflexivity.
+    - (* co_asset c1 in {tez,primary} *) left; reflexivity.
+    - (* co_asset c2 in {tez,primary} *) left; reflexivity.
+    - (* Forall input_checks *)
+      apply Forall_cons; [| apply Forall_nil].
+      unfold u_input_checks, Impl.Transfer.input_checks.
+      refine (conj _ (conj _ (conj _ _))).
+      + (* asset gate *) left. reflexivity.
+      + (* merkle_verify *)
+        unfold Spec.Xmss.merkle_verify. split; [| split].
+        * change (Impl.Transfer.ci_merkle_siblings inp) with (repeat z Spec.Hashes.tree_depth).
+          apply repeat_length.
+        * assert (2 ^ Spec.Hashes.tree_depth <> 0) by (apply Nat.pow_nonzero; lia).
+          change (Impl.Transfer.ci_pos inp) with 0. lia.
+        * reflexivity.
+      + (* xmss *)
+        change (Impl.Transfer.ci_pub_seed inp) with z.
+        change (Impl.Transfer.ci_auth_idx inp) with 0.
+        change (Impl.Transfer.ci_auth_root inp) with ar.
+        change (Impl.Transfer.ci_auth_siblings inp) with sib.
+        change (Impl.Transfer.ci_wots_sig inp) with
+          (Spec.Xmss.sign F_chain ADRS_chain z 0 0 (wots_digits sh) sks).
+        apply (u_xmss_honest z (wots_digits sh) sks sib leaf Hdlen (Hwd_bd sh) Hleaf).
+        unfold sib. apply repeat_length.
+      + (* nullifier *)
+        reflexivity.
+    - (* co_v p > 0 *) cbn. lia.
+    - (* asset_pub in {tez,primary} *) left; reflexivity.
+    - (* acc_tez equation *)
+      change (map Impl.Transfer.ci_asset (inp :: nil)) with (asset_tez :: @nil Felt);
+      change (map Impl.Transfer.ci_v (inp :: nil)) with (2 :: @nil nat);
+      change (Impl.Transfer.co_asset c0) with asset_tez;
+      change (Impl.Transfer.co_v c0) with 0;
+      change (Impl.Transfer.co_asset pp) with asset_tez;
+      change (Impl.Transfer.co_v pp) with 1.
+      cbn [Impl.Transfer.acc_tez].
+      destruct (Felt.Felt_eq_dec asset_tez asset_tez) as [_ | Hne];
+        [lia | exfalso; apply Hne; reflexivity].
+    - (* acc_primary equation *)
+      change (map Impl.Transfer.ci_asset (inp :: nil)) with (asset_tez :: @nil Felt);
+      change (map Impl.Transfer.ci_v (inp :: nil)) with (2 :: @nil nat);
+      change (Impl.Transfer.co_asset c0) with asset_tez;
+      change (Impl.Transfer.co_v c0) with 0;
+      change (Impl.Transfer.co_asset pp) with asset_tez;
+      change (Impl.Transfer.co_v pp) with 1.
+      cbn [Impl.Transfer.acc_primary].
+      destruct (Felt.Felt_eq_dec asset_tez asset_tez) as [_ | Hne];
+        [lia | exfalso; apply Hne; reflexivity].
   Qed.
 
 End UnshieldRelation.
