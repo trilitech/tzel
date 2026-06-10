@@ -285,6 +285,29 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   aggregate is the independent sum. Faithfulness is by transcription
   of credit/debit_deposit (validated by reading the kernel).
 
+- **END-TO-END KERNEL CONSERVATION (`Spec/KernelLedger.v`):** joins
+  the pool accounting (`Spec.KernelPool`) and the note system
+  (`Spec.LedgerNf`) into ONE aggregate per-asset model over the whole
+  kernel value lifecycle. State tracks, per asset: deposited, in
+  pools, in live notes, burned (fees), withdrawn. Invariant
+  (preserved by every transition): `dep a = pool a + notes a +
+  burned a + wd a`. Transitions mirror kernel moves: deposit (L1->
+  pool), shield_tez (single pool -> recipient+producer notes + fee
+  burn), shield_fa2 (the DUAL-POOL FA2 shield — FA2 pool funds
+  v+fee AND the tez pool funds producer_fee, so the tez producer note
+  is backed not minted; the only two-asset transition, where "no
+  unbacked tez" lives), withdraw (note -> L1), burn_fee (note ->
+  burned). Theorems (zero admits):
+  - `no_inflation`: ks_wd a <= ks_dep a — withdrawn never exceeds
+    deposited, across deposits/shields/withdrawals/fees including the
+    FA2 dual-pool path.
+  - `outflows_backed`: wd + live-notes + burned <= deposited — the
+    sharper "every outflow and live note is backed by a deposit",
+    confirming FA2-shield producer tez is fully backed.
+  Faithfulness boundary: the per-asset note-internal conservation a
+  transfer relies on is the LedgerNf result; this adds the
+  pool<->note<->L1 boundary at the aggregate level.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

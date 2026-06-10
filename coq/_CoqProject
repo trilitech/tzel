@@ -15,6 +15,7 @@ Spec/Ledger.v
 Spec/LedgerNf.v
 Spec/LedgerBounded.v
 Spec/KernelPool.v
+Spec/KernelLedger.v
 
 Impl/Common.v
 Impl/Hashes.v
