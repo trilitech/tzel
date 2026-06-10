@@ -922,6 +922,24 @@ nullifier/commitment binding.
   2^d — the entire O(depth) frontier correctness is self-contained,
   zero admits, no leftover hypotheses.
 
+- **CONFIG-UPDATE AUTHORIZATION UNFORGEABLE (`Spec/ConfigAuth.v`):** the
+  kernel authenticates verifier-/bridge-config updates with a WOTS+
+  signature from the admin key against a COMPILED-IN expected leaf
+  (authenticate_verifier_config / authenticate_bridge_config:
+  verify_wots_signature_against_leaf). So config substitution (swapping
+  in a malicious verifier/bridge) is prevented by WOTS+ unforgeability.
+  config_update_unforgeable (zero admits): two config updates that both
+  authenticate against the SAME admin leaf, where the second is a
+  forward-only forgery, (a) recover the same admin WOTS public key
+  (ltree_injective) AND (b) sign the SAME config
+  (wots_one_time_unforgeable). So an attacker cannot authenticate any
+  config other than the one the admin actually signed. The
+  kernel-GOVERNANCE analogue of the transaction-level
+  xmss_one_time_unforgeable (authenticates against a fixed leaf
+  directly, no Merkle auth path), composing the proven WOTS/L-tree
+  machinery. A real kernel security check that wasn't yet stated as a
+  theorem.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
