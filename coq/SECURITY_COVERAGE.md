@@ -44,15 +44,38 @@ audit").
 - `Spec.KernelPool.credit_overflow_rejected` (the kernel's `checked_add`
   rejects overflow; pool balance stays bounded).
 
-## Per-asset 2-accumulator constraints
+## Per-asset 2-accumulator constraints — the GATE is load-bearing
 
 > "circuits take a witness-declared primary non-tez asset A and pin every
-> input/output asset to {ASSET_TEZ, A}."
+> input/output asset to {ASSET_TEZ, A}."  The 2-accumulator scheme is
+> sound ONLY if that gate holds for every slot — the top adversarial
+> concern: any slot whose asset is unconstrained (or gated against the
+> wrong set) breaks per-asset closure, since the two lanes can't catch an
+> imbalance in a third asset.
 
-- Modeled directly: the `phi_*_value_conservation` predicates quantify
-  over *all* assets via `sum_at a`, which subsumes the two-accumulator
-  closure (tez and the primary asset both close; all others are 0 on both
-  sides).  `GrandConservation.grand_conservation` is the per-asset law.
+- `Impl.Transfer.two_accumulator_conservation` proves the crux: given the
+  asset gate on inputs AND outputs (`asset_gate primary _` =
+  `Forall (∈ {tez, primary})`) plus the two lane equations, the FULL
+  per-asset conservation (`Spec.Transfer.phi_value_conservation`, a
+  `forall a`) follows.  The gate is a *required, used* hypothesis — the
+  "third asset `a ∉ {tez, primary}`" case closes only via
+  `sum_at_absent_zero`, which needs the gate.  Without it the lemma is
+  unprovable, exactly mirroring the design's soundness condition.
+- The gate is part of the MODELED relation, so the Cairo is obligated to
+  enforce it: `TransferRelation` / `UnshieldRelation` carry a gate
+  conjunct for every slot — inputs (via `*_input_checks`), each change
+  slot (`co_asset c1/c2 ∈ {tez, primary}`, **including `cm_change_2`**),
+  the producer slot pinned to tez, and — for unshield — the public exit
+  `asset_pub ∈ {tez, primary}` (the Phase-E.5 fix).
+  `transfer_relation_sound` / `unshield_relation_sound` extract these and
+  feed `two_accumulator_conservation`.  So no slot is left unconstrained.
+- The bug-#1 `v_pub` lane-routing fix is modeled and proved: in
+  `UnshieldRelation` the exit `(asset_pub, v_pub)` is folded into the
+  accumulator lists, so `v_pub` lands in the `asset_pub` lane (tez OR
+  primary), never unconditionally in tez — the precise inverse of the
+  `2003bf5` bug.
+- `GrandConservation.grand_conservation` is the per-asset law across any
+  mixed batch.
 
 ## Asset registry: duplicate-ticketer dedup + routing
 
