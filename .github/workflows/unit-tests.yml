@@ -18,11 +18,53 @@ permissions:
 env:
   TZEL_TRAP_FULL_XMSS_REBUILDS: "1"
   CARGO_TERM_COLOR: always
+  # Cap compile parallelism (fewer concurrent rustc/LLVM codegen => lower peak
+  # RSS) for the heavy rust-and-cairo job's COMPILE phase. Secondary lever: the
+  # observed reap is in the Cairo TEST phase, which this does not touch — swap
+  # (below) is the primary mitigation there. Together they REDUCE the runner-
+  # reap probability; they are not a proven bound. If reaps persist, escalate
+  # to a larger runner (more RAM/vCPU) or split the heavy nightly builds out.
+  CARGO_BUILD_JOBS: "3"
 
+# `Swatinem/rust-cache` amortises the cargo registry + target/ across runs
+# (cache key bumps on Cargo.lock), dropping warm wallclock from ~9 min cold
+# to ~3-4 min.
+#
+# Runner-reap flake (root cause, 2026-05-23 investigation): this job was
+# intermittently failing mid-Cairo with "The runner has received a shutdown
+# signal" — NOT a test failure, and NOT the "org wallclock cap" earlier
+# comments guessed (the kills were scattered across 59 s-578 s with no
+# wallclock clustering), and NOT cured by the earlier Cairo-first reorder
+# (that only changed which test the freeze landed near). It is runner-side
+# RESOURCE EXHAUSTION: the heavy multi-toolchain build (stable + nightly +
+# scarb, ~13 crates) spikes memory/CPU, the runner agent misses its heartbeat,
+# and the control plane reaps the agent ~30 s later. Mitigated by the swap
+# step (first job step) + the CARGO_BUILD_JOBS cap (env, above). Cairo still
+# runs first because it's cheap and keeps output flowing, but that's hygiene,
+# not the load-bearing fix.
 jobs:
   rust-and-cairo:
     runs-on: ubuntu-latest
     steps:
+      # Memory headroom against the runner-reap flake (see header). The observed
+      # freeze is in the Cairo TEST phase, so a transient RSS spike is the
+      # plausible trigger; 10 GB swap on the large /mnt ephemeral disk lets it
+      # page out instead of starving the runner agent. set -euo pipefail makes a
+      # partial failure loud (swapoff -a first means we briefly drop the ~4 GB
+      # default swap, so we must not silently end with less); rm -f guards a
+      # stale file on a (rare) reused runner. No external action.
+      - name: Add swap space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo swapoff -a || true
+          sudo rm -f /mnt/ci-swapfile
+          sudo fallocate -l 10G /mnt/ci-swapfile || sudo dd if=/dev/zero of=/mnt/ci-swapfile bs=1M count=10240
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+          free -h
+
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
@@ -38,6 +80,20 @@ jobs:
         uses: software-mansion/setup-scarb@2a96b748888e3329ee44ac9ac073d930e692b3cd  # v1
         with:
           scarb-version: "2.16.1"
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6  # v2.7.8
+        with:
+          shared-key: rust-and-cairo
+
+      # Cairo first: it's short, and running it before the heavy Rust
+      # compile keeps the runner emitting output throughout — works
+      # around the runner-reaped-during-quiet-final-phase pattern that
+      # bit the workflow once the post-#25 Rust step grew long enough
+      # to delay scarb's start by ~6+ min.
+      - name: Run Cairo unit tests
+        working-directory: cairo
+        run: scarb test
 
       - name: Run Rust unit tests
         run: |
@@ -76,10 +132,6 @@ jobs:
             scripts.tests.test_shadownet_operator_paths \
             scripts.tests.test_workflow_references
 
-      - name: Run Cairo unit tests
-        working-directory: cairo
-        run: scarb test
-
   ocaml:
     runs-on: ubuntu-latest
     env:
@@ -107,6 +159,11 @@ jobs:
 
       - name: Set up Rust stable
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-04-30
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6  # v2.7.8
+        with:
+          shared-key: ocaml-cross-impl
 
       - name: Run OCaml unit tests
         run: opam exec -- ./scripts/ocaml_unit_tests.sh

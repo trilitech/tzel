@@ -60,10 +60,9 @@ fresh rollup origination using the committed kernel build.
 ## 0. Ushuaianet Network Parameters
 
 The currently deployed TzEL rollup runs on **Ushuaianet**. The L1 / DAL /
-explorer endpoints below are stable; the rollup-address and bridge-ticketer
-are tied to a specific origination and are kept out of this tutorial as
-literals — fetch them from the canonical config so the doc never drifts
-from the live deployment.
+explorer endpoints below are stable; the rollup address and bridge ticketer
+are tied to a specific origination and will change if Ushuaianet is
+re-originated.
 
 | Parameter | Value |
 |---|---|
@@ -73,20 +72,13 @@ from the live deployment.
 | DAL bootstrap P2P | `dal.ushuaianet.teztnets.com:11732` |
 | Faucet | `https://faucet.ushuaianet.teztnets.com` |
 | TzKT explorer | `https://ushuaianet.tzkt.io` |
-| TzEL rollup address | `sr1...` — see `tzel-infra/networks/ushuaianet.yml` (`tzel_rollup_address`) |
-| TzEL bridge ticketer | `KT1...` — see `tzel-infra/networks/ushuaianet.yml` (`tzel_bridge_ticketer`) |
+| TzEL rollup address | `sr193pvbiGEhrxYnhgKcpaiWVRJmWjWYCaqH` |
+| TzEL bridge ticketer | `KT1F8CR34VPaiMVYwSbucpdEYQ2itTJsqV9A` |
 | Default DAL fee (mutez) | `100000` |
-| DAL fee address | see `tzel-infra/networks/ushuaianet-operator-fee-address.json` |
+| DAL fee address | full PaymentAddress JSON — see §5 |
 
-Both addresses live at:
-
-```
-https://github.com/trilitech/tzel-infra/blob/feat/ushaianet-4vm-refactor/networks/ushuaianet.yml
-```
-
-If you originated your own rollup, substitute the `sr1…` / `KT1…` values
-from the `make originate NETWORK=ushaianet` output in `tzel-infra` for the
-canonical ones below.
+If you originated your own rollup, substitute your own `sr1…` / `KT1…`
+values for the canonical ones above.
 
 > **Withdrawal period:** Ushuaianet's commitment period is short — withdrawals
 > become executable on L1 in roughly 6 to 7 minutes after the unshield batch
@@ -129,12 +121,10 @@ sudo cp ops/shadownet/shadownet.env.example /etc/tzel/shadownet.env
 
 Edit `/etc/tzel/shadownet.env`:
 
-- set `TZEL_ROLLUP_ADDRESS=<sr1...>` — pull from
-  `tzel-infra/networks/ushuaianet.yml` (`tzel_rollup_address`) or your
-  re-originated value (see §0)
-- set `TZEL_BRIDGE_TICKETER=<KT1...>` — pull from
-  `tzel-infra/networks/ushuaianet.yml` (`tzel_bridge_ticketer`) or your
-  re-originated ticketer
+- set `TZEL_ROLLUP_ADDRESS=sr193pvbiGEhrxYnhgKcpaiWVRJmWjWYCaqH` (or your
+  re-originated value — see §0)
+- set `TZEL_BRIDGE_TICKETER=KT1F8CR34VPaiMVYwSbucpdEYQ2itTJsqV9A` (or your
+  re-originated ticketer)
 - set `TZEL_OCTEZ_NETWORK=ushuaianet` (the env file template still shows the
   old default — override it explicitly so `octez-node config init` and
   `--network` pick up Ushuaianet)
@@ -192,22 +182,15 @@ mismatch the running rollup.
 git fetch origin && git checkout 558c2b2
 ```
 
-Set the shell variables first. Pull `ROLLUP_ADDRESS` and `BRIDGE_TICKETER`
-from `tzel-infra/networks/ushuaianet.yml` (or your local
-`make originate NETWORK=ushaianet` output if you re-originated):
+Set the shell variables first. Use the canonical Ushuaianet values from §0
+(or substitute your own re-originated values):
 
 ```bash
 export OPERATOR_URL=http://127.0.0.1:8787
 export OPERATOR_BEARER_TOKEN="$(cat /etc/tzel/operator-bearer-token)"
 
-# Fetch canonical addresses from tzel-infra (requires `yq`):
-USHUAIANET_YML=https://raw.githubusercontent.com/trilitech/tzel-infra/feat/ushaianet-4vm-refactor/networks/ushuaianet.yml
-export ROLLUP_ADDRESS="$(curl -fsSL "$USHUAIANET_YML" | yq -r .tzel_rollup_address)"
-export BRIDGE_TICKETER="$(curl -fsSL "$USHUAIANET_YML" | yq -r .tzel_bridge_ticketer)"
-
-# Or set them by hand:
-# export ROLLUP_ADDRESS=sr1...
-# export BRIDGE_TICKETER=KT1...
+export ROLLUP_ADDRESS=sr193pvbiGEhrxYnhgKcpaiWVRJmWjWYCaqH
+export BRIDGE_TICKETER=KT1F8CR34VPaiMVYwSbucpdEYQ2itTJsqV9A
 ```
 
 Extract the verifier configuration values from the checked-in verified fixture:
@@ -316,24 +299,29 @@ Create wallet files:
 > the address that publisher has advertised.
 >
 > For Ushuaianet, the DAL slot publisher running on the public host
-> advertises its address in
-> `tzel-infra/networks/ushuaianet-operator-fee-address.json` — point
-> your wallet at that file. Mechanism details in
-> `tzel-infra/docs/gcp-deploy-runbook.md` §16; failure modes are
-> covered in §12.
+> advertises the PaymentAddress in
+> [`docs/ushuaianet/operator-fee-address.json`](ushuaianet/operator-fee-address.json) — copy
+> it into your working directory and point your wallet at it. Failure
+> modes are covered in §12.
 
-Fetch the DAL fee address advertised by the public Ushuaianet host:
+Copy the DAL fee address advertised by the public Ushuaianet host (from
+your `tzel` checkout):
+
+```bash
+cp <tzel-checkout>/docs/ushuaianet/operator-fee-address.json ushuaianet-operator-fee-address.json
+```
+
+Or fetch it directly:
 
 ```bash
 curl -fsSL \
-  https://raw.githubusercontent.com/trilitech/tzel-infra/feat/ushaianet-4vm-refactor/networks/ushuaianet-operator-fee-address.json \
+  https://raw.githubusercontent.com/trilitech/tzel/main/docs/ushuaianet/operator-fee-address.json \
   -o ushuaianet-operator-fee-address.json
 ```
 
 (If you are running your own DAL slot publisher, generate the equivalent
 file from its DAL-fee wallet — `wallet receive --json` followed by
-`export-view`, in that order from the same wallet state, per
-gcp-deploy-runbook §16.)
+`export-view`, in that order from the same wallet state.)
 
 Create wallet profiles for Ushuaianet (the CLI subcommand is still spelled
 `init-shadownet` — see the naming note at the top of this file):
@@ -373,7 +361,7 @@ Notes:
   the auth fields). Each shield/transfer/unshield encrypts the DAL
   fee note to this address — see the callout above. `--dal-fee-address`
   reads the file once and inlines the JSON into the saved profile;
-  editing the file later does not re-read it (gcp-deploy-runbook §17).
+  editing the file later does not re-read it.
 - each `deposit` derives a fresh `pubkey_hash = H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)` for a wallet-controlled auth tree, then L1-tickets the deposit amount to `deposit:<hex(pubkey_hash)>`. Multiple deposits to the same `pubkey_hash` aggregate (top-ups). The shield circuit verifies an in-circuit WOTS+ signature under the recipient's auth tree, binding the entire shield request — only the wallet that holds the auth tree's signing material can drain the pool.
 - `public_account` in the profile is vestigial wallet metadata — unshield now emits an L1 outbox transfer directly to a tz/KT1 recipient supplied at unshield time.
 - keep Alice and Bob distinct
@@ -553,8 +541,7 @@ outbox message:
 ```
 
 (or, equivalently, call `octez-client send smart rollup message ...
-execute_outbox_message ...` — see `gcp-deploy-runbook.md` for the manual
-fallback.)
+execute_outbox_message ...` as a manual fallback.)
 
 Verify the L1 transfer landed:
 
@@ -589,7 +576,7 @@ For the first successful live run, save:
 - Shield rejected with "fee below minimum":
   - the rollup's `required_tx_fee` ticked up since the wallet quoted it. Re-run shield (the wallet re-quotes on each invocation); regenerate the proof if necessary.
 - `tzel-operator` returns `502 DAL fee note is not detectable by the configured operator fee address`:
-  - `dal_fee_address` does not match the address Ushuaianet's DAL slot publisher advertises. Re-run `profile init-shadownet` with `--dal-fee-address ushuaianet-operator-fee-address.json` (or patch `wallet.json.network.json` in place — the field is embedded JSON, see gcp-deploy-runbook §17).
+  - `dal_fee_address` does not match the address Ushuaianet's DAL slot publisher advertises. Re-run `profile init-shadownet` with `--dal-fee-address ushuaianet-operator-fee-address.json` (or patch `wallet.json.network.json` in place — the field is embedded JSON).
 - `execute-outbox` rejected as "commitment not yet finalized":
   - the Ushuaianet commitment period (~6.5 min) has not elapsed. Wait and retry.
 

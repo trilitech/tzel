@@ -74,6 +74,34 @@ struct Cli {
     dal_fee_address_index: Option<u32>,
     #[arg(long, default_value_t = 5)]
     reconcile_interval_secs: u64,
+    /// Restrict DAL slot selection to a half-open range `START..END`
+    /// (e.g. `0..8`). Slots are picked round-robin within the range.
+    /// Defaults to the full `0..number_of_slots` reported by the DAL
+    /// protocol parameters. Useful for partitioning slot usage across
+    /// multiple operators sharing the same DAL node.
+    #[arg(long, value_parser = parse_dal_slot_range)]
+    dal_slot_range: Option<std::ops::Range<u16>>,
+}
+
+fn parse_dal_slot_range(s: &str) -> Result<std::ops::Range<u16>, String> {
+    let (start_str, end_str) = s
+        .split_once("..")
+        .ok_or_else(|| format!("invalid --dal-slot-range '{}': expected START..END", s))?;
+    let start: u16 = start_str
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid --dal-slot-range start '{}': {}", start_str, e))?;
+    let end: u16 = end_str
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid --dal-slot-range end '{}': {}", end_str, e))?;
+    if start >= end {
+        return Err(format!(
+            "--dal-slot-range start ({}) must be strictly less than end ({})",
+            start, end
+        ));
+    }
+    Ok(start..end)
 }
 
 #[derive(Clone)]
@@ -95,6 +123,10 @@ struct OperatorConfig {
     dal_node_endpoint: Option<String>,
     octez_protocol: Option<String>,
     dal_fee_policy: Option<OperatorDalFeePolicy>,
+    /// Half-open range of DAL slot indices this operator is allowed to
+    /// publish to. `None` means "use all slots reported by the protocol".
+    /// Validated against `number_of_slots` at publish time.
+    dal_slot_range: Option<std::ops::Range<u16>>,
     id_counter: AtomicU64,
     slot_counter: AtomicU64,
 }
@@ -258,6 +290,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             dal_node_endpoint: cli.dal_node_endpoint,
             octez_protocol: cli.octez_protocol,
             dal_fee_policy,
+            dal_slot_range: cli.dal_slot_range,
             id_counter: AtomicU64::new(0),
             slot_counter: AtomicU64::new(0),
         }),
@@ -1064,8 +1097,10 @@ fn publish_dal_chunk_with_protocol(
     number_of_slots: u64,
     payload: &[u8],
 ) -> Result<RollupDalChunk, String> {
+    validate_dal_slot_range(config, number_of_slots)?;
+    let attempts = dal_slot_attempt_budget(config, number_of_slots);
     let mut last_slot_error = None;
-    for _attempt in 0..number_of_slots {
+    for _attempt in 0..attempts {
         let slot_index = select_slot_index(config, number_of_slots)?;
         let publish = post_dal_slot(dal_node_endpoint, slot_index, payload)?;
         let output = match publish_dal_commitment(
@@ -1149,8 +1184,40 @@ fn update_submission_commitment_summary(submission: &mut RollupSubmission) -> Re
 }
 
 fn select_slot_index(config: &OperatorConfig, number_of_slots: u64) -> Result<u16, String> {
-    let slot = config.slot_counter.fetch_add(1, Ordering::Relaxed) % number_of_slots;
+    let (base, span) = match &config.dal_slot_range {
+        Some(range) => (u64::from(range.start), u64::from(range.end - range.start)),
+        None => (0, number_of_slots),
+    };
+    // Check span before bumping the counter — otherwise a degenerate
+    // config (unreachable via the CLI parser but theoretically callable
+    // from the AppState construction path) would waste counter ticks
+    // on every failed call, breaking round-robin fairness for any
+    // concurrent caller sharing the same AtomicU64.
+    if span == 0 {
+        return Err("DAL slot selection has zero usable slots".into());
+    }
+    let counter = config.slot_counter.fetch_add(1, Ordering::Relaxed);
+    let slot = base + (counter % span);
     u16::try_from(slot).map_err(|_| format!("slot index {} does not fit in u16", slot))
+}
+
+fn dal_slot_attempt_budget(config: &OperatorConfig, number_of_slots: u64) -> u64 {
+    match &config.dal_slot_range {
+        Some(range) => u64::from(range.end - range.start),
+        None => number_of_slots,
+    }
+}
+
+fn validate_dal_slot_range(config: &OperatorConfig, number_of_slots: u64) -> Result<(), String> {
+    if let Some(range) = &config.dal_slot_range {
+        if u64::from(range.end) > number_of_slots {
+            return Err(format!(
+                "--dal-slot-range {}..{} exceeds DAL protocol number_of_slots={}",
+                range.start, range.end, number_of_slots
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn is_slot_header_collision(err: &str) -> bool {
@@ -1511,6 +1578,7 @@ mod tests {
             dal_node_endpoint: None,
             octez_protocol: None,
             dal_fee_policy: None,
+            dal_slot_range: None,
             id_counter: AtomicU64::new(0),
             slot_counter: AtomicU64::new(0),
         }
@@ -3152,5 +3220,47 @@ mod tests {
         let log = std::fs::read_to_string(log_path).unwrap();
         assert!(log.contains("publish"));
         assert!(log.contains("slot"));
+    }
+
+    #[test]
+    fn parse_dal_slot_range_accepts_well_formed_input() {
+        let r = parse_dal_slot_range("0..8").unwrap();
+        assert_eq!(r, 0..8);
+        let r = parse_dal_slot_range("3..7").unwrap();
+        assert_eq!(r, 3..7);
+        // Whitespace around either side is tolerated.
+        let r = parse_dal_slot_range(" 1..4 ").unwrap();
+        assert_eq!(r, 1..4);
+        // u16::MAX end is accepted; one slot below MAX.
+        let r = parse_dal_slot_range("65534..65535").unwrap();
+        assert_eq!(r, 65534..65535);
+    }
+
+    #[test]
+    fn parse_dal_slot_range_rejects_invalid_input() {
+        // Empty range (half-open semantics: start must be strictly less).
+        let err = parse_dal_slot_range("0..0").unwrap_err();
+        assert!(
+            err.contains("strictly less"),
+            "expected `strictly less` in {err}"
+        );
+        // Inverted bounds.
+        let err = parse_dal_slot_range("8..3").unwrap_err();
+        assert!(err.contains("strictly less"));
+        // Missing separator.
+        let err = parse_dal_slot_range("5").unwrap_err();
+        assert!(err.contains("expected START..END"));
+        // Non-numeric end.
+        let err = parse_dal_slot_range("0..bar").unwrap_err();
+        assert!(err.contains("--dal-slot-range end"));
+        // Non-numeric start.
+        let err = parse_dal_slot_range("foo..5").unwrap_err();
+        assert!(err.contains("--dal-slot-range start"));
+        // Overflowing u16.
+        let err = parse_dal_slot_range("0..65536").unwrap_err();
+        assert!(err.contains("--dal-slot-range end"));
+        // Empty string.
+        let err = parse_dal_slot_range("").unwrap_err();
+        assert!(err.contains("expected START..END"));
     }
 }

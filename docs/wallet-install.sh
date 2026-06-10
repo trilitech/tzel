@@ -1,9 +1,10 @@
 #!/bin/sh
 # tzel-wallet installer.
 #
-# Pulls one Docker image (daemon + tzel CLI + UI, no nginx) and runs it
-# on http://127.0.0.1:8787. The daemon serves the UI and API on the same
-# port — no separate web server needed. Self-custodial: keys live in
+# Pulls one Docker image (nginx + daemon + tzel CLI + UI) and runs it
+# on http://127.0.0.1:${HOST_PORT} (default 8080; configurable via
+# TZEL_WALLET_HOST_PORT). nginx serves the UI and proxies /api/* to the
+# daemon on the same container. Self-custodial: keys live in
 # $HOME/.tzel-wallet on this machine.
 #
 # Usage:
@@ -18,7 +19,7 @@ set -eu
 IMAGE="${TZEL_WALLET_IMAGE:-ghcr.io/trilitech/tzel-wallet:latest}"
 SCRIPT_URL="${TZEL_INSTALL_SCRIPT_URL:-https://tzel.tezos.com/wallet-install.sh}"
 CONTAINER="${TZEL_WALLET_CONTAINER_NAME:-tzel-wallet}"
-HOST_PORT="${TZEL_WALLET_HOST_PORT:-8787}"
+HOST_PORT="${TZEL_WALLET_HOST_PORT:-8080}"
 DATA_DIR="${TZEL_DATA_DIR:-$HOME/.tzel-wallet}"
 
 # Ushuaianet defaults — override via env to target a different network.
@@ -148,7 +149,7 @@ done
 docker run -d \
   --name "$CONTAINER" \
   --restart unless-stopped \
-  -p "127.0.0.1:${HOST_PORT}:8787" \
+  -p "127.0.0.1:${HOST_PORT}:80" \
   -v "${DATA_DIR}:/home/tzel/.tzel-wallet" \
   $env_flags \
   "$IMAGE" >/dev/null

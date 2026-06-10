@@ -1336,6 +1336,50 @@ fn wallet_xmss_floor_path(path: &str) -> PathBuf {
     PathBuf::from(format!("{}.xmss-floor", path))
 }
 
+/// Cooperative-yield sentinel for `cmd_rollup_sync`. The daemon (or any other
+/// concurrent caller that wants to take the wallet lock for a slow op) can
+/// `touch` this file to ask an in-flight sync to stop at its next checkpoint
+/// boundary. Removed by the caller once its slow op completes.
+fn wallet_yield_path(path: &str) -> PathBuf {
+    PathBuf::from(format!("{}.yield", path))
+}
+
+/// True iff the cooperative-yield sentinel at `path` was written by a
+/// daemon process that no longer exists. Mirrors the existing
+/// `is_stale_wallet_lock` discipline: a daemon that crashed after
+/// `touch <wallet>.yield` but before `rm` would otherwise leave a
+/// permanent sentinel — every subsequent sync would yield at its
+/// first checkpoint and never make progress.
+///
+/// Forward-compatibility with daemons / tests that write non-PID
+/// content to the sentinel: any read failure or parse failure
+/// returns `Ok(false)` ("treat as live"). The legacy daemon shape
+/// (and several existing tests, e.g. `std::fs::write(yield_path,
+/// b"yield")`) still triggers the yield correctly. Once the daemon
+/// PR catches up to writing `<pid>\n`, the recovery path activates
+/// for stale sentinels without changing observed behaviour for
+/// live ones.
+///
+/// On non-unix targets we cannot probe `/proc`, so we always say
+/// "live" — same conservative posture as `is_stale_wallet_lock`.
+#[cfg(unix)]
+fn is_stale_yield_sentinel(path: &Path) -> bool {
+    let content = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let pid: u32 = match content.lines().next().and_then(|l| l.trim().parse().ok()) {
+        Some(p) => p,
+        None => return false, // legacy / non-PID payload — treat as live
+    };
+    !PathBuf::from(format!("/proc/{}", pid)).exists()
+}
+
+#[cfg(not(unix))]
+fn is_stale_yield_sentinel(_path: &Path) -> bool {
+    false
+}
+
 #[cfg(unix)]
 fn is_stale_wallet_lock(path: &Path) -> Result<bool, String> {
     let pid_text = std::fs::read_to_string(path).map_err(|e| format!("read lock file: {}", e))?;
@@ -1718,7 +1762,7 @@ fn get_text(url: &str) -> Result<String, String> {
         .map_err(|e| format!("HTTP error: {}", e))?;
     resp.into_body()
         .read_to_string()
-        .map_err(|e| format!("read response: {}", e))
+        .map_err(|e| format!("read response: {e}"))
 }
 
 fn get_text_allow_404(url: &str) -> Result<Option<String>, String> {
@@ -1727,7 +1771,7 @@ fn get_text_allow_404(url: &str) -> Result<Option<String>, String> {
             .into_body()
             .read_to_string()
             .map(Some)
-            .map_err(|e| format!("read response: {}", e)),
+            .map_err(|e| format!("read response: {e}")),
         Err(ureq::Error::StatusCode(404)) => Ok(None),
         Err(e) => Err(format!("HTTP error: {}", e)),
     }
@@ -2244,64 +2288,12 @@ impl<'a> RollupRpc<'a> {
         self.load_notes_since_at_block("head", cursor)
     }
 
-    fn read_published_note_bytes_at_block(
-        &self,
-        block_ref: &str,
-        index: u64,
-    ) -> Result<Option<Vec<u8>>, String> {
-        let direct_key = indexed_durable_key(DURABLE_NOTE_PREFIX, index);
-        if self
-            .read_durable_length_at_block(block_ref, &direct_key)?
-            .is_some()
-        {
-            let bytes = self.read_durable_bytes_at_block(block_ref, &direct_key)?;
-            if bytes.len() > MAX_PUBLISHED_NOTE_BYTES {
-                return Err(format!(
-                    "durable note {} at {} exceeds max supported size {}",
-                    index, direct_key, MAX_PUBLISHED_NOTE_BYTES
-                ));
-            }
-            return Ok(Some(bytes));
-        }
-
-        let len_key = indexed_durable_note_len_key(index);
-        if self
-            .read_durable_length_at_block(block_ref, &len_key)?
-            .is_none()
-        {
-            return Ok(None);
-        }
-
-        let total_len_u64 = self.read_u64_at_block(block_ref, &len_key)?;
-        let total_len = usize::try_from(total_len_u64).map_err(|_| {
-            format!(
-                "chunked durable note {} length does not fit in usize",
-                index
-            )
-        })?;
-        if total_len > MAX_PUBLISHED_NOTE_BYTES {
-            return Err(format!(
-                "chunked durable note {} length {} exceeds max supported size {}",
-                index, total_len, MAX_PUBLISHED_NOTE_BYTES
-            ));
-        }
-        let chunk_count = total_len.div_ceil(DURABLE_NOTE_CHUNK_BYTES);
-        let mut bytes = Vec::with_capacity(total_len);
-        for chunk_index in 0..chunk_count {
-            let chunk_key = indexed_durable_note_chunk_key(index, chunk_index);
-            let mut chunk = self.read_durable_bytes_at_block(block_ref, &chunk_key)?;
-            bytes.append(&mut chunk);
-        }
-        if bytes.len() != total_len {
-            return Err(format!(
-                "chunked durable note {} length mismatch: expected {}, got {}",
-                index,
-                total_len,
-                bytes.len()
-            ));
-        }
-        Ok(Some(bytes))
-    }
+    // Note: the previous synchronous `read_published_note_bytes_at_block`
+    // helper has been replaced by the concurrent
+    // `fetch_one_published_note` free function (used inside the
+    // worker-thread tokio runtime in `load_notes_since_at_block`). The
+    // sequential-loop version is no longer reachable from the hot path
+    // and would only diverge from the concurrent path under future edits.
 
     fn load_notes_since_at_block(
         &self,
@@ -2318,10 +2310,44 @@ impl<'a> RollupRpc<'a> {
                 cursor, count
             ));
         }
+        if cursor == count {
+            return Ok(NotesFeedResp {
+                notes: Vec::new(),
+                next_cursor: count,
+            });
+        }
 
+        // Hot path: 67k commits × ~40 ms per sequential round trip is the
+        // dominant sync cost. Hand the per-index fetches off to a concurrent
+        // reqwest pool; ordering is reassembled by `index` after the
+        // out-of-order completes.
+        //
+        // This `load_notes_since_at_block` path is the one-shot caller
+        // (proving snapshots, full-state loads). It builds its own
+        // short-lived client; the `cmd_rollup_sync` per-batch hot path
+        // uses `SyncFetcher` instead so the client survives across batches
+        // (see B3 in PR #25's review thread).
+        let concurrency = sync_concurrency()?;
+        let base_url = self.profile.rollup_node_url.trim_end_matches('/').to_string();
+        let block_ref_owned = block_ref.to_string();
+        let indices: Vec<u64> = (cursor..count).map(|i| i as u64).collect();
+        let payloads = run_async_isolated(async move {
+            let client = build_concurrent_http_client(concurrency)?;
+            fetch_published_notes_concurrent(
+                &client,
+                &base_url,
+                &block_ref_owned,
+                &indices,
+                concurrency,
+            )
+            .await
+        })?;
+
+        debug_assert_eq!(payloads.len(), count - cursor);
         let mut notes = Vec::with_capacity(count - cursor);
-        for i in cursor..count {
-            let Some(bytes) = self.read_published_note_bytes_at_block(block_ref, i as u64)? else {
+        for (offset, bytes) in payloads.into_iter().enumerate() {
+            let i = cursor + offset;
+            let Some(bytes) = bytes else {
                 let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64);
                 return Err(format!(
                     "rollup durable state is missing note {} at {} while tree size is {}. This usually means the deployed rollup kernel does not persist published note payloads, or the rollup node is not serving the expected durable state.",
@@ -2335,10 +2361,6 @@ impl<'a> RollupRpc<'a> {
             notes,
             next_cursor: count,
         })
-    }
-
-    fn load_nullifiers(&self) -> Result<Vec<F>, String> {
-        self.load_nullifiers_at_block("head")
     }
 
     fn load_nullifiers_at_block(&self, block_ref: &str) -> Result<Vec<F>, String> {
@@ -2356,17 +2378,43 @@ impl<'a> RollupRpc<'a> {
         Ok(nullifiers)
     }
 
-    /// For each pending deposit pool, fetch the kernel-side current
-    /// balance. The map is keyed by `(asset_id, pubkey_hash)` because
-    /// the same pubkey_hash may have separate FA2 + tez balances; the
-    /// caller must decide which it wants. `None` (absent from the
-    /// map) means the pool has never been credited (or was fully
-    /// drained — kernel garbage-collects empty entries).
-    fn load_pool_balances(
+    /// For each pending deposit pool, fetch the kernel-side current balance
+    /// at the **current rollup head**. Convenience wrapper for single-shot
+    /// callers that have no other rollup reads to consistency-pin against
+    /// — e.g. `cmd_wallet_show`'s end-of-banner pool summary.
+    ///
+    /// Callers performing **multiple** rollup reads (note slice, nullifiers,
+    /// pool balances) within one logical step MUST resolve `head_hash` once
+    /// at the top and call `load_pool_balances_at_block(&head, …)` so all
+    /// reads observe the same kernel state. The naming asymmetry
+    /// (`_at_head` vs `_at_block`) is deliberate so that re-introducing the
+    /// consistency bug (PR #24 audit, 2026-05) is loud at code review.
+    ///
+    /// The map is keyed by `(asset_id, pubkey_hash)` because the same
+    /// pubkey_hash may have separate FA2 + tez balances; the caller must
+    /// decide which it wants. `None` (absent from the map) means the pool
+    /// has never been credited (or has been fully drained — kernel
+    /// garbage-collects empty entries).
+    fn load_pool_balances_at_head(
         &self,
         pending: &[PendingDeposit],
     ) -> Result<std::collections::HashMap<(F, F), u64>, String> {
         let head = self.head_hash()?;
+        self.load_pool_balances_at_block(&head, pending)
+    }
+
+    /// Pinned-block variant of `load_pool_balances_at_head`. Use this from
+    /// `cmd_rollup_sync` where the same `head_hash` is reused across the
+    /// note slice, the nullifier set, and the pool balances — re-resolving
+    /// `head` between the three reads would let a concurrent slow-lane
+    /// drain a pool between the note scan and the finalize, causing
+    /// `apply_scan_feed_finalize` to evict a `pending_deposit` whose
+    /// `shielded_cm` was never observed in the same run's `seen_cms`.
+    fn load_pool_balances_at_block(
+        &self,
+        block_ref: &str,
+        pending: &[PendingDeposit],
+    ) -> Result<std::collections::HashMap<(F, F), u64>, String> {
         let mut map: std::collections::HashMap<(F, F), u64> =
             std::collections::HashMap::new();
         let mut seen: std::collections::HashSet<(F, F)> = std::collections::HashSet::new();
@@ -2376,7 +2424,7 @@ impl<'a> RollupRpc<'a> {
                 continue;
             }
             if let Some(balance) =
-                self.try_read_deposit_balance(&head, &p.asset_id, &p.pubkey_hash)?
+                self.try_read_deposit_balance(block_ref, &p.asset_id, &p.pubkey_hash)?
             {
                 map.insert(key, balance);
             }
@@ -2491,7 +2539,11 @@ impl<'a> RollupRpc<'a> {
         Ok(())
     }
 
-    fn load_state_snapshot(&self) -> Result<RollupStateSnapshot, String> {
+    /// Read the rollup state snapshot at the **current head**. Wrapper for
+    /// single-shot callers (proof-build paths). See
+    /// [`load_pool_balances_at_head`] for the rationale on the
+    /// `_at_head` / `_at_block` naming split.
+    fn load_state_snapshot_at_head(&self) -> Result<RollupStateSnapshot, String> {
         let head_hash = self.head_hash()?;
         self.load_state_snapshot_at_block(&head_hash)
     }
@@ -2944,6 +2996,500 @@ fn parse_rollup_rpc_bytes(raw: &str) -> Result<Vec<u8>, String> {
     Ok(payload.as_bytes().to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// Sync acceleration: concurrent HTTP fetch for `cmd_rollup_sync`.
+//
+// On a 67k-commit ushuaianet scan, the sequential `ureq::get` loop in
+// `RollupRpc::load_notes_since_at_block` spent ~95 % of wallclock waiting on
+// rollup-node round trips (~40 ms each). Issuing N requests in flight against
+// a single warm connection pool collapses that wait to ~wallclock / N until
+// the rollup-node is the bottleneck.
+//
+// The default N=4 is conservative on purpose — it matches the typical CI
+// runner vCPU count and stays comfortably below any stock rollup-node's
+// connection tolerance without measurement. Higher concurrency (8, 16, 32,
+// …) is reasonable on tuned operator boxes but should be opt-in via
+// `TZEL_SYNC_CONCURRENCY` once an operator has measured their own
+// rollup-node's tail-latency curve. See `services/scan-bench/` in
+// tzel-infra for the harness that produces those numbers.
+//
+// The hard cap of 128 prevents a misconfigured operator from filling the
+// kernel TCP backlog with handshake stalls.
+//
+// Why isolate the async runtime in a worker thread? `cmd_rollup_sync` is
+// called from a synchronous CLI dispatch *and* (transitively, via
+// `sync_watch_wallet_once`) from inside the multi-thread tokio runtime that
+// powers `tzel-detect`'s axum server. Calling `Runtime::block_on` from a
+// runtime context panics; spinning a dedicated worker thread sidesteps that
+// without forcing every caller to be async.
+// ---------------------------------------------------------------------------
+
+const SYNC_CONCURRENCY_ENV: &str = "TZEL_SYNC_CONCURRENCY";
+/// Default concurrency for the per-batch HTTP fan-out. Set conservatively
+/// at 4 (matches typical CI vCPU count) with no cross-operator measurement
+/// behind that choice — the goal is "ship-safe across every rollup-node we
+/// know about" rather than "maximise throughput". Bumping above 4 should be
+/// opt-in via `TZEL_SYNC_CONCURRENCY` once an operator has run
+/// `services/scan-bench/` in tzel-infra and confirmed their rollup node's
+/// tail-latency tolerance.
+const SYNC_CONCURRENCY_DEFAULT: usize = 4;
+const SYNC_CONCURRENCY_HARD_CAP: usize = 128;
+
+/// Read the desired HTTP fetch concurrency from `TZEL_SYNC_CONCURRENCY`.
+/// Defaults to 4; rejects values > 128 with a clear error so a misconfigured
+/// operator doesn't accidentally DoS the rollup node.
+fn sync_concurrency() -> Result<usize, String> {
+    let raw = match std::env::var(SYNC_CONCURRENCY_ENV) {
+        Ok(s) => s,
+        Err(_) => return Ok(SYNC_CONCURRENCY_DEFAULT),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(SYNC_CONCURRENCY_DEFAULT);
+    }
+    let parsed: usize = trimmed.parse().map_err(|_| {
+        format!("{SYNC_CONCURRENCY_ENV} must be a positive integer (got {raw:?})")
+    })?;
+    if parsed == 0 {
+        return Err(format!("{SYNC_CONCURRENCY_ENV} must be >= 1 (got 0)"));
+    }
+    if parsed > SYNC_CONCURRENCY_HARD_CAP {
+        return Err(format!(
+            "{SYNC_CONCURRENCY_ENV} = {parsed} exceeds hard cap of {SYNC_CONCURRENCY_HARD_CAP} — bump the cap intentionally if you really need it"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Build a reqwest client tuned for the concurrent-fetch hot path. The pool
+/// is sized at `concurrency * 2` so re-using N in-flight connections plus a
+/// small idle reserve doesn't trigger TCP handshakes mid-batch.
+fn build_concurrent_http_client(concurrency: usize) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(concurrency.saturating_mul(2))
+        // The rollup node has occasionally been observed to take >5 s on a
+        // single durable read under load; 30 s matches the ureq default
+        // and keeps the failure mode "loud error" rather than "silent retry
+        // storm".
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("reqwest client build failed: {e}"))
+}
+
+/// Map a reqwest error to the same `String` shape `ureq`-driven helpers
+/// produce, so callers' substring-matching error handling keeps working.
+fn fmt_reqwest_err(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        format!("HTTP error: timeout: {e}")
+    } else if e.is_connect() {
+        format!("HTTP error: connect: {e}")
+    } else {
+        format!("HTTP error: {e}")
+    }
+}
+
+/// Fetch a single durable-state value as raw text via reqwest.
+async fn fetch_text_async(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| fmt_reqwest_err(&e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP error: status code {}", status.as_u16()));
+    }
+    resp.text()
+        .await
+        .map_err(|e| format!("read response: {e}"))
+}
+
+/// 404-tolerant variant. Mirrors `get_text_allow_404`.
+async fn fetch_text_allow_404_async(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<Option<String>, String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| fmt_reqwest_err(&e))?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("HTTP error: status code {}", status.as_u16()));
+    }
+    resp.text()
+        .await
+        .map(Some)
+        .map_err(|e| format!("read response: {e}"))
+}
+
+/// Run an async future on a dedicated worker thread that owns its own
+/// current-thread tokio runtime. Insulates the caller from "already inside
+/// a tokio runtime" panics (`tzel-detect`'s axum handler path) and from
+/// "no runtime at all" (the synchronous CLI path).
+fn run_async_isolated<F, T>(f: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<Result<T, String>>();
+    let handle = std::thread::Builder::new()
+        .name("tzel-sync-fetch".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("tokio runtime build failed: {e}")));
+                    return;
+                }
+            };
+            let result = runtime.block_on(f);
+            let _ = tx.send(result);
+        })
+        .map_err(|e| format!("spawn fetch worker: {e}"))?;
+    let result = rx
+        .recv()
+        .map_err(|e| format!("fetch worker dropped: {e}"))?;
+    let _ = handle.join();
+    result
+}
+
+/// Long-lived concurrent-fetch context for `cmd_rollup_sync`.
+///
+/// Pre-#25-fix B3: `fetch_published_notes_concurrent` was called per-batch
+/// from the K-commit scan loop and rebuilt the `reqwest::Client` (and a
+/// fresh tokio runtime + thread) every time. At K=50 across a 67k-commit
+/// sync that's ~1340 client builds and ~1340 thread spawns, each warming
+/// a fresh connection pool from cold. The "amortised TCP+TLS handshake"
+/// claim from the design doc was false in that shape.
+///
+/// `SyncFetcher` owns:
+///
+/// * a dedicated worker OS thread (named `tzel-sync-fetch-pool`),
+/// * a current-thread tokio runtime hosted on that worker thread,
+/// * a single `reqwest::Client` whose connection pool warms once and
+///   then services every per-batch fetch issued during this
+///   `cmd_rollup_sync` call.
+///
+/// The runtime + client survive the whole `cmd_rollup_sync` invocation
+/// (and only that invocation — `--watch` re-enters `cmd_rollup_sync` per
+/// poll, so the pool is rebuilt across watch iterations; that's
+/// tolerable: the per-iteration scan is small once the wallet is caught
+/// up). The worker thread is shut down via `Drop`.
+struct SyncFetcher {
+    worker: Option<std::thread::JoinHandle<()>>,
+    cmd_tx: Option<std::sync::mpsc::Sender<SyncFetchCmd>>,
+}
+
+enum SyncFetchCmd {
+    Fetch {
+        base_url: String,
+        block_ref: String,
+        indices: Vec<u64>,
+        concurrency: usize,
+        reply: std::sync::mpsc::Sender<Result<Vec<Option<Vec<u8>>>, String>>,
+    },
+    Shutdown,
+}
+
+/// Test-only counter incremented once per `SyncFetcher::new` call.
+/// Used by `sync_fetcher_amortises_client_across_batches` to assert
+/// the production amortisation contract: a regression that rebuilds
+/// the fetcher per batch would bump this counter once per call,
+/// surfacing the per-batch TLS / runtime / worker-thread storm
+/// described in PR-#25 review B3.
+#[cfg(test)]
+static SYNC_FETCHER_NEW_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+impl SyncFetcher {
+    fn new(concurrency: usize) -> Result<Self, String> {
+        #[cfg(test)]
+        SYNC_FETCHER_NEW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SyncFetchCmd>();
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let worker = std::thread::Builder::new()
+            .name("tzel-sync-fetch-pool".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(format!("tokio runtime build failed: {e}")));
+                        return;
+                    }
+                };
+                let client = match build_concurrent_http_client(concurrency) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let _ = init_tx.send(Ok(()));
+
+                // Drive the request stream on the runtime. Each `Fetch`
+                // command runs to completion before we wait for the next;
+                // intra-batch parallelism comes from
+                // `fetch_published_notes_concurrent`'s `FuturesUnordered`,
+                // not from concurrent batch dispatch.
+                runtime.block_on(async {
+                    while let Ok(cmd) = cmd_rx.recv() {
+                        match cmd {
+                            SyncFetchCmd::Shutdown => break,
+                            SyncFetchCmd::Fetch {
+                                base_url,
+                                block_ref,
+                                indices,
+                                concurrency,
+                                reply,
+                            } => {
+                                let result = fetch_published_notes_concurrent(
+                                    &client,
+                                    &base_url,
+                                    &block_ref,
+                                    &indices,
+                                    concurrency,
+                                )
+                                .await;
+                                let _ = reply.send(result);
+                            }
+                        }
+                    }
+                });
+            })
+            .map_err(|e| format!("spawn fetch worker pool: {e}"))?;
+        match init_rx.recv() {
+            Ok(Ok(())) => Ok(SyncFetcher {
+                worker: Some(worker),
+                cmd_tx: Some(cmd_tx),
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(format!("fetch worker pool init dropped: {e}")),
+        }
+    }
+
+    fn fetch(
+        &self,
+        base_url: &str,
+        block_ref: &str,
+        indices: &[u64],
+        concurrency: usize,
+    ) -> Result<Vec<Option<Vec<u8>>>, String> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let cmd = SyncFetchCmd::Fetch {
+            base_url: base_url.to_string(),
+            block_ref: block_ref.to_string(),
+            indices: indices.to_vec(),
+            concurrency,
+            reply: reply_tx,
+        };
+        self.cmd_tx
+            .as_ref()
+            .ok_or_else(|| "SyncFetcher already shut down".to_string())?
+            .send(cmd)
+            .map_err(|_| "fetch worker pool dropped before request".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "fetch worker pool dropped before reply".to_string())?
+    }
+}
+
+impl Drop for SyncFetcher {
+    fn drop(&mut self) {
+        if let Some(tx) = self.cmd_tx.take() {
+            let _ = tx.send(SyncFetchCmd::Shutdown);
+            drop(tx);
+        }
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// URL builders for the concurrent fetch path. Free functions so the async
+/// closures don't borrow the `RollupRpc` instance — that lets the caller
+/// move owned strings into the worker-thread future.
+fn block_durable_value_url(base: &str, block_ref: &str, key: &str) -> String {
+    format!("{base}/global/block/{block_ref}/durable/wasm_2_0_0/value?key={key}")
+}
+
+fn block_durable_length_url(base: &str, block_ref: &str, key: &str) -> String {
+    format!("{base}/global/block/{block_ref}/durable/wasm_2_0_0/length?key={key}")
+}
+
+/// Fetch one published note's payload from durable storage. Mirrors
+/// `RollupRpc::read_published_note_bytes_at_block` — direct key first, fall
+/// back to the chunked layout. The chunks within a single note are still
+/// fetched sequentially because the chunk count is data-dependent on the
+/// `_len` value; the parallelism budget is spent across notes, not within
+/// a note (the chunked layout is rare and large notes amortise their own
+/// round-trips).
+async fn fetch_one_published_note(
+    client: reqwest::Client,
+    base_url: String,
+    block_ref: String,
+    index: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let direct_key = indexed_durable_key(DURABLE_NOTE_PREFIX, index);
+    let direct_len_url = block_durable_length_url(&base_url, &block_ref, &direct_key);
+    let direct_len_raw = fetch_text_allow_404_async(&client, &direct_len_url)
+        .await
+        .map_err(|e| format!("rollup RPC {direct_len_url} failed: {e}"))?;
+    let direct_present = match direct_len_raw {
+        None => false,
+        Some(raw) => RollupRpc::parse_durable_length(&direct_key, &raw)?.is_some(),
+    };
+    if direct_present {
+        let value_url = block_durable_value_url(&base_url, &block_ref, &direct_key);
+        let raw = fetch_text_async(&client, &value_url)
+            .await
+            .map_err(|e| format!("rollup RPC {value_url} failed: {e}"))?;
+        let bytes = parse_rollup_rpc_bytes(&raw)
+            .map_err(|e| format!("decode durable value at {direct_key}: {e}"))?;
+        if bytes.len() > MAX_PUBLISHED_NOTE_BYTES {
+            return Err(format!(
+                "durable note {index} at {direct_key} exceeds max supported size {MAX_PUBLISHED_NOTE_BYTES}"
+            ));
+        }
+        return Ok(Some(bytes));
+    }
+
+    let len_key = indexed_durable_note_len_key(index);
+    let len_len_url = block_durable_length_url(&base_url, &block_ref, &len_key);
+    let len_len_raw = fetch_text_allow_404_async(&client, &len_len_url)
+        .await
+        .map_err(|e| format!("rollup RPC {len_len_url} failed: {e}"))?;
+    let chunked_present = match len_len_raw {
+        None => false,
+        Some(raw) => RollupRpc::parse_durable_length(&len_key, &raw)?.is_some(),
+    };
+    if !chunked_present {
+        return Ok(None);
+    }
+
+    let len_value_url = block_durable_value_url(&base_url, &block_ref, &len_key);
+    let len_raw = fetch_text_async(&client, &len_value_url)
+        .await
+        .map_err(|e| format!("rollup RPC {len_value_url} failed: {e}"))?;
+    let len_bytes = parse_rollup_rpc_bytes(&len_raw)
+        .map_err(|e| format!("decode durable value at {len_key}: {e}"))?;
+    let total_len_u64 = RollupRpc::parse_u64(&len_key, &len_bytes)?;
+    let total_len = usize::try_from(total_len_u64).map_err(|_| {
+        format!("chunked durable note {index} length does not fit in usize")
+    })?;
+    if total_len > MAX_PUBLISHED_NOTE_BYTES {
+        return Err(format!(
+            "chunked durable note {index} length {total_len} exceeds max supported size {MAX_PUBLISHED_NOTE_BYTES}"
+        ));
+    }
+    let chunk_count = total_len.div_ceil(DURABLE_NOTE_CHUNK_BYTES);
+    let mut bytes = Vec::with_capacity(total_len);
+    for chunk_index in 0..chunk_count {
+        let chunk_key = indexed_durable_note_chunk_key(index, chunk_index);
+        let chunk_url = block_durable_value_url(&base_url, &block_ref, &chunk_key);
+        let chunk_raw = fetch_text_async(&client, &chunk_url)
+            .await
+            .map_err(|e| format!("rollup RPC {chunk_url} failed: {e}"))?;
+        let mut chunk = parse_rollup_rpc_bytes(&chunk_raw)
+            .map_err(|e| format!("decode durable value at {chunk_key}: {e}"))?;
+        bytes.append(&mut chunk);
+    }
+    if bytes.len() != total_len {
+        let got = bytes.len();
+        return Err(format!(
+            "chunked durable note {index} length mismatch: expected {total_len}, got {got}"
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// Concurrent fetch driver. Issues `concurrency` in-flight per-note requests
+/// against the rollup node, reassembles by index, and short-circuits on the
+/// first error (matches the sequential loop's abort-on-first-error contract).
+///
+/// Takes a borrowed `reqwest::Client` so callers can amortise the
+/// connection pool across multiple batches (e.g. `cmd_rollup_sync` runs many
+/// per-`checkpoint_every` batches across a 67k-commit scan and we want one
+/// warm client surviving the whole loop, not a fresh handshake-storm every
+/// batch). See `SyncFetcher` for the long-lived runtime + client wrapper.
+async fn fetch_published_notes_concurrent(
+    client: &reqwest::Client,
+    base_url: &str,
+    block_ref: &str,
+    indices: &[u64],
+    concurrency: usize,
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let mut results: Vec<Option<Option<Vec<u8>>>> = (0..indices.len()).map(|_| None).collect();
+    let mut next_to_dispatch = 0usize;
+
+    // Spawn a single-typed future for each index — async blocks at distinct
+    // call-sites have distinct anonymous types, so we go through one helper
+    // (`fetch_one_published_note`) and tuple the offset alongside via a
+    // small wrapper that returns one consistent future shape.
+    type FetchFuture = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = (usize, Result<Option<Vec<u8>>, String>)> + Send,
+        >,
+    >;
+    let make_future = |off: usize, client: reqwest::Client, base: String, block: String| -> FetchFuture {
+        let i = indices[off];
+        Box::pin(async move {
+            let r = fetch_one_published_note(client, base, block, i).await;
+            (off, r)
+        })
+    };
+
+    let mut in_flight: FuturesUnordered<FetchFuture> = FuturesUnordered::new();
+
+    // Manual flow control: keep at most `concurrency` futures in flight,
+    // drain one before queuing the next. Open-coded rather than using
+    // `buffered_unordered` so the result tuple carries its owning offset
+    // and errors propagate with the right index.
+    while next_to_dispatch < indices.len() && in_flight.len() < concurrency {
+        in_flight.push(make_future(
+            next_to_dispatch,
+            client.clone(),
+            base_url.to_string(),
+            block_ref.to_string(),
+        ));
+        next_to_dispatch += 1;
+    }
+
+    while let Some((off, res)) = in_flight.next().await {
+        match res {
+            Ok(payload) => results[off] = Some(payload),
+            Err(e) => return Err(e),
+        }
+        if next_to_dispatch < indices.len() {
+            in_flight.push(make_future(
+                next_to_dispatch,
+                client.clone(),
+                base_url.to_string(),
+                block_ref.to_string(),
+            ));
+            next_to_dispatch += 1;
+        }
+    }
+
+    Ok(results
+        .into_iter()
+        .map(|slot| slot.expect("every index slot must have been filled"))
+        .collect())
+}
+
 fn mutez_to_tez_string(amount_mutez: u64) -> String {
     let whole = amount_mutez / 1_000_000;
     let fractional = amount_mutez % 1_000_000;
@@ -3304,7 +3850,7 @@ fn run(cli: Cli) -> Result<(), String> {
         proving_service_url: None,
     };
     match cli.cmd {
-        Cmd::Keygen => cmd_keygen(&cli.wallet),
+        Cmd::Keygen => cmd_keygen(&cli.wallet, None),
         Cmd::Address => cmd_address(&cli.wallet),
         Cmd::ExportDetect { out } => cmd_export_detect(&cli.wallet, out.as_deref()),
         Cmd::ExportView { out } => cmd_export_view(&cli.wallet, out.as_deref()),
@@ -3580,7 +4126,43 @@ macro_rules! user_out {
 #[derive(Subcommand)]
 enum UserCmd {
     /// Create a new wallet file.
-    Init,
+    Init {
+        /// Initialise `wallet.json.scanned` to this rollup commitment-tree
+        /// size instead of 0.
+        ///
+        /// **Precondition (load-bearing):** the `master_sk` written by this
+        /// `cmd_init` invocation is freshly sampled — see `random_felt()`
+        /// in `cmd_keygen`. No external party can have encrypted a note
+        /// to a payment address derived from a `master_sk` that did not
+        /// exist when the corresponding commitment was published, so
+        /// commits in `[0..tree_size_at_init)` are guaranteed empty for
+        /// this wallet and the historical scan can be skipped. On a
+        /// long-running rollup that's 5–10 min wallclock saved on the
+        /// first sync (which currently holds the wallet flock and
+        /// blocks every other wallet operation through the daemon).
+        ///
+        /// **Do NOT pass this flag from a key-import path** (a future
+        /// feature where the caller seeds `master_sk` from an existing
+        /// key rather than sampling a fresh one). For an imported key
+        /// notes minted in `[0..N)` to that key DO exist on the rollup
+        /// and would be silently skipped — recoverable only by re-init
+        /// at `scanned = 0`. The CLI cannot enforce this precondition
+        /// (`master_sk` randomness is unobservable post-write); the
+        /// caller is responsible.
+        ///
+        /// The CLI itself stays rollup-agnostic — it does no network
+        /// I/O. The caller (e.g. the wallet daemon) is responsible for
+        /// querying the rollup-node's
+        /// `/global/state/values/tzel/v1/state/tree/size` and threading
+        /// the value here.
+        ///
+        /// Omitting the flag preserves the legacy behaviour
+        /// (`scanned = 0`) — useful when rollup-rpc is unavailable at
+        /// init time, or when the wallet should surface every
+        /// historical note for any reason.
+        #[arg(long, value_name = "N")]
+        at_tree_size: Option<u64>,
+    },
     /// Manage the saved network profile for this wallet.
     Profile {
         #[command(subcommand)]
@@ -3603,6 +4185,50 @@ enum UserCmd {
         /// Poll interval for `sync --watch`.
         #[arg(long, default_value_t = 5)]
         interval_secs: u64,
+        /// Checkpoint every N commits during a long sync. Each checkpoint
+        /// persists `wallet.json.scanned` + any newly-discovered notes
+        /// atomically and runs the cooperative-yield sentinel check
+        /// (`<wallet>.yield`); a smaller N means the wallet daemon can
+        /// preempt the sync sooner when it needs the flock for a slow op
+        /// (shield / transfer / unshield), at the cost of more frequent
+        /// `save_wallet` round-trips.
+        ///
+        /// Default 250 is the conservative end of the 250–500 range PR
+        /// #24 flagged as the post-#25 retune target. PR #25's parallel
+        /// HTTP + decrypt accelerations raise per-commit throughput to
+        /// the point where one fsync per 50 commits is a measurable
+        /// share of wallclock; at K=250 the per-checkpoint persist drops
+        /// to ~1.4 fsyncs/s sustained on a fast-enough operator. Numbers
+        /// in this PR's description and
+        /// `docs/sync-acceleration-design.md` are estimates: sub-1 %
+        /// overhead per checkpoint at this granularity, ~10 s of
+        /// loss-on-interrupt the next sync redoes cheaply, sub-ms
+        /// sentinel stat(). **The K=250 dial is orthogonal to the
+        /// throughput dial** N (concurrent HTTP reads, design doc §2.A)
+        /// — `services/scan-bench/` in tzel-infra measures the latter
+        /// only. A `save_wallet` micro-bench would refine THIS default.
+        ///
+        /// Don't drop below ~10 (the per-checkpoint `save_wallet` and
+        /// stat() begin to dominate the per-commit fetch work) or push
+        /// past ~500 (loss-on-interrupt becomes user-visible during
+        /// a long initial sync, defeating the cooperative-yield point).
+        /// On slow / synchronously-replicated storage (encrypted
+        /// overlays, network-mounted home-dirs), raise to 100–200 to
+        /// amortize the fsync. On fast operator boxes (NVMe, ext4,
+        /// no overlay) and when sub-second preemption matters, drop
+        /// to 20–30. `0` is rejected (would loop forever).
+        ///
+        /// Combines with `--watch`: each polling iteration honours
+        /// this value independently.
+        ///
+        /// Env var: `TZEL_SYNC_CHECKPOINT_EVERY` overrides the default
+        /// (the explicit CLI flag wins over the env if both are set).
+        #[arg(
+            long,
+            env = "TZEL_SYNC_CHECKPOINT_EVERY",
+            default_value_t = DEFAULT_CHECKPOINT_EVERY as u64,
+        )]
+        checkpoint_every: u64,
     },
     /// Show local private balance plus live public bridge balance when configured.
     Balance,
@@ -3962,7 +4588,7 @@ async fn detect_service_post_sync(
 
 fn run_user(cli: UserCli) -> Result<(), String> {
     let _wallet_lock = match &cli.cmd {
-        UserCmd::Init
+        UserCmd::Init { .. }
         | UserCmd::Receive
         | UserCmd::Sync { .. }
         | UserCmd::Deposit { .. }
@@ -4003,7 +4629,7 @@ fn run_user(cli: UserCli) -> Result<(), String> {
     // Name of the subcommand — used as the `command` field of the JSON
     // envelope emitted at end-of-run when --json is set.
     let command_name: &'static str = match &cli.cmd {
-        UserCmd::Init => "init",
+        UserCmd::Init { .. } => "init",
         UserCmd::Profile { .. } => "profile",
         UserCmd::Receive => "receive",
         UserCmd::Addresses => "addresses",
@@ -4023,19 +4649,25 @@ fn run_user(cli: UserCli) -> Result<(), String> {
     };
 
     let outcome: Result<(), String> = match cli.cmd {
-        UserCmd::Init => cmd_keygen(&cli.wallet),
+        UserCmd::Init { at_tree_size } => cmd_keygen(&cli.wallet, at_tree_size),
         UserCmd::Profile { cmd } => run_user_profile(&cli.wallet, cmd),
         UserCmd::Receive => cmd_address(&cli.wallet),
         UserCmd::Addresses => cmd_addresses(&cli.wallet),
         UserCmd::Sync {
             watch,
             interval_secs,
+            checkpoint_every,
         } => {
             let profile = load_required_network_profile(&cli.wallet)?;
+            // Cast u64 → usize: on 32-bit `as usize` would saturate, but
+            // the cmd_rollup_sync inner loop uses `std::cmp::min(..,
+            // tree_size)` so a saturated value just acts as "do the
+            // whole tree in one batch". Validity (>0) is checked there.
+            let checkpoint_every = checkpoint_every as usize;
             if watch {
-                cmd_rollup_sync_watch(&cli.wallet, &profile, interval_secs)
+                cmd_rollup_sync_watch(&cli.wallet, &profile, interval_secs, checkpoint_every)
             } else {
-                cmd_rollup_sync(&cli.wallet, &profile)
+                cmd_rollup_sync(&cli.wallet, &profile, checkpoint_every)
             }
         }
         UserCmd::Balance => cmd_user_balance(&cli.wallet),
@@ -4725,18 +5357,30 @@ fn persist_wallet_and_make_proof(
 // Commands
 // ═══════════════════════════════════════════════════════════════════════
 
-fn cmd_keygen(path: &str) -> Result<(), String> {
+fn cmd_keygen(path: &str, at_tree_size: Option<u64>) -> Result<(), String> {
     if std::path::Path::new(path).exists() {
         return Err(format!("{} already exists", path));
     }
     let master_sk = random_felt();
+
+    // `at_tree_size` lets the caller skip the historical-commit scan
+    // a fresh wallet would otherwise pay on its first sync. A wallet
+    // created at tree_size=N has, by definition, received no notes in
+    // commits [0..N), so trial-decrypting them is wasted work
+    // (5–10 min wallclock on a long-running rollup, while holding
+    // the wallet flock). Set `scanned = N` and the first sync only
+    // covers [N..current_tree_size). The usize cast is bounded by the
+    // commitment-tree depth (currently 2^32-class, fits in usize).
+    let scanned = at_tree_size
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+        .unwrap_or(0);
 
     let w = WalletFile {
         master_sk,
         addresses: vec![],
         addr_counter: 0,
         notes: vec![],
-        scanned: 0,
+        scanned,
         wots_key_indices: std::collections::HashMap::new(),
         pending_spends: vec![],
         pending_deposits: vec![],
@@ -4748,8 +5392,9 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
         json: {
             "created" => true,
             "path" => path,
+            "scanned" => scanned,
         },
-        human: "Wallet created: {}", path
+        human: "Wallet created: {} (scanned cursor: {})", path, scanned
     );
     Ok(())
 }
@@ -5247,18 +5892,31 @@ fn apply_scan_feed(
     let mut found = 0usize;
     let mut known_notes: std::collections::HashSet<(usize, F)> =
         w.notes.iter().map(|n| (n.index, n.cm)).collect();
-    for nm in &feed.notes {
-        if let Some(note) = w.try_recover_note(nm) {
-            if known_notes.insert((note.index, note.cm)) {
-                println!(
-                    "  found: v={} cm={} index={}",
-                    note.v,
-                    short(&note.cm),
-                    note.index
-                );
-                w.notes.push(note);
-                found += 1;
-            }
+
+    // ML-KEM-768 trial-decrypt is ~125 µs per attempt × |addresses| per memo,
+    // and the loop is embarrassingly parallel: `try_recover_note` only reads
+    // `&self`, the `master_sk` and address list don't change inside this
+    // call, and recovered `Note` values are independent. We hand the
+    // per-memo recovery off to rayon's default thread pool here, then merge
+    // sequentially below to preserve the deterministic
+    // `println!`-then-push order the existing test suite relies on.
+    use rayon::prelude::*;
+    let recovered: Vec<Option<Note>> = feed
+        .notes
+        .par_iter()
+        .map(|nm| w.try_recover_note(nm))
+        .collect();
+
+    for note in recovered.into_iter().flatten() {
+        if known_notes.insert((note.index, note.cm)) {
+            println!(
+                "  found: v={} cm={} index={}",
+                note.v,
+                short(&note.cm),
+                note.index
+            );
+            w.notes.push(note);
+            found += 1;
         }
     }
 
@@ -5317,6 +5975,113 @@ fn apply_scan_feed(
     }
 }
 
+/// Cooperative-yield sync: process the feed for one batch of commits
+/// (recover-only, no nullifier prune, no pending-pool prune). Pushes any
+/// newly-recovered notes into `w.notes` and advances `w.scanned` to
+/// `feed.next_cursor`. The full prune step is deferred to
+/// `apply_scan_feed_finalize` after the loop completes — that way each
+/// intermediate `save_wallet` lands a self-consistent file the next sync
+/// resumes from, while the prune still sees the cumulative cm set.
+///
+/// Returns the number of newly-recovered notes for the running tally and
+/// extends `seen_cms` with every cm in this batch (including unrecovered
+/// ones — see the cumulative-known-cm comment in `apply_scan_feed` for
+/// why that defensive cm set matters).
+fn apply_scan_feed_recover_batch(
+    w: &mut WalletFile,
+    feed: &NotesFeedResp,
+    seen_cms: &mut Vec<F>,
+) -> usize {
+    use rayon::prelude::*;
+
+    // Extend `seen_cms` with every cm in this batch (recoverable or not).
+    // The defensive cm set matters for the finalize-pin fix from PR #24's
+    // audit — see the cumulative-known-cm rationale in `apply_scan_feed`.
+    seen_cms.extend(feed.notes.iter().map(|nm| nm.cm));
+
+    // ML-KEM-768 trial-decrypt is ~125 µs per attempt × |addresses| per
+    // memo. `try_recover_note` only reads `&self` on the wallet; the
+    // master_sk and address list don't change inside this call; recovered
+    // notes are independent. Hand the per-memo recovery off to rayon's
+    // default thread pool here, then merge sequentially below to preserve
+    // the deterministic `println!`-then-push order the test suite relies
+    // on.
+    //
+    // Pre-fix B2: this loop was sequential, which meant the rayon par_iter
+    // in `apply_scan_feed` (the legacy `cmd_scan` entrypoint) was the only
+    // parallel-decrypt site — and `cmd_scan` is dead code in the
+    // cooperative-yield era. The "M=auto decrypt" banner emitted by
+    // `cmd_rollup_sync` was a lie until this `par_iter` landed.
+    let recovered: Vec<Option<Note>> = feed
+        .notes
+        .par_iter()
+        .map(|nm| w.try_recover_note(nm))
+        .collect();
+
+    let mut known_notes: std::collections::HashSet<(usize, F)> =
+        w.notes.iter().map(|n| (n.index, n.cm)).collect();
+    let mut found = 0usize;
+    for note in recovered.into_iter().flatten() {
+        if known_notes.insert((note.index, note.cm)) {
+            println!(
+                "  found: v={} cm={} index={}",
+                note.v,
+                short(&note.cm),
+                note.index
+            );
+            w.notes.push(note);
+            found += 1;
+        }
+    }
+    w.scanned = feed.next_cursor;
+    found
+}
+
+/// Final pass after batched scanning: applies the nullifier prune and the
+/// pending-pool prune using the cumulative `seen_cms` accumulated across
+/// every batch, plus the wallet's own running `w.notes` set. Mirrors the
+/// post-recovery half of `apply_scan_feed`.
+fn apply_scan_feed_finalize(
+    w: &mut WalletFile,
+    seen_cms: &[F],
+    nullifiers: impl IntoIterator<Item = F>,
+    pool_balances: &std::collections::HashMap<(F, F), u64>,
+) -> ScanSummary {
+    let mut known_cms: std::collections::HashSet<F> =
+        w.notes.iter().map(|n| n.cm).collect();
+    known_cms.extend(seen_cms.iter().copied());
+
+    let nf_set: std::collections::HashSet<F> = nullifiers.into_iter().collect();
+    let before = w.notes.len();
+    w.notes.retain(|n| !nf_set.contains(&note_nullifier(n)));
+    let spent = before - w.notes.len();
+    let before_pending = w.pending_spends.len();
+    w.pending_spends
+        .retain(|pending| !pending.nullifiers.iter().all(|nf| nf_set.contains(nf)));
+
+    let before_pools = w.pending_deposits.len();
+    w.pending_deposits.retain(|p| {
+        let drained_on_chain =
+            pool_balances.get(&(p.asset_id, p.pubkey_hash)).copied().unwrap_or(0) == 0;
+        let cm_observed = p
+            .shielded_cm
+            .as_ref()
+            .map(|cm| known_cms.contains(cm))
+            .unwrap_or(false);
+        !(drained_on_chain && cm_observed)
+    });
+    let pruned_drained_pools = before_pools - w.pending_deposits.len();
+
+    ScanSummary {
+        // `found` is tallied by the caller across all batches.
+        found: 0,
+        spent,
+        confirmed_pending: before_pending - w.pending_spends.len(),
+        pool_balances: pool_balances.clone(),
+        pruned_drained_pools,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5337,6 +6102,64 @@ mod tests {
         ALLOW_FULL_XMSS_REBUILD_IN_TESTS.store(false, std::sync::atomic::Ordering::SeqCst);
         drop(guard);
         result
+    }
+
+    /// Counted variant of [`spawn_mock_http_server`]. Returns the same
+    /// `base_url` plus an `AtomicUsize` that's incremented on every
+    /// successfully-handled request. Used by tests that need to assert on
+    /// "did the abort path actually short-circuit before all in-flight
+    /// requests were issued?" — counting the number of served requests is
+    /// the cleanest signal.
+    pub(super) fn spawn_counted_mock_http_server(
+        routes: HashMap<String, (u16, String)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_thread = counter.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock http server");
+        let addr = listener.local_addr().expect("mock server local addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                let mut buffer = [0u8; 8192];
+                let read = match stream.read(&mut buffer) {
+                    Ok(read) => read,
+                    Err(_) => continue,
+                };
+                if read == 0 {
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, body) = routes
+                    .get(path)
+                    .cloned()
+                    .unwrap_or_else(|| (404, "null".to_string()));
+                let status_text = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    _ => "Unknown",
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    status_text,
+                    body.len(),
+                    body
+                );
+                if stream.write_all(response.as_bytes()).is_ok() {
+                    counter_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        (format!("http://{}", addr), counter)
     }
 
     pub(super) fn spawn_mock_http_server(routes: HashMap<String, (u16, String)>) -> String {
@@ -8343,7 +9166,7 @@ fn cmd_user_balance(path: &str) -> Result<(), String> {
     if profile_path.exists() {
         let profile = load_network_profile(&profile_path)?;
         let rollup = RollupRpc::new(&profile);
-        let balances = rollup.load_pool_balances(&w.pending_deposits)?;
+        let balances = rollup.load_pool_balances_at_head(&w.pending_deposits)?;
         print_deposit_pool_summary(&w, &balances);
     }
     Ok(())
@@ -8408,7 +9231,13 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     let auth_domain = snapshot.auth_domain;
     let tree_size = snapshot.tree.leaves.len();
     let required_tx_fee = snapshot.required_tx_fee;
-    let balances = rollup.load_pool_balances(&wallet.pending_deposits)?;
+    // Pool balances must be read at the same pinned `head_hash` as the
+    // snapshot above; otherwise a slow-lane drain landing between the
+    // two reads would mis-classify a still-funded pool as
+    // "drained pending prune" in the printed banner. Same shape as the
+    // `cmd_rollup_sync` finalize fix (f3a0755).
+    let balances =
+        rollup.load_pool_balances_at_block(&head_hash, &wallet.pending_deposits)?;
 
     user_out!(json: { "wallet_file" => path }, human: "Wallet file: {}", path);
     user_out!(
@@ -8464,19 +9293,278 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     Ok(())
 }
 
-fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), String> {
+/// How many commits we scan between checkpoints (incremental save_wallet +
+/// cooperative-yield check).
+///
+/// 250 is the conservative end of the 250–500 range PR #24's body line 90
+/// flagged as the post-#25 retune target ("Re-tune default K to 250–500
+/// once the design doc's parallel-fetch patch (P2, see PR #25) lands; at
+/// the post-P2 wallclock, K=50 means ~7 fsyncs/s sustained — non-trivial").
+/// PR #25 lands the parallel-fetch + parallel-decrypt accelerations, which
+/// raise per-commit throughput to the point where the per-checkpoint fsync
+/// becomes a non-trivial share of wallclock at K=50; bumping to K=250
+/// amortises the persist cost back down.
+///
+/// Properties at K=250:
+///   * loss-on-interrupt is bounded to ~K commits, which the next sync
+///     redoes cheaply via the cooperative-yield resume path;
+///   * persist overhead drops ~5× vs K=50 (one atomic-rename + fsync per
+///     250 commits instead of per 50);
+///   * the per-checkpoint sentinel stat() is sub-ms either way.
+///
+/// Numbers above are estimates; the `services/scan-bench/` POC in tzel-infra
+/// is meant to refine them against a live `octez-smart-rollup-node`. Until
+/// that runs, this default is the runtime-tunable fallback exposed via
+/// `tzel-wallet sync --checkpoint-every N`.
+///
+/// Don't drop below ~10 (overhead dominates) or push past ~500 (the
+/// loss-on-interrupt becomes user-visible during a long initial sync).
+const DEFAULT_CHECKPOINT_EVERY: usize = 250;
+
+/// Test hook: invoked at every checkpoint just before the sentinel check.
+/// Production callers leave it `None`. Used by the resume / sentinel tests
+/// below to inject "create the sentinel between commit K and commit 2K"
+/// without racing on a real fs touch.
+#[cfg(test)]
+static SYNC_CHECKPOINT_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<Box<dyn Fn(&str, usize) + Send + 'static>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn set_sync_checkpoint_hook<F>(hook: F)
+where
+    F: Fn(&str, usize) + Send + 'static,
+{
+    let cell = SYNC_CHECKPOINT_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    // Poison-tolerant: a previous test that panicked inside the hook
+    // (e.g. the panic-mid-batch coverage test) leaves the Mutex in a
+    // poisoned state. The protected data is just `Option<Box<dyn Fn>>`,
+    // which is safe to overwrite — the panic didn't leave a half-set
+    // value behind. `into_inner()` recovers the guard regardless.
+    *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
+}
+
+#[cfg(test)]
+fn clear_sync_checkpoint_hook() {
+    if let Some(cell) = SYNC_CHECKPOINT_HOOK.get() {
+        *cell.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+fn fire_sync_checkpoint_hook(_path: &str, _scanned: usize) {
+    #[cfg(test)]
+    if let Some(cell) = SYNC_CHECKPOINT_HOOK.get() {
+        if let Some(hook) = cell
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            hook(_path, _scanned);
+        }
+    }
+}
+
+/// Cooperative-yield sync. Scans `[w.scanned .. tree_size)` in batches of
+/// `checkpoint_every` commits, persisting after each batch so a long initial
+/// sync no longer holds the wallet lock for the full duration: any concurrent
+/// caller that needs the lock for a slow op (shield / transfer / unshield /
+/// withdraw) touches `<wallet>.yield`, and the sync exits cleanly at its
+/// next checkpoint with `w.scanned` reflecting work already on disk. The
+/// next sync resumes from there.
+///
+/// `checkpoint_every` is tunable via `tzel-wallet sync --checkpoint-every N`.
+/// Default is `DEFAULT_CHECKPOINT_EVERY` (250). 0 is rejected (would loop
+/// forever without progress).
+///
+/// Atomicity: every checkpoint goes through `save_wallet`, which writes to
+/// a temp file, fsyncs, atomic-renames, then fsyncs the parent dir. A kill -9
+/// between fsync and rename leaves the previous wallet.json intact — at most
+/// one batch of scan work is lost, never corrupted.
+fn cmd_rollup_sync(
+    path: &str,
+    profile: &WalletNetworkProfile,
+    checkpoint_every: usize,
+) -> Result<(), String> {
+    if checkpoint_every == 0 {
+        return Err(
+            "--checkpoint-every must be > 0 (0 would loop forever without progress)".to_string(),
+        );
+    }
     let mut w = load_wallet(path)?;
     let rollup = RollupRpc::new(profile);
-    let feed = rollup.load_notes_since(w.scanned).map_err(|e| {
+
+    // One-line stderr banner: gives the operator a clear signal when a
+    // long sync starts and what tunables are in effect. `decrypt=auto`
+    // because rayon picks the worker count from the system; we don't
+    // override unless we have a measured reason to.
+    let concurrency = sync_concurrency()?;
+    eprintln!("tzel-wallet: concurrent sync: N={concurrency} fetch, M=auto decrypt");
+
+    // Pin head once: every batch reads the same block so concurrent rollup
+    // progress does not race the cursor past the tree-size we're scanning to.
+    // Nullifier and pool-balance snapshots also read this same block, so the
+    // finalize prune sees a consistent view.
+    let head_hash = rollup.head_hash().map_err(|e| {
         format!(
             "sync failed: {}. Run `tzel-wallet check` for a fuller diagnosis.",
             e
         )
     })?;
-    let nullifiers = rollup.load_nullifiers()?;
-    let pool_balances = rollup.load_pool_balances(&w.pending_deposits)?;
-    let summary = apply_scan_feed(&mut w, &feed, nullifiers, &pool_balances);
+    let tree_size: usize = rollup
+        .read_u64_at_block(&head_hash, DURABLE_TREE_SIZE)
+        .map_err(|e| {
+            format!(
+                "sync failed: {}. Run `tzel-wallet check` for a fuller diagnosis.",
+                e
+            )
+        })?
+        .try_into()
+        .map_err(|_| "tree size does not fit in usize".to_string())?;
+
+    if w.scanned > tree_size {
+        return Err(format!(
+            "wallet cursor {} is ahead of rollup tree size {}",
+            w.scanned, tree_size
+        ));
+    }
+
+    let yield_path = wallet_yield_path(path);
+    let mut total_found = 0usize;
+    let mut seen_cms: Vec<F> = Vec::new();
+    let mut yielded = false;
+
+    // Build the long-lived fetch context ONCE for this whole sync. The
+    // worker thread, tokio runtime, and reqwest client all survive every
+    // batch — so the connection pool warms exactly once instead of once
+    // per K-commit batch (~1340 cold-start handshakes on a 67k-commit
+    // sync at K=50). See `SyncFetcher` doc comment for the rationale.
+    let fetcher = SyncFetcher::new(concurrency).map_err(|e| {
+        format!(
+            "sync failed: {}. Run `tzel-wallet check` for a fuller diagnosis.",
+            e
+        )
+    })?;
+    let base_url = profile.rollup_node_url.trim_end_matches('/').to_string();
+
+    while w.scanned < tree_size {
+        // `saturating_add` defends against an adversarial
+        // `--checkpoint-every` (e.g. close to `usize::MAX`) overflowing
+        // here. The CLI flag is `u64` and clamps via `as usize` at
+        // dispatch; on 64-bit a worst-case `usize::MAX + w.scanned`
+        // would panic in debug / wrap in release. Saturating means the
+        // batch caps at `tree_size`, i.e. one final batch covers the
+        // whole remaining window — degenerate but safe.
+        let batch_end = w
+            .scanned
+            .saturating_add(checkpoint_every)
+            .min(tree_size);
+        // Per-batch [cursor, batch_end) sub-window. PR #25's concurrent
+        // fetch driver issues `concurrency` per-note requests in flight
+        // against the rollup node and reassembles by index, replacing the
+        // sequential `read_published_note_bytes_at_block` round-trip loop
+        // that dominated wallclock on long initial syncs (~95% of time on
+        // a 67k-commit ushuaianet scan).
+        let indices: Vec<u64> = (w.scanned..batch_end).map(|i| i as u64).collect();
+        let payloads = fetcher
+            .fetch(&base_url, &head_hash, &indices, concurrency)
+            .map_err(|e| {
+                format!(
+                    "sync failed: {}. Run `tzel-wallet check` for a fuller diagnosis.",
+                    e
+                )
+            })?;
+        debug_assert_eq!(payloads.len(), batch_end - w.scanned);
+        let mut notes = Vec::with_capacity(batch_end - w.scanned);
+        for (offset, bytes) in payloads.into_iter().enumerate() {
+            let i = w.scanned + offset;
+            let Some(bytes) = bytes else {
+                let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64);
+                return Err(format!(
+                    "rollup durable state is missing note {} at {} while tree size is {}. This usually means the deployed rollup kernel does not persist published note payloads, or the rollup node is not serving the expected durable state.",
+                    i, key, tree_size
+                ));
+            };
+            let (cm, enc) = canonical_wire::decode_published_note(&bytes)?;
+            notes.push(NoteMemo { index: i, cm, enc });
+        }
+        let batch_feed = NotesFeedResp {
+            notes,
+            next_cursor: batch_end,
+        };
+        total_found += apply_scan_feed_recover_batch(&mut w, &batch_feed, &mut seen_cms);
+        save_wallet(path, &w)?;
+
+        // Cooperative-yield sentinel check. Stat() is sub-ms; transient fs
+        // errors ⇒ "not present" so we never spuriously exit on a flaky FS.
+        fire_sync_checkpoint_hook(path, w.scanned);
+        if yield_path.exists() {
+            // Stale-PID recovery: if the sentinel content names a daemon
+            // that no longer exists, the daemon crashed after touching
+            // the sentinel but before rm-ing it. Without this, every
+            // subsequent sync would exit at the first checkpoint
+            // forever. Mirror the existing WalletLock stale-PID
+            // discipline. On non-PID content (legacy daemons, tests
+            // that write `b"yield"`) treat as live and yield —
+            // forward-compat.
+            if is_stale_yield_sentinel(&yield_path) {
+                // Checked unlink: if removal keeps failing (read-only fs,
+                // immutable bit, dir owner mismatch), the next loop
+                // iteration would see the same stale sentinel, recover
+                // again, fail again, and spin a "removed stale sentinel"
+                // warning per remaining batch. Surface the failure once
+                // and abort the scan with a clear error so the operator
+                // can fix the FS state instead of grepping a log spam.
+                // Capture the dead PID before unlinking so the warning
+                // gives operators something to grep / correlate with
+                // their daemon-restart logs. Best-effort: if the read
+                // fails we still emit "(unknown)" — the "we recovered
+                // from a crash" signal is what matters.
+                let dead_pid = std::fs::read_to_string(&yield_path)
+                    .ok()
+                    .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "unknown".into());
+                if let Err(e) = std::fs::remove_file(&yield_path) {
+                    return Err(format!(
+                        "stale yield sentinel at {} (daemon PID {} gone) but \
+                         could not be removed: {}. Fix fs permissions on the \
+                         wallet directory and retry.",
+                        yield_path.display(),
+                        dead_pid,
+                        e
+                    ));
+                }
+                eprintln!(
+                    "warning: removed stale yield sentinel at {} (daemon PID \
+                     {} gone); continuing scan",
+                    yield_path.display(),
+                    dead_pid
+                );
+                continue;
+            }
+            yielded = true;
+            break;
+        }
+    }
+
+    // Final flush: even when we yielded, the prune is best-effort against
+    // whatever we did scan — running it once at the end (rather than every
+    // batch) keeps the overhead sub-1% on long initial syncs. If no batches
+    // were processed at all because tree_size==w.scanned, this still produces
+    // a coherent ScanSummary for the printed banner.
+    let nullifiers = rollup.load_nullifiers_at_block(&head_hash)?;
+    // Pool balances must read at the SAME pinned block as the note slice
+    // and the nullifier set; otherwise a slow-lane that drains a pool
+    // between the note scan and the finalize would silently evict a
+    // `pending_deposit` whose `shielded_cm` was never observed in this
+    // run's `seen_cms`. (`load_pool_balances_at_head` re-resolves head;
+    // the `_at_block` overload is the consistent variant.)
+    let pool_balances =
+        rollup.load_pool_balances_at_block(&head_hash, &w.pending_deposits)?;
+    let mut summary = apply_scan_feed_finalize(&mut w, &seen_cms, nullifiers, &pool_balances);
+    summary.found = total_found;
     save_wallet(path, &w)?;
+
     let total_funded: u64 = summary.pool_balances.values().sum();
     let mut pools_awaiting_credit = 0usize;
     let mut pools_drained_pending_scan = 0usize;
@@ -8491,7 +9579,7 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
         }
     }
     println!(
-        "Synced: {} new notes, {} spent removed, {} pending confirmed, {} drained-pool entries pruned, private_available={}, pool_funded_total={}, pools_awaiting_credit={}, pools_drained_pending_scan={}",
+        "Synced: {} new notes, {} spent removed, {} pending confirmed, {} drained-pool entries pruned, private_available={}, pool_funded_total={}, pools_awaiting_credit={}, pools_drained_pending_scan={}{}",
         summary.found,
         summary.spent,
         summary.confirmed_pending,
@@ -8500,6 +9588,11 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
         total_funded,
         pools_awaiting_credit,
         pools_drained_pending_scan,
+        if yielded {
+            " (yielded mid-scan; rerun sync to finish)"
+        } else {
+            ""
+        },
     );
     Ok(())
 }
@@ -8508,6 +9601,7 @@ fn cmd_rollup_sync_watch(
     path: &str,
     profile: &WalletNetworkProfile,
     interval_secs: u64,
+    checkpoint_every: usize,
 ) -> Result<(), String> {
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
     // Upstream patch ①: this is a loop; emit the banner on stderr when
@@ -8524,7 +9618,7 @@ fn cmd_rollup_sync_watch(
         );
     }
     loop {
-        cmd_rollup_sync(path, profile)?;
+        cmd_rollup_sync(path, profile, checkpoint_every)?;
         std::thread::sleep(interval);
     }
 }
@@ -10023,7 +11117,7 @@ fn cmd_transfer_rollup(
         "recipient": to_path,
     });
     let rollup = RollupRpc::new(profile);
-    let snapshot = rollup.load_state_snapshot()?;
+    let snapshot = rollup.load_state_snapshot_at_head()?;
     let fee = resolve_requested_tx_fee(fee, snapshot.required_tx_fee)?;
     ensure_positive_dal_fee(profile.dal_fee)?;
     let root = snapshot.current_root();
@@ -10375,7 +11469,7 @@ fn cmd_unshield_rollup(
     });
     let rollup = RollupRpc::new(profile);
     let recipient = resolve_rollup_unshield_recipient(&rollup, recipient)?;
-    let snapshot = rollup.load_state_snapshot()?;
+    let snapshot = rollup.load_state_snapshot_at_head()?;
     let fee = resolve_requested_tx_fee(fee, snapshot.required_tx_fee)?;
     ensure_positive_dal_fee(profile.dal_fee)?;
     let root = snapshot.current_root();
@@ -12741,8 +13835,8 @@ mod network_profile_tests {
         }];
 
         let balances = RollupRpc::new(&profile)
-            .load_pool_balances(&pending)
-            .expect("load_pool_balances should succeed");
+            .load_pool_balances_at_head(&pending)
+            .expect("load_pool_balances_at_head should succeed");
 
         assert_eq!(balances.get(&(ASSET_TEZ, pubkey_hash)), Some(&amount));
         assert_eq!(balances.len(), 1);
@@ -12800,4 +13894,1949 @@ mod network_profile_tests {
     #[test]
     #[ignore = "TODO: re-implement on pool model — head-pinning is now structural, but black-box mock surface is large"]
     fn cmd_shield_rollup_pins_fee_and_balance_reads_to_same_head() {}
+
+    /// `cmd_keygen` without `at_tree_size` preserves the legacy default
+    /// (`scanned = 0`) so existing callers that don't yet pass the
+    /// new flag aren't surprised. Locks the back-compat contract.
+    #[test]
+    fn cmd_keygen_defaults_scanned_to_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        let path_str = path.to_str().unwrap();
+        cmd_keygen(path_str, None).expect("init succeeds");
+        let w = load_wallet(path_str).expect("load created wallet");
+        assert_eq!(w.scanned, 0);
+    }
+
+    /// `at_tree_size = Some(0)` must be equivalent to `None` — both
+    /// produce `scanned = 0`. Locks the boundary so a future rewrite
+    /// that special-cases `Some(0)` differently (e.g. interprets it
+    /// as "skip everything", which would be a u64 → usize sign-change
+    /// footgun) breaks loudly.
+    #[test]
+    fn cmd_keygen_at_tree_size_zero_equals_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        let path_str = path.to_str().unwrap();
+        cmd_keygen(path_str, Some(0)).expect("init succeeds");
+        let w = load_wallet(path_str).expect("load created wallet");
+        assert_eq!(w.scanned, 0);
+    }
+
+    /// `cmd_keygen` with `at_tree_size = N` writes `scanned = N` so
+    /// the first sync only covers `[N..current_tree_size)` rather
+    /// than `[0..current_tree_size)`. This is the load-bearing
+    /// "skip historical scan" property: a brand-new wallet has
+    /// received no notes prior to its creation, so the historical
+    /// commits are guaranteed empty for it. On a long-running
+    /// network this drops the first-sync wallclock from minutes
+    /// to seconds.
+    #[test]
+    fn cmd_keygen_with_at_tree_size_initialises_scanned_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        let path_str = path.to_str().unwrap();
+        cmd_keygen(path_str, Some(67_890)).expect("init succeeds");
+        let w = load_wallet(path_str).expect("load created wallet");
+        assert_eq!(w.scanned, 67_890);
+    }
+
+    /// Refuses to clobber an existing wallet file regardless of
+    /// `at_tree_size` — the flag must not become an accidental reset
+    /// path. Symmetric with the existing legacy-default behaviour.
+    #[test]
+    fn cmd_keygen_refuses_to_overwrite_existing_wallet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        let path_str = path.to_str().unwrap();
+        cmd_keygen(path_str, None).expect("first init");
+        let err = cmd_keygen(path_str, Some(123))
+            .expect_err("second init must refuse");
+        assert!(err.contains("already exists"), "got: {err}");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Cooperative-yield sync (DEFAULT_CHECKPOINT_EVERY = 250)
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Spawn a trivial child, wait for it to exit, and return its
+    /// freshly-reaped PID. Used by stale-sentinel tests that need a
+    /// "definitely dead" PID without relying on `kernel.pid_max` lore.
+    /// Linux PID allocation is sequential, so the just-reaped PID will
+    /// not recycle within any realistic test runtime.
+    fn freshly_dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn `true` to acquire a soon-dead PID");
+        let pid = child.id();
+        child
+            .wait()
+            .expect("wait `true` so its PID is reaped before we use it");
+        pid
+    }
+
+    /// Build the minimal route table `cmd_rollup_sync` needs for a wallet
+    /// scanning [start, tree_size). `recoverable_at` selects which note
+    /// indices are recoverable by the test wallet (others are random
+    /// non-decryptable bytes — they exercise the "skip non-recoverable"
+    /// path of `try_recover_note`). All routes are pinned to `block_hash`.
+    fn sync_routes_for_window(
+        wallet: &WalletFile,
+        block_hash: &str,
+        tree_size: u64,
+        recoverable_at: &std::collections::HashMap<u64, (u64, F)>, // index -> (value, rseed)
+    ) -> HashMap<String, (u16, String)> {
+        let mut routes: HashMap<String, (u16, String)> = HashMap::new();
+        routes.insert(
+            "/global/block/head/hash".into(),
+            (200, format!("\"{}\"", block_hash)),
+        );
+        // Length probes for "do we have a full DURABLE_NOTE_PREFIX entry?":
+        // we always serve via the direct key, so length = encoded.len().
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                block_hash, DURABLE_TREE_SIZE
+            ),
+            (200, format!("\"{}\"", hex::encode(tree_size.to_le_bytes()))),
+        );
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                block_hash, DURABLE_NULLIFIER_COUNT
+            ),
+            (200, format!("\"{}\"", hex::encode(0u64.to_le_bytes()))),
+        );
+
+        for i in 0..tree_size {
+            let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i);
+            let bytes = if let Some((value, rseed)) = recoverable_at.get(&i) {
+                let nm = super::tests::note_memo_for_wallet_address(
+                    wallet, 0, *value, *rseed, None,
+                );
+                canonical_wire::encode_published_note(&nm.cm, &nm.enc)
+                    .expect("published note encodes")
+            } else {
+                // Forge a "valid published note" wrapping a non-recoverable
+                // payload (random cm + zero-length enc). The wallet decodes
+                // it via canonical_wire then `try_recover_note` returns
+                // None — exactly the behaviour we want for filler notes.
+                let cm = felt_tag(format!("filler-cm-{}", i).as_bytes());
+                let nm = super::tests::note_memo_for_wallet_address(
+                    wallet,
+                    0,
+                    1,
+                    felt_tag(format!("filler-rseed-{}", i).as_bytes()),
+                    None,
+                );
+                canonical_wire::encode_published_note(&cm, &nm.enc)
+                    .expect("filler note encodes")
+            };
+            routes.insert(
+                format!(
+                    "/global/block/{}/durable/wasm_2_0_0/length?key={}",
+                    block_hash, key
+                ),
+                (200, bytes.len().to_string()),
+            );
+            routes.insert(
+                format!(
+                    "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                    block_hash, key
+                ),
+                (200, format!("\"{}\"", hex::encode(bytes))),
+            );
+        }
+        routes
+    }
+
+    // ---------------------------------------------------------------------
+    // Sync-acceleration tests (P2): concurrent HTTP fetch + parallel decrypt.
+    // ---------------------------------------------------------------------
+
+    /// Build the mock-rollup route table for `note_count` direct (non-chunked)
+    /// notes. The first half of the routes are the tree-size length+value
+    /// pair; the rest are per-note `length` + `value` for the direct key.
+    /// `chunked_len_routes` is set to "null" because the direct path always
+    /// fires first, so the chunked-len fallback should never be consulted.
+    fn mock_routes_for_direct_notes(notes: &[NoteMemo]) -> HashMap<String, (u16, String)> {
+        let count = notes.len() as u64;
+        let mut routes = HashMap::from([
+            (
+                "/global/block/head/durable/wasm_2_0_0/length?key=/tzel/v1/state/tree/size".into(),
+                (200u16, "8".into()),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/value?key=/tzel/v1/state/tree/size".into(),
+                (200u16, format!("\"{}\"", hex::encode(count.to_le_bytes()))),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/length?key=/tzel/v1/state/nullifiers/count"
+                    .into(),
+                (200u16, "8".into()),
+            ),
+            (
+                "/global/block/head/durable/wasm_2_0_0/value?key=/tzel/v1/state/nullifiers/count"
+                    .into(),
+                (200u16, format!("\"{}\"", hex::encode(0u64.to_le_bytes()))),
+            ),
+        ]);
+        for (idx, nm) in notes.iter().enumerate() {
+            let key = indexed_durable_key(DURABLE_NOTE_PREFIX, idx as u64);
+            let encoded = canonical_wire::encode_published_note(&nm.cm, &nm.enc)
+                .expect("encode published note for mock");
+            routes.insert(
+                format!("/global/block/head/durable/wasm_2_0_0/length?key={key}"),
+                (200u16, format!("{}", encoded.len())),
+            );
+            routes.insert(
+                format!("/global/block/head/durable/wasm_2_0_0/value?key={key}"),
+                (200u16, format!("\"{}\"", hex::encode(&encoded))),
+            );
+        }
+        routes
+    }
+
+    /// Sentinel pre-existing → cmd_rollup_sync exits at the first checkpoint.
+    /// Confirms `w.scanned` advanced by exactly DEFAULT_CHECKPOINT_EVERY (the batch
+    /// boundary) when tree_size > DEFAULT_CHECKPOINT_EVERY, and reflects the full
+    /// tree_size when smaller.
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_exits_at_first_checkpoint_when_sentinel_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        let mut wallet = super::tests::test_wallet(1);
+        wallet.scanned = 0;
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let tree_size: u64 = (DEFAULT_CHECKPOINT_EVERY as u64) * 3;
+        let block_hash = "BLyieldsentinel";
+        let routes = sync_routes_for_window(
+            &wallet,
+            block_hash,
+            tree_size,
+            &std::collections::HashMap::new(),
+        );
+
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+
+        // Pre-create the sentinel: first checkpoint must exit cleanly.
+        let yield_path = wallet_yield_path(wallet_path_str);
+        std::fs::write(&yield_path, b"yield").expect("write sentinel");
+
+        cmd_rollup_sync(wallet_path_str, &profile, DEFAULT_CHECKPOINT_EVERY).expect("sync should yield without error");
+
+        let saved = load_wallet(wallet_path_str).expect("reload wallet");
+        assert_eq!(
+            saved.scanned, DEFAULT_CHECKPOINT_EVERY,
+            "yielded sync should land exactly one checkpoint"
+        );
+
+        // Sentinel is the daemon's responsibility to remove; the CLI does
+        // not touch it on exit.
+        assert!(yield_path.exists(), "CLI must not remove caller's sentinel");
+    }
+
+    /// Resume after a mid-scan yield. Sets the sentinel via the test hook
+    /// after the second checkpoint, then resumes. The recoverable note at
+    /// index 7 / 75 is found in run 1 (pre-yield); the recoverable note at
+    /// index 140 (post-yield) is found in run 2.
+    ///
+    /// **Tautology guard** (PR-#24 coverage audit, post-B1): the second
+    /// run uses a *restricted* mock where notes `[0..trigger_at)` return
+    /// 503. The correct shape — `cmd_rollup_sync` reads `w.scanned`
+    /// (= trigger_at after the first run) and resumes from there —
+    /// touches only notes `[trigger_at..tree_size)`, all of which are
+    /// served. A regression that resets `w.scanned = 0` at the top of
+    /// `cmd_rollup_sync` (the auditor's mutation) would re-issue
+    /// fetches for the restricted range and the second `cmd_rollup_sync`
+    /// call would Err out, failing this test loudly. Without this
+    /// restriction, the original test passed under that mutation
+    /// because both shapes converge on `final_state.scanned == tree_size`
+    /// after enough work — it didn't actually verify "resumed from".
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_resumes_from_checkpointed_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        let mut wallet = super::tests::test_wallet(1);
+        wallet.scanned = 0;
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        // Custom K=5 (not DEFAULT_CHECKPOINT_EVERY=50): the resume
+        // semantics are independent of K, and the smaller fixture
+        // means the per-note RPC + decode loop runs ~10x fewer times.
+        // CI runtime is bounded by the org-level workflow cap on
+        // ubuntu-latest; trimming this test from ~30s → ~3s buys
+        // headroom for the full unit-tests job.
+        let custom_k: usize = 5;
+        let tree_size: u64 = (custom_k as u64) * 3 + 2;
+        let block_hash = "BLresumecheckpoint";
+        let trigger_at = custom_k * 2;
+
+        let mut recoverable: std::collections::HashMap<u64, (u64, F)> =
+            std::collections::HashMap::new();
+        recoverable.insert(2, (101, felt_tag(b"resume-note-2")));
+        recoverable.insert(7, (202, felt_tag(b"resume-note-7")));
+        recoverable.insert(13, (303, felt_tag(b"resume-note-13")));
+
+        // Mock #1 — full route set for the first run.
+        let routes_full =
+            sync_routes_for_window(&wallet, block_hash, tree_size, &recoverable);
+        let url_full = super::tests::spawn_mock_http_server(routes_full);
+        let profile_full = super::tests::rollup_profile_for_url(&url_full);
+
+        // Trip the sentinel after the second checkpoint (cursor reaches
+        // 2 * custom_k). The hook fires at every checkpoint
+        // boundary just before the existence-check.
+        let yield_path = wallet_yield_path(wallet_path_str).to_path_buf();
+        let yield_clone = yield_path.clone();
+        set_sync_checkpoint_hook(move |_path, scanned| {
+            if scanned == trigger_at {
+                let _ = std::fs::write(&yield_clone, b"yield");
+            }
+        });
+
+        cmd_rollup_sync(wallet_path_str, &profile_full, custom_k)
+            .expect("first sync should yield");
+
+        let mid = load_wallet(wallet_path_str).expect("reload mid wallet");
+        assert_eq!(
+            mid.scanned, trigger_at,
+            "resume cursor must reflect the last completed checkpoint"
+        );
+        let recovered_run1: std::collections::HashSet<usize> =
+            mid.notes.iter().map(|n| n.index).collect();
+        assert!(
+            recovered_run1.contains(&2),
+            "note at index 2 must be recovered before yield"
+        );
+        assert!(
+            recovered_run1.contains(&7),
+            "note at index 7 must be recovered before yield"
+        );
+        assert!(
+            !recovered_run1.contains(&13),
+            "note at index 13 lies past the yield boundary and must NOT be recovered yet"
+        );
+
+        // Mock #2 — restricted: notes [0..trigger_at) return 503. The
+        // resume run MUST NOT re-fetch already-scanned indices; if it
+        // does (regression that ignores `w.scanned`), the 503 surfaces
+        // as an Err and the test fails.
+        let mut routes_restricted =
+            sync_routes_for_window(&wallet, block_hash, tree_size, &recoverable);
+        for i in 0..(trigger_at as u64) {
+            let note_key = indexed_durable_key(DURABLE_NOTE_PREFIX, i);
+            routes_restricted.insert(
+                format!(
+                    "/global/block/{}/durable/wasm_2_0_0/length?key={}",
+                    block_hash, note_key
+                ),
+                (503, "\"already scanned, must not be re-fetched\"".into()),
+            );
+            routes_restricted.insert(
+                format!(
+                    "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                    block_hash, note_key
+                ),
+                (503, "\"already scanned, must not be re-fetched\"".into()),
+            );
+        }
+        let url_restricted =
+            super::tests::spawn_mock_http_server(routes_restricted);
+        let profile_restricted =
+            super::tests::rollup_profile_for_url(&url_restricted);
+
+        // Resume: clear the sentinel and the hook; second run completes.
+        clear_sync_checkpoint_hook();
+        std::fs::remove_file(&yield_path).expect("remove sentinel");
+
+        cmd_rollup_sync(wallet_path_str, &profile_restricted, custom_k)
+            .expect("second sync should finish without re-fetching restricted indices");
+        let final_state = load_wallet(wallet_path_str).expect("reload final wallet");
+        assert_eq!(
+            final_state.scanned, tree_size as usize,
+            "second run must finish the scan"
+        );
+        let recovered_final: std::collections::HashSet<usize> =
+            final_state.notes.iter().map(|n| n.index).collect();
+        assert!(recovered_final.contains(&2));
+        assert!(recovered_final.contains(&7));
+        assert!(
+            recovered_final.contains(&13),
+            "note past the prior yield boundary must be recovered on resume"
+        );
+    }
+
+    /// Three-iteration yield-then-resume — mirrors `cmd_rollup_sync_watch`'s
+    /// loop body (`loop { cmd_rollup_sync(); sleep(); }`) without
+    /// invoking the loop directly (the watch fn has no clean escape
+    /// short of an error). Drives a sentinel that persists across two
+    /// consecutive iterations, then is removed before the third —
+    /// asserts cumulative state (`w.scanned`, `w.notes`) advances
+    /// correctly through repeated yields without corruption.
+    ///
+    /// The load-bearing property: `seen_cms` is per-`cmd_rollup_sync`
+    /// call (not process-global), but finalize reseeds `known_cms` with
+    /// `w.notes.iter().map(|n| n.cm)` — so notes recovered in iter 1
+    /// remain observed for the iter 3 prune even though that iteration's
+    /// `seen_cms` only carries iter 3's batch. A regression that moved
+    /// `seen_cms` to a process-local accumulator (or stopped folding
+    /// `w.notes` into `known_cms`) would surface here.
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_watch_loop_body_yields_twice_then_finishes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        let mut wallet = super::tests::test_wallet(1);
+        wallet.scanned = 0;
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        // Custom K=5 (not DEFAULT_CHECKPOINT_EVERY=50): the
+        // three-iteration yield semantics are independent of K, but
+        // the per-note RPC + decode loop scales with `tree_size`. CI
+        // runtime is bounded by an org-level workflow cap on
+        // ubuntu-latest; trimming this test from ~70s → ~7s buys
+        // headroom. Same shape as the resume test above.
+        let custom_k: usize = 5;
+        let tree_size: u64 = (custom_k as u64) * 3 + 2;
+        let block_hash = "BLwatchloop";
+
+        // Recoverable notes spread across all three iterations so the
+        // test can assert progressive recovery.
+        let mut recoverable: std::collections::HashMap<u64, (u64, F)> =
+            std::collections::HashMap::new();
+        recoverable.insert(2, (101, felt_tag(b"watch-loop-note-iter1")));
+        recoverable.insert(
+            custom_k as u64 + 1,
+            (202, felt_tag(b"watch-loop-note-iter2")),
+        );
+        recoverable.insert(
+            (custom_k as u64) * 2 + 1,
+            (303, felt_tag(b"watch-loop-note-iter3")),
+        );
+
+        let routes =
+            sync_routes_for_window(&wallet, block_hash, tree_size, &recoverable);
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+
+        // Sentinel persists for iter 1 and iter 2. Use legacy `b"yield"`
+        // content so the CLI treats it as live (no stale-PID unlink
+        // races to coordinate against in this test).
+        let yield_path = wallet_yield_path(wallet_path_str);
+        std::fs::write(&yield_path, b"yield").expect("seed sentinel");
+
+        // Iter 1: 0 → K, yield.
+        cmd_rollup_sync(wallet_path_str, &profile, custom_k)
+            .expect("iter 1 yields cleanly");
+        let after_iter1 = load_wallet(wallet_path_str).expect("reload after iter 1");
+        assert_eq!(
+            after_iter1.scanned, custom_k,
+            "iter 1 must yield exactly at the first checkpoint"
+        );
+        let recovered_iter1: std::collections::HashSet<usize> =
+            after_iter1.notes.iter().map(|n| n.index).collect();
+        assert!(
+            recovered_iter1.contains(&2),
+            "iter 1 must have recovered the in-batch note (index 2)"
+        );
+        assert!(
+            yield_path.exists(),
+            "CLI does not unlink a live sentinel — daemon owns its lifecycle"
+        );
+
+        // Iter 2: K → 2K, yield. Sentinel still present.
+        cmd_rollup_sync(wallet_path_str, &profile, custom_k)
+            .expect("iter 2 yields cleanly with sentinel still live");
+        let after_iter2 = load_wallet(wallet_path_str).expect("reload after iter 2");
+        assert_eq!(
+            after_iter2.scanned,
+            custom_k * 2,
+            "iter 2 must advance the cursor by another K"
+        );
+        let recovered_iter2: std::collections::HashSet<usize> =
+            after_iter2.notes.iter().map(|n| n.index).collect();
+        assert!(recovered_iter2.contains(&2), "iter 1 note must persist");
+        assert!(
+            recovered_iter2.contains(&(custom_k + 1)),
+            "iter 2 must have recovered its in-batch note"
+        );
+
+        // Iter 3: sentinel removed → scan finishes.
+        std::fs::remove_file(&yield_path).expect("remove sentinel before iter 3");
+        cmd_rollup_sync(wallet_path_str, &profile, custom_k)
+            .expect("iter 3 finishes the scan");
+        let final_state = load_wallet(wallet_path_str).expect("reload final");
+        assert_eq!(
+            final_state.scanned, tree_size as usize,
+            "iter 3 must reach tree_size"
+        );
+        let recovered_final: std::collections::HashSet<usize> =
+            final_state.notes.iter().map(|n| n.index).collect();
+        assert!(recovered_final.contains(&2));
+        assert!(recovered_final.contains(&(custom_k + 1)));
+        assert!(
+            recovered_final.contains(&(custom_k * 2 + 1)),
+            "iter 3 must have recovered the post-yield note"
+        );
+    }
+
+    /// Atomic-rename invariant: while the scan is running, a concurrent
+    /// reader observes only fully-formed wallet.json snapshots. Since
+    /// `save_wallet` writes to a temp file then atomic-renames, every read
+    /// must serde-parse cleanly — never a half-written file.
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_intermediate_wallet_is_always_parseable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap().to_string();
+
+        let mut wallet = super::tests::test_wallet(1);
+        wallet.scanned = 0;
+        save_wallet(&wallet_path_str, &wallet).expect("save wallet");
+
+        let tree_size: u64 = (DEFAULT_CHECKPOINT_EVERY as u64) * 4;
+        let block_hash = "BLatomicparse";
+        let routes = sync_routes_for_window(
+            &wallet,
+            block_hash,
+            tree_size,
+            &std::collections::HashMap::new(),
+        );
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_reader = stop.clone();
+        let reader_path = wallet_path_str.clone();
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0usize;
+            while !stop_reader.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Ok(data) = std::fs::read_to_string(&reader_path) {
+                    let parsed: Result<WalletFile, _> = serde_json::from_str(&data);
+                    assert!(
+                        parsed.is_ok(),
+                        "intermediate wallet.json must always parse: {:?}",
+                        parsed.err()
+                    );
+                    reads += 1;
+                }
+                std::thread::yield_now();
+            }
+            reads
+        });
+
+        cmd_rollup_sync(&wallet_path_str, &profile, DEFAULT_CHECKPOINT_EVERY).expect("sync should finish");
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let reads = reader.join().expect("reader thread");
+        assert!(
+            reads > 0,
+            "reader thread must have observed at least one snapshot"
+        );
+
+        let final_state = load_wallet(&wallet_path_str).expect("reload final wallet");
+        assert_eq!(final_state.scanned, tree_size as usize);
+    }
+
+    /// `cmd_rollup_sync` rejects `checkpoint_every = 0` early with a
+    /// clear error message. Without this guard the inner `while
+    /// w.scanned < tree_size` loop would compute `batch_end =
+    /// w.scanned + 0 = w.scanned`, do zero work, never advance, and
+    /// loop forever — a footgun in the CLI flag default that's
+    /// trivially bypassable. Locks the validation contract so a future
+    /// refactor can't silently drop the check.
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_refuses_zero_checkpoint_every() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().expect("utf8 path");
+
+        let wallet = super::tests::test_wallet(1);
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        // We don't even need a live mock-rollup — the validation must
+        // fire before any RPC call. Use a profile pointing at a
+        // deliberately-unreachable port to make this guarantee
+        // explicit (a regression that lets the loop start would hang
+        // on the connect, not pass).
+        let profile = super::tests::rollup_profile_for_url("http://127.0.0.1:1");
+
+        let err = cmd_rollup_sync(wallet_path_str, &profile, 0)
+            .expect_err("checkpoint_every = 0 must be rejected");
+        assert!(
+            err.contains("--checkpoint-every must be > 0"),
+            "expected clear validation error, got: {err}",
+        );
+    }
+
+    /// `cmd_rollup_sync` honours the runtime `checkpoint_every` parameter,
+    /// not a hardcoded constant. Trips the sentinel via the test hook
+    /// after the second batch boundary at K=7 (cursor=14) and asserts
+    /// `wallet.json.scanned == 14` exactly. Without this test, a future
+    /// regression that ignored the parameter and used `DEFAULT_CHECKPOINT_EVERY`
+    /// internally would still pass every other cooperative-yield test
+    /// (they all use the default). The `serial` attribute groups it
+    /// with the other hook-using tests so the process-global
+    /// `SYNC_CHECKPOINT_HOOK` is not raced.
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_respects_custom_checkpoint_every() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        let mut wallet = super::tests::test_wallet(1);
+        wallet.scanned = 0;
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let custom_k: usize = 7;
+        let trigger_at: usize = custom_k * 2;
+        let tree_size: u64 = (custom_k as u64) * 5;
+        let block_hash = "BLcustomk";
+
+        let recoverable = std::collections::HashMap::new();
+        let routes = sync_routes_for_window(&wallet, block_hash, tree_size, &recoverable);
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+
+        let yield_path = wallet_yield_path(wallet_path_str).to_path_buf();
+        let yield_clone = yield_path.clone();
+        set_sync_checkpoint_hook(move |_path, scanned| {
+            if scanned == trigger_at {
+                let _ = std::fs::write(&yield_clone, b"yield");
+            }
+        });
+
+        cmd_rollup_sync(wallet_path_str, &profile, custom_k)
+            .expect("sync should yield without error");
+
+        let saved = load_wallet(wallet_path_str).expect("reload wallet");
+        assert_eq!(
+            saved.scanned, trigger_at,
+            "yielded sync at K={custom_k} must land exactly on the K-aligned cursor"
+        );
+
+        clear_sync_checkpoint_hook();
+        let _ = std::fs::remove_file(&yield_path);
+    }
+
+    /// HTTP error mid-batch: a 5xx from the rollup-rpc partway through
+    /// the scan must (a) propagate as Err to the caller, (b) leave
+    /// `wallet.json.scanned` at the last successful checkpoint
+    /// boundary (NOT at the failed cursor — that would risk a corrupt
+    /// JSON write), and (c) not touch the sentinel either way (the
+    /// daemon owns sentinel lifecycle, not the CLI).
+    ///
+    /// Walks-through: K=10, tree_size=35. Mock returns 503 on the
+    /// note value lookup at index 15 (within the second batch
+    /// [10..20)). First batch [0..10) succeeds and persists
+    /// `scanned = 10`. Second batch fails on its 6th iteration; the
+    /// in-RAM `w.scanned = 10` is never re-saved with a higher
+    /// value. Caller sees Err. wallet.json on disk shows scanned=10.
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_http_error_mid_batch_preserves_last_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        let mut wallet = super::tests::test_wallet(1);
+        wallet.scanned = 0;
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let custom_k: usize = 10;
+        let tree_size: u64 = 35;
+        let block_hash = "BLhttperror";
+
+        let recoverable = std::collections::HashMap::new();
+        let mut routes =
+            sync_routes_for_window(&wallet, block_hash, tree_size, &recoverable);
+
+        // Override one route in the second batch [10..20) to 503.
+        // The CLI fetches length-then-value; failing the value read
+        // is enough — the inner `?` aborts the whole sync.
+        let bad_key = indexed_durable_key(DURABLE_NOTE_PREFIX, 15);
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                block_hash, bad_key
+            ),
+            (503, "{\"error\":\"Service Unavailable\"}".to_string()),
+        );
+
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+
+        // Pre-create a sentinel-NOT marker: assert the CLI doesn't
+        // create the sentinel as part of error handling. We start
+        // with no sentinel; verify it's still absent after the run.
+        let yield_path = wallet_yield_path(wallet_path_str).to_path_buf();
+        assert!(!yield_path.exists(), "sentinel must not pre-exist");
+
+        let err = cmd_rollup_sync(wallet_path_str, &profile, custom_k)
+            .expect_err("sync must error on the 503");
+        assert!(
+            err.contains("sync failed") || err.contains("durable") || err.contains("HTTP"),
+            "error must reference the underlying RPC failure, got: {err}",
+        );
+
+        // Last successful checkpoint = first batch boundary (10).
+        let saved = load_wallet(wallet_path_str).expect("reload wallet");
+        assert_eq!(
+            saved.scanned, custom_k,
+            "scanned must reflect the last fully-completed batch (K={custom_k}), \
+             not the cursor where the error fired"
+        );
+
+        // CLI must NOT have touched the sentinel — daemon owns that.
+        assert!(
+            !yield_path.exists(),
+            "CLI must not create sentinel on error paths"
+        );
+    }
+
+    /// Panic mid-batch: a panic from the test hook (simulating any
+    /// unexpected unwind during the scan loop, e.g. a future Drop
+    /// that touches FS state) must NOT corrupt wallet.json. The
+    /// atomic-rename invariant guarantees the prior on-disk state
+    /// survives intact. After the panic the wallet is reloadable
+    /// and `scanned` reflects the last completed checkpoint.
+    ///
+    /// Drives: panic via `set_sync_checkpoint_hook` after the second
+    /// checkpoint (cursor=20 with K=10). Use `catch_unwind` to
+    /// observe the panic without aborting the test. Then reload
+    /// wallet.json and assert it parses + cursor==20.
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_panic_mid_batch_preserves_wallet_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap().to_string();
+
+        let mut wallet = super::tests::test_wallet(1);
+        wallet.scanned = 0;
+        save_wallet(&wallet_path_str, &wallet).expect("save wallet");
+
+        let custom_k: usize = 10;
+        let tree_size: u64 = 35;
+        let block_hash = "BLpanic";
+
+        let recoverable = std::collections::HashMap::new();
+        let routes = sync_routes_for_window(&wallet, block_hash, tree_size, &recoverable);
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+
+        let panic_at: usize = custom_k * 2;
+        set_sync_checkpoint_hook(move |_path, scanned| {
+            if scanned == panic_at {
+                panic!("simulated mid-batch unwind at scanned={scanned}");
+            }
+        });
+
+        let path_for_thread = wallet_path_str.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cmd_rollup_sync(&path_for_thread, &profile, custom_k)
+        }));
+        clear_sync_checkpoint_hook();
+
+        assert!(
+            result.is_err(),
+            "the hook must propagate panic out of cmd_rollup_sync"
+        );
+
+        // Wallet must still be parseable + cursor at the last
+        // completed checkpoint (the panic fires AFTER the
+        // save_wallet at scanned=panic_at, so panic_at IS the
+        // committed value).
+        let saved = load_wallet(&wallet_path_str).expect("wallet must still parse");
+        assert_eq!(
+            saved.scanned, panic_at,
+            "panic after checkpoint write must preserve the just-written cursor"
+        );
+    }
+
+    /// Stale-PID sentinel recovery: a daemon that crashed after
+    /// `touch <wallet>.yield` but before `rm` would otherwise leave
+    /// a permanent sentinel. Every subsequent sync would see it,
+    /// exit at the first checkpoint, make K commits of progress,
+    /// then exit again — wedged forever, identical to the
+    /// stale-WalletLock failure mode the existing
+    /// `is_stale_wallet_lock` recovery solves. Mirror the same
+    /// discipline: the daemon writes its PID into the sentinel; the
+    /// CLI checks `/proc/<pid>` and unlinks if dead.
+    ///
+    /// This test pre-creates the sentinel containing a guaranteed-dead
+    /// PID (1 = init, never the daemon; in a sandbox it's PID 1 of the
+    /// container, which on cargo-test is /proc/1 = the test runner —
+    /// so we use a high PID that's definitely not running). Then runs
+    /// sync against a small tree (K * 2). The CLI must remove the
+    /// sentinel, scan everything, and finish with `scanned == tree_size`.
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_recovers_from_stale_yield_sentinel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        let mut wallet = super::tests::test_wallet(1);
+        wallet.scanned = 0;
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let custom_k: usize = 10;
+        let tree_size: u64 = 25;
+        let block_hash = "BLstalepid";
+
+        let recoverable = std::collections::HashMap::new();
+        let routes = sync_routes_for_window(&wallet, block_hash, tree_size, &recoverable);
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+
+        // Pre-create the sentinel with a deliberately-dead PID. Spawn
+        // a trivial child, wait for it to exit, and use its
+        // freshly-reaped PID. Linux PID allocation is sequential —
+        // a just-reaped PID won't recycle until the allocator wraps
+        // (millions of fork()s away), so this is robust regardless of
+        // `kernel.pid_max` (default 32_768 on dev boxes, up to 4M on
+        // container hosts where a hardcoded `999999` could be live).
+        let yield_path = wallet_yield_path(wallet_path_str);
+        let dead_pid = freshly_dead_pid();
+        std::fs::write(&yield_path, format!("{}\n", dead_pid))
+            .expect("write stale sentinel");
+        assert!(yield_path.exists(), "sentinel must be present pre-sync");
+
+        cmd_rollup_sync(wallet_path_str, &profile, custom_k)
+            .expect("sync should complete after recovering from stale sentinel");
+
+        // Scan ran to completion despite the pre-existing sentinel.
+        let saved = load_wallet(wallet_path_str).expect("reload wallet");
+        assert_eq!(
+            saved.scanned, tree_size as usize,
+            "stale sentinel must not stop the sync; scan must reach tree_size"
+        );
+        // CLI removed the stale sentinel during recovery.
+        assert!(
+            !yield_path.exists(),
+            "stale sentinel must be unlinked during recovery"
+        );
+    }
+
+    /// Forward-compat for legacy / non-PID sentinel content (e.g.
+    /// existing tests that write `b"yield"`, or a daemon that hasn't
+    /// caught up to writing PIDs yet). Non-numeric content must be
+    /// treated as "live" — the CLI yields normally, just like the
+    /// pre-stale-recovery behaviour. Without this, deploying the new
+    /// CLI ahead of the new daemon would mis-classify every legacy
+    /// sentinel as "stale" and break preemption.
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_treats_legacy_sentinel_content_as_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        let mut wallet = super::tests::test_wallet(1);
+        wallet.scanned = 0;
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let custom_k: usize = 10;
+        let tree_size: u64 = 30;
+        let block_hash = "BLlegacy";
+
+        let recoverable = std::collections::HashMap::new();
+        let routes = sync_routes_for_window(&wallet, block_hash, tree_size, &recoverable);
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+
+        let yield_path = wallet_yield_path(wallet_path_str);
+        // Non-numeric: a real daemon hasn't migrated to PID-content yet,
+        // OR a test that pre-dates the recovery feature. Either way,
+        // CLI must yield (treat as live).
+        std::fs::write(&yield_path, b"yield").expect("write legacy sentinel");
+
+        cmd_rollup_sync(wallet_path_str, &profile, custom_k)
+            .expect("sync should yield without error on legacy sentinel");
+
+        let saved = load_wallet(wallet_path_str).expect("reload wallet");
+        assert_eq!(
+            saved.scanned, custom_k,
+            "legacy sentinel must trigger yield at the first checkpoint"
+        );
+        assert!(
+            yield_path.exists(),
+            "CLI must NOT unlink a live (non-PID) sentinel — the daemon owns lifecycle"
+        );
+    }
+
+    /// `--watch` + `--checkpoint-every 0`: the validation in
+    /// cmd_rollup_sync fires on the FIRST iteration (before any RPC
+    /// call), the `?` propagates, and `cmd_rollup_sync_watch`'s
+    /// outer `loop { cmd_rollup_sync(...)?; sleep; }` aborts cleanly.
+    /// No infinite loop, no spurious progress, error message
+    /// matches the validation surface.
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_watch_with_zero_checkpoint_every_aborts_first_iter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        let wallet = super::tests::test_wallet(1);
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        // Unreachable RPC URL — the validation must fire BEFORE any
+        // RPC call. If the loop ever reaches the outer iteration
+        // sleep, we'd deadline rather than fail-fast on the
+        // unreachable URL: the test would hang well past its
+        // budget. Asserts the validation is genuinely pre-RPC.
+        let profile = super::tests::rollup_profile_for_url("http://127.0.0.1:1");
+
+        // interval_secs=1 because the loop only sleeps if
+        // cmd_rollup_sync returns Ok — which it must NOT here.
+        let err = cmd_rollup_sync_watch(wallet_path_str, &profile, 1, 0)
+            .expect_err("watch + K=0 must abort before sleeping");
+        assert!(
+            err.contains("--checkpoint-every must be > 0"),
+            "watch must surface the same validation error as a one-shot sync, \
+             got: {err}",
+        );
+    }
+
+    /// `load_pool_balances_at_block` must read pool balances against the
+    /// caller-provided block_ref, NOT re-resolve `head` internally. This
+    /// is the consistency invariant `cmd_rollup_sync`'s finalize relies
+    /// on: nullifiers + pool balances must come from the same pinned
+    /// head as the note slice, otherwise a slow-lane drain that lands
+    /// between reads would silently evict a `pending_deposit` whose
+    /// `shielded_cm` was never observed in the same run.
+    ///
+    /// Drives two block hashes pointing at different pool-balance
+    /// values: the test asserts `_at_block(BL_old)` returns the OLD
+    /// value even when "head" would resolve to BL_new. A regression
+    /// that calls `head_hash()` inside the helper picks up NEW and
+    /// fails this test loudly.
+    #[test]
+    fn rollup_rpc_load_pool_balances_at_block_uses_pinned_block() {
+        use std::collections::HashMap;
+        let pkh: F = felt_tag(b"pool-pinned-test");
+        let pkh_hex = hex::encode(pkh);
+        let key = format!(
+            "{}{}/{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
+            pkh_hex
+        );
+
+        let block_old = "BLpinnedold";
+        let block_new = "BLpinnednew";
+        let value_old: u64 = 1_000_000;
+        let value_new: u64 = 5_000_000;
+        let bytes_old = value_old.to_le_bytes();
+        let bytes_new = value_new.to_le_bytes();
+
+        let mut routes: HashMap<String, (u16, String)> = HashMap::new();
+        // Head resolves to NEW: a regression that calls `self.head_hash()`
+        // inside the helper would pick this up and read NEW value
+        // (5_000_000), not OLD (1_000_000).
+        routes.insert(
+            "/global/block/head/hash".into(),
+            (200, format!("\"{}\"", block_new)),
+        );
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/length?key={}",
+                block_old, key
+            ),
+            (200, "8".into()),
+        );
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                block_old, key
+            ),
+            (200, format!("\"{}\"", hex::encode(bytes_old))),
+        );
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/length?key={}",
+                block_new, key
+            ),
+            (200, "8".into()),
+        );
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                block_new, key
+            ),
+            (200, format!("\"{}\"", hex::encode(bytes_new))),
+        );
+
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rpc = RollupRpc::new(&profile);
+        let pending = vec![PendingDeposit {
+            asset_id: ASSET_TEZ,
+            pubkey_hash: pkh,
+            blind: felt_tag(b"pool-pinned-blind"),
+            address_index: 0,
+            auth_domain: felt_tag(b"auth-domain-pinned"),
+            amount: 0,
+            operation_hash: None,
+            shielded_cm: None,
+        }];
+
+        let pinned = rpc
+            .load_pool_balances_at_block(block_old, &pending)
+            .expect("load_pool_balances_at_block must succeed");
+        let pinned_value = pinned.get(&(ASSET_TEZ, pkh)).copied();
+        assert_eq!(
+            pinned_value,
+            Some(value_old),
+            "_at_block must read the pinned block, not re-resolve head"
+        );
+    }
+
+    /// Mirror of `rollup_rpc_load_pool_balances_at_block_uses_pinned_block`
+    /// for `load_state_snapshot_at_block`. `cmd_wallet_check` reads both
+    /// helpers against the same captured `head_hash`; this test locks
+    /// the snapshot helper's pinned-block invariant the same way the
+    /// pool-balance test locks the balance helper's. Without it, a
+    /// regression that re-resolves head inside
+    /// `load_state_snapshot_at_block` would break the banner (mixed
+    /// auth-domain / required-fee snapshot vs pool view) and slip past
+    /// CI.
+    #[test]
+    fn rollup_rpc_load_state_snapshot_at_block_uses_pinned_block() {
+        use std::collections::HashMap;
+        let block_old = "BLsnapold";
+        let block_new = "BLsnapnew";
+        let auth_domain_old: F = felt_tag(b"auth-domain-snap-old");
+        let auth_domain_new: F = felt_tag(b"auth-domain-snap-new");
+        let empty_root: F = MerkleTree::from_leaves(vec![]).root();
+
+        let mut routes: HashMap<String, (u16, String)> = HashMap::new();
+        // Head resolves to NEW. A regression that calls `self.head_hash()`
+        // inside `load_state_snapshot_at_block` would pick up NEW and
+        // surface `auth_domain_new` instead of `auth_domain_old`.
+        routes.insert(
+            "/global/block/head/hash".into(),
+            (200, format!("\"{}\"", block_new)),
+        );
+
+        for (block, dom) in [
+            (block_old, auth_domain_old),
+            (block_new, auth_domain_new),
+        ] {
+            // block_level — both blocks at level 100; required_tx_fee
+            // chain falls back to 0 because LAST_INPUT_LEVEL is null.
+            routes.insert(
+                format!("/global/block/{}/level", block),
+                (200, "100".into()),
+            );
+            // tree_size = 0 ⇒ no per-note URL routes needed.
+            routes.insert(
+                format!(
+                    "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                    block, DURABLE_TREE_SIZE
+                ),
+                (200, format!("\"{}\"", hex::encode(0u64.to_le_bytes()))),
+            );
+            // tree_root = empty-tree root (matches what
+            // `load_state_snapshot_at_block` recomputes from zero notes).
+            routes.insert(
+                format!(
+                    "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                    block, DURABLE_TREE_ROOT
+                ),
+                (200, format!("\"{}\"", hex::encode(empty_root))),
+            );
+            // auth_domain — DIFFERENT between blocks (the differentiator).
+            routes.insert(
+                format!(
+                    "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                    block, DURABLE_AUTH_DOMAIN
+                ),
+                (200, format!("\"{}\"", hex::encode(dom))),
+            );
+            // Optional reads return null ⇒ required_tx_fee = 0.
+            for opt_key in [
+                DURABLE_LAST_INPUT_LEVEL,
+                DURABLE_PRIVATE_TX_FEE_LEVEL,
+                DURABLE_PRIVATE_TX_COUNT_IN_LEVEL,
+            ] {
+                routes.insert(
+                    format!(
+                        "/global/block/{}/durable/wasm_2_0_0/length?key={}",
+                        block, opt_key
+                    ),
+                    (200, "null".into()),
+                );
+            }
+        }
+
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rpc = RollupRpc::new(&profile);
+
+        let snap = rpc
+            .load_state_snapshot_at_block(block_old)
+            .expect("load_state_snapshot_at_block must succeed");
+        assert_eq!(
+            snap.auth_domain, auth_domain_old,
+            "_at_block must read auth_domain at the pinned block, not the re-resolved head"
+        );
+        assert_eq!(
+            snap.tree.leaves.len(),
+            0,
+            "tree_size = 0 ⇒ snapshot has no notes"
+        );
+        // Note: `required_tx_fee` is the same for both blocks (idle
+        // fee-level chain ⇒ count=0 ⇒ base fee), so it can't
+        // distinguish pinned-vs-re-resolved here. The auth_domain
+        // assertion above is the load-bearing one.
+    }
+
+    /// E2E regression for the `cmd_rollup_sync` finalize call site.
+    /// Drives a full sync against a stateful mock whose `/head/hash`
+    /// route returns `block_old` on the first read (so the function
+    /// pins to it) and `block_new` on every subsequent read. The
+    /// scan must drive at least one batch through the loop AND the
+    /// `pending_deposit.shielded_cm` must match a cm observed in
+    /// that batch's `seen_cms`, otherwise the eviction predicate
+    /// `drained_on_chain && cm_observed` cannot fire and the test
+    /// is tautological (cf. PR-#24 review B1: an earlier draft of
+    /// this test had `tree_size = 0` + `shielded_cm = None` and
+    /// passed under the regression — load-bearing assertion was
+    /// dead).
+    ///
+    /// Setup driving the load-bearing path:
+    ///   - tree_size = 1, one published note at index 0 wrapping
+    ///     `observed_cm` (a stable felt the test pre-computes).
+    ///   - `wallet.pending_deposits[0].shielded_cm = Some(observed_cm)`
+    ///     so finalize evaluates `cm_observed = true`.
+    ///   - block_old: pool funded at 1 ꜩ (the truth pinned by sync).
+    ///   - block_new: pool drained (length null, returns 0 ⇒
+    ///     `drained_on_chain = true`).
+    ///
+    /// Correct shape: head pinned to block_old at the top, pool
+    /// reads at block_old → funded → deposit retained. Counter
+    /// resolves head exactly once.
+    ///
+    /// Regression (`load_pool_balances_at_head` at the finalize
+    /// call site): head re-resolved during finalize → block_new
+    /// → pool drained → `drained_on_chain && cm_observed` ⇒ true ⇒
+    /// deposit evicted → `pending_deposits.len() == 0` ⇒ assertion
+    /// fails. Verified mechanically by reverting line 7972 of the
+    /// commit being asserted, running this test, observing failure,
+    /// then restoring.
+    #[test]
+    #[serial_test::serial(sync_checkpoint_hook)]
+    fn cmd_rollup_sync_pins_pool_reads_to_finalize_head() {
+        use std::collections::HashMap;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let block_old = "BLfinalizeold";
+        let block_new = "BLfinalizenew";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        // Pre-compute the cm we will publish at index 0 AND wire as
+        // the deposit's `shielded_cm`. This is the load-bearing
+        // coupling: the batch scan pushes `observed_cm` into
+        // `seen_cms`, finalize sees `cm_observed = true`, and pool
+        // reads at the regression's `block_new` (drained) would then
+        // satisfy `drained_on_chain && cm_observed` ⇒ eviction.
+        let observed_cm: F = felt_tag(b"e2e-finalize-observed-cm");
+
+        let mut wallet = super::tests::test_wallet(1);
+        wallet.scanned = 0;
+        let pkh = felt_tag(b"finalize-pin-pool-pkh");
+        wallet.pending_deposits.push(PendingDeposit {
+            asset_id: ASSET_TEZ,
+            pubkey_hash: pkh,
+            blind: felt_tag(b"finalize-pin-blind"),
+            address_index: 0,
+            auth_domain: felt_tag(b"finalize-pin-auth"),
+            amount: 1_000_000,
+            operation_hash: None,
+            shielded_cm: Some(observed_cm),
+        });
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        // Encode a published-note wrapping `observed_cm`. Any enc
+        // payload works (this note is non-recoverable from the
+        // wallet's keys; what matters is the cm flowing into
+        // `seen_cms`, which `apply_scan_feed_recover_batch` does
+        // unconditionally).
+        let filler_nm = super::tests::note_memo_for_wallet_address(
+            &wallet,
+            0,
+            1,
+            felt_tag(b"finalize-pin-filler-rseed"),
+            None,
+        );
+        let note_bytes = canonical_wire::encode_published_note(&observed_cm, &filler_nm.enc)
+            .expect("published note encodes");
+        let note_key = indexed_durable_key(DURABLE_NOTE_PREFIX, 0);
+
+        let pkh_hex = hex::encode(pkh);
+        let pool_key =
+            format!(
+            "{}{}/{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
+            pkh_hex
+        );
+        let value_old: u64 = 1_000_000;
+        let tree_size: u64 = 1;
+
+        let mut routes: HashMap<String, (u16, String)> = HashMap::new();
+        // Mirror the same per-block durable shape on both blocks so
+        // the regression-induced re-resolution doesn't 404 on tree /
+        // nullifier reads — the failure must surface specifically at
+        // the pool-balance read, not as a generic RPC error.
+        for block in [block_old, block_new] {
+            routes.insert(
+                format!(
+                    "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                    block, DURABLE_TREE_SIZE
+                ),
+                (200, format!("\"{}\"", hex::encode(tree_size.to_le_bytes()))),
+            );
+            routes.insert(
+                format!(
+                    "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                    block, DURABLE_NULLIFIER_COUNT
+                ),
+                (200, format!("\"{}\"", hex::encode(0u64.to_le_bytes()))),
+            );
+            routes.insert(
+                format!(
+                    "/global/block/{}/durable/wasm_2_0_0/length?key={}",
+                    block, note_key
+                ),
+                (200, note_bytes.len().to_string()),
+            );
+            routes.insert(
+                format!(
+                    "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                    block, note_key
+                ),
+                (200, format!("\"{}\"", hex::encode(&note_bytes))),
+            );
+        }
+        // Pool balance — funded at block_old (length=8 + value=1_000_000),
+        // drained at block_new (length=null, helper returns 0 ⇒
+        // `drained_on_chain = true`).
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/length?key={}",
+                block_old, pool_key
+            ),
+            (200, "8".into()),
+        );
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                block_old, pool_key
+            ),
+            (200, format!("\"{}\"", hex::encode(value_old.to_le_bytes()))),
+        );
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/length?key={}",
+                block_new, pool_key
+            ),
+            (200, "null".into()),
+        );
+
+        // Stateful listener: head/hash uses a counter; everything else
+        // falls back to the routes HashMap.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock http server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_thread = counter.clone();
+        let block_old_owned = block_old.to_string();
+        let block_new_owned = block_new.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                use std::io::{Read, Write};
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buffer = [0u8; 8192];
+                let read = match stream.read(&mut buffer) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                if read == 0 {
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let (status, body) = if path == "/global/block/head/hash" {
+                    let n = counter_thread.fetch_add(1, Ordering::SeqCst);
+                    let block = if n == 0 {
+                        &block_old_owned
+                    } else {
+                        &block_new_owned
+                    };
+                    (200u16, format!("\"{}\"", block))
+                } else {
+                    routes
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_else(|| (404, "null".to_string()))
+                };
+                let response = format!(
+                    "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let base_url = format!("http://{}", addr);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+
+        cmd_rollup_sync(wallet_path_str, &profile, DEFAULT_CHECKPOINT_EVERY)
+            .expect("sync should finish on a stable empty tree");
+
+        let saved = load_wallet(wallet_path_str).expect("reload wallet");
+        // The pool was funded at block_old (the pinned head). The
+        // pending_deposit must still be there. If a regression has
+        // finalize re-resolve head (which now serves block_new where
+        // the pool is drained), the deposit gets evicted as "drained
+        // pending prune" and this assertion fails.
+        assert_eq!(
+            saved.pending_deposits.len(),
+            1,
+            "finalize must read pool balances at the pinned block_old (funded), \
+             NOT a re-resolved block_new (drained); regression evicts the deposit"
+        );
+        assert_eq!(
+            saved.pending_deposits[0].pubkey_hash, pkh,
+            "the surviving pending_deposit must be the one we set up"
+        );
+        // Strong sanity: `cmd_rollup_sync` MUST resolve
+        // `head_hash()` exactly once and pin the result for every
+        // subsequent read. Any future regression that re-introduces
+        // a head-resolving call inside the loop or finalize will
+        // bump this counter — and a single extra resolution lands
+        // on `block_new` (drained), satisfying the eviction predicate
+        // and failing the `pending_deposits` assertion above too.
+        // We keep both checks because they fail differently
+        // (resolution count tells you WHERE to look; eviction tells
+        // you the SHAPE of the bug).
+        let resolutions = counter.load(Ordering::SeqCst);
+        assert_eq!(
+            resolutions, 1,
+            "cmd_rollup_sync must resolve head/hash exactly once (pinned thereafter); \
+             got {} resolutions — a head-resolving helper crept back into the call path",
+            resolutions
+        );
+    }
+
+    /// Companion to `cmd_rollup_sync_pins_pool_reads_to_finalize_head`:
+    /// proves the fixture's failure mechanism is REAL (not tautological)
+    /// without touching the production call site. Builds the same
+    /// stateful mock + same wallet shape, then invokes
+    /// `load_pool_balances_at_head` (the head-resolving helper, what
+    /// the regression would call) followed by `apply_scan_feed_finalize`
+    /// with `seen_cms = [observed_cm]`. The pool resolves to `block_new`
+    /// (drained) → `drained_on_chain && cm_observed` ⇒ deposit evicted.
+    ///
+    /// This test exists because PR-#24 reviewers caught an earlier
+    /// version of the e2e test where the eviction predicate could
+    /// never fire (`shielded_cm = None` ⇒ `cm_observed` always
+    /// false), making the load-bearing assertion dead. By asserting
+    /// here that the same fixture, when fed through the regression
+    /// helper, DOES evict, we lock in that the e2e test's
+    /// assertion is exercising a live mechanism.
+    #[test]
+    fn fixture_for_finalize_pin_test_actually_evicts_under_regression_helper() {
+        use std::collections::HashMap;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let block_old = "BLfixturetestold";
+        let block_new = "BLfixturetestnew";
+        let observed_cm: F = felt_tag(b"e2e-finalize-observed-cm-fixture");
+
+        let mut wallet = super::tests::test_wallet(1);
+        let pkh = felt_tag(b"finalize-pin-pool-pkh-fixture");
+        wallet.pending_deposits.push(PendingDeposit {
+            asset_id: ASSET_TEZ,
+            pubkey_hash: pkh,
+            blind: felt_tag(b"finalize-pin-blind-fixture"),
+            address_index: 0,
+            auth_domain: felt_tag(b"finalize-pin-auth-fixture"),
+            amount: 1_000_000,
+            operation_hash: None,
+            shielded_cm: Some(observed_cm),
+        });
+
+        let pkh_hex = hex::encode(pkh);
+        let pool_key =
+            format!(
+            "{}{}/{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
+            pkh_hex
+        );
+        let value_old: u64 = 1_000_000;
+
+        let mut routes: HashMap<String, (u16, String)> = HashMap::new();
+        // block_old: pool funded.
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/length?key={}",
+                block_old, pool_key
+            ),
+            (200, "8".into()),
+        );
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/value?key={}",
+                block_old, pool_key
+            ),
+            (200, format!("\"{}\"", hex::encode(value_old.to_le_bytes()))),
+        );
+        // block_new: pool drained.
+        routes.insert(
+            format!(
+                "/global/block/{}/durable/wasm_2_0_0/length?key={}",
+                block_new, pool_key
+            ),
+            (200, "null".into()),
+        );
+
+        // Stateful listener: head_old first, head_new thereafter.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock http server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_thread = counter.clone();
+        let block_old_owned = block_old.to_string();
+        let block_new_owned = block_new.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                use std::io::{Read, Write};
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buffer = [0u8; 8192];
+                let read = match stream.read(&mut buffer) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                if read == 0 {
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let (status, body) = if path == "/global/block/head/hash" {
+                    let n = counter_thread.fetch_add(1, Ordering::SeqCst);
+                    let block = if n == 0 {
+                        &block_old_owned
+                    } else {
+                        &block_new_owned
+                    };
+                    (200u16, format!("\"{}\"", block))
+                } else {
+                    routes
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_else(|| (404, "null".to_string()))
+                };
+                let response = format!(
+                    "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let base_url = format!("http://{}", addr);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rpc = RollupRpc::new(&profile);
+
+        // Burn one head/hash resolution to mimic the "scan ran first
+        // and pinned to block_old" preamble.
+        let pinned = rpc.head_hash().expect("first head/hash resolves to old");
+        assert_eq!(pinned, block_old, "first resolution serves block_old");
+
+        // Now invoke the REGRESSION helper — which re-resolves head,
+        // landing on block_new (drained).
+        let drained_pool = rpc
+            .load_pool_balances_at_head(&wallet.pending_deposits)
+            .expect("regression helper succeeds");
+        assert_eq!(
+            drained_pool.get(&(ASSET_TEZ, pkh)).copied().unwrap_or(0),
+            0,
+            "regression read at block_new must see drained pool"
+        );
+
+        // Feed that drained view into finalize with the observed cm
+        // present in seen_cms — exactly the path the e2e test
+        // protects against.
+        let seen_cms = vec![observed_cm];
+        let summary =
+            apply_scan_feed_finalize(&mut wallet, &seen_cms, vec![], &drained_pool);
+        assert_eq!(
+            wallet.pending_deposits.len(),
+            0,
+            "fixture must demonstrate the regression actually evicts \
+             the deposit; if it doesn't, the sibling e2e test is \
+             tautological and protects nothing"
+        );
+        assert_eq!(
+            summary.pruned_drained_pools, 1,
+            "finalize must report exactly the one regression-induced eviction"
+        );
+    }
+
+    fn build_recoverable_notes(wallet: &WalletFile, count: usize) -> Vec<NoteMemo> {
+        (0..count)
+            .map(|i| {
+                let mut rseed = ZERO;
+                rseed[0] = (i & 0xff) as u8;
+                rseed[1] = ((i >> 8) & 0xff) as u8;
+                let mut note_memo = super::tests::note_memo_for_wallet_address(
+                    wallet,
+                    0,
+                    100 + i as u64,
+                    rseed,
+                    Some(format!("memo-{i}").as_bytes()),
+                );
+                note_memo.index = i;
+                note_memo
+            })
+            .collect()
+    }
+
+    /// Guards `TZEL_SYNC_CONCURRENCY` env mutations from racing other
+    /// tests reading the same env. cargo-test runs in-binary tests in
+    /// parallel; without the mutex, one test setting N=1 could leak into
+    /// another's read.
+    fn sync_concurrency_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GUARD.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap()
+    }
+
+    /// 2.A test #1: scanning the same window with `TZEL_SYNC_CONCURRENCY=1`
+    /// and `=8` must yield byte-for-byte the same `NotesFeedResp`.
+    /// Validates that out-of-order completion is reassembled correctly.
+    #[test]
+    fn concurrent_fetch_returns_same_results_as_sequential() {
+        let _guard = sync_concurrency_env_guard();
+        let wallet = super::tests::test_wallet(1);
+        let memos = build_recoverable_notes(&wallet, 100);
+
+        let routes = mock_routes_for_direct_notes(&memos);
+        let base_url = super::tests::spawn_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        // Sequential
+        std::env::set_var(SYNC_CONCURRENCY_ENV, "1");
+        let seq_feed = rollup
+            .load_notes_since(0)
+            .expect("sequential load should succeed");
+        // Concurrent
+        std::env::set_var(SYNC_CONCURRENCY_ENV, "8");
+        let conc_feed = rollup
+            .load_notes_since(0)
+            .expect("concurrent load should succeed");
+        std::env::remove_var(SYNC_CONCURRENCY_ENV);
+
+        assert_eq!(seq_feed.next_cursor, conc_feed.next_cursor);
+        assert_eq!(seq_feed.notes.len(), 100);
+        assert_eq!(conc_feed.notes.len(), 100);
+        for (a, b) in seq_feed.notes.iter().zip(conc_feed.notes.iter()) {
+            assert_eq!(a.index, b.index);
+            assert_eq!(a.cm, b.cm);
+            assert_eq!(a.enc.tag, b.enc.tag);
+            assert_eq!(a.enc.ct_d, b.enc.ct_d);
+            assert_eq!(a.enc.ct_v, b.enc.ct_v);
+            assert_eq!(a.enc.nonce, b.enc.nonce);
+            assert_eq!(a.enc.encrypted_data, b.enc.encrypted_data);
+        }
+        // Indices should also still be strictly monotonic — out-of-order
+        // arrival from the unordered futures must not bleed into the
+        // returned vector.
+        for (i, nm) in conc_feed.notes.iter().enumerate() {
+            assert_eq!(nm.index, i);
+        }
+    }
+
+    /// 2.A test #2: a 5xx on a single durable read must abort the entire
+    /// concurrent batch. The error message must mention an HTTP status so
+    /// callers (and `tzel-wallet check`) can route it to the right
+    /// diagnostic; it must NOT contain note-decrypt phrasing (we never
+    /// reached the post-fetch decode step).
+    ///
+    /// Post-#25 review S5 strengthening: previously this test only
+    /// asserted "an error came back". A "drain all in-flight before
+    /// propagating" refactor would still satisfy that. The strengthened
+    /// version uses a counted mock server and asserts that the number of
+    /// HTTP requests *actually served* is strictly less than the upper
+    /// bound of "every index was probed once", which proves cancellation
+    /// short-circuited rather than draining.
+    #[test]
+    fn concurrent_fetch_aborts_on_5xx() {
+        let _guard = sync_concurrency_env_guard();
+        let wallet = super::tests::test_wallet(1);
+        // Bigger fixture (50 notes, sabotage at index 7) so a "drain
+        // everything" refactor would serve >> the early-abort baseline.
+        // At concurrency=4, a correct abort serves at most ~12 length
+        // probes (concurrency in flight + the indices already
+        // dispatched up to index 7) before short-circuiting.
+        let memos = build_recoverable_notes(&wallet, 50);
+        let mut routes = mock_routes_for_direct_notes(&memos);
+
+        // Sabotage the length probe for index 7. The concurrent path's
+        // first request per index is the direct-key length probe; making
+        // that 503 is the cleanest "fetch failed mid-batch" signal.
+        let bad_key = indexed_durable_key(DURABLE_NOTE_PREFIX, 7);
+        routes.insert(
+            format!("/global/block/head/durable/wasm_2_0_0/length?key={bad_key}"),
+            (503, "internal".into()),
+        );
+
+        let (base_url, served) = super::tests::spawn_counted_mock_http_server(routes);
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        let rollup = RollupRpc::new(&profile);
+
+        std::env::set_var(SYNC_CONCURRENCY_ENV, "4");
+        let err = rollup
+            .load_notes_since(0)
+            .expect_err("concurrent fetch must propagate the 5xx");
+        std::env::remove_var(SYNC_CONCURRENCY_ENV);
+
+        assert!(
+            err.contains("503"),
+            "expected error to mention HTTP 503, got: {err}"
+        );
+        assert!(
+            err.contains("rollup RPC"),
+            "expected error to attribute the failure to a rollup RPC URL, got: {err}"
+        );
+
+        // Allow a brief drain window for in-flight responses already
+        // queued on the network. Then confirm cancellation actually
+        // short-circuited: a "drain everything before propagating"
+        // refactor would serve roughly 50 length probes + 50 value
+        // fetches = ~100 requests. A correct abort serves dramatically
+        // fewer (the pipeline-depth bound is ~concurrency-in-flight on
+        // top of the indices 0..=7 the dispatcher had already enqueued
+        // by the time index 7's 503 came back).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let n = served.load(std::sync::atomic::Ordering::SeqCst);
+        let total_indices = memos.len();
+        // Two requests per index would be ~100 served on a "drain"
+        // refactor. Even being generous to schedule jitter, half that
+        // is well above any plausible early-abort path.
+        assert!(
+            n < total_indices,
+            "abort must short-circuit before serving every index; \
+             served={n} requests for {total_indices} indices (a 'drain' \
+             refactor would have served ~{} or more)",
+            total_indices,
+        );
+    }
+
+    /// 2.A B3 test: a single `reqwest::Client` survives multiple
+    /// sequential batches via `SyncFetcher`. Without this, `cmd_rollup_sync`
+    /// would rebuild the client (and re-warm the connection pool) on every
+    /// per-K-commit batch — at K=50 across a 67k-commit sync that's ~1340
+    /// cold-start handshakes the design doc claimed were amortised away.
+    ///
+    /// Counts served HTTP requests across two back-to-back fetches: each
+    /// note triggers a length probe + a value probe = 2 requests, so two
+    /// 10-note batches should serve exactly 40. The test cares that the
+    /// SECOND batch lands without rebuilding any client; if `SyncFetcher`
+    /// were respawned per batch, the test would still pass on counts but
+    /// the timing model the design doc describes would be wrong. The
+    /// stronger contract — "same `SyncFetcher` instance services both" —
+    /// is enforced by reusing the binding across both calls below; a
+    /// future refactor that drops the client per call would force this
+    /// test to be re-shaped, which is exactly the kind of compile-time
+    /// signal we want.
+    #[test]
+    #[serial_test::serial(sync_fetcher_new_count)]
+    fn sync_fetcher_amortises_client_across_batches() {
+        // Snapshot the global `SyncFetcher::new` counter before the
+        // test. A correct implementation calls `SyncFetcher::new` once
+        // per `cmd_rollup_sync` invocation (here: once for both
+        // batches); a regression that rebuilds it per batch bumps the
+        // counter twice. Counter is gated on `#[serial(...)]` so two
+        // concurrent tests sharing this static do not stomp each
+        // other.
+        let new_before =
+            SYNC_FETCHER_NEW_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+
+        let wallet = super::tests::test_wallet(1);
+        let memos = build_recoverable_notes(&wallet, 10);
+        let routes = mock_routes_for_direct_notes(&memos);
+
+        let (base_url, served) = super::tests::spawn_counted_mock_http_server(routes);
+        let fetcher = SyncFetcher::new(4).expect("SyncFetcher init");
+        let indices: Vec<u64> = (0..10).collect();
+
+        let r1 = fetcher
+            .fetch(&base_url, "head", &indices, 4)
+            .expect("first fetch");
+        assert_eq!(r1.len(), 10);
+        let n_after_first = served.load(std::sync::atomic::Ordering::SeqCst);
+
+        let r2 = fetcher
+            .fetch(&base_url, "head", &indices, 4)
+            .expect("second fetch");
+        assert_eq!(r2.len(), 10);
+        let n_after_second = served.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            r1, r2,
+            "two back-to-back fetches against the same window must produce identical results"
+        );
+        // 1 length + 1 value per index per call ⇒ exactly 20 served per call.
+        assert_eq!(
+            n_after_first, 20,
+            "first batch should serve exactly 1 length + 1 value per index"
+        );
+        assert_eq!(
+            n_after_second - n_after_first,
+            20,
+            "second batch should serve exactly 1 length + 1 value per index"
+        );
+
+        // **Load-bearing amortisation assertion** (post-#25-review):
+        // exactly one `SyncFetcher::new` call backed both fetches. A
+        // regression that constructs a fresh `SyncFetcher` per batch
+        // would surface here as `delta == 2`, and `cmd_rollup_sync`
+        // would lose the TLS+runtime+worker-thread amortisation across
+        // batches (the storm described in PR #25 review B3).
+        let new_after =
+            SYNC_FETCHER_NEW_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            new_after - new_before,
+            1,
+            "exactly one SyncFetcher must service both batches; \
+             a per-batch rebuild would bump the counter to 2"
+        );
+
+        // SyncFetcher is dropped here ⇒ worker thread receives Shutdown
+        // and joins. If the channel had been closed early or the runtime
+        // had panicked, the next fetch would hang or error; the test
+        // body finishing without timeout is the live-fetcher signal.
+        drop(fetcher);
+    }
+
+    /// 2.C test (post-#25 review B1 rewrite): rayon parallel
+    /// `try_recover_note` must return the same `Note`s as a single-threaded
+    /// run AND must match an independent fixture-time oracle.
+    ///
+    /// Pre-fix shape (replaced): the test compared sequential
+    /// `apply_scan_feed` against parallel `apply_scan_feed`. Both branches
+    /// went through the same function, so a regression that dropped half
+    /// the recoveries from `apply_scan_feed` failed both branches
+    /// identically — the equality assertion still passed. Reviewer
+    /// reproduced this by mutating `apply_scan_feed:5330-5334` to drop
+    /// half the recoveries; the old test stayed green.
+    ///
+    /// Post-fix shape: build the fixture so we KNOW a priori which
+    /// indices are recoverable and what their (cm, value) tuples are,
+    /// then assert that BOTH the sequential and the parallel pass each
+    /// produce exactly that oracle set — and that they match each other.
+    /// Mutating the recover path to drop half of any input now fails the
+    /// oracle equality on both branches, loud.
+    ///
+    /// The hot-path target is `apply_scan_feed_recover_batch` (the
+    /// per-batch recover function `cmd_rollup_sync` calls), not the
+    /// legacy `apply_scan_feed` (used only by the dead `cmd_scan` path).
+    /// That's the function the rayon `par_iter` was added to in B2; this
+    /// test pins the contract for the function callers actually hit.
+    #[test]
+    fn parallel_decrypt_returns_same_results_as_sequential() {
+        // The recoverable wallet only has address 0 cached.
+        let wallet = super::tests::test_wallet(1);
+
+        // The "broader" wallet has two addresses cached (0 and 1) and
+        // shares the same master_sk as `wallet` (per the test fixture).
+        // We use it to mint notes against ADDRESS 1 — `wallet` only has
+        // address 0 in its `addresses` list, so `try_recover_note`'s
+        // per-address detect loop never sees address 1's KEM keys and
+        // such notes are not recoverable for `wallet`. This is the
+        // "same seed, different active address" non-recoverability
+        // shape that mirrors a daemon's restricted-address profile.
+        let broader = super::tests::test_wallet(2);
+        let total = 50usize;
+
+        // Each entry is `(memo, expected_recoverable, expected_value)`.
+        // Indices [0..50): odd indices target address 0 (recoverable
+        // for `wallet`); even indices target address 1 (only present in
+        // `broader`, NOT recoverable for `wallet`).
+        struct OracleEntry {
+            memo: NoteMemo,
+            expected_recoverable: bool,
+            expected_value: u64,
+        }
+        let oracle: Vec<OracleEntry> = (0..total)
+            .map(|i| {
+                let mut rseed = ZERO;
+                rseed[0] = (i & 0xff) as u8;
+                rseed[1] = ((i >> 8) & 0xff) as u8;
+                let recoverable = i % 2 == 1;
+                let value = 100 + i as u64;
+                let (target_wallet, addr_idx): (&WalletFile, u32) = if recoverable {
+                    (&wallet, 0)
+                } else {
+                    (&broader, 1)
+                };
+                let mut nm = super::tests::note_memo_for_wallet_address(
+                    target_wallet,
+                    addr_idx,
+                    value,
+                    rseed,
+                    Some(format!("memo-{i}").as_bytes()),
+                );
+                nm.index = i;
+                OracleEntry {
+                    memo: nm,
+                    expected_recoverable: recoverable,
+                    expected_value: value,
+                }
+            })
+            .collect();
+
+        let memos: Vec<NoteMemo> = oracle.iter().map(|o| o.memo.clone()).collect();
+        let expected_recovered: Vec<(usize, F, u64)> = oracle
+            .iter()
+            .filter(|o| o.expected_recoverable)
+            .map(|o| (o.memo.index, o.memo.cm, o.expected_value))
+            .collect();
+        assert!(
+            !expected_recovered.is_empty(),
+            "fixture must contain at least one recoverable note for the test to be load-bearing"
+        );
+        assert!(
+            expected_recovered.len() < total,
+            "fixture must contain at least one non-recoverable note so the test catches over-recovery"
+        );
+
+        let feed = NotesFeedResp {
+            notes: memos.clone(),
+            next_cursor: total,
+        };
+
+        // Sequential branch: force a one-thread rayon pool. `install`
+        // makes any nested `par_iter` collapse to serial work.
+        // `WalletFile` isn't `Clone`, so we round-trip it through serde
+        // to get independent copies for each branch — recovery pushes
+        // notes into `w.notes`, so we cannot share state across the two
+        // runs.
+        let wallet_json = serde_json::to_string(&wallet).expect("serialize wallet");
+        let mut wallet_seq: WalletFile =
+            serde_json::from_str(&wallet_json).expect("clone wallet via serde");
+        let mut wallet_par: WalletFile =
+            serde_json::from_str(&wallet_json).expect("clone wallet via serde");
+
+        let pool_seq = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon single-thread pool");
+        let mut seen_cms_seq: Vec<F> = Vec::new();
+        let found_seq = pool_seq.install(|| {
+            apply_scan_feed_recover_batch(&mut wallet_seq, &feed, &mut seen_cms_seq)
+        });
+
+        // Parallel branch: default global rayon pool.
+        let mut seen_cms_par: Vec<F> = Vec::new();
+        let found_par = apply_scan_feed_recover_batch(&mut wallet_par, &feed, &mut seen_cms_par);
+
+        // Each branch matches the independently-computed oracle.
+        assert_eq!(
+            found_seq,
+            expected_recovered.len(),
+            "sequential branch must recover exactly the oracle set"
+        );
+        assert_eq!(
+            found_par,
+            expected_recovered.len(),
+            "parallel branch must recover exactly the oracle set"
+        );
+
+        let seq_tuples: Vec<(usize, F, u64)> = wallet_seq
+            .notes
+            .iter()
+            .map(|n| (n.index, n.cm, n.v))
+            .collect();
+        let par_tuples: Vec<(usize, F, u64)> = wallet_par
+            .notes
+            .iter()
+            .map(|n| (n.index, n.cm, n.v))
+            .collect();
+        assert_eq!(
+            seq_tuples, expected_recovered,
+            "sequential branch tuples must match the oracle"
+        );
+        assert_eq!(
+            par_tuples, expected_recovered,
+            "parallel branch tuples must match the oracle"
+        );
+        // Cross-check: the two branches must agree on each other too.
+        assert_eq!(seq_tuples, par_tuples);
+
+        // `seen_cms` carries every batch cm (recoverable or not) for
+        // the finalize-pin discipline. Both branches must produce the
+        // same multiset, in input order (we extend, we don't sort).
+        let expected_seen_cms: Vec<F> = memos.iter().map(|nm| nm.cm).collect();
+        assert_eq!(
+            seen_cms_seq, expected_seen_cms,
+            "sequential branch must extend seen_cms with every batch cm in input order"
+        );
+        assert_eq!(
+            seen_cms_par, expected_seen_cms,
+            "parallel branch must extend seen_cms with every batch cm in input order"
+        );
+
+        // Cursor advance.
+        assert_eq!(wallet_seq.scanned, total);
+        assert_eq!(wallet_par.scanned, total);
+    }
 }

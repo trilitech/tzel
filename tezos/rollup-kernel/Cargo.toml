@@ -7,6 +7,12 @@ edition = "2021"
 default = ["proof-verifier"]
 proof-verifier = ["dep:tzel-verifier"]
 
+# `tzel_insecure_sandbox` is a build-time --cfg (set ONLY by the sandbox/CI
+# kernel build, never by prod) that enables the kernel-test-skip-verify
+# bypass. Declare it so the compiler doesn't warn about an unexpected cfg.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tzel_insecure_sandbox)'] }
+
 [lib]
 name = "tzel_rollup_kernel"
 path = "src/lib.rs"
