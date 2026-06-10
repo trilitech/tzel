@@ -148,6 +148,19 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   value-conservation leg of the `Relation -> Phi` refinement for
   both spending circuits (PR #36 review-attention item 1).
 
+- **Batch double-spend prevention (this iteration):**
+  `Spec/Hashes.v` `batch_nullifier_set_faithful`: a list of spend
+  descriptors `(nk_spend, cm, pos)` has no duplicates IFF its
+  nullifier list has no duplicates. Forward (non-trivial, CR
+  direction, via `desc_nf_injective` <- `nullifier_binding`): a
+  deduplicated nullifier set guarantees no note-at-position is spent
+  twice in the batch. Backward (unconditional): re-spending a
+  descriptor reproduces its nullifier so the dedup always catches
+  it. Conclusion: the kernel rejecting duplicate nullifiers prevents
+  EVERY double-spend and ONLY double-spends (no false rejection of
+  distinct spends). This lifts the per-note `nullifier_binding` to
+  the batch-level protocol guarantee.
+
 - **Malleability resistance / signature binding (this iteration):**
   - `Spec/Hashes.v` `sighash_fold_injective`: under H_sighash
     collision resistance, the fold is injective on EQUAL-LENGTH

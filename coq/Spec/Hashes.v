@@ -325,4 +325,58 @@ Section Nullifier.
     auto.
   Qed.
 
+  (** ** Batch double-spend prevention
+
+      A SPEND DESCRIPTOR is the [(nk_spend, cm, pos)] triple a single
+      input reveals.  The kernel maintains a global nullifier set and
+      rejects a batch with a repeated nullifier.  These two results
+      show that dedup is EXACTLY spend dedup — faithful in both
+      directions:
+
+      - [desc_nf_injective]: distinct descriptors have distinct
+        nullifiers (under CR).  So the kernel never rejects two
+        genuinely-different spends as if they collided (no false
+        positive).
+      - [batch_nullifier_set_faithful]: a descriptor list has no
+        duplicates IFF its nullifier list has no duplicates.  Forward
+        (the non-trivial CR direction): a deduplicated nullifier set
+        guarantees no note-at-position is spent twice in the batch.
+        Backward (unconditional): re-spending the same descriptor
+        reproduces its nullifier, so the dedup always catches it.
+
+      Together: rejecting duplicate nullifiers prevents every
+      double-spend and only double-spends. *)
+
+  Definition desc_nf (d : Felt * Felt * Felt) : Felt :=
+    let '(nk, cm, pos) := d in nullifier nk cm pos.
+
+  Lemma desc_nf_injective (Hinj : injective_2 H_nf) :
+    forall d d', desc_nf d = desc_nf d' -> d = d'.
+  Proof.
+    intros [[nk cm] pos] [[nk' cm'] pos'] H. cbn in H.
+    destruct (nullifier_binding Hinj _ _ _ _ _ _ H) as [Hnk [Hcm Hpos]].
+    subst. reflexivity.
+  Qed.
+
+  Theorem batch_nullifier_set_faithful (Hinj : injective_2 H_nf) :
+    forall descs : list (Felt * Felt * Felt),
+      NoDup descs <-> NoDup (map desc_nf descs).
+  Proof.
+    intros descs. split.
+    - (* forward: injective image of a NoDup list is NoDup *)
+      induction descs as [| d ds IH]; intros Hnd.
+      + constructor.
+      + inversion Hnd as [| ? ? Hnotin Hndtl]; subst.
+        cbn. constructor.
+        * (* ~ In (desc_nf d) (map desc_nf ds) *)
+          intro Hin.
+          apply in_map_iff in Hin.
+          destruct Hin as [d' [Hfeq Hin']].
+          apply (desc_nf_injective Hinj) in Hfeq. subst d'.
+          exact (Hnotin Hin').
+        * apply IH. exact Hndtl.
+    - (* backward: holds for any map *)
+      apply NoDup_map_inv.
+  Qed.
+
 End Nullifier.
