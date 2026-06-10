@@ -1,24 +1,24 @@
-//! Acceptance tests for the Groth16 wrap verifier, transplanted from the
-//! phase-1 PoC (`stwo-gnark-tzel/tools/groth16-verifier-poc/tests/
-//! sprint34b.rs`) onto the kernel-side `verify_groth16_wrap` /
-//! `verify_snark` entry points.
+//! Acceptance tests for the Groth16 wrap verifier on the **mv-target**
+//! artifacts (2026-06-10 cloud Setup+Prove cycle on the TzEL multiverifier
+//! root proof — the production chip shape).
 //!
 //! Fixtures (`verifier/testdata/`):
-//! * `proof.bin` / `vk.bin` — the real sprint 3.4b gnark artifacts (388 B /
-//!   9680 B; gnark's own `groth16.Verify` PASSED on them). `vk.bin` is
-//!   byte-identical to the embedded `src/wrap_vk.bin` placeholder.
-//! * `sprint34b_public_witness.txt` — the 136 public inputs (128 TreeRoots
+//! * `proof.bin` / `vk.bin` — the real mv-target gnark artifacts (388 B /
+//!   9680 B; gnark's own `groth16.Verify` PASSED on them, see
+//!   gs://tezosx-snark-artifacts/2026-06-10-mv-target-setup/). The wrapped
+//!   statement is a real TzEL multiverifier root proof aggregating
+//!   2 shield + 2 transfer leaves. `vk.bin` is byte-identical to the
+//!   embedded `src/wrap_vk.bin`.
+//! * `wrap_public_witness.txt` — the 136 public inputs (128 TreeRoots
 //!   bytes + 8 OutHash M31 lanes) dumped via gnark
-//!   `frontend.NewWitness(..., PublicOnly())` from the leaf-shape L2
-//!   fixture.
+//!   `frontend.NewWitness(..., PublicOnly())` from the mv fixture
+//!   (stwo-gnark-tzel `TestDumpPublicWitness` helper).
 //!
 //! NOTE: the full `verify_snark` happy path (Groth16 PASS **and** OutHash
-//! binding PASS) is not exercisable with these artifacts: the leaf fixture
-//! has no recoverable `output_preimage` (its 2 output values come from a
-//! sidecar, pre-mv shape, without `U_VALUE`). The binding derivation is
-//! instead pinned by golden vectors in `src/snark.rs` tests; the negative
-//! direction (valid Groth16, wrong preimage → reject at step (c)) IS
-//! exercised below.
+//! binding PASS) is not exercised here: it needs the mv root's
+//! `output_preimage`, whose derivation chain is pinned by golden vectors in
+//! `src/snark.rs` tests instead. The negative direction (valid Groth16,
+//! wrong preimage -> reject at the binding step) IS exercised below.
 
 use tzel_verifier::groth16::{
     parse_gnark_vk, verify_groth16_wrap, verify_groth16_wrap_with_vk, VerifyError, N_PUBLIC_INPUTS,
@@ -28,7 +28,7 @@ use tzel_verifier::snark::verify_snark;
 
 const PROOF_BIN: &[u8] = include_bytes!("../testdata/proof.bin");
 const VK_BIN: &[u8] = include_bytes!("../testdata/vk.bin");
-const PUBLIC_WITNESS_TXT: &str = include_str!("../testdata/sprint34b_public_witness.txt");
+const PUBLIC_WITNESS_TXT: &str = include_str!("../testdata/wrap_public_witness.txt");
 
 /// Parse the dumped public witness (`<index> <decimal>` lines) into the
 /// wrap circuit's (tree_roots, out_hash_lanes) public inputs.
@@ -79,25 +79,25 @@ fn fixture_envelope(proof_tail: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn embedded_vk_is_the_sprint34b_placeholder() {
-    // The placeholder embedded VK must be byte-identical to the testdata VK
-    // (swap to the mv-target VK will update both this fixture and the test).
+fn embedded_vk_matches_testdata_vk() {
+    // The embedded VK (mv-target, 2026-06-10 Setup) must be byte-identical
+    // to the testdata VK.
     assert_eq!(WRAP_VK_BYTES, VK_BIN);
     parse_gnark_vk(WRAP_VK_BYTES).expect("embedded VK parses");
 }
 
 #[test]
-fn accepts_real_sprint34b_proof() {
+fn accepts_real_mv_proof() {
     let (tree_roots, out_hash_lanes) = fixture_publics();
     verify_groth16_wrap(PROOF_BIN, &tree_roots, &out_hash_lanes)
-        .expect("real sprint34b proof must verify against the embedded VK");
+        .expect("real mv-target proof must verify against the embedded VK");
 }
 
 #[test]
-fn accepts_real_sprint34b_proof_with_explicit_vk() {
+fn accepts_real_mv_proof_with_explicit_vk() {
     let (tree_roots, out_hash_lanes) = fixture_publics();
     verify_groth16_wrap_with_vk(PROOF_BIN, &tree_roots, &out_hash_lanes, VK_BIN)
-        .expect("real sprint34b proof must verify");
+        .expect("real mv-target proof must verify");
 }
 
 #[test]
