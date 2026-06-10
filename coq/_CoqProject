@@ -9,6 +9,7 @@ Spec/Merkle.v
 Spec/Wots.v
 Spec/Xmss.v
 Spec/ConfigAuth.v
+Spec/ConfigOnce.v
 Spec/Transfer.v
 Spec/Shield.v
 Spec/Unshield.v

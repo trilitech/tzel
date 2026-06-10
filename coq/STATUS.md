@@ -940,6 +940,23 @@ nullifier/commitment binding.
   machinery. A real kernel security check that wasn't yet stated as a
   theorem.
 
+- **CONFIG IMMUTABILITY / SET-ONCE (`Spec/ConfigOnce.v`):** the kernel
+  installs the verifier and bridge configs ONE-SHOT (configure_verifier
+  / configure_bridge reject if already present: "rollup verifier/bridge
+  is already configured"). Modeled as a write-once register (config
+  slot = option C; a set step fires only when None; every other kernel
+  op leaves it unchanged). Proved (zero admits):
+  - config_immutable: once the slot holds Some c, every reachable later
+    state still holds Some c — the config is frozen for the kernel's
+    life;
+  - reconfigure_unchanged: any step from Some c leaves it at Some c (no
+    overwrite to a different config).
+  Complements ConfigAuth.config_update_unforgeable: together the
+  verifier/bridge is set ONCE by the admin and then IMMUTABLE — an
+  attacker can neither forge an install (ConfigAuth) nor overwrite the
+  installed config (here). Both found by reading the actual kernel
+  config-management code.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
