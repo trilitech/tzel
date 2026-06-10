@@ -240,6 +240,28 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   idealization (faithful given Cairo u64 range checks + u128
   accumulator headroom).
 
+- **OVERFLOW SAFETY PROVED — `Spec/LedgerBounded.v`:** the nat
+  idealization's faithfulness, mechanized rather than asserted.
+  - `tx_conservation_mod_iff`: for ANY modulus `ab` with headroom
+    `mx * vb < ab`, a conservation check in arithmetic mod `ab`
+    (`note_sum consumed mod ab = note_sum outputs mod ab`) is
+    EQUIVALENT to true-integer conservation. Covers the Cairo u128
+    accumulators (ab = 2^128) AND a field check (ab = the ~2^251
+    prime) — neither can wrap to fake or hide conservation, given
+    value/count bounds. Built on `note_sum_lt` (bounded note totals
+    stay < ab) and `mod_eq_iff` (mod = id below the modulus).
+  - `headroom_u128`: the side condition holds for real widths —
+    `(11 * 2^64 < 2^128)%N`, proved by `vm_compute` in binary N
+    (nat can't represent 2^128). 11 covers a transfer's worst case.
+  - `totals_bounded_by_deposit` / `totals_under_supply_cap`:
+    globally exited, live <= deposited in every reachable state, so
+    under a supply cap deposited <= B all running totals stay <= B
+    (no kernel-total overflow at any width holding B). The cap is a
+    world-fact hypothesis; the implication is proved.
+  The earlier nat/overflow caveat in LedgerNf is now discharged: the
+  model's `nat` arithmetic provably coincides with the real bounded
+  (u128 / field) arithmetic under the circuit's range + count bounds.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

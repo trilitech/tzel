@@ -13,6 +13,7 @@ Spec/Shield.v
 Spec/Unshield.v
 Spec/Ledger.v
 Spec/LedgerNf.v
+Spec/LedgerBounded.v
 
 Impl/Common.v
 Impl/Hashes.v
