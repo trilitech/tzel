@@ -14,6 +14,15 @@ let hash5 = Tzel.Hash.hash_commit
 let commit =
   hash5
 
+(** val hash_nf : felt -> felt -> felt **)
+
+let hash_nf = Tzel.Hash.hash_nf
+
+(** val nullifier : felt -> felt -> felt -> felt **)
+
+let nullifier nk_spend cm pos =
+  hash_nf nk_spend (hash_nf cm pos)
+
 (** val pack_adrs_chain : int -> int -> int -> felt **)
 
 let pack_adrs_chain = (fun key_idx chain_idx step ->

@@ -287,10 +287,20 @@ refinement + extraction + conformance), the same shape repeats for:
     commitment now has Rocq <-> OCaml <-> Cairo transitive
     assurance, byte-for-byte against a golden value (not just
     structural).
-  Remaining: extend the same extract-and-differential pattern to
-  the merkle root and sighash fold, then realize the FULL
-  transfer/unshield/shield relations + Cairo-side `run_*` runners
-  for whole-circuit conformance.
+  NULLIFIER CONFORMANCE (this iteration): same pattern extended to
+  the nullifier — `Impl/Hashes.v` `Hash_nf` + `nullifier nk cm pos
+  := H_nf nk (H_nf cm pos)` + `nullifier_refines_spec` (so the
+  proven `Spec.Hashes.nullifier_binding` transfers to the
+  extractable fn). Realized `Hash_nf => Tzel.Hash.hash_nf`,
+  extracted `nullifier`. Differential: 10k random fuzz (structural,
+  pins the nk-outside/cm-pos-inside nesting) + a non-tautological
+  golden vector against protocol_v1.json notes[0]'s nf (Rust-gen,
+  Cairo-pinned). The two security-critical multiasset primitives
+  (commitment, nullifier) now both have Rocq <-> OCaml <-> Cairo
+  conformance, golden-anchored.
+  Remaining: extend the pattern to the merkle root and sighash
+  fold, then realize the FULL transfer/unshield/shield relations +
+  Cairo-side `run_*` runners for whole-circuit conformance.
 
 ## Open questions / decisions deferred
 

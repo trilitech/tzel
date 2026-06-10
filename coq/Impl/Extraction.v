@@ -76,4 +76,8 @@ Extract Inductive nat => "int" [ "0" "Stdlib.succ" ]
     regenerated [commitment_u64_max_v1.json] fixture. *)
 Extract Constant Hash5 => "Tzel.Hash.hash_commit".
 
-Extraction "tzel_wots.ml" xmss_chain_step commit.
+(** Realize [Hash_nf] as [Tzel.Hash.hash_nf] (nulf-domain 2-input
+    hash). *)
+Extract Constant Hash_nf => "Tzel.Hash.hash_nf".
+
+Extraction "tzel_wots.ml" xmss_chain_step commit nullifier.

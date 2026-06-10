@@ -50,3 +50,23 @@ Theorem commit_refines_spec :
     commit d_j v asset rcm owner_tag
     = Spec.Hashes.commitment Hash5 d_j v asset rcm owner_tag.
 Proof. reflexivity. Qed.
+
+(** [Hash_nf] is the personalized 2-input nullifier hash
+    ([cairo/src/blake_hash.cairo] nulf domain).  Extraction realizes
+    it as [Tzel.Hash.hash_nf]. *)
+Parameter Hash_nf : Felt -> Felt -> Felt.
+
+(** The nullifier, concretely: [nf = H_nf(nk_spend, H_nf(cm, pos))]
+    — position-nested to defeat faerie-gold.  Top-level so it can be
+    extracted and differentially fuzzed + golden-tested. *)
+Definition nullifier (nk_spend cm pos : Felt) : Felt :=
+  Hash_nf nk_spend (Hash_nf cm pos).
+
+(** Refinement: executable [nullifier] equals the [Spec.Hashes]
+    abstract nullifier under [H_nf := Hash_nf].  By [Definition]
+    expansion (mirrors [commit_refines_spec]); lets the proven
+    [Spec.Hashes.nullifier_binding] transfer to the extractable fn. *)
+Theorem nullifier_refines_spec :
+  forall nk cm pos,
+    nullifier nk cm pos = Spec.Hashes.nullifier Hash_nf nk cm pos.
+Proof. reflexivity. Qed.
