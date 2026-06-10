@@ -830,6 +830,16 @@ nullifier/commitment binding.
     empty slots remain. (Also the remaining ingredient for the
     MerkleFrontier froot read-off: explicit-z0 = implicit padding.)
 
+- **MERKLE ROOT SYNTHESIS (`Spec/MerkleTree.v`):** ties the recent
+  Merkle results together. mroot_eq_root_of_padded:
+  length leaves <= 2^d -> mroot d leaves = root_of d (leaves ++
+  repeat z0 (2^d - length leaves)). The top-down recursive root of the
+  ACTUAL notes (a partial leaf list) equals the bottom-up build_level
+  fold of those notes padded with z0 to a full tree — exactly how an
+  implementation computes the committed root (fill empty slots with
+  z0, fold up). Composes root_of_mroot (full-tree bottom-up=top-down
+  equivalence) with mroot_app_zeros (padding invariance). Zero admits.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

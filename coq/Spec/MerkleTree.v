@@ -429,4 +429,22 @@ Section MerkleTree.
       apply mroot_app_z0. lia.
   Qed.
 
+  (** Synthesis: the top-down recursive root of the actual notes
+      ([mroot], a partial leaf list) equals the bottom-up [build_level]
+      fold of those notes padded with [z0] to a full tree — exactly
+      how an implementation computes the root (fill empty slots with
+      [z0], fold up).  Ties [root_of_mroot] (full-tree equivalence)
+      and [mroot_app_zeros] (padding invariance) together. *)
+  Theorem mroot_eq_root_of_padded : forall d leaves,
+    length leaves <= 2 ^ d ->
+    mroot d leaves = root_of d (leaves ++ repeat z0 (2 ^ d - length leaves)).
+  Proof.
+    intros d leaves Hlen.
+    assert (Hfull : length (leaves ++ repeat z0 (2 ^ d - length leaves)) = 2 ^ d).
+    { rewrite length_app, repeat_length. lia. }
+    rewrite (root_of_mroot d _ Hfull).
+    rewrite (mroot_app_zeros d (2 ^ d - length leaves) leaves) by lia.
+    reflexivity.
+  Qed.
+
 End MerkleTree.
