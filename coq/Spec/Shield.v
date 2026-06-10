@@ -299,3 +299,50 @@ Section PhiShield.
   Qed.
 
 End PhiShield.
+
+(** ** Shield non-malleability (signature binds the whole tx)
+
+    The shield analogue.  Shield has NO inputs, so the sighash folds
+    a structurally FIXED-length field list — no input-count
+    hypothesis is needed; equal sighashes alone force equality of
+    every public field (auth_domain, pubkey_hash, v_note, fee,
+    producer_fee, both assets, both commitments, both memo hashes). *)
+
+Section ShieldMalleability.
+
+  Variable H_sighash : Felt -> Felt -> Felt.
+
+  Theorem shield_sighash_binds
+      (Hinj : Hashes.injective_2 H_sighash)
+      (sighash tag ad ad' pkh pkh' : Felt)
+      (vn vn' fee fee' pf pf' an an' aprod aprod' : Felt)
+      (cmn cmn' cmp cmp' memo memo' pmemo pmemo' : Felt) :
+    phi_shield_sighash H_sighash sighash tag ad pkh
+      vn fee pf an aprod cmn cmp memo pmemo ->
+    phi_shield_sighash H_sighash sighash tag ad' pkh'
+      vn' fee' pf' an' aprod' cmn' cmp' memo' pmemo' ->
+    ad = ad' /\ pkh = pkh' /\ vn = vn' /\ fee = fee' /\ pf = pf'
+    /\ an = an' /\ aprod = aprod' /\ cmn = cmn' /\ cmp = cmp'
+    /\ memo = memo' /\ pmemo = pmemo'.
+  Proof.
+    intros H1 H2.
+    unfold phi_shield_sighash in H1, H2.
+    rewrite <- Hashes.sighash_fold_app in H1, H2.
+    assert (Heq :
+      Hashes.sighash_fold H_sighash tag
+        ([ad; pkh] ++ [vn; fee; pf; an; aprod; cmn; cmp; memo; pmemo])
+      = Hashes.sighash_fold H_sighash tag
+        ([ad'; pkh'] ++ [vn'; fee'; pf'; an'; aprod'; cmn'; cmp'; memo'; pmemo'])).
+    { rewrite <- H1, <- H2. reflexivity. }
+    assert (Hlenfull :
+      length ([ad; pkh] ++ [vn; fee; pf; an; aprod; cmn; cmp; memo; pmemo])
+      = length ([ad'; pkh'] ++ [vn'; fee'; pf'; an'; aprod'; cmn'; cmp'; memo'; pmemo']))
+      by reflexivity.
+    pose proof (Hashes.sighash_binds_fields H_sighash Hinj tag _ _
+                  Hlenfull Heq) as Hfields.
+    simpl in Hfields.
+    injection Hfields as Had Hpkh Hvn Hfee Hpf Han Haprod Hcmn Hcmp Hmemo Hpmemo.
+    repeat split; assumption.
+  Qed.
+
+End ShieldMalleability.

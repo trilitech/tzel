@@ -335,3 +335,64 @@ Section PhiUnshield.
   Qed.
 
 End PhiUnshield.
+
+(** ** Unshield non-malleability (signature binds the whole tx)
+
+    The unshield analogue of [Spec.Transfer.transfer_sighash_binds]:
+    two accepted unshields sharing a sighash AND input count publish
+    byte-identical public outputs — including the L1 exit triple
+    [(v_pub, asset_pub, recipient)] that releases real funds, both
+    change commitments, the producer commitment, and all memo hashes.
+
+    Concretely discharges the "the malleability argument ports to
+    unshield" claim: the proof is the same assembly as transfer,
+    differing only in the (interleaved) field layout. *)
+
+Section UnshieldMalleability.
+
+  Variable H_sighash : Felt -> Felt -> Felt.
+
+  Theorem unshield_sighash_binds
+      (Hinj : Hashes.injective_2 H_sighash)
+      (sighash tag auth_domain auth_domain' root root' : Felt)
+      (nfs nfs' : list Felt)
+      (vp vp' ap ap' fee fee' rcp rcp' : Felt)
+      (c1 c2 cp c1' c2' cp' : Felt)
+      (m1 m2 mp m1' m2' mp' : Felt) :
+    length nfs = length nfs' ->
+    phi_unshield_sighash H_sighash sighash tag auth_domain root nfs
+      vp ap fee rcp c1 c2 cp m1 m2 mp ->
+    phi_unshield_sighash H_sighash sighash tag auth_domain' root' nfs'
+      vp' ap' fee' rcp' c1' c2' cp' m1' m2' mp' ->
+    auth_domain = auth_domain' /\ root = root' /\ nfs = nfs'
+    /\ vp = vp' /\ ap = ap' /\ fee = fee' /\ rcp = rcp'
+    /\ c1 = c1' /\ m1 = m1' /\ c2 = c2' /\ m2 = m2'
+    /\ cp = cp' /\ mp = mp'.
+  Proof.
+    intros Hlen H1 H2.
+    unfold phi_unshield_sighash in H1, H2.
+    rewrite <- Hashes.sighash_fold_app in H1, H2.
+    assert (Heq :
+      Hashes.sighash_fold H_sighash tag
+        ((auth_domain :: root :: nfs)
+         ++ [vp; ap; fee; rcp; c1; m1; c2; m2; cp; mp])
+      = Hashes.sighash_fold H_sighash tag
+        ((auth_domain' :: root' :: nfs')
+         ++ [vp'; ap'; fee'; rcp'; c1'; m1'; c2'; m2'; cp'; mp'])).
+    { rewrite <- H1, <- H2. reflexivity. }
+    assert (Hlenfull :
+      length ((auth_domain :: root :: nfs)
+              ++ [vp; ap; fee; rcp; c1; m1; c2; m2; cp; mp])
+      = length ((auth_domain' :: root' :: nfs')
+              ++ [vp'; ap'; fee'; rcp'; c1'; m1'; c2'; m2'; cp'; mp'])).
+    { rewrite !length_app. simpl. rewrite Hlen. reflexivity. }
+    pose proof (Hashes.sighash_binds_fields H_sighash Hinj tag _ _ Hlenfull Heq)
+      as Hfields.
+    simpl in Hfields. injection Hfields as Had Hroot Hrest.
+    destruct (Hashes.app_eq_len_l nfs nfs' _ _ Hlen Hrest)
+      as [Hnfs Htail].
+    injection Htail as Hvp Hap Hfee Hrcp Hc1 Hm1 Hc2 Hm2 Hcp Hmp.
+    repeat split; assumption.
+  Qed.
+
+End UnshieldMalleability.

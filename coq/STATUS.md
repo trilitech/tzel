@@ -165,8 +165,16 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
     memo hashes). Since the WOTS+ signature is over the sighash,
     this is the formal "sign what you see" guarantee: a relayer
     cannot alter any public field without invalidating the
-    signature. Same pattern applies to unshield/shield (their
-    sighash predicates have the same fold shape).
+    signature.
+  - `Spec/Unshield.v` `unshield_sighash_binds` and `Spec/Shield.v`
+    `shield_sighash_binds`: the SAME guarantee proved (not just
+    asserted) for the other two circuits. Unshield binds the L1
+    exit triple (v_pub, asset_pub, recipient) that releases real
+    funds, both change commitments, the producer commitment, and
+    all memo hashes (same input-count hypothesis as transfer).
+    Shield has no inputs, so its field list is structurally
+    fixed-length and equal sighashes ALONE force every public field
+    equal — no count hypothesis needed.
 
 ## Not done
 
