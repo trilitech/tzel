@@ -32,7 +32,7 @@
     Sighash uses tag 0x02 to prevent cross-circuit replay.
 *)
 
-From Stdlib Require Import List Arith.
+From Stdlib Require Import List Arith Lia.
 Import ListNotations.
 From Common Require Import Felt.
 From Spec Require Import Hashes.
@@ -396,3 +396,74 @@ Section UnshieldMalleability.
   Qed.
 
 End UnshieldMalleability.
+
+(** ** Batch exit-path value conservation (global no-inflation on unshield)
+
+    [Spec.Transfer.batch_value_conservation] proved no value is
+    created across a batch of transfers.  This is its UNSHIELD
+    analogue — and unshield is where value actually LEAVES the
+    shielded pool to L1, so it is the most consensus-critical
+    conservation.  Summing the per-transaction circuit relation
+    [phi_unshield_value_conservation] over a whole batch, for every
+    asset [a]:
+
+        total consumed note value (a)
+          = total produced note value (a)            (change + producer)
+          + total withdrawn to L1 (a)                (sum of v_pub where asset_pub = a)
+          + (a = tez ? total burned tez fees : 0).
+
+    No batch of unshields can withdraw, as notes-plus-exits, more
+    value of any asset than the notes it consumed — derived from the
+    soundness of the per-tx conservation, not a turnstile argument. *)
+Section BatchUnshieldConservation.
+
+  Variable asset_tez : Felt.
+
+  Record UTx : Type := mkUTx {
+    utx_in_assets  : list Felt;
+    utx_in_values  : list nat;
+    utx_out_assets : list Felt;
+    utx_out_values : list nat;
+    utx_v_pub      : nat;
+    utx_asset_pub  : Felt;
+    utx_fee        : nat;
+  }.
+
+  Definition utx_wf (t : UTx) : Prop :=
+    length (utx_in_assets t) = length (utx_in_values t)
+    /\ length (utx_out_assets t) = length (utx_out_values t).
+
+  Definition utx_conserves (t : UTx) : Prop :=
+    forall a : Felt,
+      sum_at a (utx_in_assets t) (utx_in_values t)
+      = sum_at a (utx_out_assets t) (utx_out_values t)
+        + (if Felt_eq_dec a (utx_asset_pub t) then utx_v_pub t else 0)
+        + (if Felt_eq_dec a asset_tez then utx_fee t else 0).
+
+  Theorem batch_unshield_value_conservation (txs : list UTx) :
+    Forall utx_wf txs ->
+    Forall utx_conserves txs ->
+    forall a : Felt,
+      sum_at a (concat (map utx_in_assets txs))
+               (concat (map utx_in_values txs))
+      = sum_at a (concat (map utx_out_assets txs))
+                 (concat (map utx_out_values txs))
+        + list_sum (map (fun t => if Felt_eq_dec a (utx_asset_pub t)
+                                  then utx_v_pub t else 0) txs)
+        + (if Felt_eq_dec a asset_tez
+           then list_sum (map utx_fee txs) else 0).
+  Proof.
+    induction txs as [| t txs IH]; intros Hwf Hphi a.
+    - cbn. destruct (Felt_eq_dec a asset_tez); reflexivity.
+    - inversion Hwf as [| ? ? [Hwin Hwout] Hwf']; subst.
+      inversion Hphi as [| ? ? Hp Hphi']; subst.
+      cbn [map concat list_sum].
+      rewrite (sum_at_app _ _ _ _ _ Hwin).
+      rewrite (sum_at_app _ _ _ _ _ Hwout).
+      rewrite (Hp a). rewrite (IH Hwf' Hphi' a).
+      simpl list_sum.
+      destruct (Felt_eq_dec a asset_tez);
+        destruct (Felt_eq_dec a (utx_asset_pub t)); lia.
+  Qed.
+
+End BatchUnshieldConservation.

@@ -570,6 +570,24 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
     felts — distinct pools never share a durable slot, using the real
     hex encoding, no assumed injectivity.
 
+- **BATCH EXIT-PATH NO-INFLATION (`Spec/Unshield.v`):** the unshield
+  analogue of Transfer.batch_value_conservation — and unshield is
+  where value actually LEAVES the shielded pool to L1, so it is the
+  most consensus-critical conservation. Previously Unshield had only
+  the per-tx phi_unshield_value_conservation predicate; this adds the
+  global theorem. Summing the per-tx circuit relation over a whole
+  batch, for every asset a (zero admits):
+    total consumed note value (a)
+      = total produced note value (a)   (change + producer notes)
+      + total withdrawn to L1 (a)       (sum of v_pub where asset_pub=a)
+      + (a = tez ? total burned tez fees : 0).
+  So no batch of unshields can withdraw — as notes-plus-L1-exits —
+  more value of any asset than the notes it consumed, derived from
+  the soundness of the per-tx conservation (not a turnstile
+  argument). Models a UTx batch (in/out asset+value lists, v_pub,
+  asset_pub, fee); proof mirrors the transfer batch induction with
+  the extra per-asset v_pub term summed via list_sum.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
