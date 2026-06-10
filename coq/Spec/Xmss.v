@@ -933,6 +933,31 @@ Section CairoAssertions.
     | None => False
     end.
 
+  (** Domain-separated variant.  [xmss_verify_cairo] above reuses the
+      section's [H_node] for BOTH the L-tree compression and the
+      auth-tree walk.  The Cairo separates the two domains: L-tree
+      nodes hash under [pack_adrs(TAG_XMSS_LTREE, key_idx, level,
+      node_idx)] while auth-tree nodes hash under
+      [pack_adrs(TAG_XMSS_TREE, 0, level, node_idx)] — different tag
+      AND different key_idx slot.  A model that conflates them admits
+      realizations the circuit rules out (cross-domain node reuse),
+      so the Cairo-faithful relation in [Impl.Transfer] uses this
+      variant, taking the L-tree hash separately while [auth_verify]
+      keeps the section [H_node] for the auth tree. *)
+  Definition xmss_verify_cairo_sep
+      (H_ltree : nat -> nat -> Felt -> Felt -> Felt)
+      (F : Felt -> Felt -> Felt -> Felt)
+      (ADRS_chain : nat -> nat -> nat -> Felt)
+      (pub_seed : Felt)
+      (key_idx : nat) (digits : list nat) (sig : list Felt)
+      (auth_siblings : list Felt) (auth_root_val : Felt) : Prop :=
+    let endpoints :=
+      recover_all F ADRS_chain pub_seed key_idx 0 digits sig in
+    match ltree H_ltree endpoints with
+    | Some leaf => auth_verify leaf auth_root_val auth_siblings key_idx
+    | None => False
+    end.
+
   (** The Cairo-faithful [xmss_verify_cairo] is strictly stronger than
       the spec-level [xmss_verify]: it includes the depth check and
       the key-index range check.  This theorem shows the Cairo version

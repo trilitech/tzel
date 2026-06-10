@@ -187,14 +187,22 @@ refinement + extraction + conformance), the same shape repeats for:
   the protocol-level safety properties; the Spec proofs force the
   `*Relation pub wit -> Phi pub` chain to close on actual Coq
   assertions, which is the missing-assertion check.
-  STATUS: the value-conservation leg is DONE for transfer and
-  unshield (see two-accumulator entries above). Remaining: define
-  the Cairo-shaped `TransferRelation` / `UnshieldRelation` /
-  `ShieldRelation` records assembling ALL the circuit checks
-  (Merkle inclusion + nullifier + XMSS legs via `Spec.Merkle` /
-  `Spec.Xmss`, commitment well-formedness, sighash fold, the
-  accumulator equations), then prove `Relation -> Phi` by
-  conjunct assembly.
+  STATUS: TRANSFER IS DONE — `Impl/Transfer.v` defines the
+  Cairo-shaped `TransferRelation` (CairoInput/CairoOutput records
+  mirroring the witness spans; recomputed-not-trusted cm/otag/rcm;
+  Merkle + XMSS legs via `Spec.Xmss.merkle_verify` /
+  `xmss_verify_cairo_sep`; the sighash fold in Cairo order; the
+  two accumulator equations) and proves `transfer_relation_sound :
+  TransferRelation -> Phi_transfer` with every conjunct closing.
+  `Spec/Xmss.v` gained `xmss_verify_cairo_sep`, a domain-separated
+  variant of `xmss_verify_cairo` (the original conflates the
+  L-tree and auth-tree node hashes, which the Cairo separates by
+  ADRS tag and key_idx slot — the relation uses the faithful one).
+  Remaining: the parallel `UnshieldRelation` (conservation leg
+  already proved) and `ShieldRelation` (no inputs; dual-pool
+  conservation already modeled in `Spec.Shield`), then the
+  realization of the relation's hash/digit parameters at
+  extraction for the differential harness.
 
 ## Open questions / decisions deferred
 

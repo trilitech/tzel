@@ -239,3 +239,268 @@ Section TwoAccumulator.
   Qed.
 
 End TwoAccumulator.
+
+(** ** The Cairo-shaped transfer relation
+
+    [TransferRelation] below is the Rocq model of
+    [cairo/src/transfer.cairo::verify], written check-for-check in
+    the source order of the Cairo so the two can be compared by eye
+    (and, next, by the QCheck2 differential harness).  Conventions:
+
+    - One [CairoInput] record bundles the per-input witness columns
+      that Cairo passes as parallel [Span]s; the bundling IS the
+      Cairo length-equality asserts (a record row cannot be
+      ragged).  Same for the four positional [CairoOutput]s.
+    - Values the circuit RECOMPUTES from the witness ([nk_tag],
+      [otag], [rcm], the input [cm]) are definitions over the
+      record, not fields — mirroring that Cairo never trusts them
+      from the prover.
+    - Hash families, the u64→felt embedding, and the WOTS digit
+      decomposition are section parameters, realized at extraction
+      (the same realization style as [Impl.Wots]).
+
+    The headline theorem [transfer_relation_sound] discharges the
+    [Relation -> Phi] obligation for every conjunct of
+    [Spec.Transfer.Phi_transfer].  Per-input Merkle inclusion and
+    XMSS verification are carried inside the relation (they are the
+    Cairo asserts) but [Phi_transfer] deliberately does not restate
+    them — their soundness consequences (binding, uniqueness) live
+    in [Spec.Merkle] / [Spec.Xmss]. *)
+
+From Spec Require Merkle Xmss Hashes.
+
+Section TransferRelation.
+
+  (** Hash families — same shapes as [Spec.Transfer.PhiTransfer]. *)
+  Variable H_sighash : Felt -> Felt -> Felt.
+  Variable H_commit : Felt -> Felt -> Felt -> Felt -> Felt -> Felt.
+  Variable H_nf : Felt -> Felt -> Felt.
+  Variable H_owner : Felt -> Felt -> Felt -> Felt.
+  Variable H_rcm : Felt -> Felt.            (* derive_rcm *)
+  Variable H_nktag : Felt -> Felt.          (* derive_nk_tag *)
+  (** Commitment-tree node hash ([blake_hash::hash2], mrkl domain). *)
+  Variable H_merkle : Felt -> Felt -> Felt.
+  (** Auth-tree node hash: [xmss_node_hash(pub_seed, TAG_XMSS_TREE,
+      0, level, node_idx, l, r)].  Takes [pub_seed] explicitly since
+      it is a per-input witness value. *)
+  Variable H_tree_node : Felt -> nat -> nat -> Felt -> Felt -> Felt.
+  (** L-tree node hash: [xmss_node_hash(pub_seed, TAG_XMSS_LTREE,
+      key_idx, level, node_idx, l, r)] — note the extra [key_idx]
+      slot that domain-separates it from the auth tree. *)
+  Variable H_ltree_node : Felt -> nat -> nat -> nat -> Felt -> Felt -> Felt.
+  (** WOTS chain step [F pub_seed adrs x] and its ADRS encoding. *)
+  Variable F_chain : Felt -> Felt -> Felt -> Felt.
+  Variable ADRS_chain : nat -> nat -> nat -> Felt.
+
+  Variable asset_tez : Felt.
+  (** Sighash type tag 0x01 as a felt. *)
+  Variable tag_transfer_felt : Felt.
+  (** The u64 → felt embedding Cairo gets via [v.into()]. *)
+  Variable felt_of_nat : nat -> Felt.
+  (** [sighash_to_wots_digits]: felt → 133 base-4 digits. *)
+  Variable wots_digits : Felt -> list nat.
+
+  (** Per-input witness — one row of Cairo's parallel spans. *)
+  Record CairoInput : Type := mkCairoInput {
+    ci_nf              : Felt;       (* public: nf_list[i] *)
+    ci_nk_spend        : Felt;
+    ci_auth_root       : Felt;
+    ci_pub_seed        : Felt;
+    ci_auth_idx        : nat;
+    ci_d_j             : Felt;
+    ci_v               : nat;
+    ci_rseed           : Felt;
+    ci_pos             : nat;        (* cm_path_indices[i] *)
+    ci_asset           : Felt;
+    ci_merkle_siblings : list Felt;
+    ci_auth_siblings   : list Felt;
+    ci_wots_sig        : list Felt;
+  }.
+
+  (** Cairo recomputes — never trusts — these:
+        [let nk_tag = derive_nk_tag(nk_spend);
+         let otag = owner_tag(auth_root, auth_pub_seed, nk_tag);
+         let rcm = derive_rcm(rseed);
+         let cm = commit(d_j, v, asset_i, rcm, otag);] *)
+  Definition ci_otag (c : CairoInput) : Felt :=
+    H_owner (ci_auth_root c) (ci_pub_seed c) (H_nktag (ci_nk_spend c)).
+  Definition ci_rcm (c : CairoInput) : Felt := H_rcm (ci_rseed c).
+  Definition ci_cm (c : CairoInput) : Felt :=
+    H_commit (ci_d_j c) (felt_of_nat (ci_v c)) (ci_asset c)
+             (ci_rcm c) (ci_otag c).
+
+  (** Per-output witness — output slot k's fields.  [co_cm] and
+      [co_memo] are public; the rest is witness.  Cairo takes the
+      recipient's [nk_tag] directly (the sender cannot know
+      [nk_spend]), unlike inputs where it is derived. *)
+  Record CairoOutput : Type := mkCairoOutput {
+    co_cm        : Felt;             (* public *)
+    co_d_j       : Felt;
+    co_v         : nat;
+    co_rseed     : Felt;
+    co_auth_root : Felt;
+    co_pub_seed  : Felt;
+    co_nk_tag    : Felt;
+    co_memo      : Felt;             (* public *)
+    co_asset     : Felt;
+  }.
+
+  Definition co_otag (o : CairoOutput) : Felt :=
+    H_owner (co_auth_root o) (co_pub_seed o) (co_nk_tag o).
+  Definition co_rcm (o : CairoOutput) : Felt := H_rcm (co_rseed o).
+
+  (** The output-side commitment equation
+      [assert(hash::commit(d_j_k, v_k, asset_k, rcm_k, otag_k) == cm_k)]. *)
+  Definition output_cm_ok (o : CairoOutput) : Prop :=
+    co_cm o = H_commit (co_d_j o) (felt_of_nat (co_v o)) (co_asset o)
+                       (co_rcm o) (co_otag o).
+
+  (** The sighash fold, in Cairo's exact order:
+      [fold(0x01, auth_domain, root, nf_0..nf_{n-1}, fee,
+            cm_1, cm_2, cm_3, cm_4, mh_1, mh_2, mh_3, mh_4)]. *)
+  Definition relation_sighash
+      (auth_domain root : Felt) (nfs : list Felt) (fee : nat)
+      (o1 o2 o3 o4 : CairoOutput) : Felt :=
+    Spec.Hashes.sighash_fold H_sighash
+      (Spec.Hashes.sighash_fold H_sighash tag_transfer_felt
+         (auth_domain :: root :: nfs))
+      [felt_of_nat fee;
+       co_cm o1; co_cm o2; co_cm o3; co_cm o4;
+       co_memo o1; co_memo o2; co_memo o3; co_memo o4].
+
+  (** Per-input checks, in Cairo's order inside the input loop. *)
+  Definition input_checks
+      (root sighash : Felt) (primary : Felt) (c : CairoInput) : Prop :=
+    (* [assert(asset_i == ASSET_TEZ || asset_i == primary, ...)] *)
+    (ci_asset c = asset_tez \/ ci_asset c = primary)
+    (* [merkle::verify(cm, root, siblings, path_idx)] *)
+    /\ Spec.Xmss.merkle_verify H_merkle
+         (ci_cm c) root (ci_merkle_siblings c) (ci_pos c)
+    (* [xmss_recover_pk] → [xmss_ltree] → [xmss_verify_auth] *)
+    /\ Spec.Xmss.xmss_verify_cairo_sep
+         (H_tree_node (ci_pub_seed c))
+         (H_ltree_node (ci_pub_seed c) (ci_auth_idx c))
+         F_chain ADRS_chain
+         (ci_pub_seed c) (ci_auth_idx c)
+         (wots_digits sighash) (ci_wots_sig c)
+         (ci_auth_siblings c) (ci_auth_root c)
+    (* [assert(nf == *nf_list.at(i), 'transfer: bad nf')] *)
+    /\ ci_nf c = Spec.Hashes.nullifier H_nf
+                   (ci_nk_spend c) (ci_cm c) (felt_of_nat (ci_pos c)).
+
+  (** The full relation — [cairo/src/transfer.cairo::verify].
+      Conjuncts in Cairo source order. *)
+  Definition TransferRelation
+      (auth_domain root : Felt) (fee : nat)
+      (primary : Felt)             (* primary_non_tez_asset witness *)
+      (inputs : list CairoInput)
+      (o1 o2 o3 o4 : CairoOutput)  (* recipient, change_1, change_2, producer *)
+    : Prop :=
+    let sighash := relation_sighash auth_domain root
+                     (map ci_nf inputs) fee o1 o2 o3 o4 in
+    (* [assert(n >= 1)], [assert(n <= MAX_INPUTS)] *)
+    (1 <= length inputs <= 7)
+    (* [assert(asset_4 == ASSET_TEZ, 'transfer: producer must be tez')] *)
+    /\ co_asset o4 = asset_tez
+    (* the input loop *)
+    /\ Forall (input_checks root sighash primary) inputs
+    (* output asset gates for slots 1-3 *)
+    /\ (co_asset o1 = asset_tez \/ co_asset o1 = primary)
+    /\ (co_asset o2 = asset_tez \/ co_asset o2 = primary)
+    /\ (co_asset o3 = asset_tez \/ co_asset o3 = primary)
+    (* the four output commitment equations *)
+    /\ output_cm_ok o1 /\ output_cm_ok o2
+    /\ output_cm_ok o3 /\ output_cm_ok o4
+    (* [assert(v_4 > 0_u64, 'transfer prod fee')] *)
+    /\ co_v o4 > 0
+    (* the two accumulator equations *)
+    /\ acc_tez asset_tez (map ci_asset inputs) (map ci_v inputs)
+       = acc_tez asset_tez
+           [co_asset o1; co_asset o2; co_asset o3; co_asset o4]
+           [co_v o1; co_v o2; co_v o3; co_v o4] + fee
+    /\ acc_primary asset_tez (map ci_asset inputs) (map ci_v inputs)
+       = acc_primary asset_tez
+           [co_asset o1; co_asset o2; co_asset o3; co_asset o4]
+           [co_v o1; co_v o2; co_v o3; co_v o4].
+
+  (** Views into the Spec records: how a Cairo witness row presents
+      to [Phi_transfer]. *)
+  Definition input_view (c : CairoInput) : Spec.Transfer.InputData :=
+    Spec.Transfer.mkInput
+      (ci_cm c) (ci_d_j c) (felt_of_nat (ci_v c)) (ci_v c)
+      (ci_asset c) (ci_rcm c) (ci_otag c)
+      (ci_nk_spend c) (felt_of_nat (ci_pos c)) (ci_nf c).
+
+  Definition output_view (o : CairoOutput) : Spec.Transfer.OutputData :=
+    Spec.Transfer.mkOutput
+      (co_cm o) (co_d_j o) (felt_of_nat (co_v o)) (co_v o)
+      (co_asset o) (co_rcm o) (co_otag o) (co_memo o).
+
+  (** *** Soundness: the Cairo relation implies the Spec predicate. *)
+  Theorem transfer_relation_sound
+      (auth_domain root : Felt) (fee : nat) (primary : Felt)
+      (inputs : list CairoInput) (o1 o2 o3 o4 : CairoOutput) :
+    TransferRelation auth_domain root fee primary inputs o1 o2 o3 o4 ->
+    Spec.Transfer.Phi_transfer H_sighash H_commit H_nf asset_tez
+      (relation_sighash auth_domain root (map ci_nf inputs) fee o1 o2 o3 o4)
+      auth_domain root tag_transfer_felt (felt_of_nat fee) fee
+      (map input_view inputs)
+      (output_view o1) (output_view o2) (output_view o3) (output_view o4).
+  Proof.
+    intros (Hcount & Hprod_tez & Hloop & Hg1 & Hg2 & Hg3
+            & Hcm1 & Hcm2 & Hcm3 & Hcm4 & Hfee_pos & Htez & Hprim).
+    unfold Spec.Transfer.Phi_transfer.
+    repeat apply conj.
+    - (* phi_input_count: 1 <= n *)
+      rewrite length_map. apply Hcount.
+    - (* phi_input_count: n <= 7 *)
+      rewrite length_map. apply Hcount.
+    - (* input lists parallel *)
+      unfold Spec.Transfer.phi_input_lists_parallel.
+      now rewrite !length_map.
+    - (* output lists parallel *)
+      reflexivity.
+    - (* per-input commitment well-formedness: definitional — the
+         relation COMPUTES the cm from the witness *)
+      rewrite Forall_map. apply Forall_forall. intros c _.
+      reflexivity.
+    - (* per-input nullifier correctness: the loop's nf assert *)
+      rewrite Forall_map.
+      eapply Forall_impl; [| exact Hloop].
+      intros c (_ & _ & _ & Hnf). exact Hnf.
+    - (* per-output commitment well-formedness: the four asserts *)
+      repeat constructor; assumption.
+    - (* per-asset value conservation: the two-accumulator theorem *)
+      unfold Spec.Transfer.phi_value_conservation.
+      intros a. cbn [map Spec.Transfer.out_asset Spec.Transfer.out_v
+                     Spec.Transfer.in_asset Spec.Transfer.in_v
+                     input_view output_view].
+      rewrite !map_map. cbn.
+      apply (two_accumulator_conservation asset_tez primary
+               (map ci_asset inputs) (map ci_v inputs)
+               [co_asset o1; co_asset o2; co_asset o3; co_asset o4]
+               [co_v o1; co_v o2; co_v o3; co_v o4]
+               fee).
+      + (* input gate, extracted from the loop conjunct *)
+        unfold asset_gate. rewrite Forall_map.
+        eapply Forall_impl; [| exact Hloop].
+        intros c (Hgate & _). exact Hgate.
+      + (* output gate: slots 1-3 gated, slot 4 pinned to tez *)
+        unfold asset_gate.
+        apply Forall_cons; [exact Hg1 |].
+        apply Forall_cons; [exact Hg2 |].
+        apply Forall_cons; [exact Hg3 |].
+        apply Forall_cons; [left; exact Hprod_tez |].
+        apply Forall_nil.
+      + exact Htez.
+      + exact Hprim.
+    - (* sighash completeness: definitional *)
+      unfold Spec.Transfer.phi_sighash_complete, relation_sighash.
+      cbn. now rewrite map_map.
+    - (* producer asset pinned to tez *)
+      exact Hprod_tez.
+    - (* producer fee positive *)
+      exact Hfee_pos.
+  Qed.
+
+End TransferRelation.
