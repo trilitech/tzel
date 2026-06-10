@@ -36,6 +36,7 @@ From Common Require Import Felt.
 From Impl Require Import Hashes.
 From Impl Require Import Wots.
 From Impl Require Import Merkle.
+From Impl Require Import Xmss.
 From Spec Require Import MerkleTree.
 From Spec Require Import MerkleFrontier.
 
@@ -100,7 +101,17 @@ Extract Constant Hash_sighash => "Tzel.Hash.hash_sighash".
     2-input hash) for the commitment-tree path computation. *)
 Extract Constant Hash2_merkle => "Tzel.Hash.hash_merkle".
 
+(** Realize [Hash4] (4-input hash) and [pack_adrs_ltree] (L-tree ADRS at
+    key_idx 0) so the extractable XMSS L-tree compression
+    [Impl.Xmss.xmss_ltree] can be differentially fuzzed against the
+    OCaml port's [Tzel.Wots.pk_to_leaf]. *)
+Extract Constant Hash4 => "Tzel.Hash.hash4".
+Extract Constant pack_adrs_ltree =>
+  "(fun level node_idx ->
+      Tzel.Wots.pack_adrs Tzel.Wots.tag_xmss_ltree 0 level node_idx 0)".
+
 Extraction "tzel_wots.ml"
   xmss_chain_step commit nullifier sighash_fold merkle_compute_root
   MerkleTree.root_of MerkleTree.tdfront MerkleTree.mroot
-  MerkleFrontier.froot MerkleFrontier.fbuild.
+  MerkleFrontier.froot MerkleFrontier.fbuild
+  Xmss.xmss_ltree.

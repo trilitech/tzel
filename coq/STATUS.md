@@ -1159,6 +1159,21 @@ nullifier/commitment binding.
   faithfulness probe: the checksum is security-critical but its
   computation was not connected to the security proof.
 
+- **L-TREE DIFFERENTIAL — XMSS verification's untested link closed
+  (`Impl/Extraction.v`, `ocaml/coq_driver/test`):** the XMSS verify is
+  recover(chains) -> ltree(endpoints->leaf) -> merkle(leaf->root). The
+  chain step and merkle path were already differentially fuzzed; the
+  L-TREE compression in the middle was NOT (only proven injective +
+  drift-pinned). Now closed: extracted Impl.Xmss.xmss_ltree (with Hash4
+  and pack_adrs_ltree realized at key_idx 0) and differential-fuzz it
+  against the OCaml port's Tzel.Wots.pk_to_leaf over 2000 random
+  133-endpoint WOTS pubkeys (cross-impl tested vs Cairo). All pass,
+  exercising the odd-leaf carry (133 is odd). So the security-relevant
+  leaf computation (the leaf the XMSS auth path verifies against) is now
+  validated faithful, not just proven-injective. Differential suite now
+  15 cases. (The port asserts exactly n_chains=133 endpoints — the real
+  WOTS pubkey size — which the test respects.)
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

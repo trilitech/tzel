@@ -437,6 +437,40 @@ let test_frontier_root =
           Bytes.equal (extracted_frontier_root depth leaves)
                       (port_root depth leaves)))
 
+(** L-tree differential: the extractable XMSS L-tree compression
+    [Tzel_wots.xmss_ltree] (WOTS endpoints -> leaf, at key_idx 0)
+    against the OCaml port's [Tzel.Wots.pk_to_leaf].  Validates the
+    previously-untested MIDDLE link of XMSS verification
+    (chain step -> ltree -> merkle path); the chain step and merkle
+    path were already covered, the L-tree was not.  Exercises the
+    odd-leaf carry (133, the real WOTS_CHAINS, is odd). *)
+let extracted_ltree pub_seed endpoints =
+  Tzel_wots.xmss_ltree pub_seed endpoints
+
+let port_ltree pub_seed endpoints =
+  Tzel.Wots.pk_to_leaf ~pub_seed ~key_idx:0 (Array.of_list endpoints)
+
+let gen_ltree_input =
+  QCheck.Gen.(
+    let* _seed = int in
+    let pub_seed = random_felt () in
+    let endpoints = List.init 133 (fun _ -> random_felt ()) in
+    return (pub_seed, endpoints))
+
+let arb_ltree_input =
+  QCheck.make gen_ltree_input
+    ~print:(fun (ps, eps) ->
+      Printf.sprintf "pub_seed=%s |endpoints|=%d" (felt_to_hex ps) (List.length eps))
+
+let test_ltree =
+  QCheck_alcotest.to_alcotest
+    (QCheck.Test.make ~count:2000 ~name:"xmss_ltree = port pk_to_leaf"
+       arb_ltree_input
+       (fun (pub_seed, endpoints) ->
+          match extracted_ltree pub_seed endpoints with
+          | Some leaf -> Bytes.equal leaf (port_ltree pub_seed endpoints)
+          | None -> false))
+
 let () =
   Alcotest.run "extraction-diff"
     [ ("xmss_chain_step",
@@ -459,4 +493,5 @@ let () =
          Alcotest.test_case "merkle golden vector (Cairo/Rust-anchored)"
            `Quick test_merkle_golden_vector ]);
       ("merkle_tree_model",
-       [ test_root_of; test_mroot; test_tdfront; test_frontier_root ]) ]
+       [ test_root_of; test_mroot; test_tdfront; test_frontier_root ]);
+      ("xmss_ltree", [ test_ltree ]) ]

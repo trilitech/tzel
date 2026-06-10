@@ -92,6 +92,10 @@ let rec sighash_fold h_sighash acc = function
 
 let hash3 = Tzel.Hash.hash3
 
+(** val hash4 : felt -> felt -> felt -> felt -> felt **)
+
+let hash4 = Tzel.Hash.hash4
+
 (** val hash5 : felt -> felt -> felt -> felt -> felt -> felt **)
 
 let hash5 = Tzel.Hash.hash_commit
@@ -154,6 +158,59 @@ let hash2_merkle = Tzel.Hash.hash_merkle
 
 let merkle_compute_root bits siblings leaf =
   merkle_root hash2_merkle bits siblings leaf
+
+(** val pair_nodes :
+    (int -> int -> felt -> felt -> felt) -> felt list -> int -> int -> felt
+    list **)
+
+let rec pair_nodes h_node nodes level node_idx =
+  match nodes with
+  | [] -> nodes
+  | a::l ->
+    (match l with
+     | [] -> nodes
+     | b::rest ->
+       (h_node level node_idx a b)::(pair_nodes h_node rest level
+                                      (Stdlib.succ node_idx)))
+
+(** val ltree_aux :
+    (int -> int -> felt -> felt -> felt) -> int -> felt list -> int -> felt
+    option **)
+
+let rec ltree_aux h_node fuel nodes level =
+  match nodes with
+  | [] -> None
+  | x::l ->
+    (match l with
+     | [] -> Some x
+     | _::_ ->
+       ((fun fO fS n -> if n=0 then fO () else fS (n-1))
+          (fun _ -> None)
+          (fun f ->
+          ltree_aux h_node f (pair_nodes h_node nodes level 0) (Stdlib.succ
+            level))
+          fuel))
+
+(** val ltree :
+    (int -> int -> felt -> felt -> felt) -> felt list -> felt option **)
+
+let ltree h_node nodes =
+  ltree_aux h_node (length nodes) nodes 0
+
+(** val pack_adrs_ltree : int -> int -> felt **)
+
+let pack_adrs_ltree = (fun level node_idx ->
+      Tzel.Wots.pack_adrs Tzel.Wots.tag_xmss_ltree 0 level node_idx 0)
+
+(** val ltree_node_hash : felt -> int -> int -> felt -> felt -> felt **)
+
+let ltree_node_hash pub_seed level node_idx left right =
+  hash4 pub_seed (pack_adrs_ltree level node_idx) left right
+
+(** val xmss_ltree : felt -> felt list -> felt option **)
+
+let xmss_ltree pub_seed endpoints =
+  ltree (ltree_node_hash pub_seed) endpoints
 
 (** val zero_hash : ('a1 -> 'a1 -> 'a1) -> 'a1 -> int -> 'a1 **)
 

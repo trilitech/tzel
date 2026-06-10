@@ -30,6 +30,8 @@ val sighash_fold : (felt -> felt -> felt) -> felt -> felt list -> felt
 
 val hash3 : felt -> felt -> felt -> felt
 
+val hash4 : felt -> felt -> felt -> felt -> felt
+
 val hash5 : felt -> felt -> felt -> felt -> felt -> felt
 
 val commit : felt -> felt -> felt -> felt -> felt -> felt
@@ -54,6 +56,21 @@ val merkle_root :
 val hash2_merkle : felt -> felt -> felt
 
 val merkle_compute_root : bool list -> felt list -> felt -> felt
+
+val pair_nodes :
+  (int -> int -> felt -> felt -> felt) -> felt list -> int -> int -> felt list
+
+val ltree_aux :
+  (int -> int -> felt -> felt -> felt) -> int -> felt list -> int -> felt
+  option
+
+val ltree : (int -> int -> felt -> felt -> felt) -> felt list -> felt option
+
+val pack_adrs_ltree : int -> int -> felt
+
+val ltree_node_hash : felt -> int -> int -> felt -> felt -> felt
+
+val xmss_ltree : felt -> felt list -> felt option
 
 val zero_hash : ('a1 -> 'a1 -> 'a1) -> 'a1 -> int -> 'a1
 
