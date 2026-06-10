@@ -10,8 +10,8 @@ name: rocq model
 # - any push to main affecting coq/** or cairo/src/**.cairo (Cairo
 #   edits drive drift detection)
 # - same-paths PRs
-# - the coq-model branch (so the model can iterate independently of
-#   main while it's under development)
+# - the coq-model / coq-proofs branches (so the model can iterate
+#   independently of main while it's under development)
 # - workflow_dispatch
 #
 # Extraction wires through ocaml/coq_driver/ — `make` builds the
@@ -27,7 +27,7 @@ name: rocq model
 
 on:
   push:
-    branches: [main, coq-model]
+    branches: [main, coq-model, coq-proofs]
     paths:
       - "coq/**"
       - "cairo/src/**.cairo"
