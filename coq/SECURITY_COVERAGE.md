@@ -261,6 +261,29 @@ audit").
   `Hash3` / `pack_adrs_chain`. All six Impl modules carry proven
   refinement/soundness theorems.
 
+### The relation-soundness theorems are provably NON-VACUOUS
+
+A theorem `Relation -> Phi` proves nothing if `Relation` is
+unsatisfiable (a modeling contradiction would make it vacuously true —
+and the differential tests, which exercise extracted *functions*, cannot
+detect an unsatisfiable *relation*).  The relations are proven inhabited:
+
+- `Impl.Shield.shield_relation_inhabited`,
+  `Impl.Transfer.transfer_relation_inhabited`,
+  `Impl.Unshield.unshield_relation_inhabited` — a single concrete honest
+  transaction satisfies every conjunct of each relation at once (honest
+  WOTS+ signature with the key fixed first, hash-correct commitments,
+  pinned producer fee, balanced 2-accumulator).
+- `Spec.XmssInhabited.xmss_cairo_sep_inhabited` — the only
+  non-trivially-satisfiable conjunct (the in-circuit XMSS verify) is
+  inhabited in isolation.
+- `Spec.XmssInhabited.inhab_hyps_satisfiable` — the `wots_digits`/`sks`
+  well-formedness premises of those inhabitations are themselves
+  satisfiable, so the inhabitations are not vacuously conditional.
+
+All five rest on only `Felt` + `Felt_eq_dec` (Print Assumptions).  So
+the circuit-relation soundness theorems are load-bearing, not hollow.
+
 ---
 
 ## Documented properties NOT formally verified (and why)
