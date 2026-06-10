@@ -531,6 +531,28 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   Note: bounds stated as 256^8 / 256^4 (= u64 / u32) to keep them
   symbolic — writing 2^64 in unary nat would force a cbn blowup.
 
+- **STORAGE-PATH NAMESPACE COLLISION-FREEDOM (`Spec/StoragePaths.v`):**
+  the kernel keys all durable storage by a typed string path
+  (per-key-type prefix + attacker-influenceable key: hex nullifier /
+  commitment / deposit key). A CROSS-TYPE collision would be
+  catastrophic — a deposit key producing a nullifier path lets an
+  attacker mark a victim's nullifier spent (locking their note), or
+  commingle pools. Proved (zero admits) using the ACTUAL prefix
+  constants:
+  - append_eq_prefix: equal appends p++a = q++b force one base to be a
+    prefix of the other (the key fact);
+  - cross_no_collision: incomparable type prefixes (neither a prefix
+    of the other) => paths never collide for ANY keys;
+  - kernel_prefixes_pairwise_incomparable: the 7 key-bearing prefixes
+    (nullifier by-key/index, deposit, applied-shield, valid-root,
+    note, tree-branch) are pairwise incomparable, by vm_compute on the
+    real strings — including the subtle nullifiers/by-key vs
+    nullifiers/index pair that shares the long nullifiers/ stem;
+  - within_no_collision: distinct keys under one prefix => distinct
+    paths (append left-injective);
+  - concrete corollaries: deposit/applied-shield/valid-root keys can
+    never alias a nullifier path, etc.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

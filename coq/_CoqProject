@@ -24,6 +24,7 @@ Spec/KernelNullifier.v
 Spec/MerkleTree.v
 Spec/ShieldReplay.v
 Spec/WithdrawalRecord.v
+Spec/StoragePaths.v
 
 Impl/Common.v
 Impl/Hashes.v
