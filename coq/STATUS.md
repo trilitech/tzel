@@ -475,6 +475,24 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   loop (same stored data = completed-left-subtree roots, same root);
   the loop direction is an implementation detail.
 
+- **MERKLE MODEL DIFFERENTIAL (faithfulness, `coq_driver/test`):**
+  closes the by-inspection gap for the append-only-tree proofs. The
+  kernel state-machine models so far were faithful by transcription;
+  this validates the Merkle MODEL the way the circuit primitives were
+  validated. Extracted the Coq `root_of` / `mroot` / `tdfront`
+  (polymorphic over the node hash + empty-leaf) and differential-fuzz
+  them, instantiated with `Tzel.Hash.hash_merkle` / `Tzel.Felt.zero`,
+  against `Tzel.Merkle.root_of_leaves` (cross-impl tested vs Cairo and
+  the Rust kernel's hash_merkle):
+  - root_of / mroot vs port over full 2^depth trees (2k cases each);
+  - tdfront (incremental frontier) vs the batch root of (prefix ++
+    [cm]) for random prefixes (5k cases).
+  All green. So the model whose correctness was PROVED
+  (tdfront_correct) is also VALIDATED to compute what the production
+  tree computes — proof + differential, both directions. This is the
+  Coq <-> OCaml <-> Cairo/kernel faithfulness pattern (used for the
+  circuit primitives) now extended to the kernel Merkle tree.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

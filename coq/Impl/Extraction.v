@@ -36,6 +36,7 @@ From Common Require Import Felt.
 From Impl Require Import Hashes.
 From Impl Require Import Wots.
 From Impl Require Import Merkle.
+From Spec Require Import MerkleTree.
 
 Extraction Language OCaml.
 
@@ -99,4 +100,5 @@ Extract Constant Hash_sighash => "Tzel.Hash.hash_sighash".
 Extract Constant Hash2_merkle => "Tzel.Hash.hash_merkle".
 
 Extraction "tzel_wots.ml"
-  xmss_chain_step commit nullifier sighash_fold merkle_compute_root.
+  xmss_chain_step commit nullifier sighash_fold merkle_compute_root
+  MerkleTree.root_of MerkleTree.tdfront MerkleTree.mroot.

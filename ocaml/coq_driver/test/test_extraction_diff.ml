@@ -100,6 +100,21 @@ let port_merkle_root bits siblings leaf =
 let extracted_merkle_root bits siblings leaf =
   Tzel_wots.merkle_compute_root bits siblings leaf
 
+(** Merkle batch/frontier model differential.  The extracted Coq
+    MerkleTree functions (root_of, mroot, tdfront) take the node hash
+    and empty-leaf value as parameters; we instantiate them with the
+    OCaml port's Tzel.Hash.hash_merkle and Tzel.Felt.zero and compare
+    against Tzel.Merkle.root_of_leaves (cross-impl tested against
+    Cairo and the Rust kernel's hash_merkle). A pass validates the
+    Coq Merkle MODEL against the production tree — closing the
+    by-inspection faithfulness gap for the append-only-tree proofs. *)
+let merkle_H = Tzel.Hash.hash_merkle
+let merkle_z = Tzel.Felt.zero
+let port_root depth leaves = Tzel.Merkle.root_of_leaves ~depth leaves
+let extracted_root_of depth leaves = Tzel_wots.root_of merkle_H merkle_z depth leaves
+let extracted_mroot depth leaves = Tzel_wots.mroot merkle_H merkle_z depth leaves
+let extracted_tdfront depth pre cm = Tzel_wots.tdfront merkle_H merkle_z depth pre cm
+
 (** QCheck generator for chain-step inputs. *)
 let gen_chain_input =
   QCheck.Gen.(
@@ -348,6 +363,52 @@ let test_merkle_golden_vector () =
     "extracted Coq merkle fold reaches the Rust/Cairo golden root"
     true (Bytes.equal got root)
 
+(** root_of: bottom-up batch root over a FULL 2^depth leaf list. *)
+let gen_full_tree =
+  QCheck.Gen.(
+    let* depth = 0 -- 6 in
+    let n = 1 lsl depth in
+    let leaves = List.init n (fun _ -> random_felt ()) in
+    return (depth, leaves))
+let arb_full_tree =
+  QCheck.make gen_full_tree ~print:(fun (d,_) -> Printf.sprintf "depth=%d" d)
+
+let test_root_of =
+  QCheck_alcotest.to_alcotest
+    (QCheck.Test.make ~count:2000 ~name:"root_of: extracted = port"
+       arb_full_tree
+       (fun (depth, leaves) ->
+          Bytes.equal (extracted_root_of depth leaves) (port_root depth leaves)))
+
+let test_mroot =
+  QCheck_alcotest.to_alcotest
+    (QCheck.Test.make ~count:2000 ~name:"mroot (top-down) = port"
+       arb_full_tree
+       (fun (depth, leaves) ->
+          Bytes.equal (extracted_mroot depth leaves) (port_root depth leaves)))
+
+(** tdfront: the incremental frontier append of cm after a prefix of
+    length < 2^depth must equal the batch root of (prefix @ [cm]). *)
+let gen_frontier =
+  QCheck.Gen.(
+    let* depth = 0 -- 6 in
+    let cap = 1 lsl depth in
+    let* k = 0 -- (cap - 1) in
+    let pre = List.init k (fun _ -> random_felt ()) in
+    let cm = random_felt () in
+    return (depth, pre, cm))
+let arb_frontier =
+  QCheck.make gen_frontier
+    ~print:(fun (d,pre,_) -> Printf.sprintf "depth=%d |pre|=%d" d (List.length pre))
+
+let test_tdfront =
+  QCheck_alcotest.to_alcotest
+    (QCheck.Test.make ~count:5000 ~name:"tdfront (incremental) = batch root"
+       arb_frontier
+       (fun (depth, pre, cm) ->
+          Bytes.equal (extracted_tdfront depth pre cm)
+                      (port_root depth (pre @ [cm]))))
+
 let () =
   Alcotest.run "extraction-diff"
     [ ("xmss_chain_step",
@@ -368,4 +429,6 @@ let () =
       ("merkle_root",
        [ test_merkle_root;
          Alcotest.test_case "merkle golden vector (Cairo/Rust-anchored)"
-           `Quick test_merkle_golden_vector ]) ]
+           `Quick test_merkle_golden_vector ]);
+      ("merkle_tree_model",
+       [ test_root_of; test_mroot; test_tdfront ]) ]

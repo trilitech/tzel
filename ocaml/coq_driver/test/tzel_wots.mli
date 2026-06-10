@@ -1,5 +1,24 @@
 
+val length : 'a1 list -> int
+
 type felt = bytes
+
+module Nat :
+ sig
+  val add : int -> int -> int
+
+  val mul : int -> int -> int
+
+  val leb : int -> int -> bool
+
+  val ltb : int -> int -> bool
+
+  val pow : int -> int -> int
+ end
+
+val firstn : int -> 'a1 list -> 'a1 list
+
+val skipn : int -> 'a1 list -> 'a1 list
 
 val sighash_fold : (felt -> felt -> felt) -> felt -> felt list -> felt
 
@@ -29,3 +48,15 @@ val merkle_root :
 val hash2_merkle : felt -> felt -> felt
 
 val merkle_compute_root : bool list -> felt list -> felt -> felt
+
+val zero_hash : ('a1 -> 'a1 -> 'a1) -> 'a1 -> int -> 'a1
+
+val build_level : ('a1 -> 'a1 -> 'a1) -> 'a1 list -> 'a1 list
+
+val fold_levels : ('a1 -> 'a1 -> 'a1) -> int -> 'a1 list -> 'a1 list
+
+val root_of : ('a1 -> 'a1 -> 'a1) -> 'a1 -> int -> 'a1 list -> 'a1
+
+val mroot : ('a1 -> 'a1 -> 'a1) -> 'a1 -> int -> 'a1 list -> 'a1
+
+val tdfront : ('a1 -> 'a1 -> 'a1) -> 'a1 -> int -> 'a1 list -> 'a1 -> 'a1
