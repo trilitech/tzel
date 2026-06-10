@@ -37,7 +37,7 @@ use tzel_core::{
         decode_staged_note_payload, encode_kernel_result, encode_kernel_verifier_config,
         kernel_bridge_config_sighash, kernel_shield_req_to_host, kernel_transfer_req_to_host,
         kernel_unshield_req_to_host, kernel_verifier_config_sighash, validate_kernel_submit_ops,
-        KernelBridgeConfig, KernelDalPayloadKind, KernelDalPayloadPointer, KernelInboxMessage,
+        KernelBridgeConfig, KernelInboxMessage,
         KernelOpDecl, KernelOpDeclBody, KernelOpResult, KernelResult,
         KernelShieldReq, KernelSignedBridgeConfig, KernelSignedVerifierConfig, KernelStageChunk,
         KernelStagedResp, KernelStarkProof, KernelSubmitOps, KernelSubmitResp, KernelTransferReq,
@@ -57,7 +57,6 @@ use tzel_verifier::DirectProofVerifier;
 pub const MAX_INPUT_BYTES: usize = 16 * 1024;
 pub const MAX_LEDGER_STATE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESULT_ERROR_MESSAGE_BYTES: usize = 4096;
-const MAX_DAL_PAYLOAD_BYTES: usize = 512 * 1024;
 
 #[cfg(not(feature = "proof-verifier"))]
 #[derive(Debug, Clone)]
@@ -172,14 +171,6 @@ pub struct KernelStats {
     pub last_input_len: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DalParameters {
-    pub number_of_slots: u64,
-    pub attestation_lag: u64,
-    pub slot_size: u64,
-    pub page_size: u64,
-}
-
 type BridgeDepositTicket = FA2_1Ticket;
 type BridgeDepositPayload = MichelsonPair<MichelsonBytes, BridgeDepositTicket>;
 
@@ -234,14 +225,6 @@ pub trait Host {
     fn write_output(&mut self, value: &[u8]) -> Result<(), String>;
     fn write_debug(&mut self, message: &str);
     fn rollup_address(&self) -> Vec<u8>;
-    fn reveal_dal_parameters(&self) -> Result<DalParameters, String>;
-    fn reveal_dal_page(
-        &self,
-        published_level: i32,
-        slot_index: u8,
-        page_index: u16,
-        max_bytes: usize,
-    ) -> Result<Vec<u8>, String>;
 }
 
 struct DurableLedgerState<'a, H: Host> {
@@ -1056,150 +1039,6 @@ pub fn read_last_result<H: Host>(host: &H) -> Option<KernelResult> {
     decode_kernel_result(&bytes).ok()
 }
 
-fn dal_payload_kind_name(kind: &KernelDalPayloadKind) -> &'static str {
-    match kind {
-        KernelDalPayloadKind::ConfigureVerifier => "configure-verifier",
-        KernelDalPayloadKind::ConfigureBridge => "configure-bridge",
-        KernelDalPayloadKind::Shield => "shield",
-        KernelDalPayloadKind::Transfer => "transfer",
-        KernelDalPayloadKind::Unshield => "unshield",
-    }
-}
-
-fn fetch_kernel_message_from_dal<H: Host>(
-    host: &H,
-    pointer: &KernelDalPayloadPointer,
-) -> Result<KernelInboxMessage, String> {
-    if pointer.chunks.is_empty() {
-        return Err("DAL pointer message requires at least one chunk".into());
-    }
-    let payload_len = usize::try_from(pointer.payload_len)
-        .map_err(|_| "DAL payload length does not fit in usize".to_string())?;
-    if payload_len == 0 {
-        return Err("DAL payload length must be non-zero".into());
-    }
-    if payload_len > MAX_DAL_PAYLOAD_BYTES {
-        return Err(format!(
-            "DAL payload too large: {} > {}",
-            payload_len, MAX_DAL_PAYLOAD_BYTES
-        ));
-    }
-
-    let params = host.reveal_dal_parameters()?;
-    if params.number_of_slots == 0 {
-        return Err("DAL parameters reported zero slots".into());
-    }
-    if params.slot_size == 0 || params.page_size == 0 {
-        return Err("DAL parameters reported zero-sized slots or pages".into());
-    }
-
-    let declared_total = pointer.chunks.iter().try_fold(0usize, |acc, chunk| {
-        let len = usize::try_from(chunk.payload_len)
-            .map_err(|_| "DAL chunk payload length does not fit in usize".to_string())?;
-        acc.checked_add(len)
-            .ok_or_else(|| "DAL chunk lengths overflow usize".to_string())
-    })?;
-    if declared_total != payload_len {
-        return Err(format!(
-            "DAL chunk lengths do not sum to payload length: {} != {}",
-            declared_total, payload_len
-        ));
-    }
-
-    let slot_size = usize::try_from(params.slot_size)
-        .map_err(|_| "DAL slot size does not fit in usize".to_string())?;
-    let page_size = usize::try_from(params.page_size)
-        .map_err(|_| "DAL page size does not fit in usize".to_string())?;
-    let mut payload = Vec::with_capacity(payload_len);
-
-    for (index, chunk) in pointer.chunks.iter().enumerate() {
-        let chunk_len = usize::try_from(chunk.payload_len)
-            .map_err(|_| format!("DAL chunk {} length does not fit in usize", index))?;
-        if chunk_len == 0 {
-            return Err(format!("DAL chunk {} has zero payload length", index));
-        }
-        if chunk_len > slot_size {
-            return Err(format!(
-                "DAL chunk {} length {} exceeds slot size {}",
-                index, chunk_len, slot_size
-            ));
-        }
-        if u64::from(chunk.slot_index) >= params.number_of_slots {
-            return Err(format!(
-                "DAL chunk {} slot index {} exceeds number_of_slots {}",
-                index, chunk.slot_index, params.number_of_slots
-            ));
-        }
-        let published_level = i32::try_from(chunk.published_level).map_err(|_| {
-            format!(
-                "DAL chunk {} published level {} does not fit in i32",
-                index, chunk.published_level
-            )
-        })?;
-        let page_count = chunk_len.div_ceil(page_size);
-        let mut chunk_bytes = Vec::with_capacity(page_count.saturating_mul(page_size));
-        for page_index in 0..page_count {
-            let page = host.reveal_dal_page(
-                published_level,
-                chunk.slot_index,
-                u16::try_from(page_index)
-                    .map_err(|_| format!("DAL chunk {} page index overflow", index))?,
-                page_size,
-            )?;
-            if page.len() > page_size {
-                return Err(format!(
-                    "DAL chunk {} page {} exceeds page size {}",
-                    index, page_index, page_size
-                ));
-            }
-            chunk_bytes.extend_from_slice(&page);
-        }
-        if chunk_bytes.len() < chunk_len {
-            return Err(format!(
-                "DAL chunk {} truncated: need {} bytes, got {}",
-                index,
-                chunk_len,
-                chunk_bytes.len()
-            ));
-        }
-        if chunk_bytes[chunk_len..].iter().any(|byte| *byte != 0) {
-            return Err(format!(
-                "DAL chunk {} trailing padding contains non-zero data",
-                index
-            ));
-        }
-        payload.extend_from_slice(&chunk_bytes[..chunk_len]);
-    }
-
-    if payload.len() != payload_len {
-        return Err(format!(
-            "DAL payload length mismatch after reassembly: {} != {}",
-            payload.len(),
-            payload_len
-        ));
-    }
-    if hash(&payload) != pointer.payload_hash {
-        return Err("DAL payload hash mismatch".into());
-    }
-
-    let message = decode_kernel_inbox_message(&payload)?;
-    match (&pointer.kind, &message) {
-        (KernelDalPayloadKind::ConfigureVerifier, KernelInboxMessage::ConfigureVerifier(_))
-        | (KernelDalPayloadKind::ConfigureBridge, KernelInboxMessage::ConfigureBridge(_))
-        | (KernelDalPayloadKind::Shield, KernelInboxMessage::Shield(_))
-        | (KernelDalPayloadKind::Transfer, KernelInboxMessage::Transfer(_))
-        | (KernelDalPayloadKind::Unshield, KernelInboxMessage::Unshield(_)) => Ok(message),
-        (_, KernelInboxMessage::DalPointer(_)) => {
-            Err("nested DAL pointer messages are not supported".into())
-        }
-        _ => Err(format!(
-            "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
-            dal_payload_kind_name(&pointer.kind),
-            message
-        )),
-    }
-}
-
 fn apply_kernel_message<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
     sender: &InboxSender,
@@ -1225,13 +1064,6 @@ fn apply_kernel_message<H: Host>(
         KernelInboxMessage::Unshield(req) => {
             validate_transition_proof(ledger.host, &req.proof, CircuitKind::Unshield)?;
             apply_validated_unshield(ledger, &req).map(KernelResult::Unshield)
-        }
-        KernelInboxMessage::DalPointer(pointer) => {
-            let nested = fetch_kernel_message_from_dal(ledger.host, &pointer)?;
-            if matches!(nested, KernelInboxMessage::DalPointer(_)) {
-                return Err("nested DAL pointer messages are not supported".into());
-            }
-            apply_kernel_message(ledger, sender, nested)
         }
         KernelInboxMessage::StageChunk(chunk) => apply_stage_chunk(ledger, sender, &chunk),
         KernelInboxMessage::SubmitOps(submit) => apply_submit_ops(ledger, sender, &submit),
@@ -2866,7 +2698,7 @@ fn read_i32<H: Host>(host: &H, path: &[u8]) -> Option<i32> {
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_host {
-    use super::{run_with_host, DalParameters, Host, InputMessage, MAX_INPUT_BYTES};
+    use super::{run_with_host, Host, InputMessage, MAX_INPUT_BYTES};
 
     #[repr(C)]
     struct ReadInputMessageInfo {
@@ -2898,12 +2730,6 @@ mod wasm_host {
         ) -> i32;
         fn write_output(src: *const u8, num_bytes: usize) -> i32;
         fn reveal_metadata(dst: *mut u8, max_bytes: usize) -> i32;
-        fn reveal(
-            payload_addr: *const u8,
-            payload_len: usize,
-            destination_addr: *mut u8,
-            max_bytes: usize,
-        ) -> i32;
     }
 
     pub struct WasmHost;
@@ -2972,68 +2798,6 @@ mod wasm_host {
             assert_eq!(written, metadata.len() as i32, "reveal_metadata failed");
             metadata[..20].to_vec()
         }
-
-        fn reveal_dal_parameters(&self) -> Result<DalParameters, String> {
-            let payload = [3u8];
-            let mut raw = [0u8; 32];
-            let written =
-                unsafe { reveal(payload.as_ptr(), payload.len(), raw.as_mut_ptr(), raw.len()) };
-            if written != raw.len() as i32 {
-                return Err(format!(
-                    "reveal DAL parameters failed: expected {} bytes, got {}",
-                    raw.len(),
-                    written
-                ));
-            }
-            let read_u64_be = |bytes: &[u8]| -> Result<u64, String> {
-                let signed = i64::from_be_bytes(
-                    bytes
-                        .try_into()
-                        .map_err(|_| "bad DAL parameter width".to_string())?,
-                );
-                u64::try_from(signed).map_err(|_| "DAL parameter was negative".to_string())
-            };
-            Ok(DalParameters {
-                number_of_slots: read_u64_be(&raw[0..8])?,
-                attestation_lag: read_u64_be(&raw[8..16])?,
-                slot_size: read_u64_be(&raw[16..24])?,
-                page_size: read_u64_be(&raw[24..32])?,
-            })
-        }
-
-        fn reveal_dal_page(
-            &self,
-            published_level: i32,
-            slot_index: u8,
-            page_index: u16,
-            max_bytes: usize,
-        ) -> Result<Vec<u8>, String> {
-            let page_index = i16::try_from(page_index)
-                .map_err(|_| "DAL page index does not fit in i16".to_string())?;
-            let payload: Vec<u8> = [
-                &[2u8][..],
-                published_level.to_be_bytes().as_ref(),
-                &[slot_index],
-                page_index.to_be_bytes().as_ref(),
-            ]
-            .concat();
-            let mut buffer = vec![0u8; max_bytes];
-            let written = unsafe {
-                reveal(
-                    payload.as_ptr(),
-                    payload.len(),
-                    buffer.as_mut_ptr(),
-                    buffer.len(),
-                )
-            };
-            if written < 0 {
-                return Err("reveal DAL page failed".into());
-            }
-            let len = usize::try_from(written)
-                .map_err(|_| "reveal DAL page returned invalid size".to_string())?;
-            buffer.truncate(len);
-            Ok(buffer)
-        }
     }
 
     #[no_mangle]
@@ -3063,7 +2827,6 @@ mod tests {
         public_key_hash::PublicKeyHash,
         smart_rollup::SmartRollupAddress,
     };
-    use tzel_core::kernel_wire::KernelDalChunkPointer;
     use tzel_core::{
         commit, default_auth_domain, deposit_recipient_string, derive_account, derive_address,
         derive_ask, derive_auth_pub_seed, derive_kem_keys, derive_nk_spend, derive_nk_tag,
@@ -3094,8 +2857,6 @@ mod tests {
         debug: String,
         fail_output: Option<String>,
         rollup_address: Option<Vec<u8>>,
-        dal_parameters: Option<DalParameters>,
-        dal_pages: HashMap<(i32, u8, u16), Vec<u8>>,
     }
 
     impl MockHost {
@@ -3141,28 +2902,6 @@ mod tests {
 
         fn rollup_address(&self) -> Vec<u8> {
             self.effective_rollup_address()
-        }
-
-        fn reveal_dal_parameters(&self) -> Result<DalParameters, String> {
-            self.dal_parameters
-                .clone()
-                .ok_or_else(|| "mock DAL parameters are not configured".to_string())
-        }
-
-        fn reveal_dal_page(
-            &self,
-            published_level: i32,
-            slot_index: u8,
-            page_index: u16,
-            max_bytes: usize,
-        ) -> Result<Vec<u8>, String> {
-            let Some(page) = self
-                .dal_pages
-                .get(&(published_level, slot_index, page_index))
-            else {
-                return Ok(Vec::new());
-            };
-            Ok(page[..page.len().min(max_bytes)].to_vec())
         }
     }
 
@@ -4487,138 +4226,6 @@ mod tests {
             &((MAX_LEDGER_STATE_BYTES as u64) + 1).to_le_bytes(),
         );
         assert!(read_persisted_note(&host, 0).is_none());
-    }
-
-    #[test]
-    fn applies_configure_verifier_message_from_dal_pointer() {
-        let mut host = MockHost::default();
-        let config = KernelVerifierConfig {
-            auth_domain: sample_felt(0x41),
-            verified_program_hashes: sample_program_hashes(),
-        };
-        let payload =
-            encode_kernel_inbox_message(&signed_verifier_message(config.clone())).unwrap();
-        let pointer = KernelDalPayloadPointer {
-            kind: KernelDalPayloadKind::ConfigureVerifier,
-            chunks: vec![install_mock_dal_payload(
-                &mut host, 101, 1, 64, 8192, &payload,
-            )],
-            payload_len: payload.len() as u64,
-            payload_hash: hash(&payload),
-        };
-        host.inputs.push_back(InputMessage {
-            level: 13,
-            id: 0,
-            payload: encode_external_kernel_message(&KernelInboxMessage::DalPointer(pointer)),
-        });
-
-        run_with_host(&mut host);
-
-        let verifier = read_verifier_config(&host)
-            .expect("verifier config read")
-            .expect("verifier config persisted");
-        assert_eq!(verifier.auth_domain, config.auth_domain);
-        assert_eq!(
-            verifier.verified_program_hashes,
-            config.verified_program_hashes
-        );
-        assert!(matches!(
-            read_last_result(&host).unwrap(),
-            KernelResult::Configured
-        ));
-    }
-
-    #[test]
-    fn applies_configure_bridge_message_from_dal_pointer() {
-        let mut host = MockHost::default();
-        let config = KernelBridgeConfig {
-            ticketer: sample_ticketer().into(),
-        };
-        let payload = encode_kernel_inbox_message(&signed_bridge_message(config.clone())).unwrap();
-        let pointer = KernelDalPayloadPointer {
-            kind: KernelDalPayloadKind::ConfigureBridge,
-            chunks: vec![install_mock_dal_payload(
-                &mut host, 101, 2, 64, 8192, &payload,
-            )],
-            payload_len: payload.len() as u64,
-            payload_hash: hash(&payload),
-        };
-        host.inputs.push_back(InputMessage {
-            level: 14,
-            id: 0,
-            payload: encode_external_kernel_message(&KernelInboxMessage::DalPointer(pointer)),
-        });
-
-        run_with_host(&mut host);
-
-        assert_eq!(
-            host.read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
-                .expect("ticketer stored"),
-            sample_ticketer().as_bytes()
-        );
-        assert!(matches!(
-            read_last_result(&host).unwrap(),
-            KernelResult::Configured
-        ));
-    }
-
-    #[test]
-    fn rejects_dal_pointer_hash_mismatch_without_mutating_state() {
-        // This test exercises the DAL-pointer hash-mismatch path. The shield
-        // payload is an opaque vehicle here; the DAL hash check fires before
-        // the kernel even decodes shield consensus rules.
-        let mut host = MockHost::default();
-        let producer_fee = 1;
-
-        let address = sample_payment_address();
-        let producer_rseed = sample_felt(0x34);
-        let producer_enc = sample_encrypted_note(&address, producer_fee, producer_rseed, b"dal");
-        let producer_cm = sample_commitment(&address, producer_fee, producer_rseed);
-        let client_rseed = sample_felt(0x35);
-        let client_enc = sample_encrypted_note(&address, 50, client_rseed, b"shield");
-        let client_cm = sample_commitment(&address, 50, client_rseed);
-        let payload = encode_external_kernel_message(&KernelInboxMessage::Shield(KernelShieldReq {
-            pubkey_hash: pubkey_hash_from_label("alice"),
-            fee: MIN_TX_FEE,
-            producer_fee,
-            v: 50,
-            proof: sample_kernel_test_proof(),
-            client_cm,
-            client_enc,
-            producer_cm,
-            producer_enc,
-        }));
-        let mut bad_hash = hash(&payload);
-        bad_hash[0] ^= 0xFF;
-        let pointer = KernelDalPayloadPointer {
-            kind: KernelDalPayloadKind::Shield,
-            chunks: vec![install_mock_dal_payload(
-                &mut host, 101, 4, 64, 8192, &payload,
-            )],
-            payload_len: payload.len() as u64,
-            payload_hash: bad_hash,
-        };
-        host.inputs.push_back(InputMessage {
-            level: 16,
-            id: 0,
-            payload: encode_external_kernel_message(&KernelInboxMessage::DalPointer(pointer)),
-        });
-
-        run_with_host(&mut host);
-
-        let _ = producer_fee;
-        // DAL hash mismatch: kernel rejects, no balance entry mutated.
-        let balance_path =
-            deposit_balance_path(&pubkey_hash_from_label("alice"));
-        assert!(host.read_store(&balance_path, 8).is_none());
-        let ledger = read_ledger(&host).unwrap();
-        assert!(ledger.tree.leaves.is_empty());
-        match read_last_result(&host).unwrap() {
-            KernelResult::Error { message } => {
-                assert!(message.contains("DAL payload hash mismatch"))
-            }
-            other => panic!("unexpected rollup result: {:?}", other),
-        }
     }
 
     #[test]
@@ -6161,88 +5768,6 @@ mod tests {
             payload: message,
         });
         run_with_host(host);
-    }
-
-    fn install_mock_dal_payload(
-        host: &mut MockHost,
-        published_level: i32,
-        slot_index: u8,
-        page_size: usize,
-        slot_size: usize,
-        payload: &[u8],
-    ) -> KernelDalChunkPointer {
-        install_mock_dal_payload_chunks(
-            host,
-            &[(published_level, slot_index)],
-            page_size,
-            slot_size,
-            payload,
-        )
-        .into_iter()
-        .next()
-        .expect("single DAL chunk")
-    }
-
-    fn install_mock_dal_payload_chunks(
-        host: &mut MockHost,
-        chunk_specs: &[(i32, u8)],
-        page_size: usize,
-        slot_size: usize,
-        payload: &[u8],
-    ) -> Vec<KernelDalChunkPointer> {
-        assert!(page_size > 0);
-        assert!(slot_size > 0);
-        host.dal_parameters = Some(DalParameters {
-            number_of_slots: chunk_specs
-                .iter()
-                .map(|(_, slot_index)| u64::from(*slot_index))
-                .max()
-                .unwrap_or(0)
-                + 1,
-            attestation_lag: 8,
-            slot_size: slot_size as u64,
-            page_size: page_size as u64,
-        });
-
-        let mut pointers = Vec::new();
-        let mut offset = 0usize;
-        for (chunk_index, (published_level, slot_index)) in chunk_specs.iter().enumerate() {
-            if offset >= payload.len() {
-                break;
-            }
-            let remaining = payload.len() - offset;
-            let chunk_len = remaining.min(slot_size);
-            let chunk = &payload[offset..offset + chunk_len];
-            let page_count = chunk_len.div_ceil(page_size);
-            for page_index in 0..page_count {
-                let start = page_index * page_size;
-                let end = (start + page_size).min(chunk_len);
-                let mut page = vec![0u8; page_size];
-                page[..end - start].copy_from_slice(&chunk[start..end]);
-                host.dal_pages.insert(
-                    (
-                        *published_level,
-                        *slot_index,
-                        u16::try_from(page_index).expect("page index fits in u16"),
-                    ),
-                    page,
-                );
-            }
-            pointers.push(KernelDalChunkPointer {
-                published_level: u64::try_from(*published_level)
-                    .expect("published level must be non-negative"),
-                slot_index: *slot_index,
-                payload_len: chunk_len as u64,
-            });
-            offset += chunk_len;
-            if chunk_index + 1 == chunk_specs.len() && offset < payload.len() {
-                panic!("insufficient DAL chunk specs for payload");
-            }
-        }
-        if offset < payload.len() {
-            panic!("insufficient DAL chunk specs for payload");
-        }
-        pointers
     }
 
     fn encode_ticket_deposit_message(recipient: &str, amount: u64) -> Vec<u8> {

@@ -11,30 +11,21 @@ pub enum RollupSubmissionKind {
     Unshield,
 }
 
+/// Transport used for a rollup submission. The legacy `Dal` transport was
+/// deleted with the v17 DAL-pointer path (docs/SNARK-SUBMISSION-DESIGN.md,
+/// "What gets deleted"); oversized payloads await the v18 staged
+/// submission pipeline (StageChunk + SubmitOps, track W4).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RollupSubmissionTransport {
     DirectInbox,
-    Dal,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RollupSubmissionStatus {
-    PendingDal,
-    CommitmentIncluded,
-    Attested,
     SubmittedToL1,
     Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RollupDalChunk {
-    pub slot_index: u16,
-    pub published_level: i32,
-    pub payload_len: usize,
-    pub commitment: String,
-    pub operation_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,10 +44,6 @@ pub struct RollupSubmission {
     pub status: RollupSubmissionStatus,
     pub transport: RollupSubmissionTransport,
     pub operation_hash: Option<String>,
-    pub dal_chunks: Vec<RollupDalChunk>,
-    pub commitment: Option<String>,
-    pub published_level: Option<i32>,
-    pub slot_index: Option<u16>,
     pub payload_hash: Option<String>,
     pub payload_len: usize,
     pub detail: Option<String>,

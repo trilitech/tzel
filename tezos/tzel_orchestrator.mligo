@@ -27,15 +27,17 @@
        Shield            = 0x02
        Transfer          = 0x03
        Unshield          = 0x04
-       DalPointer        = 0x06
+       StageChunk        = 0x07
+       SubmitOps         = 0x08
+
+   (Tag 0x06, the v17 DalPointer, is retired and must not be reused.)
 
    This orchestrator only exposes the three user-driven variants (Shield,
    Transfer, Unshield). Verifier/bridge configuration stays on the off-chain
-   admin path; the DAL-pointer variant is reserved for the operator and
-   would expose a denial-of-service vector if a generic caller could push
-   pointers, so it is not exposed here.
+   admin path; the staged v18 submission variants (StageChunk/SubmitOps)
+   are produced by the operator pipeline and are not exposed here.
 
-   `KERNEL_WIRE_VERSION` is pinned to 17 (kernel_wire.rs:14). If the kernel
+   `KERNEL_WIRE_VERSION` is pinned to 18 (kernel_wire.rs:14). If the kernel
    bumps it, redeploy this contract — the literal at `kernel_wire_envelope`
    below must match.
 
@@ -70,9 +72,9 @@
 (* Wire constants — must stay in sync with core/src/kernel_wire.rs    *)
 (* ------------------------------------------------------------------ *)
 
-(* KERNEL_WIRE_VERSION = 17 as u16 little-endian. *)
+(* KERNEL_WIRE_VERSION = 18 as u16 little-endian. *)
 [@inline]
-let kernel_wire_version_le : bytes = 0x1100
+let kernel_wire_version_le : bytes = 0x1200
 
 (* Variant tag bytes for WireKernelInboxMessage (kernel_wire.rs:322-336). *)
 [@inline] let tag_shield   : bytes = 0x02

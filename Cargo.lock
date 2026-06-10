@@ -5713,7 +5713,6 @@ dependencies = [
  "tokio",
  "tzel-core",
  "tzel-verifier",
- "ureq",
 ]
 
 [[package]]

@@ -11,10 +11,9 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-/// v18 adds the DAL-free submission messages (`StageChunk`, `SubmitOps`);
-/// the v17 DAL-pointer path is still encodable and is deleted in track W2.
-// TODO(W2): tezos/tzel_orchestrator.mligo pins `kernel_wire_version_le = 0x1100`
-// (v17) in its framing; bump it to 0x1200 when the kernel switches to v18-only.
+/// v18 adds the DAL-free submission messages (`StageChunk`, `SubmitOps`).
+/// The v17 DAL-pointer path was deleted in track W2; its inbox tag (6) is
+/// retired and must not be reused.
 pub const KERNEL_WIRE_VERSION: u16 = 18;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
@@ -22,8 +21,6 @@ const MAX_ACCOUNT_ID_BYTES: usize = 1024;
 const MAX_PROOF_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT_PREIMAGE_ITEMS: usize = 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
-const MAX_DAL_CHUNK_POINTERS: usize = 256;
-const MAX_DAL_CHUNK_LIST_BYTES: usize = 64 * 1024;
 const MAX_ENCODED_NOTE_WIRE_BYTES: usize = (ML_KEM768_CIPHERTEXT_BYTES * 2)
     + NOTE_AEAD_NONCE_BYTES
     + ENCRYPTED_NOTE_BYTES
@@ -139,30 +136,6 @@ pub struct KernelUnshieldReq {
     pub proof: KernelStarkProof,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KernelDalPayloadKind {
-    ConfigureVerifier,
-    ConfigureBridge,
-    Shield,
-    Transfer,
-    Unshield,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KernelDalChunkPointer {
-    pub published_level: u64,
-    pub slot_index: u8,
-    pub payload_len: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KernelDalPayloadPointer {
-    pub kind: KernelDalPayloadKind,
-    pub chunks: Vec<KernelDalChunkPointer>,
-    pub payload_len: u64,
-    pub payload_hash: F,
-}
-
 /// One inbox-sized slice of an oversized payload (encrypted notes, large
 /// op-decl lists). The kernel reassembles chunks keyed by
 /// `(sender, staging_id)` and seals the entry once `hash(reassembled)`
@@ -265,7 +238,6 @@ pub enum KernelInboxMessage {
     Shield(KernelShieldReq),
     Transfer(KernelTransferReq),
     Unshield(KernelUnshieldReq),
-    DalPointer(KernelDalPayloadPointer),
     StageChunk(KernelStageChunk),
     SubmitOps(KernelSubmitOps),
 }
@@ -343,12 +315,6 @@ struct WireEncodedFeltList {
     bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireEncodedDalChunkList {
-    #[encoding(dynamic = "MAX_DAL_CHUNK_LIST_BYTES", bytes)]
-    bytes: Vec<u8>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WireStarkProof {
     bytes: Vec<u8>,
@@ -416,42 +382,6 @@ struct WireTransferResp {
 struct WireKernelUnshieldReq {
     #[encoding(dynamic = "MAX_UNSHIELD_PAYLOAD_BYTES", bytes)]
     bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-#[encoding(tags = "u8")]
-enum WireKernelDalPayloadKind {
-    #[encoding(tag = 0)]
-    Shield,
-    #[encoding(tag = 1)]
-    Transfer,
-    #[encoding(tag = 2)]
-    Unshield,
-    #[encoding(tag = 3)]
-    ConfigureVerifier,
-    #[encoding(tag = 4)]
-    ConfigureBridge,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireKernelDalChunkPointer {
-    published_level: WireU64Le,
-    slot_index: u8,
-    payload_len: WireU64Le,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireKernelDalChunkList {
-    #[encoding(dynamic = "MAX_DAL_CHUNK_POINTERS")]
-    items: Vec<WireKernelDalChunkPointer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
-struct WireKernelDalPayloadPointer {
-    kind: WireKernelDalPayloadKind,
-    chunks: WireEncodedDalChunkList,
-    payload_hash: WireFelt,
-    payload_len: WireU64Le,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -646,8 +576,8 @@ enum WireKernelInboxMessage {
     Transfer(WireKernelTransferReq),
     #[encoding(tag = 4)]
     Unshield(WireKernelUnshieldReq),
-    #[encoding(tag = 6)]
-    DalPointer(WireKernelDalPayloadPointer),
+    // Tag 6 (DalPointer) is retired — deleted with the v17 DAL path; do
+    // not reuse.
     #[encoding(tag = 7)]
     StageChunk(WireKernelStageChunk),
     #[encoding(tag = 8)]
@@ -732,9 +662,6 @@ pub fn encode_kernel_inbox_message(message: &KernelInboxMessage) -> Result<Vec<u
             KernelInboxMessage::Unshield(req) => {
                 WireKernelInboxMessage::Unshield(kernel_unshield_req_to_wire(req)?)
             }
-            KernelInboxMessage::DalPointer(pointer) => {
-                WireKernelInboxMessage::DalPointer(kernel_dal_payload_pointer_to_wire(pointer)?)
-            }
             KernelInboxMessage::StageChunk(chunk) => {
                 WireKernelInboxMessage::StageChunk(kernel_stage_chunk_to_wire(chunk)?)
             }
@@ -769,9 +696,6 @@ pub fn decode_kernel_inbox_message(bytes: &[u8]) -> Result<KernelInboxMessage, S
         )),
         WireKernelInboxMessage::Unshield(req) => Ok(KernelInboxMessage::Unshield(
             kernel_unshield_req_from_wire(req)?,
-        )),
-        WireKernelInboxMessage::DalPointer(pointer) => Ok(KernelInboxMessage::DalPointer(
-            kernel_dal_payload_pointer_from_wire(pointer)?,
         )),
         WireKernelInboxMessage::StageChunk(chunk) => Ok(KernelInboxMessage::StageChunk(
             kernel_stage_chunk_from_wire(chunk)?,
@@ -1037,100 +961,6 @@ fn signed_bridge_config_from_wire(
     Ok(KernelSignedBridgeConfig {
         config: bridge_config_from_wire(wire.config)?,
         signature: encoded_felt_list_from_wire(wire.signature)?,
-    })
-}
-
-fn kernel_dal_payload_kind_to_wire(kind: &KernelDalPayloadKind) -> WireKernelDalPayloadKind {
-    match kind {
-        KernelDalPayloadKind::ConfigureVerifier => WireKernelDalPayloadKind::ConfigureVerifier,
-        KernelDalPayloadKind::ConfigureBridge => WireKernelDalPayloadKind::ConfigureBridge,
-        KernelDalPayloadKind::Shield => WireKernelDalPayloadKind::Shield,
-        KernelDalPayloadKind::Transfer => WireKernelDalPayloadKind::Transfer,
-        KernelDalPayloadKind::Unshield => WireKernelDalPayloadKind::Unshield,
-    }
-}
-
-fn kernel_dal_payload_kind_from_wire(
-    kind: WireKernelDalPayloadKind,
-) -> Result<KernelDalPayloadKind, String> {
-    Ok(match kind {
-        WireKernelDalPayloadKind::ConfigureVerifier => KernelDalPayloadKind::ConfigureVerifier,
-        WireKernelDalPayloadKind::ConfigureBridge => KernelDalPayloadKind::ConfigureBridge,
-        WireKernelDalPayloadKind::Shield => KernelDalPayloadKind::Shield,
-        WireKernelDalPayloadKind::Transfer => KernelDalPayloadKind::Transfer,
-        WireKernelDalPayloadKind::Unshield => KernelDalPayloadKind::Unshield,
-    })
-}
-
-fn kernel_dal_chunk_pointer_to_wire(pointer: &KernelDalChunkPointer) -> WireKernelDalChunkPointer {
-    WireKernelDalChunkPointer {
-        published_level: u64_to_wire(pointer.published_level),
-        slot_index: pointer.slot_index,
-        payload_len: u64_to_wire(pointer.payload_len),
-    }
-}
-
-fn kernel_dal_chunk_pointer_from_wire(
-    wire: WireKernelDalChunkPointer,
-) -> Result<KernelDalChunkPointer, String> {
-    Ok(KernelDalChunkPointer {
-        published_level: wire_to_u64(wire.published_level)?,
-        slot_index: wire.slot_index,
-        payload_len: wire_to_u64(wire.payload_len)?,
-    })
-}
-
-fn kernel_dal_payload_pointer_to_wire(
-    pointer: &KernelDalPayloadPointer,
-) -> Result<WireKernelDalPayloadPointer, String> {
-    if pointer.chunks.is_empty() {
-        return Err("kernel DAL pointer requires at least one chunk".into());
-    }
-    if pointer.chunks.len() > MAX_DAL_CHUNK_POINTERS {
-        return Err(format!(
-            "kernel DAL pointer has too many chunks: {} > {}",
-            pointer.chunks.len(),
-            MAX_DAL_CHUNK_POINTERS
-        ));
-    }
-    let chunks = pointer
-        .chunks
-        .iter()
-        .map(kernel_dal_chunk_pointer_to_wire)
-        .collect::<Vec<_>>();
-    Ok(WireKernelDalPayloadPointer {
-        kind: kernel_dal_payload_kind_to_wire(&pointer.kind),
-        chunks: WireEncodedDalChunkList {
-            bytes: encode_tze(&WireKernelDalChunkList { items: chunks })?,
-        },
-        payload_hash: felt_to_wire(&pointer.payload_hash),
-        payload_len: u64_to_wire(pointer.payload_len),
-    })
-}
-
-fn kernel_dal_payload_pointer_from_wire(
-    wire: WireKernelDalPayloadPointer,
-) -> Result<KernelDalPayloadPointer, String> {
-    let chunks: WireKernelDalChunkList = decode_tze(&wire.chunks.bytes)?;
-    if chunks.items.is_empty() {
-        return Err("kernel DAL pointer requires at least one chunk".into());
-    }
-    if chunks.items.len() > MAX_DAL_CHUNK_POINTERS {
-        return Err(format!(
-            "kernel DAL pointer has too many chunks: {} > {}",
-            chunks.items.len(),
-            MAX_DAL_CHUNK_POINTERS
-        ));
-    }
-    Ok(KernelDalPayloadPointer {
-        kind: kernel_dal_payload_kind_from_wire(wire.kind)?,
-        chunks: chunks
-            .items
-            .into_iter()
-            .map(kernel_dal_chunk_pointer_from_wire)
-            .collect::<Result<Vec<_>, _>>()?,
-        payload_hash: wire_to_felt(wire.payload_hash)?,
-        payload_len: wire_to_u64(wire.payload_len)?,
     })
 }
 
@@ -2377,42 +2207,6 @@ mod tests {
             }
             other => panic!("unexpected decoded message: {:?}", other),
         }
-    }
-
-    #[test]
-    fn kernel_inbox_roundtrip_preserves_dal_pointer() {
-        let message = KernelInboxMessage::DalPointer(KernelDalPayloadPointer {
-            kind: KernelDalPayloadKind::ConfigureVerifier,
-            chunks: vec![
-                KernelDalChunkPointer {
-                    published_level: 101,
-                    slot_index: 3,
-                    payload_len: 4096,
-                },
-                KernelDalChunkPointer {
-                    published_level: 102,
-                    slot_index: 7,
-                    payload_len: 512,
-                },
-            ],
-            payload_len: 4608,
-            payload_hash: [0xA5; 32],
-        });
-        let encoded = encode_kernel_inbox_message(&message).unwrap();
-        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
-        let KernelInboxMessage::DalPointer(pointer) = decoded else {
-            panic!("unexpected decoded message");
-        };
-        assert_eq!(pointer.kind, KernelDalPayloadKind::ConfigureVerifier);
-        assert_eq!(pointer.chunks.len(), 2);
-        assert_eq!(pointer.chunks[0].published_level, 101);
-        assert_eq!(pointer.chunks[0].slot_index, 3);
-        assert_eq!(pointer.chunks[0].payload_len, 4096);
-        assert_eq!(pointer.chunks[1].published_level, 102);
-        assert_eq!(pointer.chunks[1].slot_index, 7);
-        assert_eq!(pointer.chunks[1].payload_len, 512);
-        assert_eq!(pointer.payload_len, 4608);
-        assert_eq!(pointer.payload_hash, [0xA5; 32]);
     }
 
     fn sample_encrypted_note(fill: u8) -> EncryptedNote {

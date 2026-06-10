@@ -290,13 +290,15 @@ output), so existing tests at
   `RollupSubmissionReceipt` pipeline (`apps/wallet/src/lib.rs:2394`) is
   the reference.
 - **`KERNEL_WIRE_VERSION` hard-coded.** The version constant
-  (`0x1100` = 17 LE) is inlined in the contract. Any bump of
+  (`0x1200` = 18 LE) is inlined in the contract. Any bump of
   `KERNEL_WIRE_VERSION` requires redeploying the orchestrator (or making
   the version a storage field — left as a follow-up to keep the first
   deployment minimal).
-- **`DalPointer` not exposed.** Only `Shield`, `Transfer`, `Unshield` are
-  user-facing. Verifier/bridge configuration (tags `0x00`/`0x01`) and DAL
-  pointers (tag `0x06`) stay on the off-chain admin path.
+- **Staged submission variants not exposed.** Only `Shield`, `Transfer`,
+  `Unshield` are user-facing. Verifier/bridge configuration (tags
+  `0x00`/`0x01`) and the v18 staged submission messages (`StageChunk`
+  `0x07` / `SubmitOps` `0x08`) stay on the off-chain operator path.
+  Tag `0x06` (the deleted v17 `DalPointer`) is retired.
 - **No fee handling on chain.** The orchestrator rejects any incoming
   `AMOUNT`. XTZ deposits to the shielded pool still go through
   `tez_bridge_ticketer.tz` (the existing path); the orchestrator only

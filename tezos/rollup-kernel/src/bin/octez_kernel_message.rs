@@ -7,7 +7,7 @@ use tzel_core::{
     auth_leaf_hash, derive_auth_pub_seed, hash,
     kernel_wire::{
         encode_kernel_inbox_message, sign_kernel_bridge_config, sign_kernel_verifier_config,
-        KernelBridgeConfig, KernelDalChunkPointer, KernelDalPayloadKind, KernelDalPayloadPointer,
+        KernelBridgeConfig,
         KernelInboxMessage, KernelShieldReq, KernelStarkProof, KernelUnshieldReq,
         KernelVerifierConfig,
     },
@@ -17,7 +17,7 @@ use tzel_core::{
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  octez_kernel_message admin-material\n  octez_kernel_message configure-bridge <sr1...> <KT1...>\n  octez_kernel_message configure-verifier <sr1...> <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message raw-configure-bridge <KT1...>\n  octez_kernel_message raw-configure-verifier <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message raw-stub-shield\n  octez_kernel_message raw-stub-unshield\n  octez_kernel_message dal-pointer <sr1...> <configure-verifier|configure-bridge|shield|transfer|unshield> <payload_hash_hex> <payload_len> (<published_level> <slot_index> <chunk_len>)+"
+        "usage:\n  octez_kernel_message admin-material\n  octez_kernel_message configure-bridge <sr1...> <KT1...>\n  octez_kernel_message configure-verifier <sr1...> <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message raw-configure-bridge <KT1...>\n  octez_kernel_message raw-configure-verifier <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message raw-stub-shield\n  octez_kernel_message raw-stub-unshield"
     );
     std::process::exit(2);
 }
@@ -53,17 +53,6 @@ fn config_admin_ask() -> F {
         return hash(b"tzel-dev-rollup-config-admin");
     }
     panic!("set TZEL_ROLLUP_CONFIG_ADMIN_ASK_HEX to sign config messages");
-}
-
-fn parse_dal_kind(kind: &str) -> KernelDalPayloadKind {
-    match kind {
-        "configure-verifier" => KernelDalPayloadKind::ConfigureVerifier,
-        "configure-bridge" => KernelDalPayloadKind::ConfigureBridge,
-        "shield" => KernelDalPayloadKind::Shield,
-        "transfer" => KernelDalPayloadKind::Transfer,
-        "unshield" => KernelDalPayloadKind::Unshield,
-        _ => usage(),
-    }
 }
 
 fn signed_bridge_message(ticketer: String) -> KernelInboxMessage {
@@ -274,60 +263,6 @@ fn main() {
                 usage();
             }
             emit_raw_message(&stub_unshield_message());
-        }
-        "dal-pointer" => {
-            let Some(rollup_address) = args.next() else {
-                usage();
-            };
-            let Some(kind) = args.next() else {
-                usage();
-            };
-            let Some(payload_hash_hex) = args.next() else {
-                usage();
-            };
-            let Some(payload_len) = args.next() else {
-                usage();
-            };
-            let kind = parse_dal_kind(&kind);
-            let payload_hash = parse_felt(&payload_hash_hex);
-            let payload_len = payload_len
-                .parse::<u64>()
-                .expect("payload_len should parse as u64");
-            let mut chunks = Vec::new();
-            loop {
-                let Some(published_level) = args.next() else {
-                    break;
-                };
-                let Some(slot_index) = args.next() else {
-                    usage();
-                };
-                let Some(chunk_len) = args.next() else {
-                    usage();
-                };
-                chunks.push(KernelDalChunkPointer {
-                    published_level: published_level
-                        .parse::<u64>()
-                        .expect("published_level should parse as u64"),
-                    slot_index: slot_index
-                        .parse::<u8>()
-                        .expect("slot_index should parse as u8"),
-                    payload_len: chunk_len
-                        .parse::<u64>()
-                        .expect("chunk_len should parse as u64"),
-                });
-            }
-            if chunks.is_empty() {
-                usage();
-            }
-            emit_targeted_message(
-                &rollup_address,
-                &KernelInboxMessage::DalPointer(KernelDalPayloadPointer {
-                    kind,
-                    chunks,
-                    payload_len,
-                    payload_hash,
-                }),
-            );
         }
         _ => usage(),
     }
