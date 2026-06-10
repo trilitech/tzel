@@ -1122,6 +1122,24 @@ nullifier/commitment binding.
   (xmss_cairo_sep_inhabited), the relations are non-vacuous on both
   the shared crypto core and as whole relations.
 
+- **FAITHFULNESS: per-input wots_sig length now modeled
+  (`Impl/Transfer.v input_checks`):** a systematic cross-check of every
+  Cairo circuit assertion against the relations found one real Cairo
+  assert not captured: the per-input WOTS+ signature length check
+  ("transfer/unshield: wots sig len", asserting each input's wots_sig
+  has WOTS_CHAINS elements). Added length (ci_wots_sig c) = wots_chains
+  as a conjunct of input_checks (shared by transfer + unshield), so the
+  relation matches the Cairo accept condition. Not a soundness gap (a
+  short sig recovers a wrong leaf -> verification fails; a long sig's
+  extra elements are harmlessly ignored), but a faithfulness-
+  completeness improvement. Updated the soundness destructuring
+  (transfer/unshield_relation_sound) and re-discharged the new conjunct
+  in the inhabitations (the honest witness's sign(...) has the right
+  length via *_sign_len_eq). The cross-check also confirmed everything
+  else is modeled: the change-slot-absent asset check (asset=0=ASSET_TEZ,
+  and ASSET_TEZ=0 so co_asset=asset_tez is faithful), the producer-tez
+  pin, conservation, gates, nullifier, merkle, xmss are all captured.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

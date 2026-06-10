@@ -387,7 +387,9 @@ Section TransferRelation.
          (ci_auth_siblings c) (ci_auth_root c)
     (* [assert(nf == *nf_list.at(i), 'transfer: bad nf')] *)
     /\ ci_nf c = Spec.Hashes.nullifier H_nf
-                   (ci_nk_spend c) (ci_cm c) (felt_of_nat (ci_pos c)).
+                   (ci_nk_spend c) (ci_cm c) (felt_of_nat (ci_pos c))
+    (* [assert(wots_sig.len() == WOTS_CHAINS, 'transfer: wots sig len')] *)
+    /\ length (ci_wots_sig c) = Spec.Hashes.wots_chains.
 
   (** The full relation — [cairo/src/transfer.cairo::verify].
       Conjuncts in Cairo source order. *)
@@ -468,7 +470,7 @@ Section TransferRelation.
     - (* per-input nullifier correctness: the loop's nf assert *)
       rewrite Forall_map.
       eapply Forall_impl; [| exact Hloop].
-      intros c (_ & _ & _ & Hnf). exact Hnf.
+      intros c (_ & _ & _ & Hnf & _). exact Hnf.
     - (* per-output commitment well-formedness: the four asserts *)
       repeat constructor; assumption.
     - (* per-asset value conservation: the two-accumulator theorem *)
@@ -526,6 +528,17 @@ Section TransferRelation.
     - reflexivity.
   Qed.
 
+  Lemma t_sign_len_eq :
+    forall (ps : Felt) (ki sc : nat) (digits : list nat) (sks : list Felt),
+      length digits = length sks ->
+      length (Spec.Xmss.sign F_chain ADRS_chain ps ki sc digits sks) = length digits.
+  Proof.
+    intros ps ki sc digits. revert sc.
+    induction digits as [| d ds IH]; intros sc [| sk rest] Hlen; cbn in *;
+      try discriminate Hlen; [reflexivity |].
+    f_equal. apply IH. lia.
+  Qed.
+
   (** NON-VACUITY: a single concrete honest transfer satisfies every
       conjunct of [TransferRelation] at once, so [transfer_relation_sound]
       is not vacuously true.  One tez input, three zero-value tez change
@@ -571,7 +584,7 @@ Section TransferRelation.
     - reflexivity.
     - apply Forall_cons; [| apply Forall_nil].
       unfold input_checks.
-      refine (conj _ (conj _ (conj _ _))).
+      refine (conj _ (conj _ (conj _ (conj _ _)))).
       + left. reflexivity.
       + unfold Spec.Xmss.merkle_verify. split; [| split].
         * change (ci_merkle_siblings inp) with (repeat z Spec.Hashes.tree_depth).
@@ -588,6 +601,9 @@ Section TransferRelation.
         apply (t_xmss_honest z (wots_digits sh) sks sib leaf Hdlen (Hwd_bd sh) Hleaf).
         unfold sib. apply repeat_length.
       + reflexivity.
+      + change (ci_wots_sig inp) with
+          (Spec.Xmss.sign F_chain ADRS_chain z 0 0 (wots_digits sh) sks).
+        rewrite (t_sign_len_eq z 0 0 (wots_digits sh) sks Hdlen). apply Hwd_len.
     - left; reflexivity.
     - left; reflexivity.
     - left; reflexivity.

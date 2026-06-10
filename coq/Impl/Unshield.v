@@ -315,7 +315,7 @@ Section UnshieldRelation.
     - (* per-input nullifier correctness: from the loop *)
       rewrite Forall_map.
       eapply Forall_impl; [| exact Hloop].
-      intros c (_ & _ & _ & Hnf). exact Hnf.
+      intros c (_ & _ & _ & Hnf & _). exact Hnf.
     - (* producer commitment well-formedness *)
       exact Hcmp.
     - (* change slot 1: present or absent *)
@@ -451,7 +451,7 @@ Section UnshieldRelation.
     - (* Forall input_checks *)
       apply Forall_cons; [| apply Forall_nil].
       unfold u_input_checks, Impl.Transfer.input_checks.
-      refine (conj _ (conj _ (conj _ _))).
+      refine (conj _ (conj _ (conj _ (conj _ _)))).
       + (* asset gate *) left. reflexivity.
       + (* merkle_verify *)
         unfold Spec.Xmss.merkle_verify. split; [| split].
@@ -471,6 +471,10 @@ Section UnshieldRelation.
         unfold sib. apply repeat_length.
       + (* nullifier *)
         reflexivity.
+      + (* wots_sig length *)
+        change (Impl.Transfer.ci_wots_sig inp) with
+          (Spec.Xmss.sign F_chain ADRS_chain z 0 0 (wots_digits sh) sks).
+        rewrite (u_sign_len_eq z 0 0 (wots_digits sh) sks Hdlen). apply Hwd_len.
     - (* co_v p > 0 *) cbn. lia.
     - (* asset_pub in {tez,primary} *) left; reflexivity.
     - (* acc_tez equation *)
