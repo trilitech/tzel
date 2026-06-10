@@ -993,6 +993,28 @@ nullifier/commitment binding.
   historical-root acceptance adds no attack. Found by reading the
   kernel's valid-root management.
 
+- **MASTER KERNEL SAFETY — invariants hold JOINTLY
+  (`Spec/KernelSoundness.v`):** unifies the per-structure invariants
+  into one. A single kernel state (nullifier set, valid-root set,
+  current root, note list, config) and one step relation (spend a
+  fresh nullifier / append a note within capacity with a genuine
+  snapshotted root / install the config once), with the conjunction
+  invariant. Proved (zero admits):
+  - kernel_state_sound: in EVERY reachable state (from a genuine-seeded
+    genesis), all four hold at once — NoDup nullifiers (no
+    double-spend), every valid root genuine, current root genuine, tree
+    within capacity. So across any interleaving of spends, appends, and
+    the config install, the kernel never double-spends, only holds
+    genuine roots, and never overfills the tree — the per-structure
+    proofs (KernelNullifier, ValidRoots, TreeCapacity) compose with NO
+    interference (a spend can't overflow the tree, an append can't
+    double-spend, configure touches none of them).
+  - kernel_config_frozen: across the SAME unified steps an installed
+    config stays installed (ConfigOnce immutability holds in the joint
+    machine too).
+  The whole-system safety statement the separate invariants compose
+  into.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

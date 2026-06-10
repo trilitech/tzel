@@ -32,6 +32,7 @@ Spec/MerkleBridge.v
 Spec/MerkleFrontierCorrect.v
 Spec/TreeCapacity.v
 Spec/ValidRoots.v
+Spec/KernelSoundness.v
 Spec/ShieldReplay.v
 Spec/WithdrawalRecord.v
 Spec/StoragePaths.v
