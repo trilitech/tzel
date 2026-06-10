@@ -67,3 +67,37 @@ Proof.
   apply base4_val_encode5.
   pose proof (checksum_bound msg Hbd) as Hb. rewrite Hlen in Hb. lia.
 Qed.
+
+
+(** The 5 checksum digits are valid base-4 digits (each [< 4]) and there
+    are exactly 5 of them — the structural half of the well-formedness
+    the inhabitation hypotheses ([Hwd_bd]/[Hwd_len]) require for the
+    checksum tail. *)
+Lemma base4_encode5_length : forall n, length (base4_encode5 n) = 5.
+Proof. intros n. reflexivity. Qed.
+
+Lemma base4_encode5_bound : forall n,
+  Forall (fun d => d <= 3) (base4_encode5 n).
+Proof.
+  intros n. unfold base4_encode5.
+  assert (B : forall x, x mod 4 <= 3)
+    by (intro x; pose proof (Nat.mod_upper_bound x 4 ltac:(lia)); lia).
+  repeat (apply Forall_cons; [apply B |]). apply Forall_nil.
+Qed.
+
+(** The complete characterization of the Cairo's checksum encoding: it
+    has the right length, valid base-4 digits, AND reads back to the
+    checksum — i.e. it satisfies everything the unforgeability premise
+    and the inhabitation hypotheses ask of the checksum tail. *)
+Theorem checksum_encoding_wellformed : forall msg,
+  length msg = 128 ->
+  Forall (fun d => d <= 3) msg ->
+  length (base4_encode5 (checksum msg)) = 5
+  /\ Forall (fun d => d <= 3) (base4_encode5 (checksum msg))
+  /\ base4_val (base4_encode5 (checksum msg)) = checksum msg.
+Proof.
+  intros msg Hlen Hbd.
+  split; [apply base4_encode5_length |].
+  split; [apply base4_encode5_bound | apply checksum_hypothesis_realized; assumption].
+Qed.
+
