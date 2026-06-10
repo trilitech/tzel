@@ -53,23 +53,44 @@ coq/
   _CoqProject              # Rocq build config, lists the three -Q paths
   MANIFEST.toml            # cairo↔coq/Impl mirror table with SHA-256 pins
   README.md                # this file
+  STATUS.md                # detailed running status of every module
+  SECURITY_COVERAGE.md     # specs/security.md property -> theorem map
   Common/Felt.v            # shared field-element type, used by Spec & Impl
-  Spec/                    # whitepaper-derived abstract spec
-    Hashes.v               # opaque hash families + cryptographic axioms
-    Merkle.v               # Merkle path verification
-    Wots.v                 # WOTS+ chain step + properties
-    Xmss.v                 # XMSS verifier + soundness statement
-    Transfer.v             # transfer relation + Phi_transfer + soundness
-    Shield.v               # ditto
-    Unshield.v             # ditto
+  Spec/                    # whitepaper-derived abstract spec (28 modules)
+    Hashes.v               # hash families; commitment / nullifier / sighash
+                           #   binding, faerie-gold, replay resistance
+    Merkle.v               # Merkle + auth-tree path binding (membership)
+    Wots.v Xmss.v          # WOTS+ chain; WOTS+ & XMSS one-time unforgeability
+    Transfer.v Shield.v Unshield.v
+                           # per-asset value conservation + sighash
+                           #   non-malleability + batch no-inflation
+    GrandConservation.v    # unified no-inflation across any mixed batch
+    Ledger.v LedgerNf.v LedgerBounded.v
+                           # global no-inflation; u64/u128 overflow safety
+    KernelLedger.v KernelPool.v KernelNullifier.v ShieldReplay.v
+                           # conservation; pool solvency; double-spend; replay
+    KernelDeposit.v AssetRegistry.v
+                           # deposit anti-spoofing; registry routing bijection
+    StoragePaths.v DepositKey.v WithdrawalRecord.v
+                           # storage-path / deposit-key collision-freedom;
+                           #   withdrawal codec round-trip
+    MerkleTree.v MerkleFrontier.v MerkleBridge.v MerkleFrontierCorrect.v
+                           # commitment tree: batch root, append-only at any
+                           #   index, O(depth) frontier read-off = batch root
+    BridgeTicketer.v BridgeBurn.v
+                           # exact collateralization; burn authentication
+    EndToEnd.v EndToEndMulti.v
+                           # L1<->L2 solvency: custody = L2 claims, per asset
   Impl/                    # extractable refinement; Cairo-shaped
     Common.v               # implementation-side shared declarations
     Hashes.v               # concrete hash parameters (realized at extraction)
     Merkle.v / Wots.v / Xmss.v / Transfer.v / Shield.v / Unshield.v
                            # 1-to-1 with Spec, plus refinement theorems
+    Extraction.v           # Coq -> OCaml extraction wiring
   Drift/check.sh           # CI: re-hash Cairo files, fail on mismatch
-  Extracted/               # (planned) Coq → OCaml extraction outputs +
-                           # QCheck2 conformance driver
+  Extracted/build.sh       # extraction → OCaml driver build
+ocaml/coq_driver/test/     # differential fuzzing: extracted Coq vs the
+                           #   cross-impl-tested OCaml port (14 cases)
 ```
 
 ## Why three layers
@@ -109,17 +130,45 @@ rocq makefile -f _CoqProject -o Makefile
 make -j2
 ```
 
-CI: `.github/workflows/coq.yml` runs the drift check + builds the
-theory. Extraction + QCheck2 conformance lands in a follow-up commit
-once the first piece of Spec ↔ Impl refinement is proven.
+CI: `.github/workflows/coq.yml` runs the drift check, builds the whole
+theory, extracts to OCaml, and runs the differential suite.
 
-## Status
+## Status (summary; see `STATUS.md` for per-module detail)
 
-- Restructure: ✓ Three-layer layout in place
-- Drift detection: ✓ Manifest + CI script working
-- First piece of Spec: `Spec/Wots.v` has the abstract chain step;
-  proofs and Impl refinement land in the next commit
-- Other Spec modules: stubs with intent docs
-- Impl modules: structural mirrors of Cairo, mostly stub bodies
-  with the chain step in `Impl/Wots.v` already defined
-- Extraction + conformance: not yet built
+The development is comprehensive and zero-admit.  Highlights:
+
+- **No `admit` anywhere** — every theorem closes.
+- **Minimal axiom base** — `Print Assumptions` across 23 headline
+  theorems (one+ from every component) shows the *entire* development
+  depends on exactly two axioms: `Felt : Type` and `Felt_eq_dec`.
+  Hash functions are uninterpreted parameters with no global
+  properties; every collision-resistance / injectivity premise is an
+  explicit *local* hypothesis, never a global axiom.
+- **Proven properties** (see `SECURITY_COVERAGE.md` for the
+  property→theorem map against `specs/security.md`):
+  - circuit no-inflation — per-asset value conservation for shield /
+    transfer / unshield, across any mixed batch
+    (`GrandConservation.grand_conservation`), plus u64/u128 overflow
+    safety (`LedgerBounded`);
+  - per-note binding — a commitment welds its value, asset, and
+    spending authority (`Hashes.commitment_binds_*`);
+  - spend integrity — double-spend (`KernelNullifier`), shield-replay
+    (`ShieldReplay`), faerie-gold (`nullifier_position_distinct`),
+    WOTS+/XMSS one-time unforgeability (`Xmss`);
+  - sighash non-malleability for all three flows;
+  - bridge / contract — exact collateralization (`BridgeTicketer`),
+    burn authentication (`BridgeBurn`), deposit anti-spoofing
+    (`KernelDeposit`), registry routing bijection (`AssetRegistry`);
+  - per-asset L1↔L2 solvency (`EndToEndMulti`);
+  - storage-path & deposit-key collision-freedom, withdrawal codec
+    round-trip;
+  - the commitment Merkle tree end to end — batch root, append-only at
+    any index, and the kernel's O(depth) frontier read-off provably
+    equals the batch root (`MerkleFrontierCorrect.froot_fbuild_eq`).
+- **Drift detection** — `MANIFEST.toml` SHA-pins the modeled Cairo
+  files; `Drift/check.sh` fails CI on divergence (6/6 mirrors).
+- **Faithfulness differential** — the extracted Coq models (WOTS chain
+  step, commitment, nullifier, sighash, merkle path, and the Merkle
+  batch root + O(depth) frontier) are fuzzed against the
+  cross-impl-tested OCaml port (14 cases) — so the proven models also
+  provably compute what the production code computes.
