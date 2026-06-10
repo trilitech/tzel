@@ -308,6 +308,26 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   transfer relies on is the LedgerNf result; this adds the
   pool<->note<->L1 boundary at the aggregate level.
 
+- **DEPOSIT ANTI-SPOOFING (`Spec/KernelDeposit.v`):** models the
+  kernel's bridge-deposit acceptance (parse_bridge_deposit +
+  validate_bridge_deposit) and proves you cannot forge a pool credit.
+  `accept` = creator=sender (authentic, non-forwarded ticket) AND
+  token_id=0 AND metadata=None AND recipient canonical AND verifier
+  configured AND sender registered. Proved (zero admits):
+  - each spoof vector is rejected: forwarded ticket (creator<>sender),
+    unregistered sender, nonzero token_id, present metadata,
+    unconfigured verifier — each implies ~accept;
+  - accept_authentic_and_registered: every accepted deposit is
+    authentic and credits a registered asset;
+  - credit_requires_owning_ticketer: to credit asset A you must be
+    the registered ticketer for A (the authentic creator maps to A);
+  - credit_ticketer_unique: under registry injectivity (one ticketer
+    per asset — derive_asset_id is a CR hash) the crediting ticketer
+    is unique, so only its holder can credit A.
+  Ticket authenticity (creator IS the minter) is the L1 guarantee
+  taken as the meaning of creator=sender (out of scope); everything
+  downstream the kernel enforces is proved.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
