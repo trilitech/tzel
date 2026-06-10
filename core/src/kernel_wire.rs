@@ -157,6 +157,21 @@ pub struct KernelStagedNoteRef {
     pub payload_hash: F,
 }
 
+/// Reference to a sealed staging entry whose reassembled bytes ARE a signed
+/// `ConfigureVerifier`/`ConfigureBridge` inbox envelope (the v17 inline
+/// config payload, which exceeds the 4096-byte inbox cap). The kernel reads
+/// the sealed payload (sender + hash bound), decodes the inner envelope, and
+/// dispatches to the same config-apply code the inline arms use. Gap #1 of
+/// `docs/SNARK-SUBMISSION-DESIGN.md`: with DAL gone there is no other
+/// transport for oversized signed config, so it reuses the StageChunk
+/// staging mechanism.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelStagedConfigRef {
+    pub staging_id: u64,
+    /// Hash of the FULL reassembled config envelope (binds the read).
+    pub payload_hash: F,
+}
+
 /// Op-specific PUBLIC fields, mirroring the v17 request structs minus the
 /// per-op proof (covered by the batch Groth16 wrap) and minus the inline
 /// encrypted notes (carried as staged refs on [`KernelOpDecl`]).
@@ -240,6 +255,9 @@ pub enum KernelInboxMessage {
     Unshield(KernelUnshieldReq),
     StageChunk(KernelStageChunk),
     SubmitOps(KernelSubmitOps),
+    /// Apply a signed config (`ConfigureVerifier`/`ConfigureBridge`) that was
+    /// staged across `StageChunk`s because it exceeds the inbox cap.
+    SubmitStagedConfig(KernelStagedConfigRef),
 }
 
 /// Result of a successfully processed `StageChunk` message (W2 staging).
@@ -421,6 +439,12 @@ struct WireKernelStagedNoteRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireKernelStagedConfigRef {
+    staging_id: WireU64Le,
+    payload_hash: WireFelt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireKernelStagedNoteRefList {
     #[encoding(dynamic = "MAX_STAGED_NOTE_LIST_BYTES")]
     items: Vec<WireKernelStagedNoteRef>,
@@ -582,6 +606,8 @@ enum WireKernelInboxMessage {
     StageChunk(WireKernelStageChunk),
     #[encoding(tag = 8)]
     SubmitOps(WireKernelSubmitOps),
+    #[encoding(tag = 9)]
+    SubmitStagedConfig(WireKernelStagedConfigRef),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -668,6 +694,12 @@ pub fn encode_kernel_inbox_message(message: &KernelInboxMessage) -> Result<Vec<u
             KernelInboxMessage::SubmitOps(submit) => {
                 WireKernelInboxMessage::SubmitOps(kernel_submit_ops_to_wire(submit)?)
             }
+            KernelInboxMessage::SubmitStagedConfig(reff) => {
+                WireKernelInboxMessage::SubmitStagedConfig(WireKernelStagedConfigRef {
+                    staging_id: u64_to_wire(reff.staging_id),
+                    payload_hash: felt_to_wire(&reff.payload_hash),
+                })
+            }
         },
     })
 }
@@ -703,6 +735,12 @@ pub fn decode_kernel_inbox_message(bytes: &[u8]) -> Result<KernelInboxMessage, S
         WireKernelInboxMessage::SubmitOps(submit) => Ok(KernelInboxMessage::SubmitOps(
             kernel_submit_ops_from_wire(submit)?,
         )),
+        WireKernelInboxMessage::SubmitStagedConfig(reff) => {
+            Ok(KernelInboxMessage::SubmitStagedConfig(KernelStagedConfigRef {
+                staging_id: wire_to_u64(reff.staging_id)?,
+                payload_hash: wire_to_felt(reff.payload_hash)?,
+            }))
+        }
     }
 }
 
@@ -3027,6 +3065,26 @@ mod tests {
             panic!("unexpected decoded message");
         };
         assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn kernel_inbox_roundtrip_preserves_submit_staged_config() {
+        let reff = KernelStagedConfigRef {
+            staging_id: 0xDEAD_BEEF_0000_0001,
+            payload_hash: [0x5A; 32],
+        };
+        let encoded =
+            encode_kernel_inbox_message(&KernelInboxMessage::SubmitStagedConfig(reff.clone()))
+                .unwrap();
+        assert!(
+            encoded.len() <= 4096,
+            "submit-staged-config must fit one inbox message"
+        );
+        let decoded = decode_kernel_inbox_message(&encoded).unwrap();
+        let KernelInboxMessage::SubmitStagedConfig(decoded) = decoded else {
+            panic!("unexpected decoded message");
+        };
+        assert_eq!(decoded, reff);
     }
 
     #[test]

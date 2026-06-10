@@ -40,7 +40,8 @@ use tzel_core::{
         KernelBridgeConfig, KernelInboxMessage,
         KernelOpDecl, KernelOpDeclBody, KernelOpResult, KernelResult,
         KernelShieldReq, KernelSignedBridgeConfig, KernelSignedVerifierConfig, KernelStageChunk,
-        KernelStagedResp, KernelStarkProof, KernelSubmitOps, KernelSubmitResp, KernelTransferReq,
+        KernelStagedConfigRef, KernelStagedResp, KernelStarkProof, KernelSubmitOps,
+        KernelSubmitResp, KernelTransferReq,
         KernelUnshieldReq, KernelVerifierConfig, KERNEL_BRIDGE_CONFIG_KEY_INDEX,
         KERNEL_VERIFIER_CONFIG_KEY_INDEX, MAX_STAGE_CHUNK_BYTES,
     },
@@ -1046,13 +1047,9 @@ fn apply_kernel_message<H: Host>(
 ) -> Result<KernelResult, String> {
     match message {
         KernelInboxMessage::ConfigureVerifier(config) => {
-            authenticate_verifier_config(&config)?;
-            configure_verifier(ledger, &config.config).map(|_| KernelResult::Configured)
+            apply_configure_verifier(ledger, &config)
         }
-        KernelInboxMessage::ConfigureBridge(config) => {
-            authenticate_bridge_config(&config)?;
-            configure_bridge(ledger, &config.config).map(|_| KernelResult::Configured)
-        }
+        KernelInboxMessage::ConfigureBridge(config) => apply_configure_bridge(ledger, &config),
         KernelInboxMessage::Shield(req) => {
             validate_transition_proof(ledger.host, &req.proof, CircuitKind::Shield)?;
             apply_validated_shield(ledger, &req).map(KernelResult::Shield)
@@ -1067,7 +1064,79 @@ fn apply_kernel_message<H: Host>(
         }
         KernelInboxMessage::StageChunk(chunk) => apply_stage_chunk(ledger, sender, &chunk),
         KernelInboxMessage::SubmitOps(submit) => apply_submit_ops(ledger, sender, &submit),
+        KernelInboxMessage::SubmitStagedConfig(reff) => {
+            apply_submit_staged_config(ledger, sender, &reff)
+        }
     }
+}
+
+/// Authenticate + apply a signed verifier config (the shared arm used by
+/// both the v17 inline `ConfigureVerifier` message and the v18 staged-config
+/// path). Factored out so [`apply_submit_staged_config`] dispatches to the
+/// EXACT same code after reassembling the staged envelope.
+fn apply_configure_verifier<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    config: &KernelSignedVerifierConfig,
+) -> Result<KernelResult, String> {
+    authenticate_verifier_config(config)?;
+    configure_verifier(ledger, &config.config).map(|_| KernelResult::Configured)
+}
+
+/// See [`apply_configure_verifier`] — the bridge counterpart.
+fn apply_configure_bridge<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    config: &KernelSignedBridgeConfig,
+) -> Result<KernelResult, String> {
+    authenticate_bridge_config(config)?;
+    configure_bridge(ledger, &config.config).map(|_| KernelResult::Configured)
+}
+
+/// Apply a v18 staged signed config (`docs/SNARK-SUBMISSION-DESIGN.md`,
+/// gap #1). The referenced sealed staging entry's reassembled bytes ARE a
+/// signed `ConfigureVerifier`/`ConfigureBridge` inbox envelope (the v17
+/// inline payload, too large for one inbox message). Steps:
+///   1. read the SEALED payload, bound to `(sender, staging_id, payload_hash)`
+///      via [`read_sealed_staging_payload`] (same hash-binding as
+///      `SubmitOps` staged-note refs — a submitter can never be served a
+///      payload it did not commit to);
+///   2. decode the inner `KernelInboxMessage`; it MUST be a config message
+///      (a staged config entry cannot smuggle a Shield/Transfer/etc.);
+///   3. dispatch to the SAME `apply_configure_*` arm the inline path uses;
+///   4. discard the staging entry on success (the config is one-shot, so the
+///      bytes are spent — releasing the budget for the sender).
+fn apply_submit_staged_config<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    sender: &InboxSender,
+    reff: &KernelStagedConfigRef,
+) -> Result<KernelResult, String> {
+    let sender_key = staging_sender_key(sender);
+    let current_level = read_i32(ledger.host, PATH_LAST_INPUT_LEVEL).unwrap_or(0);
+    gc_expired_staging_entries(ledger.host, &sender_key, current_level);
+
+    let payload = read_sealed_staging_payload(
+        ledger.host,
+        &sender_key,
+        reff.staging_id,
+        &reff.payload_hash,
+    )?;
+    let inner = decode_kernel_inbox_message(&payload)
+        .map_err(|e| format!("staged config envelope failed to decode: {}", e))?;
+
+    let result = match inner {
+        KernelInboxMessage::ConfigureVerifier(config) => apply_configure_verifier(ledger, &config),
+        KernelInboxMessage::ConfigureBridge(config) => apply_configure_bridge(ledger, &config),
+        _ => Err("staged config entry is not a ConfigureVerifier/ConfigureBridge envelope".into()),
+    }?;
+
+    // One-shot config: the staged bytes are now spent — discard the entry so
+    // the staging_id is reusable and the sender's byte budget is released.
+    if let Ok(Some(meta)) =
+        read_staging_meta(ledger.host, &staging_meta_path(&sender_key, reff.staging_id))
+    {
+        discard_staging_entry(ledger.host, &sender_key, reff.staging_id, &meta);
+    }
+
+    Ok(result)
 }
 
 /// Apply a shield request whose proof has ALREADY been verified (v17
@@ -4944,6 +5013,146 @@ mod tests {
             read_last_result(&host).unwrap(),
             KernelResult::Configured
         ));
+    }
+
+    /// Stage `envelope` across `MAX_STAGE_CHUNK_BYTES`-bounded chunks under
+    /// `staging_id`, returning the inbox inputs (mirrors the producer's
+    /// `submit_v18::chunk_payload`). Used by the v18 staged-config tests.
+    fn stage_config_inputs(staging_id: u64, envelope: &[u8]) -> Vec<InputMessage> {
+        let payload_hash = hash(envelope);
+        let chunks: Vec<&[u8]> = envelope.chunks(MAX_STAGE_CHUNK_BYTES).collect();
+        let count = chunks.len() as u16;
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                external_stage_input(
+                    9,
+                    index as i32,
+                    stage_chunk(staging_id, index as u16, count, payload_hash, bytes.to_vec()),
+                )
+            })
+            .collect()
+    }
+
+    fn submit_staged_config_input(level: i32, id: i32, staging_id: u64, payload_hash: F) -> InputMessage {
+        InputMessage {
+            level,
+            id,
+            payload: encode_external_kernel_message(&KernelInboxMessage::SubmitStagedConfig(
+                KernelStagedConfigRef {
+                    staging_id,
+                    payload_hash,
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn configures_bridge_via_staged_config() {
+        // The signed bridge config envelope, staged across chunks, then
+        // applied via SubmitStagedConfig — same end state as the inline arm.
+        let envelope =
+            encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+                ticketer: sample_ticketer().into(),
+            }))
+            .unwrap();
+        let payload_hash = hash(&envelope);
+
+        let mut inputs = stage_config_inputs(77, &envelope);
+        inputs.push(submit_staged_config_input(9, 100, 77, payload_hash));
+        let mut host = MockHost::with_inputs(inputs);
+
+        run_with_host(&mut host);
+
+        let persisted = host
+            .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+            .expect("bridge ticketer persisted via staged config");
+        assert_eq!(String::from_utf8(persisted).unwrap(), sample_ticketer());
+        assert!(matches!(
+            read_last_result(&host).unwrap(),
+            KernelResult::Configured
+        ));
+        // The staging entry is discarded on success (budget released).
+        let sender_key = staging_sender_key(&InboxSender::External);
+        assert_eq!(read_u64(&host, &staging_count_path(&sender_key)), Some(0));
+        assert_eq!(read_u64(&host, &staging_bytes_path(&sender_key)), Some(0));
+    }
+
+    #[test]
+    fn configures_verifier_via_staged_config_multi_chunk() {
+        // The verifier config envelope carries a full WOTS signature and is
+        // large — assert it actually needs ≥ 2 chunks, then stage + apply.
+        let new_domain = sample_felt(0x66);
+        let config = KernelVerifierConfig {
+            auth_domain: new_domain,
+            verified_program_hashes: sample_program_hashes(),
+        };
+        let envelope = encode_kernel_inbox_message(&signed_verifier_message(config)).unwrap();
+        assert!(
+            envelope.len() > MAX_STAGE_CHUNK_BYTES,
+            "verifier config envelope unexpectedly fits one chunk ({} bytes)",
+            envelope.len()
+        );
+        let payload_hash = hash(&envelope);
+
+        let inputs_staged = stage_config_inputs(88, &envelope);
+        assert!(inputs_staged.len() >= 2, "expected a multi-chunk staging");
+        let mut inputs = inputs_staged;
+        inputs.push(submit_staged_config_input(9, 200, 88, payload_hash));
+        let mut host = MockHost::with_inputs(inputs);
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.auth_domain, new_domain);
+        assert!(matches!(
+            read_last_result(&host).unwrap(),
+            KernelResult::Configured
+        ));
+    }
+
+    #[test]
+    fn staged_config_rejects_non_config_envelope() {
+        // A staged entry whose bytes decode to a non-config message must be
+        // rejected — staged config cannot smuggle a Shield/etc.
+        let bogus = encode_kernel_inbox_message(&KernelInboxMessage::SubmitStagedConfig(
+            KernelStagedConfigRef {
+                staging_id: 1,
+                payload_hash: [0u8; 32],
+            },
+        ))
+        .unwrap();
+        let payload_hash = hash(&bogus);
+        let mut inputs = stage_config_inputs(55, &bogus);
+        inputs.push(submit_staged_config_input(9, 300, 55, payload_hash));
+        let mut host = MockHost::with_inputs(inputs);
+
+        run_with_host(&mut host);
+
+        let message = expect_error(&host);
+        assert!(
+            message.contains("not a ConfigureVerifier/ConfigureBridge"),
+            "unexpected error: {}",
+            message
+        );
+        // No verifier config landed.
+        assert!(read_verifier_config(&host).unwrap().is_none());
+    }
+
+    #[test]
+    fn staged_config_rejects_unsealed_or_missing_entry() {
+        // SubmitStagedConfig over a staging_id that was never sealed errors,
+        // leaving state untouched.
+        let mut host = MockHost::with_inputs(vec![submit_staged_config_input(
+            9,
+            400,
+            12345,
+            [0xAB; 32],
+        )]);
+        run_with_host(&mut host);
+        let message = expect_error(&host);
+        assert!(message.contains("does not exist"), "unexpected: {}", message);
     }
 
     #[test]

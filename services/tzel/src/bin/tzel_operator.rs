@@ -16,8 +16,9 @@ use tezos_data_encoding_05::enc::BinWriter as _;
 use tezos_smart_rollup_encoding::{inbox::ExternalMessageFrame, smart_rollup::SmartRollupAddress};
 use tzel_core::{
     hash,
+    kernel_wire::encode_kernel_inbox_message,
     operator_api::{
-        RollupSubmission, RollupSubmissionStatus, RollupSubmissionTransport,
+        RollupSubmission, RollupSubmissionKind, RollupSubmissionStatus, RollupSubmissionTransport,
         SubmitRollupMessageReq, SubmitRollupMessageResp,
     },
 };
@@ -252,18 +253,36 @@ fn process_submission(
     if targeted_bytes.len() > config.direct_max_message_bytes {
         // The DAL transport was deleted together with the v17 DAL-pointer
         // wire path (docs/SNARK-SUBMISSION-DESIGN.md, "What gets deleted").
-        // Oversized payloads require the v18 staged submission pipeline
-        // (StageChunk + SubmitOps); operator-side production lands with
-        // track W4.
-        stored.submission.detail = Some(format!(
-            "message is {} bytes after framing, above direct inbox limit {}; \
-             the DAL transport was removed — oversized payloads require the \
-             v18 staged submission pipeline (StageChunk/SubmitOps, track W4)",
-            targeted_bytes.len(),
-            config.direct_max_message_bytes
-        ));
-        persist_submission(config, &stored)?;
-        return Ok(stored.submission);
+        // Oversized payloads now take the v18 staged submission pipeline.
+        //
+        // Signed config (ConfigureVerifier/ConfigureBridge) envelopes exceed
+        // 4096 bytes; the operator stages them in chunks then references the
+        // sealed entry with SubmitStagedConfig (Deliverable B / gap #1).
+        //
+        // Oversized OP payloads (Shield/Transfer/Unshield) are NOT handled
+        // here: the wallet produces the v18 message sequence (per-note
+        // StageChunk + a SubmitOps that each fit one inbox message) and
+        // submits them individually through this same direct path, because
+        // building the aggregation-tree binding requires the bootloader
+        // output preimages + the gnark wrap proof, which the operator does
+        // not have (it only sees an opaque pre-encoded payload).
+        match req.kind {
+            RollupSubmissionKind::ConfigureVerifier | RollupSubmissionKind::ConfigureBridge => {
+                return process_staged_config_submission(config, &req, stored);
+            }
+            _ => {
+                stored.submission.detail = Some(format!(
+                    "message is {} bytes after framing, above direct inbox limit {}; \
+                     oversized op payloads must be produced as a v18 StageChunk + \
+                     SubmitOps sequence by the wallet (each message fits the inbox \
+                     cap) — the operator only stages oversized signed config",
+                    targeted_bytes.len(),
+                    config.direct_max_message_bytes
+                ));
+                persist_submission(config, &stored)?;
+                return Ok(stored.submission);
+            }
+        }
     }
 
     match inject_direct_message(config, &targeted_bytes, false) {
@@ -280,6 +299,76 @@ fn process_submission(
             Err(err)
         }
     }
+}
+
+/// Stage an oversized signed config envelope (the `req.payload`, which is a
+/// full `ConfigureVerifier`/`ConfigureBridge` inbox message) across
+/// `StageChunk`s, then submit a `SubmitStagedConfig` referencing the sealed
+/// entry (`docs/SNARK-SUBMISSION-DESIGN.md`, gap #1 / Deliverable B). Each
+/// produced message fits the inbox cap; they are injected in order so the
+/// staging entry is sealed by the time `SubmitStagedConfig` lands.
+///
+/// The `staging_id` is derived from the submission counter so concurrent
+/// config submissions from this operator do not collide in the kernel's
+/// `(sender, staging_id)` namespace.
+fn process_staged_config_submission(
+    config: &OperatorConfig,
+    req: &SubmitRollupMessageReq,
+    mut stored: StoredSubmission,
+) -> Result<RollupSubmission, String> {
+    let staging_id = config.id_counter.fetch_add(1, Ordering::Relaxed);
+    let messages = tzel_services::submit_v18::build_staged_config_submission(
+        staging_id,
+        &req.payload,
+    )
+    .map_err(|e| format!("failed to build staged config submission: {}", e))?;
+
+    let mut hashes: Vec<String> = Vec::with_capacity(messages.len());
+    for (index, message) in messages.iter().enumerate() {
+        let encoded = encode_kernel_inbox_message(message)
+            .map_err(|e| format!("failed to encode staged config message {}: {}", index, e))?;
+        let framed = encode_targeted_rollup_message(&req.rollup_address, &encoded)?;
+        if framed.len() > config.direct_max_message_bytes {
+            let detail = format!(
+                "staged config message {} is {} bytes after framing, above inbox limit {}",
+                index,
+                framed.len(),
+                config.direct_max_message_bytes
+            );
+            stored.submission.detail = Some(detail.clone());
+            persist_submission(config, &stored)?;
+            return Err(detail);
+        }
+        match inject_direct_message(config, &framed, false) {
+            Ok(output) => {
+                if let Some(h) = extract_operation_hash(&output) {
+                    hashes.push(h);
+                }
+            }
+            Err(err) => {
+                stored.submission.detail = Some(format!(
+                    "staged config message {} of {} injection failed: {}",
+                    index,
+                    messages.len(),
+                    err
+                ));
+                persist_submission(config, &stored)?;
+                return Err(err);
+            }
+        }
+    }
+
+    stored.submission.status = RollupSubmissionStatus::SubmittedToL1;
+    // The terminal SubmitStagedConfig op hash is the meaningful receipt.
+    stored.submission.operation_hash = hashes.last().cloned();
+    stored.submission.detail = Some(format!(
+        "staged signed config across {} StageChunk message(s) + 1 SubmitStagedConfig \
+         (staging_id {})",
+        messages.len().saturating_sub(1),
+        staging_id
+    ));
+    persist_submission(config, &stored)?;
+    Ok(stored.submission)
 }
 
 fn inject_direct_message(
@@ -641,7 +730,9 @@ mod tests {
     }
 
     #[test]
-    fn oversized_message_fails_cleanly() {
+    fn oversized_op_message_fails_cleanly() {
+        // Oversized OP payloads (Shield/Transfer/Unshield) are not staged by
+        // the operator — the wallet must produce the v18 message sequence.
         let script_dir = make_client_script("#!/bin/sh\necho 'should not inject'\n");
         let config = config_with_client(&script_dir.path().join("octez-client"));
         let req = SubmitRollupMessageReq {
@@ -655,7 +746,42 @@ mod tests {
         assert!(submission.operation_hash.is_none());
         let detail = submission.detail.as_deref().unwrap();
         assert!(detail.contains("above direct inbox limit"));
-        assert!(detail.contains("StageChunk/SubmitOps"));
+        assert!(detail.contains("StageChunk"));
+        assert!(detail.contains("SubmitOps"));
+    }
+
+    #[test]
+    fn oversized_config_is_staged_and_submitted() {
+        // A >4KiB signed config envelope is staged across StageChunk messages
+        // then applied via SubmitStagedConfig — each injection succeeds.
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooStagedConfigHash123456789'\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        // The real L1 inbox cap — large enough to frame a full StageChunk
+        // (~3.9 KiB payload) but smaller than the whole config envelope, so
+        // the config is forced down the staged path while each chunk fits.
+        config.direct_max_message_bytes = DEFAULT_DIRECT_MAX_MESSAGE_BYTES;
+        let req = SubmitRollupMessageReq {
+            kind: RollupSubmissionKind::ConfigureVerifier,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            payload: sample_configure_verifier_payload(),
+        };
+        // Sanity: the config envelope really is oversized (would not fit
+        // one framed inbox message), so it takes the staged path.
+        let framed = encode_targeted_rollup_message(&req.rollup_address, &req.payload).unwrap();
+        assert!(framed.len() > config.direct_max_message_bytes);
+
+        let submission = process_submission(&config, req).unwrap();
+        assert_eq!(submission.status, RollupSubmissionStatus::SubmittedToL1);
+        assert_eq!(submission.transport, RollupSubmissionTransport::DirectInbox);
+        assert_eq!(
+            submission.operation_hash.as_deref(),
+            Some("ooStagedConfigHash123456789")
+        );
+        let detail = submission.detail.as_deref().unwrap();
+        assert!(detail.contains("staged signed config"));
+        assert!(detail.contains("SubmitStagedConfig"));
     }
 
     #[test]

@@ -372,6 +372,22 @@ pub fn leaf_mv_publics(
     }
 }
 
+/// [`leaf_mv_publics`] taking the raw 32-byte LE felts the kernel wire
+/// carries (`&[RawF]`), converting exactly as [`derive_mv_root_publics`]
+/// does for a `Declared` slot. Lets producers (wallet/operator) derive a
+/// leaf's mv publics without depending on `starknet-types-core` directly —
+/// e.g. to fill an `Opaque` padding slot that duplicates a declared leaf.
+pub fn leaf_mv_publics_raw(
+    leaf_preprocessed_root_lanes: [u32; 8],
+    output_preimage: &[RawF],
+) -> MvNodePublics {
+    let felts: Vec<Felt> = output_preimage
+        .iter()
+        .map(|raw| Felt::from_bytes_le(raw))
+        .collect();
+    leaf_mv_publics(leaf_preprocessed_root_lanes, &felts)
+}
+
 /// One leaf slot of an aggregation-tree binding
 /// (`docs/SNARK-SUBMISSION-DESIGN.md`, `TreeBinding`).
 #[derive(Debug)]

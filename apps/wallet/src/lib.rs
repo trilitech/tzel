@@ -16,6 +16,7 @@ use tzel_services::operator_api::{
     RollupSubmission, RollupSubmissionKind, RollupSubmissionStatus, RollupSubmissionTransport,
     SubmitRollupMessageReq, SubmitRollupMessageResp,
 };
+use tzel_services::submit_v18;
 use tzel_services::*;
 use tzel_verifier::ProofBundle as VerifyProofBundle;
 
@@ -2407,6 +2408,52 @@ impl<'a> RollupRpc<'a> {
         result
     }
 
+    /// Produce and submit a v18 DAL-free op batch (track W4): build the
+    /// per-note `StageChunk`s + the referencing `SubmitOps` from `ops`, then
+    /// submit each message in order (staging entries first, so they are
+    /// sealed by the time `SubmitOps` lands). Returns the receipt of the
+    /// terminal `SubmitOps` message.
+    ///
+    /// `prover` is the gnark wrap-proof seam ([`submit_v18::Groth16WrapProver`]):
+    /// production wires a real prover; tests/dev use
+    /// `submit_v18::StubGroth16Prover`. A batch of size 1 is the single-op
+    /// (padded) mode; up to `MAX_BATCH_OPS` amortise one SNARK.
+    // CLI/flow wiring (replacing the v17 inline op path) lands with the W5
+    // sandbox E2E + fixture regen; the producer capability is complete here.
+    #[allow(dead_code)]
+    fn submit_v18_op_batch(
+        &self,
+        ops: &[submit_v18::OpInput],
+        staging_start: u64,
+        prover: &dyn submit_v18::Groth16WrapProver,
+    ) -> Result<RollupSubmissionReceipt, String> {
+        let mut allocator = submit_v18::StagingIdAllocator::new(staging_start);
+        let submission = submit_v18::build_op_submission(ops, &mut allocator, prover)?;
+        let mut last: Option<RollupSubmissionReceipt> = None;
+        for message in &submission.messages {
+            last = Some(self.submit_kernel_message(message)?);
+        }
+        last.ok_or_else(|| "v18 op batch produced no messages".to_string())
+    }
+
+    /// Produce and submit an oversized signed config (track W4 / gap #1):
+    /// stage the `config_envelope` (a full `ConfigureVerifier`/`ConfigureBridge`
+    /// inbox payload) across chunks, then submit a `SubmitStagedConfig`
+    /// referencing the sealed entry. Returns the terminal message's receipt.
+    #[allow(dead_code)]
+    fn submit_v18_staged_config(
+        &self,
+        config_envelope: &[u8],
+        staging_id: u64,
+    ) -> Result<RollupSubmissionReceipt, String> {
+        let messages = submit_v18::build_staged_config_submission(staging_id, config_envelope)?;
+        let mut last: Option<RollupSubmissionReceipt> = None;
+        for message in &messages {
+            last = Some(self.submit_kernel_message(message)?);
+        }
+        last.ok_or_else(|| "staged config produced no messages".to_string())
+    }
+
     fn deposit_to_bridge(
         &self,
         pubkey_hash: &F,
@@ -2530,6 +2577,14 @@ fn write_temp_rollup_message_file(bytes: &[u8]) -> Result<std::path::PathBuf, St
     Ok(path)
 }
 
+/// The operator-API `kind` for a kernel message. The v18 staged-submission
+/// messages (StageChunk / SubmitOps / SubmitStagedConfig) have no dedicated
+/// `RollupSubmissionKind` — the field is advisory book-keeping on the
+/// direct-inbox path — so each is mapped to the closest existing kind: a
+/// staging/submit-ops message is part of an op flow (reported as `Shield`,
+/// the default op kind), and a staged config carries a `ConfigureVerifier`
+/// envelope. Callers that need precise kinds should build the v18 sequence
+/// explicitly via [`build_v18_op_submission`] / `submit_v18`.
 fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
     match message {
         KernelInboxMessage::Shield(_) => RollupSubmissionKind::Shield,
@@ -2537,11 +2592,12 @@ fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
         KernelInboxMessage::Unshield(_) => RollupSubmissionKind::Unshield,
         KernelInboxMessage::ConfigureVerifier(_) => RollupSubmissionKind::ConfigureVerifier,
         KernelInboxMessage::ConfigureBridge(_) => RollupSubmissionKind::ConfigureBridge,
-        // TODO(W4): wallet-side production of the v18 DAL-free submission
-        // path (StageChunk + SubmitOps) lands with track W4.
+        // v18 staged submission (track W4): StageChunk + SubmitOps carry op
+        // data; SubmitStagedConfig carries a signed config envelope.
         KernelInboxMessage::StageChunk(_) | KernelInboxMessage::SubmitOps(_) => {
-            unreachable!("wallet does not produce v18 staged submission messages yet (W4)")
+            RollupSubmissionKind::Shield
         }
+        KernelInboxMessage::SubmitStagedConfig(_) => RollupSubmissionKind::ConfigureVerifier,
     }
 }
 

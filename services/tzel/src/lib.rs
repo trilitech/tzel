@@ -4,6 +4,7 @@ pub mod canonical_wire;
 pub mod interop_scenario;
 pub mod proof_bench;
 pub mod protocol_vectors;
+pub mod submit_v18;
 
 pub use tzel_core::*;
 use tzel_verifier::ProofBundle as VerifyProofBundle;
