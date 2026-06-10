@@ -196,4 +196,29 @@ Section Nullifier.
     nullifier nk cm pos = nullifier nk cm pos.
   Proof. reflexivity. Qed.
 
+  (** Under collision resistance of [H_nf] (modeled as injectivity,
+      taken as a lemma hypothesis per this file's convention), a
+      nullifier value BINDS the spending key, the note commitment,
+      and the leaf position: equal nullifiers only arise from the
+      same [(nk_spend, cm, pos)] triple.
+
+      Together with [nullifier_deterministic] this gives the
+      protocol's double-spend semantics in both directions:
+      - completeness: re-spending the same note at the same
+        position reproduces the same nullifier, so the kernel's
+        nullifier-set membership check always fires;
+      - soundness: a nullifier collision between different notes,
+        positions, or keys would be an [H_nf] collision — the
+        kernel's check never falsely locks an unspent note. *)
+  Lemma nullifier_binding (Hinj : injective_2 H_nf)
+      (nk cm pos nk' cm' pos' : Felt) :
+    nullifier nk cm pos = nullifier nk' cm' pos' ->
+    nk = nk' /\ cm = cm' /\ pos = pos'.
+  Proof.
+    intros Heq.
+    destruct (Hinj _ _ _ _ Heq) as [Hnk Hinner].
+    destruct (Hinj _ _ _ _ Hinner) as [Hcm Hpos].
+    auto.
+  Qed.
+
 End Nullifier.

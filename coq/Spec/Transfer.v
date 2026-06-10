@@ -46,7 +46,7 @@
     are the two fees described in whitepaper §"Fees".
 *)
 
-From Stdlib Require Import List Arith.
+From Stdlib Require Import List Arith Lia.
 Import ListNotations.
 From Common Require Import Felt.
 From Spec Require Import Hashes.
@@ -422,3 +422,87 @@ Section PhiTransfer.
   Qed.
 
 End PhiTransfer.
+
+(** ** Batch-level conservation (no inflation across a block)
+
+    The per-transaction [phi_value_conservation] composes: over ANY
+    sequence of accepted transactions, and for EVERY asset, the
+    total value entering equals the total value leaving, with the
+    tez lane additionally shrinking by exactly the sum of the
+    public fees burned.  In particular no sequence of transfers can
+    inflate any asset's supply, and non-tez assets are conserved
+    exactly.
+
+    Stated over flattened input/output multisets; the unshield
+    variant (with public exits) reduces to this shape by folding
+    each exit in as one more output entry, as in
+    [Impl.Unshield.unshield_two_accumulator_conservation]. *)
+
+Section BatchConservation.
+
+  Variable asset_tez : Felt.
+
+  (** [sum_at] distributes over parallel-list concatenation.  The
+      length hypothesis keeps the prefix lists aligned — without
+      it a ragged prefix would shift values onto the wrong
+      assets. *)
+  Lemma sum_at_app (target : Felt) (xs ys : list Felt)
+      (vs ws : list nat) :
+    length xs = length vs ->
+    sum_at target (xs ++ ys) (vs ++ ws)
+    = sum_at target xs vs + sum_at target ys ws.
+  Proof.
+    revert vs.
+    induction xs as [| x xr IH]; intros [| v vr] Hlen;
+      try discriminate; cbn.
+    - reflexivity.
+    - rewrite IH by (injection Hlen; auto). lia.
+  Qed.
+
+  (** One accepted transaction's flattened contribution. *)
+  Record BatchTx : Type := mkBatchTx {
+    btx_in_assets  : list Felt;
+    btx_in_values  : list nat;
+    btx_out_assets : list Felt;
+    btx_out_values : list nat;
+    btx_fee        : nat;
+  }.
+
+  Definition batch_tx_wf (t : BatchTx) : Prop :=
+    length (btx_in_assets t) = length (btx_in_values t)
+    /\ length (btx_out_assets t) = length (btx_out_values t).
+
+  Definition batch_tx_conserves (t : BatchTx) : Prop :=
+    phi_value_conservation asset_tez
+      (btx_in_assets t) (btx_in_values t)
+      (btx_out_assets t) (btx_out_values t)
+      (btx_fee t).
+
+  Theorem batch_value_conservation (txs : list BatchTx) :
+    Forall batch_tx_wf txs ->
+    Forall batch_tx_conserves txs ->
+    forall a : Felt,
+      sum_at a (concat (map btx_in_assets txs))
+               (concat (map btx_in_values txs))
+      = sum_at a (concat (map btx_out_assets txs))
+                 (concat (map btx_out_values txs))
+        + (if Felt_eq_dec a asset_tez
+           then list_sum (map btx_fee txs) else 0).
+  Proof.
+    induction txs as [| t txs IH]; intros Hwf Hphi a.
+    - cbn. destruct (Felt_eq_dec a asset_tez); reflexivity.
+    - inversion Hwf as [| ? ? [Hwin Hwout] Hwf']; subst.
+      inversion Hphi as [| ? ? Hp Hphi']; subst.
+      cbn [map concat list_sum].
+      rewrite (sum_at_app _ _ _ _ _ Hwin).
+      rewrite (sum_at_app _ _ _ _ _ Hwout).
+      rewrite (Hp a). rewrite (IH Hwf' Hphi' a).
+      (* Reduce list_sum on the head cons so the per-tx fee and the
+         tail total appear as separate linear atoms; keep sum_at
+         folded (a blanket cbn would unfold sum_at's fixpoint and
+         lia rejects the resulting match as non-linear). *)
+      simpl list_sum.
+      destruct (Felt_eq_dec a asset_tez); lia.
+  Qed.
+
+End BatchConservation.

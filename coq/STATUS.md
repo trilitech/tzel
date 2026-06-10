@@ -222,10 +222,31 @@ refinement + extraction + conformance), the same shape repeats for:
   debit equations as an explicit hypothesis in
   `phi_shield_value_conservation`'s exact shape — the seam where
   a future kernel model plugs in.
-  Remaining: realization of the relations' hash / digit / node
-  parameters at extraction (the `Impl/Extraction.v` pattern) and
-  the QCheck2 differential harness against Cairo runners — the
-  "fuzzing" half of model<->circuit conformance.
+  HIGH-LEVEL PROPERTIES (this iteration):
+  - `Spec/Hashes.v` `nullifier_binding`: under H_nf injectivity
+    (CR), equal nullifiers imply the same (nk_spend, cm, pos) —
+    the double-spend soundness direction, complementing
+    `nullifier_deterministic` (completeness).
+  - `Spec/Transfer.v` `batch_value_conservation`: per-tx
+    `phi_value_conservation` COMPOSES over a list of accepted txs —
+    for every asset, total in = total out + (tez fees burned).
+    No sequence of transfers inflates any asset's supply; non-tez
+    assets conserved exactly. Proved via `sum_at_app`
+    (parallel-list concatenation distributes).
+  CONFORMANCE / FUZZING:
+  - `coq/Extracted/build.sh` now guards the differential-test
+    snapshot: it fails loudly (or refreshes under
+    REFRESH_TEST_SNAPSHOT=1) if `ocaml/coq_driver/test`'s tracked
+    `tzel_wots.{ml,mli}` drift from the fresh Rocq extraction, so
+    the QCheck2 harness can never silently validate stale code.
+  - `.github/workflows/coq.yml` now RUNS the differential test
+    (`dune test coq_driver/test`, 15k random witnesses/run:
+    10k single chain-step + 5k iterated) after the smoke vector —
+    previously the harness existed but no workflow executed it.
+  Remaining: realize the FULL transfer/unshield/shield relations'
+  hash / digit / node parameters at extraction (chain-step is done)
+  and add Cairo-side `run_*` runners so the differential covers
+  whole-circuit conformance, not just the WOTS chain step.
 
 ## Open questions / decisions deferred
 

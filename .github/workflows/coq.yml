@@ -117,3 +117,13 @@ jobs:
             echo "::error::expected $expected, got $out"
             exit 1
           fi
+
+      - name: Differential conformance (extracted Rocq vs OCaml port)
+        # The QCheck2 harness feeds thousands of random
+        # (x, pub_seed, key_idx, chain_idx, step) witnesses to BOTH
+        # the extracted-Rocq xmss_chain_step and the OCaml protocol
+        # port, asserting byte-equality. build.sh has already proven
+        # the test/ snapshot matches the fresh extraction, so this
+        # runs the real extracted code, not a stale copy.
+        run: opam exec -- dune test coq_driver/test
+        working-directory: ocaml
