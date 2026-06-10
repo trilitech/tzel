@@ -775,6 +775,32 @@ nullifier/commitment binding.
   — the hard content is tdfront_correct, this packages it for the
   whole tree.)
 
+- **O(depth) INCREMENTAL FRONTIER (`Spec/MerkleFrontier.v`):** models
+  the kernel's actual O(depth) frontier state (simulate_frontier_append
+  / branches[]) as a binary-counter frontier and proves its core
+  structural correctness — the genuinely-hard incremental-Merkle item
+  deferred earlier, now substantially closed. A frontier is a
+  list (option Felt); appending a leaf is binary increment with carry.
+  Proved (zero admits):
+  - mroot_combine: the carry is value-correct
+    (mroot (S lv)(a++b) = H (mroot lv a)(mroot lv b) for |a|=2^lv);
+  - fval_fappend: fappend is a correct binary counter (appending a
+    height-lv block adds 2^lv to the represented leaf count, with
+    carry);
+  - fappend_preserves_frep + fbuild_frep: the frontier built by
+    appending all leaves FAITHFULLY REPRESENTS them — every slot is
+    exactly the complete-subtree root of its leaf block (decreasing
+    size). This is the correctness of the kernel's O(depth)
+    branches[] state: it tracks the true subtree roots using O(depth)
+    storage, not the full leaf array.
+  - froot_empty: the root read off an empty frontier = zero_hash d.
+  REMAINING (documented, NOT admitted): the read-off bridge
+  froot (fbuild leaves) = mroot d leaves (level-offset + padding
+  bookkeeping). The security-relevant committed-root=batch-root is
+  already in MerkleTree (tree_root_correct) + differentially
+  validated; this adds the O(depth)-state structural correctness
+  beneath it.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
