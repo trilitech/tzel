@@ -22,6 +22,7 @@ Spec/EndToEnd.v
 Spec/AssetRegistry.v
 Spec/KernelNullifier.v
 Spec/MerkleTree.v
+Spec/ShieldReplay.v
 
 Impl/Common.v
 Impl/Hashes.v

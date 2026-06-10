@@ -439,6 +439,33 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   Future work: extend frontier correctness to arbitrary append
   indices (the general frontier invariant).
 
+- **SHIELD REPLAY PROTECTION (`Spec/ShieldReplay.v`):** the kernel
+  records each applied shield's client_cm (applied_shield_path /
+  has_marker) and rejects a shield whose cm is already present —
+  without which an attacker could top up a drained pool, resubmit a
+  victim's shield proof, and mint a DUPLICATE of the recipient's note
+  at a fresh position (independently spendable, doubling their
+  balance). The mechanism is an append-only dedup set, structurally
+  identical to the nullifier set — so rather than duplicate the
+  proof, this INSTANTIATES Spec.KernelNullifier's polymorphic
+  machinery at the commitment type. Proved (zero admits):
+  - applied_set_nodup: no commitment is recorded by two shields;
+  - shield_replay_rejected: a shield re-presenting an applied cm
+    cannot step;
+  - no_duplicate_shielded_note: once cm c is shielded, no reachable
+    future shield carrying c is accepted — the recipient note is
+    minted at most once; the balance cannot be doubled by replay.
+  Demonstrates one verified mechanism (the append-only dedup set)
+  covering TWO distinct attacks: double-spend (nullifiers) and
+  shield-replay note-duplication (commitments).
+
+- **STILL OPEN (hard, deferred):** the GENERAL append-only Merkle
+  frontier correctness for arbitrary append indices (the per-level
+  frontier invariant). MerkleTree proves the first-leaf case +
+  zero-subtree; the general case (bottom-up frontier vs top-down
+  recursive root, with the bit-indexed frontier invariant) is a
+  genuine multi-step proof.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
