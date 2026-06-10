@@ -890,6 +890,16 @@ nullifier/commitment binding.
   root_of_mroot -> padding invariance -> base independence -> bridge ->
   froot_correct, all zero-admit.
 
+- **FRONTIER READ-OFF DIFFERENTIAL (faithfulness):** validates the
+  just-proved O(depth) frontier MODEL against the production tree.
+  Extracted MerkleFrontier.froot / fbuild and differential-fuzz
+  froot d (fbuild leaves) 0 z0 against Tzel.Merkle.root_of_leaves
+  (cross-impl tested vs Cairo / the Rust kernel hash_merkle) over 5000
+  random (depth, leaves) with length leaves < 2^depth. All pass. So
+  froot_fbuild_eq's claim (frontier read-off = batch root) is both
+  PROVED and empirically VALIDATED, and the froot/fbuild model is
+  confirmed faithful. Differential suite now 14 cases.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

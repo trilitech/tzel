@@ -115,6 +115,13 @@ let extracted_root_of depth leaves = Tzel_wots.root_of merkle_H merkle_z depth l
 let extracted_mroot depth leaves = Tzel_wots.mroot merkle_H merkle_z depth leaves
 let extracted_tdfront depth pre cm = Tzel_wots.tdfront merkle_H merkle_z depth pre cm
 
+(** The O(depth) frontier read-off: build the binary-counter frontier
+    from the leaves, then read the root off it (next position empty,
+    z0). [froot_fbuild_eq] proves this equals the batch root; this
+    validates the froot/fbuild MODEL against the production tree. *)
+let extracted_frontier_root depth leaves =
+  Tzel_wots.froot merkle_H merkle_z depth (Tzel_wots.fbuild merkle_H leaves) 0 merkle_z
+
 (** QCheck generator for chain-step inputs. *)
 let gen_chain_input =
   QCheck.Gen.(
@@ -409,6 +416,27 @@ let test_tdfront =
           Bytes.equal (extracted_tdfront depth pre cm)
                       (port_root depth (pre @ [cm]))))
 
+(** frontier read-off: leaves with length < 2^depth (so the frontier
+    fits in depth slots), root off the frontier = batch root. *)
+let gen_frontier_root =
+  QCheck.Gen.(
+    let* depth = 0 -- 6 in
+    let cap = 1 lsl depth in
+    let* k = 0 -- (cap - 1) in
+    let leaves = List.init k (fun _ -> random_felt ()) in
+    return (depth, leaves))
+let arb_frontier_root =
+  QCheck.make gen_frontier_root
+    ~print:(fun (d,l) -> Printf.sprintf "depth=%d |leaves|=%d" d (List.length l))
+
+let test_frontier_root =
+  QCheck_alcotest.to_alcotest
+    (QCheck.Test.make ~count:5000 ~name:"froot(fbuild) = batch root"
+       arb_frontier_root
+       (fun (depth, leaves) ->
+          Bytes.equal (extracted_frontier_root depth leaves)
+                      (port_root depth leaves)))
+
 let () =
   Alcotest.run "extraction-diff"
     [ ("xmss_chain_step",
@@ -431,4 +459,4 @@ let () =
          Alcotest.test_case "merkle golden vector (Cairo/Rust-anchored)"
            `Quick test_merkle_golden_vector ]);
       ("merkle_tree_model",
-       [ test_root_of; test_mroot; test_tdfront ]) ]
+       [ test_root_of; test_mroot; test_tdfront; test_frontier_root ]) ]

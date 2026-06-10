@@ -1,4 +1,8 @@
 
+type 'a option =
+| Some of 'a
+| None
+
 (** val length : 'a1 list -> int **)
 
 let rec length = function
@@ -70,6 +74,13 @@ let rec skipn n l =
                | [] -> []
                | _::l0 -> skipn n0 l0)
     n
+
+(** val fold_left : ('a1 -> 'a2 -> 'a1) -> 'a2 list -> 'a1 -> 'a1 **)
+
+let rec fold_left f l a0 =
+  match l with
+  | [] -> a0
+  | b::l0 -> fold_left f l0 (f a0 b)
 
 (** val sighash_fold : (felt -> felt -> felt) -> felt -> felt list -> felt **)
 
@@ -205,3 +216,35 @@ let rec tdfront h z0 d pre cm =
            (tdfront h z0 d'
              (skipn (Nat.pow (Stdlib.succ (Stdlib.succ 0)) d') pre) cm))
     d
+
+(** val fappend :
+    ('a1 -> 'a1 -> 'a1) -> 'a1 option list -> 'a1 -> 'a1 option list **)
+
+let rec fappend h front cur =
+  match front with
+  | [] -> (Some cur)::[]
+  | o::rest ->
+    (match o with
+     | Some s -> None::(fappend h rest (h s cur))
+     | None -> (Some cur)::rest)
+
+(** val froot :
+    ('a1 -> 'a1 -> 'a1) -> 'a1 -> int -> 'a1 option list -> int -> 'a1 -> 'a1 **)
+
+let rec froot h z0 d front lv acc =
+  (fun fO fS n -> if n=0 then fO () else fS (n-1))
+    (fun _ -> acc)
+    (fun d' ->
+    match front with
+    | [] -> froot h z0 d' [] (Stdlib.succ lv) (h acc (zero_hash h z0 lv))
+    | o::rest ->
+      (match o with
+       | Some s -> froot h z0 d' rest (Stdlib.succ lv) (h s acc)
+       | None ->
+         froot h z0 d' rest (Stdlib.succ lv) (h acc (zero_hash h z0 lv))))
+    d
+
+(** val fbuild : ('a1 -> 'a1 -> 'a1) -> 'a1 list -> 'a1 option list **)
+
+let fbuild h leaves =
+  fold_left (fappend h) leaves []

@@ -1,4 +1,8 @@
 
+type 'a option =
+| Some of 'a
+| None
+
 val length : 'a1 list -> int
 
 type felt = bytes
@@ -19,6 +23,8 @@ module Nat :
 val firstn : int -> 'a1 list -> 'a1 list
 
 val skipn : int -> 'a1 list -> 'a1 list
+
+val fold_left : ('a1 -> 'a2 -> 'a1) -> 'a2 list -> 'a1 -> 'a1
 
 val sighash_fold : (felt -> felt -> felt) -> felt -> felt list -> felt
 
@@ -60,3 +66,10 @@ val root_of : ('a1 -> 'a1 -> 'a1) -> 'a1 -> int -> 'a1 list -> 'a1
 val mroot : ('a1 -> 'a1 -> 'a1) -> 'a1 -> int -> 'a1 list -> 'a1
 
 val tdfront : ('a1 -> 'a1 -> 'a1) -> 'a1 -> int -> 'a1 list -> 'a1 -> 'a1
+
+val fappend : ('a1 -> 'a1 -> 'a1) -> 'a1 option list -> 'a1 -> 'a1 option list
+
+val froot :
+  ('a1 -> 'a1 -> 'a1) -> 'a1 -> int -> 'a1 option list -> int -> 'a1 -> 'a1
+
+val fbuild : ('a1 -> 'a1 -> 'a1) -> 'a1 list -> 'a1 option list
