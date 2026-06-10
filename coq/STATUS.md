@@ -33,12 +33,21 @@ Verified on a clean rebuild from scratch:
 - **25 Spec modules + Impl + Common** build under Rocq 9.0.0 (~16s).
 - **Zero admits** anywhere (`grep Admitted|admit\b` = 0); strict
   no-`admit` requirement met.
-- **Minimal, honest axiom base** — `Print Assumptions` on the
-  capstones (grand_conservation, EndToEndMulti, KernelLedger.no_inflation)
-  shows ONLY `Felt` + `Felt_eq_dec`. The hash functions are
+- **Minimal, honest axiom base (comprehensive)** — `Print Assumptions`
+  across 23 HEADLINE theorems spanning every component (no-inflation
+  for all flows + multiasset, per-note value/asset/auth binding,
+  nullifier binding, faerie-gold, double-spend, shield-replay, WOTS/
+  XMSS one-time unforgeability, bridge collateralization, burn
+  authentication, deposit anti-spoofing, registry routing, per-asset
+  L1<->L2 solvency, storage-path & deposit-key collision-freedom,
+  withdrawal serialization, the full O(depth) Merkle frontier, merkle
+  binding) shows the ENTIRE body of work depends on EXACTLY TWO
+  axioms: `Felt : Type` and `Felt_eq_dec`. The hash functions are
   uninterpreted `Parameter`s with NO global properties; every
   collision-resistance / injectivity assumption is a LOCAL Section
-  hypothesis, never a global axiom.
+  hypothesis, never a global axiom. (The clean rebuild also guards
+  against stale .vo — it caught a local stale MerkleFrontierCorrect.vo
+  that a clean build resolves; CI always builds clean.)
 - **Drift check 6/6**: the Cairo↔Coq mirrors match (SHA-pinned).
 - **Differential faithfulness 13/13**: extracted Coq functions
   (chain-step, commit, nullifier, sighash, merkle path, and the
