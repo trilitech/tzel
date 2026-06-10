@@ -12,6 +12,7 @@ Spec/Transfer.v
 Spec/Shield.v
 Spec/Unshield.v
 Spec/Ledger.v
+Spec/LedgerNf.v
 
 Impl/Common.v
 Impl/Hashes.v
