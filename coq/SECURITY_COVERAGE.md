@@ -284,6 +284,38 @@ detect an unsatisfiable *relation*).  The relations are proven inhabited:
 All five rest on only `Felt` + `Felt_eq_dec` (Print Assumptions).  So
 the circuit-relation soundness theorems are load-bearing, not hollow.
 
+## How faithfulness (model ↔ implementation) is established
+
+The Coq relations/state-machines are claimed to model the Cairo
+circuits, the Rust kernel, and the Michelson contract.  That claim
+rests on three independent mechanisms, not on trust:
+
+1. **SHA-pinned drift gate** (`Drift/check.sh`, `MANIFEST.toml`): every
+   modeled Cairo file's SHA-256 is pinned; CI fails on any divergence,
+   forcing a model review when the source changes (6/6 mirrors).
+2. **Differential fuzzing** (`ocaml/coq_driver/test`, 14 cases): the
+   *extracted* Coq functions (chain step, commitment, nullifier,
+   sighash, merkle path, O(depth) frontier root) are checked
+   byte-for-byte against the cross-impl-tested OCaml port on thousands
+   of random inputs — so the executable parts of the model compute what
+   the implementation computes.
+3. **Systematic assertion cross-check** (manual, documented): every
+   assertion in the three Cairo circuits, every check in the Michelson
+   bridge contract, and the kernel's deposit/config/capacity/valid-root
+   gates were enumerated and matched to a relation conjunct or a
+   theorem.  This found exactly one omission — the per-input `wots_sig`
+   length assert — now modeled (`input_checks`).  Confirmed faithful:
+   the asset gates, 2-accumulator balance, producer-tez pin, nullifier,
+   merkle membership, in-circuit XMSS, change-slot-absent zeroing
+   (`asset = 0 = ASSET_TEZ`), and the deposit accept gates
+   (`d_creator = d_sender` anti-relay, token_id=0, no metadata,
+   canonical recipient, registered sender, configured).
+
+What the differential cannot establish (relation *satisfiability*) is
+covered by the inhabitation theorems above; what drift+differential
+cannot establish (the relation *Props* match the Cairo accept
+condition) is covered by the assertion cross-check.
+
 ---
 
 ## Documented properties NOT formally verified (and why)
