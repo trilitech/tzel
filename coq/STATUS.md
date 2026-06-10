@@ -175,6 +175,15 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
     Shield has no inputs, so its field list is structurally
     fixed-length and equal sighashes ALONE force every public field
     equal — no count hypothesis needed.
+  - `Spec/Hashes.v` `replay_resistant`: the cross-circuit capstone.
+    Under CR, two transactions starting from DIFFERENT type tags
+    (transfer 0x01 / unshield 0x02 / shield 0x03 / pubkey 0x04) that
+    fold the same NUMBER of public fields can never share a sighash,
+    so a WOTS+ signature valid for one circuit is never valid for
+    another — blocking sign-a-transfer-replay-as-shield confusion at
+    the signature layer. Equal-arity is the in-scope case; cross-
+    arity confusion is blocked outside the model by the kernel's
+    per-circuit program-hash pinning (documented in the theorem).
 
 ## Not done
 

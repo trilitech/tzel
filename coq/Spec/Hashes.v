@@ -206,6 +206,37 @@ Section SighashFold.
     now destruct (sighash_fold_injective Hinj xs ys tag tag Hlen Heq).
   Qed.
 
+  (** ** Cross-circuit replay resistance
+
+      The sighash starts from a circuit TYPE TAG (transfer = 0x01,
+      unshield = 0x02, shield = 0x03, pubkey-hash = 0x04; see
+      [Spec.Transfer]).  Under collision resistance, two transactions
+      that start from DIFFERENT tags and fold the same NUMBER of
+      public fields can never share a sighash — so a WOTS+ signature
+      (computed over the sighash) valid for one circuit is never
+      valid for another.  This blocks "sign a transfer, replay it as
+      a shield" style cross-circuit confusion at the signature layer.
+
+      Equal-arity is the in-scope case: the three spending/entry
+      circuits publish different numbers of fields in general
+      (transfer/unshield carry per-input nullifiers; shield none), so
+      cross-arity confusion is instead blocked OUTSIDE this model by
+      the kernel pinning each circuit's program hash before applying
+      its message — a transfer proof is only ever verified against
+      the transfer program.  Within a fixed arity, the tag alone
+      suffices, and that is what this theorem certifies. *)
+  Theorem replay_resistant (Hinj : injective_2 H_sighash) :
+    forall (tag1 tag2 : Felt) (fields1 fields2 : list Felt),
+      tag1 <> tag2 ->
+      length fields1 = length fields2 ->
+      sighash_fold tag1 fields1 <> sighash_fold tag2 fields2.
+  Proof.
+    intros tag1 tag2 fields1 fields2 Htag Hlen Heq.
+    destruct (sighash_fold_injective Hinj fields1 fields2 tag1 tag2 Hlen Heq)
+      as [Htageq _].
+    exact (Htag Htageq).
+  Qed.
+
   (** Utility: equal-length prefixes of equal concatenations match. *)
   Lemma app_eq_len_l (xs xs' ys ys' : list Felt) :
     length xs = length xs' ->
