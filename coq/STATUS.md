@@ -27,6 +27,44 @@ docs/whitepaper.tex + specs/spec.md
 
 Strict requirement: **no `admit` anywhere**. Every theorem closes.
 
+## Integrity audit (full-theory health check)
+
+Verified on a clean rebuild from scratch:
+- **25 Spec modules + Impl + Common** build under Rocq 9.0.0 (~16s).
+- **Zero admits** anywhere (`grep Admitted|admit\b` = 0); strict
+  no-`admit` requirement met.
+- **Minimal, honest axiom base** — `Print Assumptions` on the
+  capstones (grand_conservation, EndToEndMulti, KernelLedger.no_inflation)
+  shows ONLY `Felt` + `Felt_eq_dec`. The hash functions are
+  uninterpreted `Parameter`s with NO global properties; every
+  collision-resistance / injectivity assumption is a LOCAL Section
+  hypothesis, never a global axiom.
+- **Drift check 6/6**: the Cairo↔Coq mirrors match (SHA-pinned).
+- **Differential faithfulness 13/13**: extracted Coq functions
+  (chain-step, commit, nullifier, sighash, merkle path, and the
+  Merkle tree model root_of/mroot/tdfront) match the cross-impl-tested
+  OCaml port byte-for-byte under fuzzing.
+
+## Verification map (how the layers compose)
+
+```
+circuit no-inflation (any shield/transfer/unshield mix, any asset)   [GrandConservation]
+        │  grounded in the real per-flow circuit relations
+        ▼     (unshield_is_op / shield_is_op ↔ phi_*_value_conservation)
+kernel value conservation (withdrawn ≤ deposited, per asset)          [KernelLedger, KernelPool]
+        │  + deposit anti-spoofing, registry routing, double-spend,
+        │    shield-replay, storage-path & deposit-key collision-freedom
+        ▼
+per-asset L1↔L2 collateralization (custody = pool + notes, ∀ asset)   [EndToEndMulti, EndToEnd]
+        │  bridge holds exactly the FA2 backing each asset's L2 claims
+        ▼
+L1 bridge contract: exact collateralization + mint anti-spoof +       [BridgeTicketer, BridgeBurn,
+   burn authentication (no foreign-ticket drain)                       KernelDeposit]
+```
+Underneath: WOTS+ one-time unforgeability, append-only Merkle
+correctness (general index), withdrawal-record serialization safety,
+nullifier/commitment binding.
+
 ## Done
 
 - **Branch + scaffolding:** `coq-model` branch exists with the
