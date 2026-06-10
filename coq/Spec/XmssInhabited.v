@@ -67,3 +67,27 @@ Section XmssInhab.
   Qed.
 
 End XmssInhab.
+
+(** The well-formedness hypotheses the three circuit-relation
+    inhabitation theorems
+    ([Impl.{Shield,Transfer,Unshield}.*_relation_inhabited]) take on
+    [wots_digits] and [sks] are jointly SATISFIABLE — so those
+    inhabitations are not vacuously conditional on contradictory
+    premises.  Witness: the constant base-w-zero digit map and an
+    all-[z] key of the right length. *)
+Theorem inhab_hyps_satisfiable (z : Felt) :
+  exists (wd : Felt -> list nat) (sks : list Felt),
+    length sks = Hashes.wots_chains
+    /\ sks <> nil
+    /\ (forall sh, length (wd sh) = Hashes.wots_chains)
+    /\ (forall sh, Forall (fun d => d <= Hashes.wots_chain_len) (wd sh)).
+Proof.
+  exists (fun _ => repeat 0 Hashes.wots_chains), (repeat z Hashes.wots_chains).
+  split; [apply repeat_length |].
+  split.
+  - intro Hnil. apply (f_equal (@length Felt)) in Hnil.
+    rewrite repeat_length in Hnil. cbn in Hnil. discriminate Hnil.
+  - split; [intro; apply repeat_length |].
+    intro sh. apply Forall_forall. intros x Hx.
+    apply repeat_spec in Hx. subst x. lia.
+Qed.
