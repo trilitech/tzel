@@ -69,17 +69,50 @@
 //! (`compute_privacy_bootloader_output`, `src/lib.rs:168-171` +
 //! `verify_recursive_circuit`, `src/lib.rs:108-114`).
 //!
-//! ## mv-target assumption (output_values shape)
+//! ## Leaf mode vs mv mode (output_values shape)
 //!
-//! `output_values = [output_hash.0, output_hash.1, U_VALUE]` is the
-//! **mv-target / privacy-recursion** shape (`CIRCUIT_OUTPUT_ADDRESSES =
-//! [3, 4, 2]` in `privacy_circuit_verify/src/consts.rs`; `U_VALUE` is the
-//! logup anchor output at address 2, stwo-circuits
-//! `crates/circuits/src/context.rs:20`). The sprint 3.4b **leaf** fixture
-//! predates this and carries only 2 output values, so the full
-//! `verify_snark` happy path cannot be exercised until the Track A mv
-//! artifacts exist; [`compute_expected_out_hash`] is pinned instead by an
-//! independently-derived golden vector (see tests).
+//! Two derivations of `expected_OutHash` exist, depending on WHAT the wrap
+//! circuit verified:
+//!
+//! **Leaf mode** ([`compute_expected_out_hash`]) — the wrap verifies a
+//! privacy-recursion *leaf* statement: `output_values = [output_hash.0,
+//! output_hash.1, U_VALUE]` (3 QM31s, `CIRCUIT_OUTPUT_ADDRESSES = [3, 4,
+//! 2]` in `privacy_circuit_verify/src/consts.rs`, output values built at
+//! `privacy_circuit_verify/src/lib.rs:114`), where `output_hash` derives
+//! from the Cairo bootloader `output_preimage`. Only this statement type
+//! lists `U_VALUE` (the logup anchor at wire 2, stwo-circuits
+//! `crates/circuits/src/context.rs:20`) as an *explicit* output value.
+//!
+//! **mv mode** ([`compute_expected_out_hash_mv`]) — the production shape:
+//! the wrap verifies a `circuit_multiverifier` *root* proof aggregating a
+//! binary tree of statements. mv claims have exactly `N_RESERVED = 2`
+//! output values (stwo-circuits `crates/circuit_common/src/lib.rs:8`;
+//! `crates/circuit_multiverifier/src/verify.rs:96`
+//! `set_outputs(&[output_hash.0, output_hash.1])`) and `U_VALUE` does NOT
+//! appear among them — for `CircuitStatement`-built circuits the `u` wire
+//! is enforced through the public logup sum instead
+//! (`crates/circuit_verifier/src/statement.rs:120-127` appends the pair
+//! `(U_VAR_IDX, u)`; `crates/circuit_verifier/src/verify.rs` step-3 note
+//! "this is fine for soundness because `u` is checked as part of the
+//! logup sum"). Each mv node's 2 outputs are
+//!
+//! ```text
+//! parent.output_values = blake_m31(
+//!     childL.preprocessed_root ‖ childL.output_values
+//!   ‖ childR.preprocessed_root ‖ childR.output_values )   // 8 QM31s = 128 B
+//! ```
+//!
+//! (`crates/circuit_multiverifier/src/verify.rs:64-96`: preimage build at
+//! :79-88, `blake(.., 16 * len)` at :90-94), each QM31 framed as 4 u32 LE
+//! lanes (`crates/circuits/src/blake.rs:47-54` `to_bytes`, mirrored by the
+//! witness `blake_qm31` at `blake.rs:67-85`). The chip then hashes
+//! `TreeRoots[preprocessed] ‖ Claim.OutputValues` — 32 + 2×16 = 64 bytes
+//! for the mv root (`stwo-gnark-tzel/verifier/circuit_verifier_chip.go:
+//! 119-150`, call site `:672-676`) — into `OutHash`.
+//!
+//! Both modes are pinned by golden vectors; mv mode additionally by the
+//! real 2026-06-10 mv-target fixture (see tests +
+//! `tests/snark_wrap_acceptance.rs`).
 
 use starknet_types_core::felt::Felt;
 use stwo::core::fields::qm31::QM31;
@@ -170,6 +203,81 @@ pub fn compute_expected_out_hash(
     blake_m31_lanes(&preimage)
 }
 
+/// Public data of one aggregation-tree node as seen by its PARENT
+/// multiverifier: the node's preprocessed root (`HashValue<QM31>`, 8 M31
+/// lanes) and its 2 claim output values (8 M31 lanes). Lane order is the
+/// upstream QM31 LE framing `a.0, a.1, b.0, b.1` per QM31 (stwo-circuits
+/// 2bf051f `crates/circuits/src/blake.rs:47-54`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MvNodePublics {
+    pub preprocessed_root_lanes: [u32; 8],
+    pub output_lanes: [u32; 8],
+}
+
+impl MvNodePublics {
+    fn check_m31(&self) -> Result<(), String> {
+        for (what, lanes) in [
+            ("preprocessed_root", &self.preprocessed_root_lanes),
+            ("output_values", &self.output_lanes),
+        ] {
+            if let Some(lane) = lanes.iter().find(|l| **l >= (1 << 31) - 1) {
+                return Err(format!("mv child {what} lane not an M31 value: {lane}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One multiverifier tree level: re-derive a parent mv node's 2 claim
+/// output values (as 8 M31 lanes) from its two children's publics.
+///
+/// Mirrors `build_multiverifier_circuit` (stwo-circuits 2bf051f
+/// `crates/circuit_multiverifier/src/verify.rs:64-96`):
+/// `blake_m31([rootL.0, rootL.1, ovL.0, ovL.1, rootR.0, rootR.1, ovR.0,
+/// ovR.1], n_bytes = 16 × 8)` — 128 bytes of u32-LE lanes, standard
+/// blake2s-256, digest lanes reduced to M31. Validated off-circuit against
+/// real aggregation runs by
+/// `services/reprover/tests/mv_output_derivation.rs` and pinned by the
+/// `testdata/mv_root_children.json` golden vectors.
+pub fn compute_mv_output_values(left: &MvNodePublics, right: &MvNodePublics) -> [u32; 8] {
+    let mut preimage = [0u8; 2 * 2 * 8 * 4]; // 2 children × (root + ov) × 8 lanes × 4 B
+    for (c, child) in [left, right].into_iter().enumerate() {
+        for (i, lane) in child
+            .preprocessed_root_lanes
+            .iter()
+            .chain(child.output_lanes.iter())
+            .enumerate()
+        {
+            let off = c * 64 + i * 4;
+            preimage[off..off + 4].copy_from_slice(&lane.to_le_bytes());
+        }
+    }
+    blake_m31_lanes(&preimage)
+}
+
+/// Re-derive the wrap circuit's `OutHash` for an **mv root** proof from the
+/// root's preprocessed root (`TreeRoots[0]`, 32 raw bytes) and its 2 claim
+/// output values (8 M31 lanes, e.g. from [`compute_mv_output_values`]).
+///
+/// Mirrors the chip's `outputHash` over `TreeRoots[preprocessed] ‖
+/// Claim.OutputValues` (`stwo-gnark-tzel/verifier/circuit_verifier_chip.go:
+/// 119-150`, called at `:672-676`), which itself mirrors upstream
+/// `build_verification_circuit` (stwo-circuits 2bf051f
+/// `crates/circuit_verifier/src/verify.rs`, step 3). The mv claim has
+/// exactly 2 output values and NO trailing `U_VALUE` (see module docs) —
+/// preimage = 32 + 2 × 16 = 64 bytes.
+pub fn compute_expected_out_hash_mv(
+    preprocessed_root: &[u8; 32],
+    root_output_lanes: &[u32; 8],
+) -> [u32; OUT_HASH_LANES] {
+    let mut preimage = [0u8; 32 + 2 * 16];
+    preimage[..32].copy_from_slice(preprocessed_root);
+    for (i, lane) in root_output_lanes.iter().enumerate() {
+        preimage[32 + i * 4..32 + (i + 1) * 4].copy_from_slice(&lane.to_le_bytes());
+    }
+    blake_m31_lanes(&preimage)
+}
+
 /// `reduce_to_m31(blake2s-256(data))` as 8 u32 lanes — the
 /// "Blake2sM31" digest used throughout the lifted chip/channel.
 ///
@@ -247,6 +355,60 @@ pub fn verify_snark_with_vk<'a>(
 
     // (d) Parse (program_hash, public_outputs).
     parse_single_task_output_preimage(output_preimage)
+}
+
+/// The Option E precompile, **mv mode**: verify a Groth16-wrapped TzEL
+/// multiverifier ROOT proof and bind it to the root's two children
+/// (their preprocessed roots + claim outputs).
+///
+/// Steps (a) and (c) are as in [`verify_snark`]; step (b) re-derives
+/// `OutHash` through the aggregation-tree chain
+/// ([`compute_mv_output_values`] one level up from the children, then
+/// [`compute_expected_out_hash_mv`] with `TreeRoots[0]`). On success
+/// returns the validated root `output_values` lanes — the binding anchor
+/// for walking further down the tree (children-of-children → … → per-leaf
+/// `(program_hash, public_outputs)`; that walk is pure
+/// [`compute_mv_output_values`] recursion plus the leaf-mode stage-1
+/// derivation and needs no further SNARK material).
+pub fn verify_snark_mv(
+    proof_bytes: &[u8],
+    left_child: &MvNodePublics,
+    right_child: &MvNodePublics,
+) -> Result<[u32; 8], String> {
+    verify_snark_mv_with_vk(proof_bytes, left_child, right_child, WRAP_VK_BYTES)
+}
+
+/// [`verify_snark_mv`] with an explicit gnark VK (testing / VK rotation).
+pub fn verify_snark_mv_with_vk(
+    proof_bytes: &[u8],
+    left_child: &MvNodePublics,
+    right_child: &MvNodePublics,
+    vk_bytes: &[u8],
+) -> Result<[u32; 8], String> {
+    let envelope = parse_snark_proof_envelope(proof_bytes)?;
+    left_child.check_m31()?;
+    right_child.check_m31()?;
+
+    // (a) Groth16 verification on the chip's public inputs.
+    verify_groth16_wrap_with_vk(
+        envelope.gnark_proof_bytes,
+        &envelope.tree_roots,
+        &envelope.out_hash_lanes,
+        vk_bytes,
+    )
+    .map_err(|e| format!("groth16 wrap verification failed: {e}"))?;
+
+    // (b) + (c) OutHash binding through the mv derivation chain.
+    let root_output_lanes = compute_mv_output_values(left_child, right_child);
+    let expected = compute_expected_out_hash_mv(&envelope.tree_roots[0], &root_output_lanes);
+    if expected != envelope.out_hash_lanes {
+        return Err(format!(
+            "mv children do not match proof OutHash: expected lanes {:?}, proof carries {:?}",
+            expected, envelope.out_hash_lanes
+        ));
+    }
+
+    Ok(root_output_lanes)
 }
 
 #[cfg(test)]
@@ -343,6 +505,72 @@ mod tests {
                 1582265401, 1538535622, 2135620025, 1601248341, 1791917009, 204480096, 808409381,
                 1431869092
             ],
+        );
+    }
+
+    /// mv-mode stage 2 pinned by the REAL 2026-06-10 mv-target wrap fixture:
+    /// `TreeRoots[0]` + `OutHash` come from the chip-dumped public witness
+    /// (`testdata/wrap_public_witness.txt`, indices 0..32 and 128..136), and
+    /// the root `output_values` lanes are the mv root proof's
+    /// `claim.output_values` observed during the fixture export run
+    /// (`services/reprover/tests/export_mv_fixture.rs`) and re-captured by
+    /// `mv_output_derivation.rs`. Pins the 64-byte preimage layout
+    /// (root ‖ 2 QM31s, NO U_VALUE) against chip-validated ground truth.
+    #[test]
+    fn mv_out_hash_matches_wrap_fixture() {
+        let mut root = [0u8; 32];
+        root.copy_from_slice(
+            &hex::decode("0b38551b4456ef029086970a2f0ee7415a7e052ab5c5f526344ad2439942fc51")
+                .unwrap(),
+        );
+        let root_output_lanes: [u32; 8] = [
+            802081382, 416909726, 1859869728, 63892159, 106802067, 1890177931, 1827850667,
+            1829696004,
+        ];
+        assert_eq!(
+            compute_expected_out_hash_mv(&root, &root_output_lanes),
+            [
+                440499038, 323128790, 518444590, 444371365, 603497046, 1594598412, 638277005,
+                1938560081
+            ],
+            "must match OutHash lanes of the dumped mv-target public witness"
+        );
+    }
+
+    /// mv-mode stage 1 (one multiverifier tree level) pinned by the
+    /// captured golden vectors of the fixture aggregation
+    /// (`testdata/mv_root_children.json`, root node — asserted off-circuit
+    /// against the real `claim.output_values` during capture by
+    /// `services/reprover/tests/mv_output_derivation.rs`). The expected
+    /// lanes are the mv root's claim outputs, which chain into
+    /// [`compute_expected_out_hash_mv`] (see
+    /// `mv_out_hash_matches_wrap_fixture`).
+    #[test]
+    fn mv_output_values_golden_vector() {
+        let left = MvNodePublics {
+            preprocessed_root_lanes: [
+                1329128718, 79407594, 317031791, 1097889202, 829834258, 737675984, 793553350,
+                583776393,
+            ],
+            output_lanes: [
+                1632211865, 503564493, 2081962125, 385989669, 2023033939, 827547523, 562925084,
+                1455057832,
+            ],
+        };
+        let right = MvNodePublics {
+            preprocessed_root_lanes: left.preprocessed_root_lanes,
+            output_lanes: [
+                1405712821, 543965878, 942313946, 142366770, 1542713610, 901705420, 1935673009,
+                587138056,
+            ],
+        };
+        assert_eq!(
+            compute_mv_output_values(&left, &right),
+            [
+                802081382, 416909726, 1859869728, 63892159, 106802067, 1890177931, 1827850667,
+                1829696004
+            ],
+            "must match the mv root proof's claim.output_values"
         );
     }
 

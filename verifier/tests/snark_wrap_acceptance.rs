@@ -14,21 +14,60 @@
 //!   `frontend.NewWitness(..., PublicOnly())` from the mv fixture
 //!   (stwo-gnark-tzel `TestDumpPublicWitness` helper).
 //!
-//! NOTE: the full `verify_snark` happy path (Groth16 PASS **and** OutHash
-//! binding PASS) is not exercised here: it needs the mv root's
-//! `output_preimage`, whose derivation chain is pinned by golden vectors in
-//! `src/snark.rs` tests instead. The negative direction (valid Groth16,
-//! wrong preimage -> reject at the binding step) IS exercised below.
+//! * `mv_root_children.json` — the mv root's two children (preprocessed
+//!   root + claim output lanes each), captured during a deterministic
+//!   re-run of the fixture aggregation by
+//!   `services/reprover/tests/mv_output_derivation.rs` (which also asserts
+//!   the off-circuit blake derivation at every tree node). These drive the
+//!   POSITIVE `verify_snark_mv` happy path below: Groth16 PASS on the real
+//!   proof **and** OutHash binding PASS through the mv derivation chain.
+//!
+//! NOTE: the *leaf-mode* `verify_snark` happy path is still not exercised
+//! here — the wrapped statement is an mv root, so there is no consistent
+//! bootloader `output_preimage` for it; leaf mode stays pinned by golden
+//! vectors in `src/snark.rs`. Its negative direction (valid Groth16, wrong
+//! preimage -> reject at the binding step) IS exercised below.
 
 use tzel_verifier::groth16::{
     parse_gnark_vk, verify_groth16_wrap, verify_groth16_wrap_with_vk, VerifyError, N_PUBLIC_INPUTS,
     WRAP_VK_BYTES,
 };
-use tzel_verifier::snark::verify_snark;
+use tzel_verifier::snark::{verify_snark, verify_snark_mv, MvNodePublics};
 
 const PROOF_BIN: &[u8] = include_bytes!("../testdata/proof.bin");
 const VK_BIN: &[u8] = include_bytes!("../testdata/vk.bin");
 const PUBLIC_WITNESS_TXT: &str = include_str!("../testdata/wrap_public_witness.txt");
+const MV_ROOT_CHILDREN_JSON: &str = include_str!("../testdata/mv_root_children.json");
+
+/// Parse the captured mv-root golden data: the root's two children plus the
+/// root's expected `output_values` lanes.
+fn fixture_mv_children() -> (MvNodePublics, MvNodePublics, [u32; 8]) {
+    let doc: serde_json::Value = serde_json::from_str(MV_ROOT_CHILDREN_JSON).unwrap();
+    let root_node = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["label"] == "mv_to_mv_root")
+        .expect("mv_to_mv_root node in mv_root_children.json");
+    let lanes8 = |v: &serde_json::Value| -> [u32; 8] {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| u32::try_from(x.as_u64().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap()
+    };
+    let child = |v: &serde_json::Value| MvNodePublics {
+        preprocessed_root_lanes: lanes8(&v["preprocessed_root_lanes"]),
+        output_lanes: lanes8(&v["output_lanes"]),
+    };
+    (
+        child(&root_node["left"]),
+        child(&root_node["right"]),
+        lanes8(&root_node["parent_output_lanes"]),
+    )
+}
 
 /// Parse the dumped public witness (`<index> <decimal>` lines) into the
 /// wrap circuit's (tree_roots, out_hash_lanes) public inputs.
@@ -186,6 +225,62 @@ fn verify_snark_rejects_mismatched_output_preimage() {
         err.contains("does not match proof OutHash"),
         "must fail at the OutHash binding step (Groth16 already passed), got: {err}"
     );
+}
+
+/// POSITIVE happy path, mv mode: the real Groth16 proof verifies (step a)
+/// AND the OutHash binding passes (steps b+c) when fed the REAL children of
+/// the wrapped mv root (captured from a deterministic re-run of the fixture
+/// aggregation). Exercises the full envelope → Groth16 → mv derivation →
+/// binding chain against the embedded production VK.
+#[test]
+fn verify_snark_mv_accepts_real_proof_with_real_children() {
+    let envelope = fixture_envelope(PROOF_BIN);
+    let (left, right, expected_root_ov) = fixture_mv_children();
+    let root_ov = verify_snark_mv(&envelope, &left, &right)
+        .expect("full mv-mode happy path: Groth16 PASS + OutHash binding PASS");
+    assert_eq!(
+        root_ov, expected_root_ov,
+        "returned root output lanes must equal the captured mv root claim outputs"
+    );
+}
+
+/// mv-mode binding negative: a single flipped child output lane must be
+/// rejected at the binding step (Groth16 already passed).
+#[test]
+fn verify_snark_mv_rejects_tampered_child_outputs() {
+    let envelope = fixture_envelope(PROOF_BIN);
+    let (left, mut right, _) = fixture_mv_children();
+    right.output_lanes[3] ^= 0x01;
+    let err = verify_snark_mv(&envelope, &left, &right).unwrap_err();
+    assert!(
+        err.contains("mv children do not match proof OutHash"),
+        "must fail at the OutHash binding step, got: {err}"
+    );
+}
+
+/// mv-mode binding negative: a flipped child preprocessed-root lane is
+/// equally rejected — the children's ROOTS are part of the hashed chain,
+/// so a proof cannot be re-bound to a different child circuit shape.
+#[test]
+fn verify_snark_mv_rejects_tampered_child_root() {
+    let envelope = fixture_envelope(PROOF_BIN);
+    let (mut left, right, _) = fixture_mv_children();
+    left.preprocessed_root_lanes[0] ^= 0x01;
+    let err = verify_snark_mv(&envelope, &left, &right).unwrap_err();
+    assert!(
+        err.contains("mv children do not match proof OutHash"),
+        "must fail at the OutHash binding step, got: {err}"
+    );
+}
+
+/// mv-mode input validation: non-M31 child lanes are rejected up front.
+#[test]
+fn verify_snark_mv_rejects_non_m31_child_lane() {
+    let envelope = fixture_envelope(PROOF_BIN);
+    let (left, mut right, _) = fixture_mv_children();
+    right.output_lanes[0] = u32::MAX;
+    let err = verify_snark_mv(&envelope, &left, &right).unwrap_err();
+    assert!(err.contains("not an M31 value"), "{err}");
 }
 
 /// `verify_snark` step (a) failure: tampering the gnark proof inside the
