@@ -369,6 +369,30 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   taken as zero (rollup/producer fees are tez, on the tez lane in
   KernelLedger).
 
+- **ASSET REGISTRY ROUND-TRIP CONSISTENCY (`Spec/AssetRegistry.v`):**
+  models the kernel's registry (compose_asset_registry_with,
+  asset_for_ticketer, ticketer_for_asset) and proves the cross-layer
+  routing-correctness property the security review flagged (item 3).
+  Both lookups are first-match `find`, so the round-trip is FALSE
+  without: derive_asset_id injective on ticketers (CR) AND
+  derive t <> ASSET_TEZ (domain separation), plus the registry's
+  dedup of an FA2 ticketer equal to the tez one. Proved (zero admits,
+  real list reasoning not accounting):
+  - roundtrip_ta / roundtrip_at: under NoDup keys the two first-match
+    lookups invert each other;
+  - compose_ticketers_nodup / compose_assets_nodup: the composed
+    registry has distinct ticketers AND distinct asset_ids (derive
+    injective + nonzero gives the asset distinctness);
+  - deposit_withdraw_roundtrip / withdraw_deposit_roundtrip: deposit
+    routing (ticketer->asset) and withdrawal routing (asset->ticketer)
+    are proper mutual inverses — no deposit of asset A can unlock a
+    withdrawal routed to the WRONG bridge;
+  - fa2_routes_correctly: a registered FA2 ticketer u routes deposits
+    to derive u and withdrawals of derive u back to u.
+  The CR/nonzero hypotheses are the same kind Spec.Hashes takes for
+  nullifiers/commitments; here they make the cross-layer asset
+  routing provably unambiguous.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
