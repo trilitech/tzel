@@ -954,8 +954,13 @@ nullifier/commitment binding.
   Complements ConfigAuth.config_update_unforgeable: together the
   verifier/bridge is set ONCE by the admin and then IMMUTABLE — an
   attacker can neither forge an install (ConfigAuth) nor overwrite the
-  installed config (here). Both found by reading the actual kernel
-  config-management code.
+  installed config (here). Plus operations_require_config: in any
+  reachable state where >=1 operation (deposit/shield/transfer/unshield)
+  has occurred, the config is installed — the kernel processes no
+  transactions before the config is in place. So the FULL config
+  lifecycle: installed only by the admin (ConfigAuth), only once /
+  immutable, and required before any operation. All found by reading
+  the actual kernel config-management code.
 
 ## Not done
 
