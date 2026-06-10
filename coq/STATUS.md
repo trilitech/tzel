@@ -198,6 +198,32 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
     arity confusion is blocked outside the model by the kernel's
     per-circuit program-hash pinning (documented in the theorem).
 
+- **GLOBAL no-inflation law (NEW — `Spec/Ledger.v`):** the headline
+  system-wide theorem, from circuit soundness, NOT a pool/turnstile
+  argument. Models the shielded ledger as a state machine (deposit
+  log, exit log, live-note multiset) with two transitions:
+  `step_deposit` (value enters) and `step_settle` (the common
+  shield/transfer/unshield shape: consume a sub-multiset of live
+  notes, produce new ones, send `exits` out, under per-asset
+  conservation). `reachable_invariant`: every state reachable from
+  `genesis` satisfies `deposited(a) = exited(a) + live(a)` for every
+  asset. `no_inflation`: hence `exited(a) <= deposited(a)` always —
+  no interleaving of operations can move more of any asset out than
+  came in (public withdrawals are exits, so withdrawn <= deposited).
+  The settle step has NO pool-balance check; its only structural
+  condition is `live = consumed ++ rest` (consumed notes are really
+  present), which is what Merkle membership + nullifier uniqueness
+  (`batch_nullifier_set_faithful`) deliver. Bridges
+  `settle_conservation_of_transfer` / `_unshield` show the settle
+  step's per-asset conservation hypothesis IS exactly
+  `phi_value_conservation` / `phi_unshield_value_conservation` with
+  the right exit list, so a proven transfer/unshield induces a valid
+  step. REMAINING SEAM: the multiset-containment consumption rule is
+  modeled (justified by the separately-proven membership/nullifier
+  lemmas) rather than mechanically threaded from a circuit trace —
+  closing that (carry a nullifier set in the Step state, prove
+  consumed notes fresh) is the next tightening.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

@@ -11,6 +11,7 @@ Spec/Xmss.v
 Spec/Transfer.v
 Spec/Shield.v
 Spec/Unshield.v
+Spec/Ledger.v
 
 Impl/Common.v
 Impl/Hashes.v
