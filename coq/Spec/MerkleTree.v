@@ -306,4 +306,84 @@ Section MerkleTree.
       rewrite <- Hsplit. reflexivity.
   Qed.
 
+  (* ============================================================= *)
+  (** ** Bottom-up = top-down batch root                            *)
+  (* ============================================================= *)
+
+  (** [root_of] (bottom-up: pair adjacent, fold up) and [mroot]
+      (top-down: recursive split) are TWO definitions of the batch
+      Merkle root.  This proves they AGREE on full trees — a
+      fundamental consistency the file relied on implicitly
+      ([empty_subtree] is about [root_of]; [tdfront_correct] about
+      [mroot]). *)
+
+  Lemma build_level_length : forall n l,
+    length l = 2 * n -> length (build_level l) = n.
+  Proof.
+    induction n as [| n IH]; intros l Hlen.
+    - destruct l; [reflexivity | cbn [length] in Hlen; lia].
+    - destruct l as [| a [| b r]]; cbn [length] in Hlen; try lia.
+      cbn [build_level length]. f_equal. apply IH. lia.
+  Qed.
+
+  Lemma build_level_firstn : forall n l,
+    build_level (firstn (2 * n) l) = firstn n (build_level l).
+  Proof.
+    induction n as [| n IH]; intros l.
+    - cbn [firstn]. destruct l; reflexivity.
+    - destruct l as [| a [| b r]].
+      + cbn [firstn]. reflexivity.
+      + cbn [firstn build_level]. replace (2 * S n) with (S (S (2*n))) by lia.
+        cbn [firstn build_level]. reflexivity.
+      + replace (2 * S n) with (S (S (2 * n))) by lia.
+        cbn [firstn build_level]. rewrite IH. reflexivity.
+  Qed.
+
+  Lemma build_level_skipn : forall n l,
+    build_level (skipn (2 * n) l) = skipn n (build_level l).
+  Proof.
+    induction n as [| n IH]; intros l.
+    - reflexivity.
+    - destruct l as [| a [| b r]].
+      + reflexivity.
+      + cbn [build_level]. replace (2 * S n) with (S (S (2*n))) by lia.
+        cbn [skipn]. destruct (2*n); reflexivity.
+      + replace (2 * S n) with (S (S (2 * n))) by lia.
+        cbn [skipn build_level]. rewrite IH. reflexivity.
+  Qed.
+
+  (** Pairing the bottom level and taking the depth-[k] root equals the
+      depth-[S k] root. *)
+  Lemma build_level_mroot : forall k l,
+    length l = 2 ^ (S k) -> mroot k (build_level l) = mroot (S k) l.
+  Proof.
+    induction k as [| k IH]; intros l Hlen.
+    - destruct l as [| a [| b [| c r]]]; cbn in Hlen; try lia.
+      cbn [build_level mroot firstn skipn]. reflexivity.
+    - cbn [mroot].
+      assert (Hlen2 : length l = 2 * 2 ^ S k)
+        by (rewrite Hlen; apply Nat.pow_succ_r').
+      assert (Hf : firstn (2 ^ k) (build_level l) = build_level (firstn (2 ^ S k) l)).
+      { rewrite (Nat.pow_succ_r' 2 k). rewrite build_level_firstn. reflexivity. }
+      assert (Hs : skipn (2 ^ k) (build_level l) = build_level (skipn (2 ^ S k) l)).
+      { rewrite (Nat.pow_succ_r' 2 k). rewrite build_level_skipn. reflexivity. }
+      rewrite Hf, Hs.
+      rewrite (IH (firstn (2 ^ S k) l)) by (rewrite length_firstn; lia).
+      rewrite (IH (skipn (2 ^ S k) l)) by (rewrite length_skipn; lia).
+      reflexivity.
+  Qed.
+
+  Theorem root_of_mroot : forall d l,
+    length l = 2 ^ d -> root_of d l = mroot d l.
+  Proof.
+    induction d as [| d IH]; intros l Hlen.
+    - cbn in Hlen. destruct l as [| a [| b r]]; cbn [length] in Hlen; try lia.
+      cbn [root_of fold_levels mroot]. reflexivity.
+    - unfold root_of in *. cbn [fold_levels].
+      assert (Hbl : length (build_level l) = 2 ^ d).
+      { apply build_level_length. rewrite Hlen. apply Nat.pow_succ_r'. }
+      rewrite (IH (build_level l) Hbl).
+      apply build_level_mroot. exact Hlen.
+  Qed.
+
 End MerkleTree.

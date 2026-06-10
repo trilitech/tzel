@@ -801,6 +801,22 @@ nullifier/commitment binding.
   validated; this adds the O(depth)-state structural correctness
   beneath it.
 
+- **BOTTOM-UP = TOP-DOWN MERKLE ROOT (`Spec/MerkleTree.v`):** proves
+  the two batch-root definitions agree — a fundamental consistency the
+  file relied on implicitly (empty_subtree is about root_of, the
+  bottom-up build_level fold; tdfront_correct about mroot, the
+  top-down recursive split) but never connected. Genuinely hard
+  (bottom-up pairwise vs top-down halving). Proved (zero admits):
+  - build_level_firstn / build_level_skipn: pairing commutes with
+    taking the first/last n pairs;
+  - build_level_length: build_level halves an even-length list;
+  - build_level_mroot: pairing the bottom level + depth-k root =
+    depth-(S k) root;
+  - root_of_mroot: length l = 2^d -> root_of d l = mroot d l. So the
+    two Merkle-root definitions in the file are interchangeable, and
+    results proved about one (empty_subtree on root_of, tdfront/
+    tree_root on mroot) transfer to the other.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
