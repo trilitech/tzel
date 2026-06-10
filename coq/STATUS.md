@@ -416,6 +416,29 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
     distinct notes never collide, so spending one never falsely
     blocks another.
 
+- **APPEND-ONLY MERKLE TREE (`Spec/MerkleTree.v`):** verifies the
+  ALGORITHMS the kernel uses to compute commitment-tree roots
+  (zero_hashes precompute + simulate_frontier_append), not an
+  accounting invariant — a genuine algorithm-correctness proof.
+  Against an explicit batch Merkle-root definition (build_level
+  pair-and-hash, folded depth times), proved (zero admits):
+  - empty_subtree: the root of an all-empty depth-h subtree equals
+    zero_hash h — i.e. the kernel's precomputed zero_hashes[h] is the
+    correct empty-subtree root (an off-by-one there would let a
+    prover forge membership in empty slots). Via build_level_repeat
+    (a uniform layer halves) + a custom hpow mirroring zero_hash's
+    recursion to avoid a Nat.iter direction mismatch.
+  - frontier_first_leaf: the incremental simulate_frontier_append
+    (O(depth) state, never the full leaf array) computes, for the
+    first appended leaf, the SAME root as the batch definition over
+    [cm, z0, z0, ...]. The append-only-Merkle algorithm (Zcash /
+    Ethereum deposit contract); proving it equals the structural
+    batch root (via the left-spine = fold_levels of a leaf + empty
+    padding) is the non-trivial correctness letting the kernel commit
+    notes without storing the whole tree.
+  Future work: extend frontier correctness to arbitrary append
+  indices (the general frontier invariant).
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
