@@ -348,6 +348,27 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   the Michelson/protocol semantics justifying that a burn can only
   consume an authentic outstanding ticket.
 
+- **L1<->L2 CROSS-SYSTEM SOLVENCY (`Spec/EndToEnd.v`):** COMPOSES
+  the bridge and kernel into one state machine, LINKED by the value
+  crossing the boundary, and proves the cross-system invariant the
+  separate facts only imply piecewise:
+    L1 FA2 custody = L2 pool value + L2 live-note value.
+  The link is the crux: a deposit credits L1 custody (bridge mint)
+  AND the L2 pool by the same amount (atomic); a withdrawal debits L2
+  notes (unshield) AND L1 custody (the outbox ticket the bridge
+  burns) by the same amount — bridge and kernel cannot move
+  independently across the boundary. Theorems (zero admits):
+  - `l1_collateral_equals_l2_claims`: custody = pool + notes always;
+  - `notes_backed_by_l1`: every live L2 note is backed by real L1 FA2
+    (notes <= custody);
+  - `no_stranded_l1`: no L1 FA2 stranded beyond L2 claims;
+  - `withdrawal_honored`: any live note value has the L1 custody to
+    release;
+  - `roundtrip_solvency`: total withdrawn to L1 <= total deposited.
+  Scope: one FA2 asset (per-asset independent); FA2-denominated fees
+  taken as zero (rollup/producer fees are tez, on the tez lane in
+  KernelLedger).
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
