@@ -101,3 +101,36 @@ Proof.
   split; [apply base4_encode5_bound | apply checksum_hypothesis_realized; assumption].
 Qed.
 
+
+(** WOTS+ one-time unforgeability for the REAL message format: 128
+    message digits with the Cairo's concrete 5-digit base-4 checksum
+    tail.  All four checksum well-formedness premises of
+    [Spec.Xmss.wots_one_time_unforgeable] (the two digit bounds and the
+    two [base4_val = checksum] facts) are now DISCHARGED by the
+    encoding's proven properties — so the only remaining hypotheses are
+    the attacker's forward-only moves (each forged digit and checksum
+    digit at least the original).  A forward-only forger cannot change
+    the message. *)
+Theorem wots_unforgeable_concrete_checksum :
+  forall msg msg' : list nat,
+    length msg = 128 -> length msg' = 128 ->
+    Forall (fun d => d <= 3) msg -> Forall (fun d => d <= 3) msg' ->
+    Forall2 (fun d' d => d' >= d) msg' msg ->
+    Forall2 (fun d' d => d' >= d)
+      (base4_encode5 (checksum msg')) (base4_encode5 (checksum msg)) ->
+    msg' = msg.
+Proof.
+  intros msg msg' Hl Hl' Hb Hb' Hm Hc.
+  apply (wots_one_time_unforgeable msg msg'
+           (base4_encode5 (checksum msg)) (base4_encode5 (checksum msg'))).
+  - exact (eq_trans Hl (eq_sym Hl')).
+  - exact Hb.
+  - exact Hb'.
+  - apply base4_encode5_bound.
+  - apply base4_encode5_bound.
+  - exact (checksum_hypothesis_realized msg Hl Hb).
+  - exact (checksum_hypothesis_realized msg' Hl' Hb').
+  - exact Hm.
+  - exact Hc.
+Qed.
+
