@@ -70,6 +70,11 @@ Extract Constant pack_adrs_chain =>
 Extract Inductive nat => "int" [ "0" "Stdlib.succ" ]
   "(fun fO fS n -> if n=0 then fO () else fS (n-1))".
 
+(** Map Coq [list] to OCaml's native [list] so extracted signatures
+    use [_ list] (not a re-defined inductive) — lets the driver pass
+    ordinary OCaml lists to [sighash_fold]. *)
+Extract Inductive list => "list" [ "[]" "(::)" ].
+
 (** Realize [Hash5] as [Tzel.Hash.hash_commit] — the 5-felt
     commitment hash (multiasset cmmt domain).  Bit-equivalent to the
     Cairo [hash5] under the cross-impl interop check and the
@@ -80,4 +85,8 @@ Extract Constant Hash5 => "Tzel.Hash.hash_commit".
     hash). *)
 Extract Constant Hash_nf => "Tzel.Hash.hash_nf".
 
-Extraction "tzel_wots.ml" xmss_chain_step commit nullifier.
+(** Realize [Hash_sighash] as [Tzel.Hash.hash_sighash] (sigh-domain
+    2-input hash). *)
+Extract Constant Hash_sighash => "Tzel.Hash.hash_sighash".
+
+Extraction "tzel_wots.ml" xmss_chain_step commit nullifier sighash_fold.

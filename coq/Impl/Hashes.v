@@ -19,6 +19,7 @@
 *)
 
 From Common Require Import Felt.
+From Stdlib Require Import List.
 From Spec Require Import Hashes.
 
 Parameter Hash3 : Felt -> Felt -> Felt -> Felt.
@@ -69,4 +70,25 @@ Definition nullifier (nk_spend cm pos : Felt) : Felt :=
 Theorem nullifier_refines_spec :
   forall nk cm pos,
     nullifier nk cm pos = Spec.Hashes.nullifier Hash_nf nk cm pos.
+Proof. reflexivity. Qed.
+
+(** [Hash_sighash] is the personalized 2-input sighash hash
+    ([cairo/src/blake_hash.cairo] sigh domain).  Extraction realizes
+    it as [Tzel.Hash.hash_sighash]. *)
+Parameter Hash_sighash : Felt -> Felt -> Felt.
+
+(** The sighash fold, concretely: left-fold [Hash_sighash] over the
+    field list starting from [acc] (the type tag at the protocol
+    level).  Top-level so it can be extracted and differentially
+    fuzzed + golden-tested.  Equals [Spec.Hashes.sighash_fold] under
+    [H_sighash := Hash_sighash] — the malleability theorems
+    ([transfer_sighash_binds] et al.) thus constrain exactly this
+    extractable computation. *)
+Definition sighash_fold (acc : Felt) (fields : list Felt) : Felt :=
+  Spec.Hashes.sighash_fold Hash_sighash acc fields.
+
+Theorem sighash_fold_refines_spec :
+  forall acc fields,
+    sighash_fold acc fields
+    = Spec.Hashes.sighash_fold Hash_sighash acc fields.
 Proof. reflexivity. Qed.

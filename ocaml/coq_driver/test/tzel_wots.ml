@@ -1,6 +1,12 @@
 
 type felt = bytes
 
+(** val sighash_fold : (felt -> felt -> felt) -> felt -> felt list -> felt **)
+
+let rec sighash_fold h_sighash acc = function
+| [] -> acc
+| x::rest -> sighash_fold h_sighash (h_sighash acc x) rest
+
 (** val hash3 : felt -> felt -> felt -> felt **)
 
 let hash3 = Tzel.Hash.hash3
@@ -22,6 +28,15 @@ let hash_nf = Tzel.Hash.hash_nf
 
 let nullifier nk_spend cm pos =
   hash_nf nk_spend (hash_nf cm pos)
+
+(** val hash_sighash : felt -> felt -> felt **)
+
+let hash_sighash = Tzel.Hash.hash_sighash
+
+(** val sighash_fold0 : felt -> felt list -> felt **)
+
+let sighash_fold0 acc fields =
+  sighash_fold hash_sighash acc fields
 
 (** val pack_adrs_chain : int -> int -> int -> felt **)
 

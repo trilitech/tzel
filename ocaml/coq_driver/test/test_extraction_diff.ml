@@ -69,6 +69,18 @@ let port_nullifier nk cm pos =
 let extracted_nullifier nk cm pos =
   Tzel_wots.nullifier nk cm pos
 
+(** OCaml port reference for the sighash fold.  The port's
+    [Tzel.Hash.sighash_fold] takes a non-empty list and folds from
+    its HEAD, so [sighash_fold (acc :: fields)] equals the Coq
+    [sighash_fold acc fields] (fold over [fields] from [acc]). *)
+let port_sighash_fold acc fields =
+  Tzel.Hash.sighash_fold (acc :: fields)
+
+(** The Rocq-extracted sighash fold (sighash_fold0 = the Impl
+    wrapper that bakes in Tzel.Hash.hash_sighash). *)
+let extracted_sighash_fold acc fields =
+  Tzel_wots.sighash_fold0 acc fields
+
 (** QCheck generator for chain-step inputs. *)
 let gen_chain_input =
   QCheck.Gen.(
@@ -227,6 +239,44 @@ let test_nullifier_golden_vector () =
     "extracted Coq nullifier reproduces the Rust/Cairo golden nf"
     true (Bytes.equal (extracted_nullifier nk cm pos) expected)
 
+(** Sighash-fold differential: a random accumulator (the type tag at
+    protocol level) plus a random-length list of random field felts.
+    The malleability theorems (transfer/unshield/shield_sighash_binds)
+    are stated about exactly this fold, so conformance here ties
+    those proofs to the running computation. *)
+let gen_sighash_input =
+  QCheck.Gen.(
+    let acc = random_felt () in
+    let* n = 0 -- 12 in
+    let* fields = list_size (return n) (return (random_felt ())) in
+    return (acc, fields))
+
+let arb_sighash_input =
+  QCheck.make gen_sighash_input
+    ~print:(fun (acc, fields) ->
+      Printf.sprintf "acc=%s |fields|=%d" (felt_to_hex acc) (List.length fields))
+
+let test_sighash_fold =
+  QCheck_alcotest.to_alcotest
+    (QCheck.Test.make ~count:10000 ~name:"sighash_fold: extracted = port"
+       arb_sighash_input
+       (fun (acc, fields) ->
+          Bytes.equal (extracted_sighash_fold acc fields)
+                      (port_sighash_fold acc fields)))
+
+(** Golden-vector anchor (NON-tautological): protocol_v1.json's
+    sighash[0] folds items [1;2;3] (LE felts) to a fixed result the
+    Rust gen-test-vectors computes and cross-impl interop pins to
+    Cairo.  Coq form: acc = items[0], fields = [items[1]; items[2]]. *)
+let test_sighash_golden_vector () =
+  let i0 = felt_of_hex "0100000000000000000000000000000000000000000000000000000000000000" in
+  let i1 = felt_of_hex "0200000000000000000000000000000000000000000000000000000000000000" in
+  let i2 = felt_of_hex "0300000000000000000000000000000000000000000000000000000000000000" in
+  let expected = felt_of_hex "93b3ee7d5953594ce9932c87f88ef6d71757630802b6f6b10b62b5c341c65b00" in
+  Alcotest.(check bool)
+    "extracted Coq sighash_fold reproduces the Rust/Cairo golden result"
+    true (Bytes.equal (extracted_sighash_fold i0 [i1; i2]) expected)
+
 let () =
   Alcotest.run "extraction-diff"
     [ ("xmss_chain_step",
@@ -239,4 +289,8 @@ let () =
       ("nullifier",
        [ test_nullifier;
          Alcotest.test_case "nullifier golden vector (Cairo/Rust-anchored)"
-           `Quick test_nullifier_golden_vector ]) ]
+           `Quick test_nullifier_golden_vector ]);
+      ("sighash_fold",
+       [ test_sighash_fold;
+         Alcotest.test_case "sighash golden vector (Cairo/Rust-anchored)"
+           `Quick test_sighash_golden_vector ]) ]

@@ -1,6 +1,8 @@
 
 type felt = bytes
 
+val sighash_fold : (felt -> felt -> felt) -> felt -> felt list -> felt
+
 val hash3 : felt -> felt -> felt -> felt
 
 val hash5 : felt -> felt -> felt -> felt -> felt -> felt
@@ -10,6 +12,10 @@ val commit : felt -> felt -> felt -> felt -> felt -> felt
 val hash_nf : felt -> felt -> felt
 
 val nullifier : felt -> felt -> felt -> felt
+
+val hash_sighash : felt -> felt -> felt
+
+val sighash_fold0 : felt -> felt list -> felt
 
 val pack_adrs_chain : int -> int -> int -> felt
 

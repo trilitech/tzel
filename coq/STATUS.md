@@ -298,9 +298,22 @@ refinement + extraction + conformance), the same shape repeats for:
   Cairo-pinned). The two security-critical multiasset primitives
   (commitment, nullifier) now both have Rocq <-> OCaml <-> Cairo
   conformance, golden-anchored.
-  Remaining: extend the pattern to the merkle root and sighash
-  fold, then realize the FULL transfer/unshield/shield relations +
-  Cairo-side `run_*` runners for whole-circuit conformance.
+  SIGHASH-FOLD CONFORMANCE (this iteration): the binding primitive
+  the malleability theorems are stated about is now differentially
+  tested. `Impl/Hashes.v` `Hash_sighash` + `sighash_fold acc fields
+  := Spec.Hashes.sighash_fold Hash_sighash ...` +
+  `sighash_fold_refines_spec`. Realized `Hash_sighash =>
+  Tzel.Hash.hash_sighash`, extracted (with Coq `list` now mapped to
+  native OCaml list). Differential: 10k random fuzz (random acc +
+  random-length field list) + non-tautological golden vector
+  against protocol_v1.json sighash[0] (Rust-gen, Cairo-pinned). So
+  the malleability proofs (transfer/unshield/shield_sighash_binds)
+  now constrain a computation shown byte-equal to the Cairo's.
+  Differential suite is now 8 cases: chain step x2, commit
+  fuzz+golden, nullifier fuzz+golden, sighash fuzz+golden.
+  Remaining: merkle-root differential, then realize the FULL
+  transfer/unshield/shield relations + Cairo-side `run_*` runners
+  for whole-circuit conformance.
 
 ## Open questions / decisions deferred
 
