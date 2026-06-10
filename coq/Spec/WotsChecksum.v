@@ -16,6 +16,7 @@
 
 From Stdlib Require Import List Arith Lia.
 Import ListNotations.
+From Common Require Import Felt.
 From Spec Require Import Xmss.
 
 (** The Cairo's checksum-digit construction: [cs & 3], then [cs >> 2],
@@ -132,5 +133,47 @@ Proof.
   - exact (checksum_hypothesis_realized msg' Hl' Hb').
   - exact Hm.
   - exact Hc.
+Qed.
+
+
+(** The same discharge at the XMSS level — the actual one-time
+    signature scheme the circuit verifies ([xmss_verify]).  For the real
+    digit format (128 message digits ++ the Cairo's 5-digit base-4
+    checksum tail), two accepting XMSS verifications under the same
+    auth path, related by a forward-only forgery, must be of the SAME
+    message.  All checksum premises discharged by the encoding. *)
+Theorem xmss_unforgeable_concrete_checksum :
+  forall (F : Felt -> Felt -> Felt -> Felt) (ADRS_chain : nat -> nat -> nat -> Felt)
+         (H_node : nat -> nat -> Felt -> Felt -> Felt) (pub_seed : Felt) (key_idx : nat)
+         (msg1 msg2 : list nat) (sig1 sig2 : list Felt)
+         (auth_bits : list bool) (auth_siblings : list Felt) (auth_root_val : Felt),
+    Hashes.node_injective H_node ->
+    length auth_bits = length auth_siblings ->
+    length (msg1 ++ base4_encode5 (checksum msg1)) = length sig1 ->
+    length (msg2 ++ base4_encode5 (checksum msg2)) = length sig2 ->
+    length msg1 = 128 -> length msg2 = 128 ->
+    Forall (fun d => d <= 3) msg1 -> Forall (fun d => d <= 3) msg2 ->
+    xmss_verify F ADRS_chain H_node pub_seed key_idx
+      (msg1 ++ base4_encode5 (checksum msg1)) sig1 auth_bits auth_siblings auth_root_val ->
+    xmss_verify F ADRS_chain H_node pub_seed key_idx
+      (msg2 ++ base4_encode5 (checksum msg2)) sig2 auth_bits auth_siblings auth_root_val ->
+    Forall2 (fun d2 d1 => d2 >= d1) msg2 msg1 ->
+    Forall2 (fun d2 d1 => d2 >= d1)
+      (base4_encode5 (checksum msg2)) (base4_encode5 (checksum msg1)) ->
+    msg1 = msg2.
+Proof.
+  intros F ADRS_chain H_node pub_seed key_idx msg1 msg2 sig1 sig2
+    auth_bits auth_siblings auth_root_val
+    Hni Hab Hs1 Hs2 Hl1 Hl2 Hb1 Hb2 Hv1 Hv2 Hm Hc.
+  pose proof (xmss_one_time_unforgeable F ADRS_chain H_node pub_seed key_idx
+    msg1 (base4_encode5 (checksum msg1)) msg2 (base4_encode5 (checksum msg2))
+    sig1 sig2 auth_bits auth_siblings auth_root_val
+    Hni Hab Hs1 Hs2 (eq_trans Hl1 (eq_sym Hl2))
+    (eq_trans (base4_encode5_length _) (eq_sym (base4_encode5_length _)))
+    Hb1 Hb2 (base4_encode5_bound _) (base4_encode5_bound _)
+    (checksum_hypothesis_realized msg1 Hl1 Hb1)
+    (checksum_hypothesis_realized msg2 Hl2 Hb2)
+    Hv1 Hv2 Hm Hc) as [_ Hmsg].
+  exact Hmsg.
 Qed.
 
