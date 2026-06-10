@@ -962,6 +962,21 @@ nullifier/commitment binding.
   immutable, and required before any operation. All found by reading
   the actual kernel config-management code.
 
+- **TREE CAPACITY -> committed root is correct (`Spec/TreeCapacity.v`):**
+  grounds froot_fbuild_eq in the kernel's actual capacity check. The
+  kernel rejects appends past 2^DEPTH leaves (append_note /
+  ensure_note_capacity: "Merkle tree full"). Modeled as a note list
+  under capacity-checked append (a step fires only when count < cap).
+  Proved (zero admits):
+  - capacity_invariant: the note count never exceeds 2^DEPTH;
+  - committed_root_correct: when the tree is not full, the root the
+    kernel reads off its O(depth) frontier (froot over fbuild) equals
+    the batch Merkle root of the committed notes (mroot).
+  So the capacity check is exactly what discharges the
+  length leaves < 2^DEPTH precondition of froot_fbuild_eq — the kernel
+  always commits the true Merkle root of the notes it appended. Closes
+  the loop between the Merkle frontier proof and the kernel's usage.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
