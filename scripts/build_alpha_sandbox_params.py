@@ -29,14 +29,12 @@ def build_params(
     dal["attestation_lag"] = attestation_lag
     if "attestation_lags" in dal:
         # Some newer Octez builds require the final attestation_lags entry to
-        # match attestation_lag. Preserve compatibility by only rewriting the
-        # list when the source constants already expose that field, and only
-        # update the trailing value instead of collapsing the whole vector.
-        lags = list(dal["attestation_lags"])
-        if lags:
-            lags[-1] = attestation_lag
-        else:
-            lags = [attestation_lag]
+        # match attestation_lag, and (since the 2026-03 Alpha) the whole list
+        # to be ordered increasingly. Keep the source entries strictly below
+        # attestation_lag and append attestation_lag as the trailing value so
+        # both invariants hold.
+        lags = [lag for lag in dal["attestation_lags"] if lag < attestation_lag]
+        lags.append(attestation_lag)
         dal["attestation_lags"] = lags
 
     out_path.write_text(

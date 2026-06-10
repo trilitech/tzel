@@ -1,0 +1,191 @@
+# Compiled from tzel_orchestrator.mligo
+# ligo: local dev build at ~/.local/bin/ligo (version metadata empty; installed 2026-05-30); `ligo compile contract tezos/tzel_orchestrator.mligo`
+{ parameter
+    (or (address %set_rollup)
+        (or (or %set_forward_mode (address %forward_to_rollup) (unit %emit_only))
+            (or (address %set_admin)
+                (or (bool %set_paused) (or (bytes %unshield) (or (bytes %transfer) (bytes %shield))))))) ;
+  storage
+    (pair (address %admin)
+          (pair (address %rollup)
+                (pair (or %forward_mode (address %forward_to_rollup) (unit %emit_only))
+                      (pair (bool %paused) (nat %nonce))))) ;
+  code { LAMBDA
+           (pair (pair address (pair address (pair (or address unit) (pair bool nat)))) bytes)
+           operation
+           { UNPAIR ;
+             PUSH nat 0 ;
+             DUP 3 ;
+             SIZE ;
+             COMPARE ;
+             EQ ;
+             IF { PUSH string "TZEL_ORCH_EMPTY_CALLDATA" ; FAILWITH } {} ;
+             DUP ;
+             GET 5 ;
+             IF_LEFT
+               { SWAP ;
+                 DROP ;
+                 CONTRACT bytes ;
+                 IF_NONE
+                   { PUSH string "TZEL_ORCH_ROLLUP_NOT_FOUND" ; FAILWITH }
+                   { PUSH mutez 0 ; DIG 2 ; TRANSFER_TOKENS } }
+               { DROP ; GET 8 ; PAIR ; EMIT %tzel_inbox (pair nat bytes) } } ;
+         LAMBDA
+           (pair address (pair address (pair (or address unit) (pair bool nat))))
+           unit
+           { GET 7 ;
+             IF { PUSH string "TZEL_ORCH_PAUSED" ; FAILWITH } {} ;
+             PUSH mutez 0 ;
+             AMOUNT ;
+             COMPARE ;
+             GT ;
+             IF { PUSH string "TZEL_ORCH_UNEXPECTED_AMOUNT" ; FAILWITH } {} ;
+             UNIT } ;
+         LAMBDA
+           (pair address (pair address (pair (or address unit) (pair bool nat))))
+           unit
+           { CAR ;
+             SENDER ;
+             COMPARE ;
+             NEQ ;
+             IF { PUSH string "TZEL_ORCH_NOT_ADMIN" ; FAILWITH } {} ;
+             UNIT } ;
+         DIG 3 ;
+         UNPAIR ;
+         IF_LEFT
+           { DIG 3 ;
+             DROP ;
+             DIG 3 ;
+             DROP ;
+             DUP 2 ;
+             DIG 3 ;
+             SWAP ;
+             EXEC ;
+             DROP ;
+             UPDATE 3 ;
+             NIL operation }
+           { IF_LEFT
+               { DIG 3 ;
+                 DROP ;
+                 DIG 3 ;
+                 DROP ;
+                 DUP 2 ;
+                 DIG 3 ;
+                 SWAP ;
+                 EXEC ;
+                 DROP ;
+                 UPDATE 5 ;
+                 NIL operation }
+               { IF_LEFT
+                   { DIG 3 ;
+                     DROP ;
+                     DIG 3 ;
+                     DROP ;
+                     DUP 2 ;
+                     DIG 3 ;
+                     SWAP ;
+                     EXEC ;
+                     DROP ;
+                     UPDATE 1 ;
+                     NIL operation }
+                   { IF_LEFT
+                       { DIG 3 ;
+                         DROP ;
+                         DIG 3 ;
+                         DROP ;
+                         DUP 2 ;
+                         DIG 3 ;
+                         SWAP ;
+                         EXEC ;
+                         DROP ;
+                         UPDATE 7 ;
+                         NIL operation }
+                       { DIG 2 ;
+                         DROP ;
+                         IF_LEFT
+                           { DUP 2 ;
+                             DIG 3 ;
+                             SWAP ;
+                             EXEC ;
+                             DROP ;
+                             NIL bytes ;
+                             SWAP ;
+                             CONS ;
+                             PUSH bytes 0x04 ;
+                             CONS ;
+                             PUSH bytes 0x1100 ;
+                             CONS ;
+                             CONCAT ;
+                             DUP 2 ;
+                             PAIR ;
+                             DIG 2 ;
+                             SWAP ;
+                             EXEC ;
+                             DUP 2 ;
+                             PUSH nat 1 ;
+                             DIG 3 ;
+                             GET 8 ;
+                             ADD ;
+                             UPDATE 8 }
+                           { IF_LEFT
+                               { DUP 2 ;
+                                 DIG 3 ;
+                                 SWAP ;
+                                 EXEC ;
+                                 DROP ;
+                                 NIL bytes ;
+                                 SWAP ;
+                                 CONS ;
+                                 PUSH bytes 0x03 ;
+                                 CONS ;
+                                 PUSH bytes 0x1100 ;
+                                 CONS ;
+                                 CONCAT ;
+                                 DUP 2 ;
+                                 PAIR ;
+                                 DIG 2 ;
+                                 SWAP ;
+                                 EXEC ;
+                                 DUP 2 ;
+                                 PUSH nat 1 ;
+                                 DIG 3 ;
+                                 GET 8 ;
+                                 ADD ;
+                                 UPDATE 8 }
+                               { DUP 2 ;
+                                 DIG 3 ;
+                                 SWAP ;
+                                 EXEC ;
+                                 DROP ;
+                                 NIL bytes ;
+                                 SWAP ;
+                                 CONS ;
+                                 PUSH bytes 0x02 ;
+                                 CONS ;
+                                 PUSH bytes 0x1100 ;
+                                 CONS ;
+                                 CONCAT ;
+                                 DUP 2 ;
+                                 PAIR ;
+                                 DIG 2 ;
+                                 SWAP ;
+                                 EXEC ;
+                                 DUP 2 ;
+                                 PUSH nat 1 ;
+                                 DIG 3 ;
+                                 GET 8 ;
+                                 ADD ;
+                                 UPDATE 8 } } ;
+                         NIL operation ;
+                         DIG 2 ;
+                         CONS } } } } ;
+         PAIR } ;
+  view "get_storage"
+       unit
+       (pair (address %admin)
+             (pair (address %rollup)
+                   (pair (or %forward_mode (address %forward_to_rollup) (unit %emit_only))
+                         (pair (bool %paused) (nat %nonce)))))
+       { CDR } ;
+  view "get_nonce" unit nat { GET 10 } }
+

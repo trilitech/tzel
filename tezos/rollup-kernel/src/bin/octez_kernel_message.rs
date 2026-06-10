@@ -8,14 +8,16 @@ use tzel_core::{
     kernel_wire::{
         encode_kernel_inbox_message, sign_kernel_bridge_config, sign_kernel_verifier_config,
         KernelBridgeConfig, KernelDalChunkPointer, KernelDalPayloadKind, KernelDalPayloadPointer,
-        KernelInboxMessage, KernelVerifierConfig,
+        KernelInboxMessage, KernelShieldReq, KernelStarkProof, KernelUnshieldReq,
+        KernelVerifierConfig,
     },
-    ProgramHashes, F,
+    EncryptedNote, ProgramHashes, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES,
+    NOTE_AEAD_NONCE_BYTES, OUTGOING_RECOVERY_CT_BYTES,
 };
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  octez_kernel_message admin-material\n  octez_kernel_message configure-bridge <sr1...> <KT1...>\n  octez_kernel_message configure-verifier <sr1...> <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message raw-configure-bridge <KT1...>\n  octez_kernel_message raw-configure-verifier <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message dal-pointer <sr1...> <configure-verifier|configure-bridge|shield|transfer|unshield> <payload_hash_hex> <payload_len> (<published_level> <slot_index> <chunk_len>)+"
+        "usage:\n  octez_kernel_message admin-material\n  octez_kernel_message configure-bridge <sr1...> <KT1...>\n  octez_kernel_message configure-verifier <sr1...> <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message raw-configure-bridge <KT1...>\n  octez_kernel_message raw-configure-verifier <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message raw-stub-shield\n  octez_kernel_message raw-stub-unshield\n  octez_kernel_message dal-pointer <sr1...> <configure-verifier|configure-bridge|shield|transfer|unshield> <payload_hash_hex> <payload_len> (<published_level> <slot_index> <chunk_len>)+"
     );
     std::process::exit(2);
 }
@@ -93,6 +95,70 @@ fn signed_verifier_message(
         )
         .expect("verifier config should sign"),
     )
+}
+
+/// A wire-valid `KernelInboxMessage::Shield` whose cryptographic content is
+/// all zeros. It decodes successfully through `decode_kernel_inbox_message`
+/// (the encrypted notes have the exact required lengths) but is
+/// deterministically rejected by `apply_kernel_message` — on an unconfigured
+/// rollup the first failure is "proof verifier is not configured".
+///
+/// Used by the orchestrator sandbox smoke to assert the kernel *dispatch*
+/// path (internal `Transfer<MichelsonBytes>` → `decode_kernel_inbox_message`
+/// → `apply_kernel_message`) without shipping a multi-megabyte real proof
+/// through an L1 operation.
+fn stub_encrypted_note() -> EncryptedNote {
+    EncryptedNote {
+        ct_d: vec![0u8; ML_KEM768_CIPHERTEXT_BYTES],
+        tag: 0,
+        ct_v: vec![0u8; ML_KEM768_CIPHERTEXT_BYTES],
+        nonce: vec![0u8; NOTE_AEAD_NONCE_BYTES],
+        encrypted_data: vec![0u8; ENCRYPTED_NOTE_BYTES],
+        outgoing_ct: vec![0u8; OUTGOING_RECOVERY_CT_BYTES],
+    }
+}
+
+fn stub_shield_message() -> KernelInboxMessage {
+    let stub_note = stub_encrypted_note();
+    KernelInboxMessage::Shield(KernelShieldReq {
+        pubkey_hash: [0u8; 32],
+        fee: 0,
+        v: 0,
+        producer_fee: 0,
+        proof: KernelStarkProof {
+            proof_bytes: vec![0u8; 32],
+            output_preimage: Vec::new(),
+        },
+        client_cm: [0u8; 32],
+        client_enc: stub_note.clone(),
+        producer_cm: [0u8; 32],
+        producer_enc: stub_note,
+    })
+}
+
+/// A wire-valid `KernelInboxMessage::Unshield` with zeroed cryptographic
+/// content and no change note. With a single mandatory encrypted note it is
+/// the only user-facing TzEL request that fits under the L1 smart-rollup
+/// inbox message size cap (4096 bytes) — Shield and Transfer carry two or
+/// more notes and cannot fit. Like the stub shield, it decodes cleanly and
+/// is deterministically rejected by `apply_kernel_message` with
+/// "proof verifier is not configured" on an unconfigured rollup.
+fn stub_unshield_message() -> KernelInboxMessage {
+    KernelInboxMessage::Unshield(KernelUnshieldReq {
+        root: [0u8; 32],
+        nullifiers: vec![[0u8; 32]],
+        v_pub: 0,
+        fee: 0,
+        recipient: "tz1VSUr8wwNhLAzempoch5d6hLRiTh8Cjcjb".to_string(),
+        cm_change: [0u8; 32],
+        enc_change: None,
+        cm_fee: [0u8; 32],
+        enc_fee: stub_encrypted_note(),
+        proof: KernelStarkProof {
+            proof_bytes: vec![0u8; 32],
+            output_preimage: Vec::new(),
+        },
+    })
 }
 
 fn emit_raw_message(message: &KernelInboxMessage) {
@@ -196,6 +262,18 @@ fn main() {
             emit_raw_message(&signed_verifier_message(
                 auth_domain, shield, transfer, unshield,
             ));
+        }
+        "raw-stub-shield" => {
+            if args.next().is_some() {
+                usage();
+            }
+            emit_raw_message(&stub_shield_message());
+        }
+        "raw-stub-unshield" => {
+            if args.next().is_some() {
+                usage();
+            }
+            emit_raw_message(&stub_unshield_message());
         }
         "dal-pointer" => {
             let Some(rollup_address) = args.next() else {

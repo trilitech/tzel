@@ -252,6 +252,30 @@ output), so existing tests at
 
 ## 6. Known limitations / open questions
 
+- **Mode A requires a `bytes`-typed rollup (sandbox-verified).** The
+  orchestrator resolves the rollup with
+  `Tezos.get_contract_opt (bytes contract)`. A rollup originated with the
+  ticket-bearing parameter type
+  `(pair bytes (ticket (pair nat (option bytes))))` (the type needed for
+  live bridge deposits, see `rollup-kernel/README.md`) fails that
+  typecheck, so `%shield` aborts with `TZEL_ORCH_ROLLUP_NOT_FOUND`. Mode A
+  and the L1 ticket bridge are therefore mutually exclusive on a single
+  rollup today. Unifying them needs an `or`-typed rollup parameter (e.g.
+  `(or (bytes %kernel) (pair %deposit bytes (ticket ...)))`), the
+  orchestrator targeting the `%kernel` entrypoint, and a kernel parser
+  that unwraps the Micheline `Left/Right` constructor.
+- **The 4096-byte inbox cap blocks full Shield/Transfer bodies
+  (sandbox-verified).** An L1 smart-rollup inbox message (internal
+  transfers included) is capped at 4096 bytes; the protocol rejects the
+  operation at injection with `Failed to encode a rollup management
+  protocol inbox message value`. A wire-valid Shield body carries two
+  mandatory encrypted notes (~3.4 KiB each, ML-KEM768 ciphertexts) and is
+  ~7.1 KiB *before* any real proof — it can never fit. A minimal Unshield
+  (no change note) is ~3.7 KiB and fits only with a stub proof. Since real
+  STARK proofs are megabytes, Mode A can only ever carry *pointer-sized*
+  payloads: practical use requires either exposing a rate-limited
+  DAL-pointer entrypoint or Mode B (event + relayer, which has the same
+  cap on external messages but can shard via DAL).
 - **Atomicity scope.** In Mode A the Michelson op group, the orchestrator
   call, the internal TRANSFER_TOKENS, and the inbox enqueueing all happen
   atomically at L1 op level. But the **rollup execution** of the resulting

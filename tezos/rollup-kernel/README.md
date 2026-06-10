@@ -125,6 +125,21 @@ TZEL_RUN_OCTEZ_ROLLUP_SANDBOX_DAL=1 \
   cargo test -p tzel-rollup-kernel --test octez_sandbox_dal -- --ignored --nocapture
 ```
 
+```bash
+TZEL_RUN_ORCHESTRATOR_SANDBOX=1 \
+  cargo test -p tzel-rollup-kernel --test octez_orchestrator_sandbox -- --ignored --nocapture
+```
+
+The orchestrator smoke (no DAL node needed) originates a `bytes`-typed
+rollup plus the `tzel_orchestrator.tz` contract (Mode A,
+`Forward_to_rollup`), calls `%shield`/`%unshield` through it, and asserts —
+via `/tzel/v1/state/last_result.bin` — that the kernel parses the resulting
+internal `Transfer<MichelsonBytes>` inbox entries and dispatches them
+through `apply_kernel_message` (deterministic rejections on an unconfigured
+verifier). See `scripts/octez_orchestrator_sandbox_smoke.sh` and
+`tezos/TZEL_ORCHESTRATOR_README.md` §6 for the Mode A size/typing limits it
+documents.
+
 The DAL smoke requires `octez-dal-node` in addition to the normal sandbox
 dependencies. It spins up a local node, baker, DAL node, rollup node, and
 publishes both the signed config messages and the checked-in verified shield
