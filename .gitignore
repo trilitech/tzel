@@ -27,3 +27,4 @@ docs/whitepaper.pdf
 .claude/
 .attic/
 VM_HANDOFF_*.md
+contracts/.ligo/
