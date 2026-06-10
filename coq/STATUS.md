@@ -607,6 +607,25 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
     holds in every reachable state, now with the burn guard GROUNDED
     in the real %burn authentication rather than assumed.
 
+- **GRAND UNIFIED NO-INFLATION (`Spec/GrandConservation.v`):** the
+  capstone — UNIFIES shield/transfer/unshield into one operation type
+  and one conservation law, then proves value is conserved per asset
+  across ANY MIXED batch. Each Op has input/output note lists + three
+  scalar lanes: a deposit lane (shield credits from L1), an exit lane
+  (unshield withdraws to L1), a tez fee. op_conserves(o):
+    sum_at a in + deposit@a = sum_at a out + exit@a + fee@tez.
+  Theorems (zero admits):
+  - grand_conservation: across any list of mixed ops, for every asset
+    a, total notes-consumed + total deposited = total notes-produced +
+    total withdrawn + total tez fees. No sequence of shields,
+    transfers, and unshields in any order creates or destroys value of
+    any asset — derived from each op's circuit-relation soundness.
+  - unshield_is_op / shield_is_op: the unified op_conserves
+    specializes exactly to the unshield circuit relation
+    (phi_unshield_value_conservation) and the shield relation, so the
+    unification is grounded in the real per-flow relations, not a
+    fresh abstraction. (Transfer is the deposit=exit=0 case.)
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

@@ -11,6 +11,7 @@ Spec/Xmss.v
 Spec/Transfer.v
 Spec/Shield.v
 Spec/Unshield.v
+Spec/GrandConservation.v
 Spec/Ledger.v
 Spec/LedgerNf.v
 Spec/LedgerBounded.v
