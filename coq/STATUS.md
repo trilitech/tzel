@@ -1036,6 +1036,22 @@ nullifier/commitment binding.
   Transfer, Shield, Unshield) carry proven refinement/soundness
   theorems — the extraction source is sound end to end.
 
+- **AXIOM AUDIT extended to all recent + Impl-layer theorems
+  (cross-layer, complete):** Print Assumptions on the recent kernel
+  modules (config-governance, tree-capacity, valid-roots, master
+  soundness) shows they rest on ONLY `Felt : Type` — no unexpected
+  axioms. The Impl-layer theorems (xmss_verify_impl_one_time_
+  unforgeable, xmss_ltree_injective_impl) additionally depend on the
+  hash/ADRS PARAMETERS (Hash3, Hash4, pack_adrs_ltree, pack_adrs_chain)
+  — the uninterpreted hash interface that is realized concretely at
+  extraction. Crucially, NO global properties are asserted on those
+  Parameters (only their function signatures appear; every collision-
+  resistance / injectivity premise remains a LOCAL hypothesis). So the
+  complete cross-layer picture: Spec theorems assume only Felt (+
+  Felt_eq_dec where used); Impl theorems assume Felt + the abstract
+  hash functions with no asserted properties. No surprises at any
+  layer.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)
