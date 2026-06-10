@@ -328,6 +328,26 @@ Strict requirement: **no `admit` anywhere**. Every theorem closes.
   taken as the meaning of creator=sender (out of scope); everything
   downstream the kernel enforces is proved.
 
+- **L1 BRIDGE COLLATERALIZATION (`Spec/BridgeTicketer.v`):** models
+  the Michelson FA2 bridge ticketer (tezos/fa2_bridge_ticketer.tz)
+  and proves it is ALWAYS EXACTLY collateralized. State: bt_custody
+  (FA2 held by SELF), bt_outstanding (SELF-minted tickets in
+  circulation), bt_in/bt_out (running FA2 totals). Steps mirror the
+  entrypoints: %mint (0<n; custody+=n, outstanding+=n, atomic FA2
+  pull + ticket mint) and %burn (n<=outstanding, i.e. authentic
+  ticketer==SELF + linearity; custody-=n, outstanding-=n). Invariant
+  `bt_custody = bt_outstanding`. Proved (zero admits):
+  - `fully_collateralized`: custody = outstanding always — two-sided
+    (>= every ticket redeemable; <= no FA2 stranded beyond tickets);
+  - `ticket_redeemable`: any n <= outstanding has the custody to be
+    released (burns never fail for want of funds);
+  - `bridge_solvency`: bt_out <= bt_in (FA2 released <= FA2
+    deposited);
+  - `custody_backed`, `no_overburn` (over-burning takes no step).
+  Out of scope (L1 given): ticket linearity + creator authenticity —
+  the Michelson/protocol semantics justifying that a burn can only
+  consume an authentic outstanding ticket.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

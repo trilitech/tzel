@@ -17,6 +17,7 @@ Spec/LedgerBounded.v
 Spec/KernelPool.v
 Spec/KernelLedger.v
 Spec/KernelDeposit.v
+Spec/BridgeTicketer.v
 
 Impl/Common.v
 Impl/Hashes.v
