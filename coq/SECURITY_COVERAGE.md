@@ -439,8 +439,11 @@ rests on three independent mechanisms, not on trust:
    conformance-tested end-to-end.  The XMSS auth-tree node hash is also
    pinned WITH the circuit's `TAG_XMSS_TREE` constant (the L-tree test
    covers only `TAG_XMSS_LTREE`), so both XMSS tree tags are validated.
-   Ten primitives/derivations total; only the relation-level full-witness
-   conformance remains.  The remaining primitives and the relation-level full-witness
+   Also pinned: derive_nk_spend, and — importantly — the WOTS+ message
+   ENCODING (sighash -> 133 base-4 digits + checksum, via
+   sighash_to_wots_digits), which is forgery-relevant and was NOT
+   covered by the function differential.  Twelve primitives/derivations
+   total; only the relation-level full-witness conformance remains.  The remaining primitives and the relation-level full-witness
    conformance follow this pattern and are forthcoming; until they land
    the Cairo's tie to the model is established for them by mechanisms 1
    and 3 (SHA-pinned drift + the assertion cross-check).

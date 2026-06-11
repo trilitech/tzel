@@ -432,6 +432,24 @@ mod tests {
         assert(super::derive_rcm(1) == 0x0196c2d85de4b92b728836ddb61ee177e1e1ca23219a862cbc42cf03b19f1b98, 'rcm conformance');
     }
 
+    // Cross-impl conformance for derive_nk_spend (nk_spend = H_nkSP(nk, d_j)):
+    // the Cairo's derive_nk_spend(1, 2) must equal the port's hash_nk_spend.
+    #[test]
+    fn test_nk_spend_conforms_to_model() {
+        assert(super::derive_nk_spend(1, 2) == 0x07ff0c83534ba4795cb8750ef71f4555b35b09ffdf39d61cacf6c83087978530, 'nk_spend conformance');
+    }
+
+    // Cross-impl conformance for the WOTS+ message ENCODING
+    // (sighash -> 133 base-4 digits incl. the 5 checksum digits). This is
+    // forgery-relevant and was NOT covered by the function differential.
+    // Port decompose_sighash(0xdeadbeef) = the digit vector below.
+    #[test]
+    fn test_sighash_digits_conform_to_model() {
+        let digits = super::sighash_to_wots_digits(0xdeadbeef);
+        let expected = array![3, 3, 2, 3, 2, 3, 3, 2, 1, 3, 2, 2, 2, 3, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 1, 1, 1];
+        assert(digits.span() == expected.span(), 'wots digits conformance');
+    }
+
     fn checksum_value(digits: Span<u32>) -> u32 {
         let mut checksum: u32 = 0;
         let mut i: u32 = 0;
