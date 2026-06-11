@@ -208,6 +208,22 @@ audit").
   invariant preserved by every mint/burn `BStep`),
   `ticket_redeemable` (any amount ≤ outstanding tickets is ≤ custody —
   every ticket is always redeemable).
+- **Model fidelity (cross-checked vs the `.tz`, line-level):** the
+  `BState`/`BStep` state machine above was verified to faithfully model
+  `tezos/fa2_bridge_ticketer.tz`, not merely assumed.  Traced through the
+  Michelson stack: `%mint` pulls `amount` of the FA2 token (SENDER →
+  SELF via FA2 `%transfer`) and then `TICKET`-mints a ticket of the SAME
+  `amount` (the pulled `amount` is `DIG`-ed to the `TICKET` value arg),
+  so ticket value == FA2 collateral EXACTLY 1:1 — the data flow the
+  collateralization invariant rests on; `%burn` `READ_TICKET`s and
+  rejects unless creator == SELF, content == `(0, None)`, amount > 0,
+  before releasing `amount`.  The canonical `(0, None)` content +
+  asset-by-KT1-address routing matches the kernel's `token_id == 0`
+  deposit check.  No discrepancy found here — in contrast to the OCaml
+  port `shield_sighash` drift that the same line-level cross-check
+  discipline surfaced (see the faithfulness FINDING below), which is the
+  point: the discipline catches drift where it exists and confirms
+  fidelity where it doesn't.
 - **Burn authentication:** `Spec.BridgeBurn.custody_decrease_authentic`
   (a foreign ticket cannot drain custody — the `ticketer == SELF`
   check), `foreign_ticket_rejected` / `forwarded_ticket_rejected`
