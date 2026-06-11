@@ -430,8 +430,8 @@ rests on three independent mechanisms, not on trust:
    `test_nullifier_conforms_to_model`, `scarb test`): the Cairo's `commit`
    and `nullifier` on fixed inputs equal the model values, verified
    byte-identical to the port (`hash_commit` / nested `hash_nf`) — closing
-   `Coq ↔ port ↔ Cairo` for the commitment, nullifier, WOTS+ chain-step, AND Merkle-node-hash
-   primitives and fixing the byte↔felt252 packing.  The remaining primitives and the relation-level full-witness
+   `Coq ↔ port ↔ Cairo` for the commitment, nullifier, WOTS+ chain-step, Merkle-node-hash, AND
+   sighash-fold primitives and fixing the byte↔felt252 packing.  The remaining primitives and the relation-level full-witness
    conformance follow this pattern and are forthcoming; until they land
    the Cairo's tie to the model is established for them by mechanisms 1
    and 3 (SHA-pinned drift + the assertion cross-check).

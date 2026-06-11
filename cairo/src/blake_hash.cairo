@@ -407,6 +407,15 @@ mod tests {
         assert(nf == 0x02a0506477f37357b2ae26d93b75df6edbecb9db08ce3688e8018065778f88dd, 'nullifier model conformance');
     }
 
+    // Cross-impl conformance for the sighash fold step: the OCaml port's
+    // Tzel.Hash.sighash_fold [1; 2] (one fold step from acc=1 over [2]) =
+    // little-endian bytes 5e166d...f007; the Cairo's sighash_fold(1, 2) (a
+    // single hash2_with_iv(sighash_iv, .)) must agree.
+    #[test]
+    fn test_sighash_fold_conforms_to_model() {
+        assert(super::sighash_fold(1, 2) == 0x07f0f8d6a4ea789d045e1cedf28c900413d82bc5af0f46af56a62329ff6d165e, 'sighash fold conformance');
+    }
+
     fn checksum_value(digits: Span<u32>) -> u32 {
         let mut checksum: u32 = 0;
         let mut i: u32 = 0;
