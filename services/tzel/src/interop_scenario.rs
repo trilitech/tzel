@@ -455,4 +455,42 @@ mod tests {
         assert_eq!(reparsed.expected.tree_size, 6);
         assert_eq!(reparsed.expected.nullifier_count, 2);
     }
+
+    // Golden per-flow sighash values on fixed inputs.  These are the
+    // SHARED cross-impl reference: ocaml/test/test_main.ml pins
+    // Transaction.{shield,transfer,unshield}_sighash to the SAME three
+    // constants, so the OCaml port's sighash field-sets/order stay
+    // byte-identical to the kernel's core::*_sighash.  If either side's
+    // sighash drifts (a dropped or reordered field — exactly the
+    // multiasset regression this fixes), its test fails.  Inputs:
+    // shield  (auth=1, pkh=2, v=10, fee=3, pfee=4, cm_r=5, cm_p=6, mh_r=7,
+    //          mh_p=8, asset_r=0, asset_p=0)
+    // transfer(auth=1, root=2, nf=[3], fee=4, cm1=5, cm2=6, cm3=0, cm4=7,
+    //          mh1=8, mh2=9, mh3=0, mh4=10)
+    // unshield(auth=1, root=2, nf=[3], v=10, asset_pub=0, fee=4, recip=5,
+    //          cm_change=6, mh_change=7, cm_change2=0, mh_change2=0,
+    //          cm_fee=8, mh_fee=9)
+    #[test]
+    fn test_sighash_golden_matches_core() {
+        let f = |n: u64| u64_to_felt(n);
+        assert_eq!(
+            hex::encode(shield_sighash(
+                &f(1), &f(2), 10, 3, 4, &f(5), &f(6), &f(7), &f(8), &f(0), &f(0)
+            )),
+            "fbd968dd9f9d00603a75c08046c200d3d8d6fb7e7119187c84e37837585f4b04"
+        );
+        assert_eq!(
+            hex::encode(transfer_sighash(
+                &f(1), &f(2), &[f(3)], 4, &f(5), &f(6), &f(0), &f(7), &f(8), &f(9), &f(0), &f(10)
+            )),
+            "cb2f332c6f6047f457a611cab39719e3378f864124504d6334ae70536a2f0401"
+        );
+        assert_eq!(
+            hex::encode(unshield_sighash(
+                &f(1), &f(2), &[f(3)], 10, &f(0), 4, &f(5), &f(6), &f(7), &f(0), &f(0), &f(8), &f(9)
+            )),
+            "360b52a6051b21dbe78b12baf6a933f769b9a4b081481e9186c78aeaa07ca507"
+        );
+    }
+
 }

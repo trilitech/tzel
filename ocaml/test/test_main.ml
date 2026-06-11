@@ -1034,6 +1034,43 @@ let test_sighash_transfer_unshield_distinct () =
   Alcotest.(check bool) "transfer != unshield sighash (type tag)" false
     (Tzel.Felt.equal sh_t sh_u)
 
+(* Cross-impl conformance: the OCaml port's per-flow sighashes must be
+   byte-identical to the Rust kernel's core::{shield,transfer,unshield}_sighash.
+   These three golden constants are the SAME ones asserted in
+   services/tzel/src/interop_scenario.rs::test_sighash_golden_matches_core
+   (computed from the Rust). A dropped or reordered field on the OCaml side
+   -- exactly the multiasset staleness this fixes -- changes the fold and
+   fails here. (The accounting-only cross-impl interop cannot catch a
+   sighash field-set drift, which is why this dedicated test exists.) *)
+let test_sighash_matches_rust_core_golden () =
+  let f n = Tzel.Felt.of_u64 n in
+  let sh = Tzel.Transaction.shield_sighash
+    ~auth_domain:(f 1) ~pubkey_hash:(f 2) ~v_pub:10L ~fee:3L ~producer_fee:4L
+    ~asset_new:(f 0) ~asset_producer:(f 0) ~cm_new:(f 5) ~cm_producer:(f 6)
+    ~memo_ct_hash:(f 7) ~producer_memo_ct_hash:(f 8) in
+  Alcotest.(check string) "shield sighash == Rust core golden"
+    "fbd968dd9f9d00603a75c08046c200d3d8d6fb7e7119187c84e37837585f4b04"
+    (Tzel.Felt.to_hex sh);
+  let tr = Tzel.Transaction.transfer_sighash {
+    auth_domain = f 1; root = f 2; nullifiers = [f 3]; fee = 4L;
+    cm_1 = f 5; cm_2 = f 6; cm_3 = f 0; cm_4 = f 7;
+    memo_ct_hash_1 = f 8; memo_ct_hash_2 = f 9;
+    memo_ct_hash_3 = f 0; memo_ct_hash_4 = f 10;
+  } in
+  Alcotest.(check string) "transfer sighash == Rust core golden"
+    "cb2f332c6f6047f457a611cab39719e3378f864124504d6334ae70536a2f0401"
+    (Tzel.Felt.to_hex tr);
+  let un = Tzel.Transaction.unshield_sighash {
+    auth_domain = f 1; root = f 2; nullifiers = [f 3]; v_pub = 10L;
+    asset_pub = f 0; fee = 4L; recipient_id = f 5;
+    cm_change = f 6; memo_ct_hash_change = f 7;
+    cm_change_2 = f 0; memo_ct_hash_change_2 = f 0;
+    cm_fee = f 8; memo_ct_hash_fee = f 9;
+  } in
+  Alcotest.(check string) "unshield sighash == Rust core golden"
+    "360b52a6051b21dbe78b12baf6a933f769b9a4b081481e9186c78aeaa07ca507"
+    (Tzel.Felt.to_hex un)
+
 let test_build_shield () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 200) in
   let alice = derive_test_address keys 0 in
@@ -2336,6 +2373,7 @@ let () =
       Alcotest.test_case "sighash transfer" `Quick test_sighash_transfer;
       Alcotest.test_case "sighash unshield" `Quick test_sighash_unshield;
       Alcotest.test_case "transfer vs unshield" `Quick test_sighash_transfer_unshield_distinct;
+      Alcotest.test_case "sighash == rust core golden" `Quick test_sighash_matches_rust_core_golden;
       Alcotest.test_case "build shield" `Quick test_build_shield;
       Alcotest.test_case "build output" `Quick test_build_output;
       Alcotest.test_case "build transfer public" `Quick test_build_transfer_public;
