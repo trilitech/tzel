@@ -398,6 +398,20 @@ mod tests {
         );
     }
 
+    // Multiasset conformance: the commitment must BIND the witness asset
+    // tag, not fold a constant. commit(1, 42, asset=5, 2, 3) matches the
+    // port's hash_commit for a non-tez (FA2) asset, AND differs from the
+    // asset=0 commitment -- so a circuit that ignored the asset slot (or
+    // pinned it to 0) would fail here. The tez-only commit test above
+    // cannot catch that (folding 0 either way).
+    #[test]
+    fn test_commit_binds_asset_conforms_to_model() {
+        let cm5 = super::commit(1, 42_u64, 5, 2, 3);
+        let cm0 = super::commit(1, 42_u64, 0, 2, 3);
+        assert(cm5 == 0x06d6d22b0907cf34809779dfdae543192900076005caa11d78c6aa93177c8206, 'fa2 commit conformance');
+        assert(cm5 != cm0, 'commit must bind asset');
+    }
+
     // Cross-impl conformance for the nullifier primitive: the OCaml port
     // computes nullifier(nk=1, cm=2, pos=3) = H_nf(nk, H_nf(cm, pos)) =
     // little-endian bytes dd888f...a002; the Cairo circuit must agree.
