@@ -139,6 +139,45 @@ let () =
       ~view_seed:0x46
   in
 
+  (* ───────── Multiasset (FA2) round-trip ─────────
+     A self-contained FA2 shield -> FA2 unshield flow. alice receives an
+     FA2 note (asset bound into the commitment); the producer-fee notes
+     stay tez. The unshield spends the FA2 note and releases it to L1 as
+     the FA2 asset. The opposite-implementation ledger consumes these
+     commitments/nullifiers opaquely (same as the tez flow). *)
+  let fa2_ticketer = "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc" in
+  let fa2 = Tzel.Asset_registry.derive_asset_id fa2_ticketer in
+
+  let fa2_shield_rseed = fixed_felt 0xA1 in
+  let fa2_shield_note = Tzel.Note.create ~asset:fa2 alice_addr0 400_000L fa2_shield_rseed in
+  let (fa2_shield_enc, fa2_shield_memo_ct_hash) =
+    deterministic_encrypted_note alice_addr0
+      ~v:400_000L ~rseed:fa2_shield_rseed
+      ~memo:(Bytes.of_string "interop-fa2-shield")
+      ~detect_seed:0x51 ~view_seed:0x61
+  in
+  let fa2_shield_producer_rseed = fixed_felt 0xA4 in
+  let fa2_shield_producer_note = Tzel.Note.create producer_addr0 1L fa2_shield_producer_rseed in
+  let (fa2_shield_producer_enc, fa2_shield_producer_memo_ct_hash) =
+    deterministic_encrypted_note producer_addr0
+      ~v:1L ~rseed:fa2_shield_producer_rseed
+      ~memo:(Bytes.of_string "interop-fa2-dal-shield")
+      ~detect_seed:0x54 ~view_seed:0x64
+  in
+  let fa2_tree = Tzel.Merkle.create_with_leaves ~depth:48 in
+  ignore (Tzel.Merkle.append_with_leaves fa2_tree fa2_shield_note.cm);
+  ignore (Tzel.Merkle.append_with_leaves fa2_tree fa2_shield_producer_note.cm);
+  let fa2_root_after_shield = Tzel.Merkle.root_with_leaves fa2_tree in
+  let fa2_shield_nf = Tzel.Note.nullifier alice_addr0.nk_spend fa2_shield_note.cm 0 in
+  let fa2_unshield_fee_rseed = fixed_felt 0xA6 in
+  let fa2_unshield_fee_note = Tzel.Note.create producer_addr0 1L fa2_unshield_fee_rseed in
+  let (fa2_unshield_fee_enc, fa2_unshield_fee_memo_ct_hash) =
+    deterministic_encrypted_note producer_addr0
+      ~v:1L ~rseed:fa2_unshield_fee_rseed
+      ~memo:(Bytes.of_string "interop-fa2-dal-unshield")
+      ~detect_seed:0x56 ~view_seed:0x66
+  in
+
   let json =
     `Assoc [
       "auth_domain", json_felt auth_domain;
@@ -200,6 +239,52 @@ let () =
         ];
         "tree_size", `Int 6;
         "nullifier_count", `Int 2;
+      ];
+      "fa2", `Assoc [
+        "ticketer", `String fa2_ticketer;
+        "asset_id", json_felt fa2;
+        "shield", `Assoc [
+          "sender", `String "alice";
+          "v", `Int 400_000;
+          "fee", `Int fee;
+          "producer_fee", `Int producer_fee;
+          "address", Tzel.Encoding.payment_address_to_json (payment_address_wire_of_addr alice_addr0);
+          "cm", json_felt fa2_shield_note.cm;
+          "enc", Tzel.Encoding.encrypted_note_to_json fa2_shield_enc;
+          "memo_ct_hash", json_felt fa2_shield_memo_ct_hash;
+          "producer_address", Tzel.Encoding.payment_address_to_json (payment_address_wire_of_addr producer_addr0);
+          "producer_cm", json_felt fa2_shield_producer_note.cm;
+          "producer_enc", Tzel.Encoding.encrypted_note_to_json fa2_shield_producer_enc;
+          "producer_memo_ct_hash", json_felt fa2_shield_producer_memo_ct_hash;
+        ];
+        "unshield", `Assoc [
+          "root", json_felt fa2_root_after_shield;
+          "nullifiers", json_felt_list [fa2_shield_nf];
+          "v_pub", `Int 99_999;
+          "asset_pub", json_felt fa2;
+          "fee", `Int fee;
+          "recipient", `String interop_l1_recipient;
+          "cm_change", json_felt Tzel.Felt.zero;
+          "enc_change", `Null;
+          "memo_ct_hash_change", json_felt Tzel.Felt.zero;
+          "cm_change_2", json_felt Tzel.Felt.zero;
+          "memo_ct_hash_change_2", json_felt Tzel.Felt.zero;
+          "cm_fee", json_felt fa2_unshield_fee_note.cm;
+          "enc_fee", Tzel.Encoding.encrypted_note_to_json fa2_unshield_fee_enc;
+          "memo_ct_hash_fee", json_felt fa2_unshield_fee_memo_ct_hash;
+        ];
+        "expected", `Assoc [
+          "withdrawals", `List [
+            `Assoc [
+              "asset_id", json_felt fa2;
+              "recipient", `String interop_l1_recipient;
+              "amount", `Int 99_999;
+            ];
+          ];
+          (* 2 shield notes (recipient + producer) + 1 unshield fee note. *)
+          "tree_size", `Int 3;
+          "nullifier_count", `Int 1;
+        ];
       ];
     ]
   in

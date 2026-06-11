@@ -85,6 +85,23 @@ pub struct InteropExpected {
     pub nullifier_count: usize,
 }
 
+/// An end-to-end multiasset (FA2) round-trip: an FA2 shield (a non-tez
+/// recipient note funded from the FA2 pool, plus a tez producer-fee note
+/// funded from the tez pool) followed by an FA2 unshield that spends that
+/// note and releases it to L1. Exercises the dual-pool shield, the FA2
+/// note commitment, and asset-routed withdrawal across implementations.
+/// `shield`/`unshield` reuse the tez step shapes; the per-flow `asset_id`
+/// is what makes the recipient note + the withdrawal non-tez.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct InteropFa2Flow {
+    pub ticketer: String,
+    #[serde(with = "hex_f")]
+    pub asset_id: F,
+    pub shield: InteropShieldStep,
+    pub unshield: InteropUnshieldStep,
+    pub expected: InteropExpected,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InteropScenario {
     #[serde(with = "hex_f")]
@@ -94,6 +111,12 @@ pub struct InteropScenario {
     pub transfer: InteropTransferStep,
     pub unshield: InteropUnshieldStep,
     pub expected: InteropExpected,
+    /// Optional multiasset round-trip. Both the OCaml generator
+    /// (ocaml/test/gen_interop_scenario.ml) and this Rust generator
+    /// populate it with the same deterministic FA2 flow; the cross-impl
+    /// tests apply it on the opposite implementation's ledger.
+    #[serde(default)]
+    pub fa2: Option<InteropFa2Flow>,
 }
 
 struct DerivedScenarioAddress {
@@ -145,19 +168,24 @@ fn derive_scenario_address(acc: &Account, j: u32) -> DerivedScenarioAddress {
     }
 }
 
-fn commit_for_address(address: &PaymentAddress, v: u64, rseed: &F) -> F {
+fn commit_for_address_asset(address: &PaymentAddress, v: u64, rseed: &F, asset: &F) -> F {
     let rcm = derive_rcm(rseed);
     let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
-    commit(&address.d_j, v, &ASSET_TEZ, &rcm, &otag)
+    commit(&address.d_j, v, asset, &rcm, &otag)
 }
 
-fn deterministic_note(
+fn commit_for_address(address: &PaymentAddress, v: u64, rseed: &F) -> F {
+    commit_for_address_asset(address, v, rseed, &ASSET_TEZ)
+}
+
+fn deterministic_note_asset(
     address: &PaymentAddress,
     v: u64,
     rseed: &F,
     memo: &[u8],
     detect_seed: u8,
     view_seed: u8,
+    asset: &F,
 ) -> (F, EncryptedNote, F) {
     let ek_v = ml_kem_768::EncapsulationKey::new(address.ek_v.as_slice().try_into().unwrap())
         .expect("valid ek_v");
@@ -172,9 +200,23 @@ fn deterministic_note(
         &fixed_ephemeral(detect_seed),
         &fixed_ephemeral(view_seed),
     );
-    let cm = commit_for_address(address, v, rseed);
+    // The asset is bound only into the commitment; the encrypted note's
+    // plaintext (v, rseed, memo) does not carry it (the watcher recovers
+    // the asset by iterating the candidate registry).
+    let cm = commit_for_address_asset(address, v, rseed, asset);
     let mh = memo_ct_hash(&enc);
     (cm, enc, mh)
+}
+
+fn deterministic_note(
+    address: &PaymentAddress,
+    v: u64,
+    rseed: &F,
+    memo: &[u8],
+    detect_seed: u8,
+    view_seed: u8,
+) -> (F, EncryptedNote, F) {
+    deterministic_note_asset(address, v, rseed, memo, detect_seed, view_seed, &ASSET_TEZ)
 }
 
 pub fn generate_interop_scenario() -> InteropScenario {
@@ -260,6 +302,8 @@ pub fn generate_interop_scenario() -> InteropScenario {
         0x46,
     );
 
+    let fa2 = generate_fa2_flow(&alice_addr0, &producer_addr0);
+
     InteropScenario {
         auth_domain,
         initial_alice_balance,
@@ -317,6 +361,103 @@ pub fn generate_interop_scenario() -> InteropScenario {
             }],
             tree_size: 6,
             nullifier_count: 2,
+        },
+        fa2: Some(fa2),
+    }
+}
+
+/// The canonical FA2 ticketer used by the interop scenario. Its
+/// derive_asset_id is the non-tez asset_id the FA2 recipient note + the
+/// FA2 withdrawal carry. Must match ocaml/test/gen_interop_scenario.ml.
+pub const INTEROP_FA2_TICKETER: &str = "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc";
+
+/// Build the deterministic FA2 round-trip (shield then unshield-to-L1).
+/// `alice` receives the FA2 note; `producer` receives the tez producer-fee
+/// notes. Kept byte-identical to the OCaml generator's FA2 block.
+fn generate_fa2_flow(
+    alice: &DerivedScenarioAddress,
+    producer: &DerivedScenarioAddress,
+) -> InteropFa2Flow {
+    let asset_id = derive_asset_id(INTEROP_FA2_TICKETER);
+
+    // FA2 shield: alice's recipient note carries the FA2 asset; the
+    // producer-fee note stays tez.
+    let (shield_cm, shield_enc, shield_mh) = deterministic_note_asset(
+        &alice.payment,
+        400_000,
+        &fixed_felt(0xA1),
+        b"interop-fa2-shield",
+        0x51,
+        0x61,
+        &asset_id,
+    );
+    let (shield_producer_cm, shield_producer_enc, shield_producer_mh) = deterministic_note(
+        &producer.payment,
+        1,
+        &fixed_felt(0xA4),
+        b"interop-fa2-dal-shield",
+        0x54,
+        0x64,
+    );
+
+    let mut tree = MerkleTree::new();
+    tree.append(shield_cm);
+    tree.append(shield_producer_cm);
+    let root_after_fa2_shield = tree.root();
+    let shield_nf = nullifier(&alice.nk_spend, &shield_cm, 0);
+
+    // FA2 unshield: spend the FA2 note, release the full value to L1 with
+    // no change; the producer-fee note is tez.
+    let (fee_cm, fee_enc, fee_mh) = deterministic_note(
+        &producer.payment,
+        1,
+        &fixed_felt(0xA6),
+        b"interop-fa2-dal-unshield",
+        0x56,
+        0x66,
+    );
+
+    InteropFa2Flow {
+        ticketer: INTEROP_FA2_TICKETER.into(),
+        asset_id,
+        shield: InteropShieldStep {
+            sender: "alice".into(),
+            v: 400_000,
+            fee: MIN_TX_FEE,
+            producer_fee: 1,
+            address: alice.payment.clone(),
+            cm: shield_cm,
+            enc: shield_enc,
+            memo_ct_hash: shield_mh,
+            producer_cm: shield_producer_cm,
+            producer_enc: shield_producer_enc,
+            producer_memo_ct_hash: shield_producer_mh,
+        },
+        unshield: InteropUnshieldStep {
+            root: root_after_fa2_shield,
+            nullifiers: vec![shield_nf],
+            v_pub: 99_999,
+            asset_pub: asset_id,
+            fee: MIN_TX_FEE,
+            recipient: INTEROP_L1_RECIPIENT.into(),
+            cm_change: ZERO,
+            enc_change: None,
+            memo_ct_hash_change: ZERO,
+            cm_change_2: ZERO,
+            memo_ct_hash_change_2: ZERO,
+            cm_fee: fee_cm,
+            enc_fee: fee_enc,
+            memo_ct_hash_fee: fee_mh,
+        },
+        expected: InteropExpected {
+            withdrawals: vec![WithdrawalRecord {
+                asset_id,
+                recipient: INTEROP_L1_RECIPIENT.into(),
+                amount: 99_999,
+            }],
+            // 2 shield notes (recipient + producer) + 1 unshield fee note.
+            tree_size: 3,
+            nullifier_count: 1,
         },
     }
 }
@@ -454,6 +595,74 @@ mod tests {
         );
         assert_eq!(reparsed.expected.tree_size, 6);
         assert_eq!(reparsed.expected.nullifier_count, 2);
+
+        // The FA2 flow round-trips through JSON with its non-tez asset_id.
+        let fa2 = reparsed.fa2.expect("scenario carries an FA2 flow");
+        assert_eq!(fa2.asset_id, derive_asset_id(INTEROP_FA2_TICKETER));
+        assert_eq!(fa2.unshield.asset_pub, fa2.asset_id);
+        assert_eq!(
+            fa2.expected.withdrawals,
+            vec![WithdrawalRecord {
+                asset_id: fa2.asset_id,
+                recipient: INTEROP_L1_RECIPIENT.into(),
+                amount: 99_999,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_generated_fa2_flow_is_self_consistent() {
+        let scenario = generate_interop_scenario();
+        let fa2 = scenario.fa2.expect("scenario carries an FA2 flow");
+        let asset_id = derive_asset_id(INTEROP_FA2_TICKETER);
+        assert_eq!(fa2.asset_id, asset_id);
+        assert_ne!(asset_id, ASSET_TEZ, "FA2 asset_id must be non-tez");
+
+        let alice_acc = derive_account(&fixed_felt(0x11));
+        let producer_acc = derive_account(&fixed_felt(0x77));
+        let alice_addr0 = derive_scenario_address(&alice_acc, 0);
+        let producer_addr0 = derive_scenario_address(&producer_acc, 0);
+
+        // Shield recipient note commits to the FA2 asset; the producer-fee
+        // note is tez.
+        assert_eq!(
+            fa2.shield.cm,
+            commit_for_address_asset(&alice_addr0.payment, 400_000, &fixed_felt(0xA1), &asset_id)
+        );
+        assert_eq!(
+            fa2.shield.producer_cm,
+            commit_for_address(&producer_addr0.payment, 1, &fixed_felt(0xA4))
+        );
+
+        // The unshield spends the FA2 shield note (position 0) against the
+        // post-shield root and releases it to L1 as the FA2 asset.
+        let mut tree = MerkleTree::new();
+        tree.append(fa2.shield.cm);
+        tree.append(fa2.shield.producer_cm);
+        assert_eq!(fa2.unshield.root, tree.root());
+        assert_eq!(
+            fa2.unshield.nullifiers,
+            vec![nullifier(&alice_addr0.nk_spend, &fa2.shield.cm, 0)]
+        );
+        assert_eq!(fa2.unshield.asset_pub, asset_id);
+        assert_eq!(fa2.unshield.v_pub, 99_999);
+        assert_eq!(fa2.unshield.cm_change, ZERO);
+        assert_eq!(
+            fa2.unshield.cm_fee,
+            commit_for_address(&producer_addr0.payment, 1, &fixed_felt(0xA6))
+        );
+        tree.append(fa2.unshield.cm_fee);
+
+        assert_eq!(fa2.expected.tree_size, tree.leaves.len());
+        assert_eq!(fa2.expected.nullifier_count, 1);
+        assert_eq!(
+            fa2.expected.withdrawals,
+            vec![WithdrawalRecord {
+                asset_id,
+                recipient: INTEROP_L1_RECIPIENT.into(),
+                amount: 99_999,
+            }]
+        );
     }
 
     // Golden per-flow sighash values on fixed inputs.  These are the

@@ -28,7 +28,7 @@ fn ocaml_dune_command() -> Command {
     }
 }
 
-fn ocaml_scenario() -> InteropScenario {
+fn run_ocaml_scenario() -> InteropScenario {
     let out = ocaml_dune_command()
         .current_dir(workspace_root().join("ocaml"))
         .args(["exec", "test/gen_interop_scenario.exe"])
@@ -43,20 +43,34 @@ fn ocaml_scenario() -> InteropScenario {
     serde_json::from_slice(&out.stdout).expect("valid interop scenario JSON")
 }
 
-fn shield_req(step: &InteropShieldStep, auth_domain: &F) -> (F, ShieldReq) {
+/// The scenario is deterministic, so generate it at most once even though
+/// several tests consume it. Caching also avoids racing `dune exec`
+/// invocations across cargo's parallel test threads (concurrent invocations
+/// contend on dune's build lock and one spuriously fails).
+fn ocaml_scenario() -> InteropScenario {
+    static CACHE: std::sync::OnceLock<InteropScenario> = std::sync::OnceLock::new();
+    CACHE.get_or_init(run_ocaml_scenario).clone()
+}
+
+fn shield_req(step: &InteropShieldStep, asset_id: &F, auth_domain: &F) -> (F, ShieldReq) {
     // The interop scenario doesn't carry a (blind, auth tree) for the
     // deposit pool — it only needs the cross-impl ledger transition to
     // agree on the outputs of `shield`/`transfer`/`unshield`. Synthesize
     // a deterministic pubkey_hash from the step fields and seed the
     // matching pool with the exact debit; the host-side proof check is
     // satisfied by an output_preimage that mirrors the request.
+    //
+    // `asset_id` is the recipient note's asset (ASSET_TEZ for the tez
+    // flow, derive_asset_id(ticketer) for the FA2 flow); it sits in both
+    // the request and the proof's `asset_new` slot (index 9), which the
+    // kernel cross-checks against the request.
     let pubkey_hash = tzel_core::hash(&[
         auth_domain.as_slice(),
         step.cm.as_slice(),
         step.producer_cm.as_slice(),
     ].concat());
     let req = ShieldReq {
-        asset_id: ASSET_TEZ,
+        asset_id: *asset_id,
         pubkey_hash,
         v: step.v,
         fee: step.fee,
@@ -73,7 +87,7 @@ fn shield_req(step: &InteropShieldStep, auth_domain: &F) -> (F, ShieldReq) {
                 step.producer_cm,
                 step.memo_ct_hash,
                 step.producer_memo_ct_hash,
-                ASSET_TEZ,
+                *asset_id,
             ],
         },
         client_cm: step.cm,
@@ -146,7 +160,10 @@ fn unshield_req(step: &InteropUnshieldStep, auth_domain: &F) -> UnshieldReq {
     let mut output_preimage = vec![*auth_domain, step.root];
     output_preimage.extend(step.nullifiers.iter().copied());
     output_preimage.push(u64_to_felt(step.v_pub));
-    output_preimage.push(ASSET_TEZ); // asset_pub (Phase B)
+    // asset_pub: ASSET_TEZ for the tez flow, the FA2 asset_id for the FA2
+    // flow. The kernel reads it from the proof and stamps the withdrawal
+    // record with it so the L1 outbox routes to the right ticketer.
+    output_preimage.push(step.asset_pub);
     output_preimage.push(u64_to_felt(step.fee));
     output_preimage.push(hash(step.recipient.as_bytes()));
     output_preimage.push(step.cm_change);
@@ -180,7 +197,7 @@ fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     let mut ledger = Ledger::with_auth_domain(scenario.auth_domain);
     let exact_debit = scenario.shield.v + scenario.shield.fee + scenario.shield.producer_fee;
     let (pubkey_hash, shield_req_built) =
-        shield_req(&scenario.shield, &scenario.auth_domain);
+        shield_req(&scenario.shield, &ASSET_TEZ, &scenario.auth_domain);
     ledger
         .deposit(&deposit_recipient_string(&pubkey_hash), exact_debit)
         .expect("deposit pool");
@@ -219,4 +236,73 @@ fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     // producer = +1 vs the pre-Phase-C count.
     assert_eq!(ledger.tree.leaves.len(), scenario.expected.tree_size + 1);
     assert_eq!(ledger.nullifiers.len(), scenario.expected.nullifier_count);
+}
+
+/// End-to-end multiasset round-trip: the OCaml wallet generates an FA2
+/// shield + FA2 unshield, and the Rust ledger applies them. Verifies the
+/// dual-pool shield (FA2 pool funds v+fee, tez pool funds producer_fee),
+/// that the OCaml-computed FA2 commitment is accepted, and that the
+/// resulting WithdrawalRecord carries the FA2 asset_id (asset-routed exit)
+/// rather than tez.
+#[test]
+fn test_ocaml_fa2_flow_applies_on_rust_ledger() {
+    let scenario = ocaml_scenario();
+    let fa2 = scenario.fa2.clone().expect("scenario carries an FA2 flow");
+    assert_ne!(fa2.asset_id, ASSET_TEZ, "FA2 asset_id must be non-tez");
+
+    let mut ledger = Ledger::with_auth_domain(scenario.auth_domain);
+
+    // Dual-pool funding: the (fa2, pubkey) pool covers v + fee; the
+    // (ASSET_TEZ, pubkey) pool covers producer_fee (producer fees are
+    // permanently tez).
+    let (pubkey_hash, shield_req_built) =
+        shield_req(&fa2.shield, &fa2.asset_id, &scenario.auth_domain);
+    let recipient = deposit_recipient_string(&pubkey_hash);
+    ledger
+        .deposit_asset(&fa2.asset_id, &recipient, fa2.shield.v + fa2.shield.fee)
+        .expect("fa2 pool");
+    ledger
+        .deposit(&recipient, fa2.shield.producer_fee)
+        .expect("tez pool for producer fee");
+
+    let shield_resp = ledger.shield(&shield_req_built).expect("fa2 shield");
+    assert_eq!(shield_resp.cm, fa2.shield.cm);
+    assert_eq!(shield_resp.index, 0);
+    assert_eq!(shield_resp.producer_cm, fa2.shield.producer_cm);
+    assert_eq!(shield_resp.producer_index, 1);
+
+    // Both pools fully drained by the dual-pool debit.
+    assert!(
+        ledger
+            .deposit_balances
+            .get(&fa2.asset_id)
+            .and_then(|inner| inner.get(&pubkey_hash))
+            .is_none(),
+        "fa2 pool should be drained"
+    );
+    assert!(
+        ledger
+            .deposit_balances
+            .get(&ASSET_TEZ)
+            .and_then(|inner| inner.get(&pubkey_hash))
+            .is_none(),
+        "tez producer-fee pool should be drained"
+    );
+
+    // FA2 unshield: spend the FA2 note (position 0) against the live root
+    // and release it to L1 as the FA2 asset.
+    let mut adjusted_unshield = fa2.unshield.clone();
+    adjusted_unshield.root = ledger.tree.root();
+    let unshield_resp = ledger
+        .unshield(&unshield_req(&adjusted_unshield, &scenario.auth_domain))
+        .expect("fa2 unshield");
+    assert_eq!(unshield_resp.change_index, None);
+    // The producer fee note appears after the 2 shield notes.
+    assert_eq!(unshield_resp.producer_index, 2);
+
+    // The withdrawal record is routed by the FA2 asset_id (not tez).
+    assert_eq!(ledger.withdrawals, fa2.expected.withdrawals);
+    assert_eq!(ledger.withdrawals[0].asset_id, fa2.asset_id);
+    assert_eq!(ledger.tree.leaves.len(), fa2.expected.tree_size);
+    assert_eq!(ledger.nullifiers.len(), fa2.expected.nullifier_count);
 }

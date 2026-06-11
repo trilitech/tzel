@@ -54,8 +54,12 @@ let rust_scenario_json () =
       "-p"; "tzel-services"; "--bin"; "gen-interop-scenario";
     |]
 
+(* The Rust generator is deterministic; run it once and share the parsed
+   JSON across the tez and FA2 tests. *)
+let rust_scenario = lazy (Yojson.Basic.from_string (rust_scenario_json ()))
+
 let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
-  let json = Yojson.Basic.from_string (rust_scenario_json ()) in
+  let json = Lazy.force rust_scenario in
   let auth_domain = felt_of_hex (json_string (json_field "auth_domain" json)) in
   let initial_alice_balance = Int64.of_int (json_int (json_field "initial_alice_balance" json)) in
   let ledger = Tzel.Ledger.create ~auth_domain in
@@ -170,10 +174,112 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     (json_int (json_field "nullifier_count" expected))
     (Hashtbl.length ledger.nullifier_set)
 
+(* Reverse direction of the FA2 round-trip: the Rust generator emits the
+   FA2 shield + FA2 unshield, and the OCaml ledger applies them. Exercises
+   the OCaml dual-pool shield (FA2 pool funds v+fee, tez pool funds the
+   producer fee) and asset-routed withdrawal against Rust-generated
+   commitments. *)
+let test_rust_fa2_flow_applies_on_ocaml_ledger () =
+  let json = Lazy.force rust_scenario in
+  let auth_domain = felt_of_hex (json_string (json_field "auth_domain" json)) in
+  let fa2 = json_field "fa2" json in
+  let asset_id = felt_of_hex (json_string (json_field "asset_id" fa2)) in
+  Alcotest.(check bool) "fa2 asset_id is non-tez" true (not (Tzel.Felt.is_zero asset_id));
+  let ledger = Tzel.Ledger.create ~auth_domain in
+
+  (* FA2 shield: recipient note carries the FA2 asset, producer note tez. *)
+  let shield = json_field "shield" fa2 in
+  let shield_v = Int64.of_int (json_int (json_field "v" shield)) in
+  let shield_fee = Int64.of_int (json_int (json_field "fee" shield)) in
+  let shield_producer_fee = Int64.of_int (json_int (json_field "producer_fee" shield)) in
+  let shield_cm = felt_of_hex (json_string (json_field "cm" shield)) in
+  let shield_producer_cm = felt_of_hex (json_string (json_field "producer_cm" shield)) in
+  let shield_mch = felt_of_hex (json_string (json_field "memo_ct_hash" shield)) in
+  let shield_prod_mch = felt_of_hex (json_string (json_field "producer_memo_ct_hash" shield)) in
+  let shield_pubkey_hash =
+    Tzel.Hash.sighash_fold [auth_domain; shield_cm; shield_producer_cm]
+  in
+  let shield_pub : Tzel.Transaction.shield_public = {
+    asset_new = asset_id; asset_producer = Tzel.Felt.zero;
+    auth_domain; pubkey_hash = shield_pubkey_hash;
+    v_pub = shield_v; fee = shield_fee; producer_fee = shield_producer_fee;
+    cm_new = shield_cm; cm_producer = shield_producer_cm;
+    memo_ct_hash = shield_mch; producer_memo_ct_hash = shield_prod_mch;
+  } in
+  (* Dual-pool funding: FA2 pool covers v+fee; tez pool covers producer_fee. *)
+  Tzel.Ledger.credit_deposit ledger ~asset_id ~pubkey_hash:shield_pubkey_hash
+    ~amount:(Int64.add shield_v shield_fee) ();
+  Tzel.Ledger.credit_deposit ledger ~pubkey_hash:shield_pubkey_hash
+    ~amount:shield_producer_fee ();
+  begin match Tzel.Ledger.apply_shield ledger ~pub:shield_pub
+                ~memo_ct_hash:shield_mch ~producer_memo_ct_hash:shield_prod_mch with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "fa2 shield failed: %s" e
+  end;
+  (* Both pools drained by the dual-pool debit. *)
+  Alcotest.(check bool) "fa2 pool drained" true
+    (Option.is_none (Tzel.Ledger.deposit_balance ledger ~asset_id ~pubkey_hash:shield_pubkey_hash ()));
+  Alcotest.(check bool) "tez producer pool drained" true
+    (Option.is_none (Tzel.Ledger.deposit_balance ledger ~pubkey_hash:shield_pubkey_hash ()));
+
+  (* FA2 unshield: spend the FA2 note and release it to L1. *)
+  let unshield = json_field "unshield" fa2 in
+  let recipient = json_string (json_field "recipient" unshield) in
+  let unshield_pub : Tzel.Transaction.unshield_public = {
+    auth_domain;
+    root = felt_of_hex (json_string (json_field "root" unshield));
+    nullifiers = List.map (fun x -> felt_of_hex (json_string x))
+      (json_list (json_field "nullifiers" unshield));
+    v_pub = Int64.of_int (json_int (json_field "v_pub" unshield));
+    asset_pub = felt_of_hex (json_string (json_field "asset_pub" unshield));
+    fee = Int64.of_int (json_int (json_field "fee" unshield));
+    recipient_id = Tzel.Hash.account_id recipient;
+    cm_change = felt_of_hex (json_string (json_field "cm_change" unshield));
+    memo_ct_hash_change = felt_of_hex (json_string (json_field "memo_ct_hash_change" unshield));
+    cm_change_2 = felt_of_hex (json_string (json_field "cm_change_2" unshield));
+    memo_ct_hash_change_2 = felt_of_hex (json_string (json_field "memo_ct_hash_change_2" unshield));
+    cm_fee = felt_of_hex (json_string (json_field "cm_fee" unshield));
+    memo_ct_hash_fee = felt_of_hex (json_string (json_field "memo_ct_hash_fee" unshield));
+  } in
+  begin match Tzel.Ledger.apply_unshield ledger
+                ~recipient_string:recipient unshield_pub
+                ~memo_ct_hash_change:unshield_pub.memo_ct_hash_change
+                ~memo_ct_hash_fee:unshield_pub.memo_ct_hash_fee with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "fa2 unshield failed: %s" e
+  end;
+
+  (* The withdrawal record is routed by the FA2 asset_id (not tez). *)
+  let expected = json_field "expected" fa2 in
+  let expected_w =
+    json_list (json_field "withdrawals" expected)
+    |> List.map (fun entry ->
+         (felt_of_hex (json_string (json_field "asset_id" entry)),
+          json_string (json_field "recipient" entry),
+          Int64.of_int (json_int (json_field "amount" entry))))
+  in
+  begin match Tzel.Ledger.withdrawal_records ledger, expected_w with
+  | [(a, r, amt)], [(ea, er, eamt)] ->
+    Alcotest.(check bool) "withdrawal asset = fa2 asset_id" true (Tzel.Felt.equal a ea);
+    Alcotest.(check bool) "withdrawal asset is non-tez" true (not (Tzel.Felt.is_zero a));
+    Alcotest.(check string) "withdrawal recipient" er r;
+    Alcotest.(check int64) "withdrawal amount" eamt amt
+  | got, _ ->
+    Alcotest.failf "expected one FA2 withdrawal record, got %d" (List.length got)
+  end;
+  Alcotest.(check int) "tree size"
+    (json_int (json_field "tree_size" expected))
+    (Tzel.Ledger.tree_size ledger);
+  Alcotest.(check int) "nullifier count"
+    (json_int (json_field "nullifier_count" expected))
+    (Hashtbl.length ledger.nullifier_set)
+
 let () =
   Alcotest.run "tzel-interop" [
     ("interop", [
       Alcotest.test_case "rust wallet scenario applies on ocaml ledger" `Quick
         test_rust_wallet_scenario_applies_on_ocaml_ledger;
+      Alcotest.test_case "rust fa2 flow applies on ocaml ledger" `Quick
+        test_rust_fa2_flow_applies_on_ocaml_ledger;
     ]);
   ]
