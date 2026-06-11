@@ -442,8 +442,12 @@ rests on three independent mechanisms, not on trust:
    Also pinned: derive_nk_spend, and — importantly — the WOTS+ message
    ENCODING (sighash -> 133 base-4 digits + checksum, via
    sighash_to_wots_digits), which is forgery-relevant and was NOT
-   covered by the function differential.  Twelve primitives/derivations
-   total; only the relation-level full-witness conformance remains.  The remaining primitives and the relation-level full-witness
+   covered by the function differential.  Also pinned the WOTS+ pubkey RECOVERY (recover_pk, the in-circuit
+   signature-verification core) via the pinned ltree: recover -> compress
+   -> leaf matched to the port.  Thirteen primitives/derivations total;
+   the full WOTS+/XMSS verification path (chain step, digit encoding,
+   recovery, L-tree, both tree tags) is now conformance-tested.  Only the
+   relation-level full-witness conformance remains.  The remaining primitives and the relation-level full-witness
    conformance follow this pattern and are forthcoming; until they land
    the Cairo's tie to the model is established for them by mechanisms 1
    and 3 (SHA-pinned drift + the assertion cross-check).
