@@ -126,6 +126,17 @@ mod tests {
         assert(r == 0x03031ab01c1e9ff18b8d4d1487e6813dd4a8d3b2bb10bab0bb07f30787b4ab21, 'chain_step model conformance');
     }
 
+    // Cross-impl conformance for the L-tree (WOTS pubkey -> leaf) compression:
+    // the OCaml port's pk_to_leaf(pub_seed=1, key_idx=0, pk=[1..133]) =
+    // little-endian bytes 0a6df4...d402; the Cairo's xmss_ltree must agree.
+    // Exercises the full 133-endpoint compression incl. the odd-leaf carry.
+    #[test]
+    fn test_ltree_conforms_to_model() {
+        let nodes = array![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133];
+        let leaf = super::xmss_ltree(1, 0_u32, nodes.span());
+        assert(leaf == 0x02d49e9fc14f97af93271bde286a24ee3c5dd85392d3bfc5b299f88a4af46d0a, 'ltree model conformance');
+    }
+
     use tzel::{blake_hash as hash, merkle};
     use super::{
         POW128, POW160, POW64, POW96, TAG_XMSS_LTREE, TAG_XMSS_TREE, WOTS_CHAINS, WOTS_W, pack_adrs,
