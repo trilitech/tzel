@@ -121,6 +121,17 @@ audit").
   sighash publish byte-identical public fields (recipient, amounts, asset
   commitments, nullifiers, fee, memo hashes).  Since the WOTS+ signature
   is over the sighash, no field can be altered without invalidating it.
+  In particular the unshield's L1 `recipient` / `asset` / `amount` are
+  signed — the sequencer cannot redirect or re-denominate a withdrawal.
+- `Impl.Shield.shield_note_bound_to_pubkey_hash` — ENTRY-POINT BINDING:
+  the SAME `(auth_root, auth_pub_seed)` are folded into both the public
+  deposit-pool key (`pubkey_hash`) and the created note's owner tag, and
+  the in-circuit XMSS is verified under that `auth_root`.  So an accepted
+  shield to a published `pubkey_hash` owned by `(R, PS)` is forced to
+  create a note owned by exactly `(R, PS)`, and only that key-holder can
+  perform it — nobody can shield a victim's pool into a note they
+  control.  The deposit→note creation-side companion to
+  `spend_authorized_by_owner`.
 - `Spec.Hashes.replay_resistant` (cross-deployment replay via auth_domain).
 
 ## WOTS+ one-time / key-reuse safety
