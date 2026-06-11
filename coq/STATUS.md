@@ -1174,6 +1174,24 @@ nullifier/commitment binding.
   15 cases. (The port asserts exactly n_chains=133 endpoints — the real
   WOTS pubkey size — which the test respects.)
 
+- **THEFT RESISTANCE — spend authorization made explicit
+  (`Impl/Transfer.v` `spend_authorized_by_owner`):** the headline
+  ownership property, previously enforced structurally but never named.
+  The relation recomputes each spent note's commitment ci_cm from the
+  SAME ci_auth_root the in-circuit XMSS signature is verified against
+  (ci_otag = H_owner(ci_auth_root, ci_pub_seed, H_nktag(ci_nk_spend)),
+  ci_cm = H_commit(..., ci_otag)). Theorem (zero admits): under
+  commitment- and owner-tag injectivity (injective_5 H_commit /
+  injective_3 H_owner), if an accepted spend consumes a note whose
+  commitment has owner (R, ps, nkt), then ci_auth_root = R AND
+  ci_pub_seed = ps AND H_nktag(ci_nk_spend) = nkt — the spender's
+  signing identity is forced to be the note's owner. Composed with the
+  relation's XMSS verification under ci_auth_root and WOTS+/XMSS
+  one-time unforgeability: only the holder of R's signing key can spend
+  a note owned by R. Covers BOTH transfer and unshield (they share
+  CairoInput / input_checks verbatim). You cannot spend someone else's
+  note.
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

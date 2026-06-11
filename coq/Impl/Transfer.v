@@ -632,4 +632,36 @@ Section TransferRelation.
         [lia | exfalso; apply Hne; reflexivity].
   Qed.
 
+  (** ** Spend authorization — theft resistance
+
+      The headline ownership guarantee, made explicit.  A note's
+      commitment binds its owner tag
+      [owner_tag = H_owner(auth_root, pub_seed, nk_tag)], and the
+      relation RECOMPUTES the spent note's commitment ([ci_cm]) from the
+      SAME [ci_auth_root] that the in-circuit XMSS signature is verified
+      against (the [xmss_verify_cairo_sep] conjunct uses [ci_auth_root]
+      as the auth-tree root).  Hence if an accepted spend consumes a
+      note whose commitment has owner [(R, ps, nkt)], the spender's
+      signing [auth_root] MUST be exactly [R]: no other [ci_auth_root]
+      reproduces that commitment, by commitment- and owner-tag
+      injectivity.  Composed with the relation's XMSS verification under
+      [ci_auth_root] and WOTS+/XMSS one-time unforgeability, this is
+      theft resistance: only the holder of [R]'s signing key can spend a
+      note owned by [R] — you cannot spend someone else's note. *)
+  Theorem spend_authorized_by_owner :
+    Spec.Hashes.injective_5 H_commit -> Spec.Hashes.injective_3 H_owner ->
+    forall (c : CairoInput) (d v asset rcm R ps nkt : Felt),
+      ci_cm c = H_commit d v asset rcm (H_owner R ps nkt) ->
+      ci_auth_root c = R
+      /\ ci_pub_seed c = ps
+      /\ H_nktag (ci_nk_spend c) = nkt.
+  Proof.
+    intros Hcom Hown c d v asset rcm R ps nkt Hcm.
+    unfold ci_cm, ci_otag in Hcm.
+    apply Hcom in Hcm.
+    destruct Hcm as (_ & _ & _ & _ & Hotag).
+    apply Hown in Hotag.
+    exact Hotag.
+  Qed.
+
 End TransferRelation.
