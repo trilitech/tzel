@@ -161,25 +161,32 @@ let () =
         "root", json_felt root_after_shield;
         "nullifiers", json_felt_list [shield_nf];
         "fee", `Int fee;
+        (* Multiasset 4-slot layout: 1 = recipient, 2 = change_1,
+           3 = change_2 (empty, tez-only), 4 = producer-fee. *)
         "cm_1", json_felt transfer_note_1.cm;
         "cm_2", json_felt transfer_note_2.cm;
-        "cm_3", json_felt transfer_note_3.cm;
+        "cm_3", json_felt Tzel.Felt.zero;
+        "cm_4", json_felt transfer_note_3.cm;
         "enc_1", Tzel.Encoding.encrypted_note_to_json transfer_enc_1;
         "enc_2", Tzel.Encoding.encrypted_note_to_json transfer_enc_2;
         "enc_3", Tzel.Encoding.encrypted_note_to_json transfer_enc_3;
         "memo_ct_hash_1", json_felt transfer_memo_ct_hash_1;
         "memo_ct_hash_2", json_felt transfer_memo_ct_hash_2;
-        "memo_ct_hash_3", json_felt transfer_memo_ct_hash_3;
+        "memo_ct_hash_3", json_felt Tzel.Felt.zero;
+        "memo_ct_hash_4", json_felt transfer_memo_ct_hash_3;
       ];
       "unshield", `Assoc [
         "root", json_felt root_after_transfer;
         "nullifiers", json_felt_list [bob_nf];
         "v_pub", `Int 99_999;
+        "asset_pub", json_felt Tzel.Felt.zero;
         "fee", `Int fee;
         "recipient", `String interop_l1_recipient;
         "cm_change", json_felt Tzel.Felt.zero;
         "enc_change", `Null;
         "memo_ct_hash_change", json_felt Tzel.Felt.zero;
+        "cm_change_2", json_felt Tzel.Felt.zero;
+        "memo_ct_hash_change_2", json_felt Tzel.Felt.zero;
         "cm_fee", json_felt unshield_fee_note.cm;
         "enc_fee", Tzel.Encoding.encrypted_note_to_json unshield_fee_enc;
         "memo_ct_hash_fee", json_felt unshield_fee_memo_ct_hash;

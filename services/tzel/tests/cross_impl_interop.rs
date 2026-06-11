@@ -85,20 +85,23 @@ fn shield_req(step: &InteropShieldStep, auth_domain: &F) -> (F, ShieldReq) {
 }
 
 fn transfer_req(step: &InteropTransferStep, auth_domain: &F) -> TransferReq {
-    // Phase C: cm_3 is a zero-value change_2 slot; the producer fee moves
-    // to cm_4. We mirror the existing scenario's producer (was cm_3) at
-    // cm_4 and use a synthetic zero placeholder for cm_3.
+    // Multiasset 4-slot: slot 3 (change_2) is an empty placeholder; the
+    // producer fee is in slot 4.  The OCaml wallet now emits these slots
+    // directly (cm_3 = ZERO, cm_4 = producer) — this consumes them as-is,
+    // with NO compensating shift, so a wallet that regressed to the old
+    // 3-slot layout (producer in cm_3, cm_4 = ZERO) would now fail here
+    // (missing producer note) instead of being silently papered over.
     let mut output_preimage = vec![*auth_domain, step.root];
     output_preimage.extend(step.nullifiers.iter().copied());
     output_preimage.push(u64_to_felt(step.fee));
     output_preimage.push(step.cm_1);
     output_preimage.push(step.cm_2);
     output_preimage.push(ZERO); // cm_3 = change_2 placeholder
-    output_preimage.push(step.cm_3); // cm_4 = producer fee (was cm_3)
+    output_preimage.push(step.cm_4); // cm_4 = producer fee
     output_preimage.push(step.memo_ct_hash_1);
     output_preimage.push(step.memo_ct_hash_2);
     output_preimage.push(ZERO); // mh_3 = 0 for zero-value change_2
-    output_preimage.push(step.memo_ct_hash_3); // mh_4 = producer memo
+    output_preimage.push(step.memo_ct_hash_4); // mh_4 = producer memo
     let dummy_empty_enc = EncryptedNote {
         ct_d: vec![0; tzel_core::ML_KEM768_CIPHERTEXT_BYTES],
         ct_v: vec![0; tzel_core::ML_KEM768_CIPHERTEXT_BYTES],
@@ -127,7 +130,7 @@ fn transfer_req(step: &InteropTransferStep, auth_domain: &F) -> TransferReq {
         cm_1: step.cm_1,
         cm_2: step.cm_2,
         cm_3: cm_3_placeholder,
-        cm_4: step.cm_3,
+        cm_4: step.cm_4,
         enc_1: step.enc_1.clone(),
         enc_2: step.enc_2.clone(),
         enc_3: dummy_empty_enc,

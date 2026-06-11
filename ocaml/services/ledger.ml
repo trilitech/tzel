@@ -301,15 +301,19 @@ let apply_transfer ledger (pub : Transaction.transfer_public)
     Error "memo_ct_hash_1 mismatch"
   else if not (Felt.equal memo_ct_hash_2 pub.memo_ct_hash_2) then
     Error "memo_ct_hash_2 mismatch"
-  else if not (Felt.equal memo_ct_hash_3 pub.memo_ct_hash_3) then
-    Error "memo_ct_hash_3 mismatch"
+  (* Multiasset slot layout: slot 1 = recipient, 2 = change_1,
+     3 = change_2 (empty in this tez-only port), 4 = producer-fee.
+     The caller's [memo_ct_hash_3] is the producer memo (record slot 4). *)
+  else if not (Felt.equal memo_ct_hash_3 pub.memo_ct_hash_4) then
+    Error "memo_ct_hash_3 (producer) mismatch"
   else
     match check_and_insert_nullifiers ledger pub.nullifiers with
     | Error e -> Error e
     | Ok () ->
       append_commitment ledger pub.cm_1;
       append_commitment ledger pub.cm_2;
-      append_commitment ledger pub.cm_3;
+      (* slot 3 (change_2) is empty in the tez-only port; skip the zero leaf *)
+      append_commitment ledger pub.cm_4;
       Ok ()
 
 let apply_unshield ledger ~recipient_string (pub : Transaction.unshield_public)

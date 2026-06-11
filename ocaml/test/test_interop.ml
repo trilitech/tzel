@@ -79,6 +79,7 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     ]
   in
   let shield_pub : Tzel.Transaction.shield_public = {
+    asset_new = Tzel.Felt.zero; asset_producer = Tzel.Felt.zero;
     auth_domain;
     pubkey_hash = shield_pubkey_hash;
     v_pub = shield_v; fee = shield_fee; producer_fee = shield_producer_fee;
@@ -109,14 +110,17 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     cm_1 = felt_of_hex (json_string (json_field "cm_1" transfer));
     cm_2 = felt_of_hex (json_string (json_field "cm_2" transfer));
     cm_3 = felt_of_hex (json_string (json_field "cm_3" transfer));
+    cm_4 = felt_of_hex (json_string (json_field "cm_4" transfer));
     memo_ct_hash_1 = felt_of_hex (json_string (json_field "memo_ct_hash_1" transfer));
     memo_ct_hash_2 = felt_of_hex (json_string (json_field "memo_ct_hash_2" transfer));
     memo_ct_hash_3 = felt_of_hex (json_string (json_field "memo_ct_hash_3" transfer));
+    memo_ct_hash_4 = felt_of_hex (json_string (json_field "memo_ct_hash_4" transfer));
   } in
   begin match Tzel.Ledger.apply_transfer ledger transfer_pub
                 ~memo_ct_hash_1:transfer_pub.memo_ct_hash_1
                 ~memo_ct_hash_2:transfer_pub.memo_ct_hash_2
-                ~memo_ct_hash_3:transfer_pub.memo_ct_hash_3 with
+                (* caller's slot-3 memo is the producer (record slot 4) *)
+                ~memo_ct_hash_3:transfer_pub.memo_ct_hash_4 with
   | Ok () -> ()
   | Error e -> Alcotest.failf "transfer failed: %s" e
   end;
@@ -130,10 +134,13 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     nullifiers = List.map (fun x -> felt_of_hex (json_string x))
       (json_list (json_field "nullifiers" unshield));
     v_pub = Int64.of_int (json_int (json_field "v_pub" unshield));
+    asset_pub = felt_of_hex (json_string (json_field "asset_pub" unshield));
     fee = Int64.of_int (json_int (json_field "fee" unshield));
     recipient_id = Tzel.Hash.account_id recipient;
     cm_change = felt_of_hex (json_string (json_field "cm_change" unshield));
     memo_ct_hash_change = felt_of_hex (json_string (json_field "memo_ct_hash_change" unshield));
+    cm_change_2 = felt_of_hex (json_string (json_field "cm_change_2" unshield));
+    memo_ct_hash_change_2 = felt_of_hex (json_string (json_field "memo_ct_hash_change_2" unshield));
     cm_fee = felt_of_hex (json_string (json_field "cm_fee" unshield));
     memo_ct_hash_fee = felt_of_hex (json_string (json_field "memo_ct_hash_fee" unshield));
   } in

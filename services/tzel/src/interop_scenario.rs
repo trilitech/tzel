@@ -28,12 +28,16 @@ pub struct InteropTransferStep {
     #[serde(with = "hex_f_vec")]
     pub nullifiers: Vec<F>,
     pub fee: u64,
+    // Multiasset 4-slot layout: 1 = recipient/change, 2 = recipient/change,
+    // 3 = change_2 (empty in this tez-only scenario), 4 = producer-fee.
     #[serde(with = "hex_f")]
     pub cm_1: F,
     #[serde(with = "hex_f")]
     pub cm_2: F,
     #[serde(with = "hex_f")]
     pub cm_3: F,
+    #[serde(with = "hex_f")]
+    pub cm_4: F,
     pub enc_1: EncryptedNote,
     pub enc_2: EncryptedNote,
     pub enc_3: EncryptedNote,
@@ -43,6 +47,8 @@ pub struct InteropTransferStep {
     pub memo_ct_hash_2: F,
     #[serde(with = "hex_f")]
     pub memo_ct_hash_3: F,
+    #[serde(with = "hex_f")]
+    pub memo_ct_hash_4: F,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -52,6 +58,8 @@ pub struct InteropUnshieldStep {
     #[serde(with = "hex_f_vec")]
     pub nullifiers: Vec<F>,
     pub v_pub: u64,
+    #[serde(with = "hex_f")]
+    pub asset_pub: F,
     pub fee: u64,
     pub recipient: String,
     #[serde(with = "hex_f")]
@@ -59,6 +67,10 @@ pub struct InteropUnshieldStep {
     pub enc_change: Option<EncryptedNote>,
     #[serde(with = "hex_f")]
     pub memo_ct_hash_change: F,
+    #[serde(with = "hex_f")]
+    pub cm_change_2: F,
+    #[serde(with = "hex_f")]
+    pub memo_ct_hash_change_2: F,
     #[serde(with = "hex_f")]
     pub cm_fee: F,
     pub enc_fee: EncryptedNote,
@@ -268,25 +280,31 @@ pub fn generate_interop_scenario() -> InteropScenario {
             root: root_after_shield,
             nullifiers: vec![shield_nf],
             fee: MIN_TX_FEE,
+            // slot 3 (change_2) empty; producer-fee in slot 4
             cm_1: transfer_cm_1,
             cm_2: transfer_cm_2,
-            cm_3: transfer_cm_3,
+            cm_3: ZERO,
+            cm_4: transfer_cm_3,
             enc_1: transfer_enc_1,
             enc_2: transfer_enc_2,
             enc_3: transfer_enc_3,
             memo_ct_hash_1: transfer_mh_1,
             memo_ct_hash_2: transfer_mh_2,
-            memo_ct_hash_3: transfer_mh_3,
+            memo_ct_hash_3: ZERO,
+            memo_ct_hash_4: transfer_mh_3,
         },
         unshield: InteropUnshieldStep {
             root: root_after_transfer,
             nullifiers: vec![bob_nf],
             v_pub: 99_999,
+            asset_pub: ASSET_TEZ,
             fee: MIN_TX_FEE,
             recipient: INTEROP_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             memo_ct_hash_change: ZERO,
+            cm_change_2: ZERO,
+            memo_ct_hash_change_2: ZERO,
             cm_fee: unshield_fee_cm,
             enc_fee: unshield_fee_enc,
             memo_ct_hash_fee: unshield_fee_mh,
@@ -333,8 +351,9 @@ mod tests {
             scenario.transfer.cm_2,
             commit_for_address(&bob_addr0.payment, 200_000, &fixed_felt(0x23))
         );
+        assert_eq!(scenario.transfer.cm_3, ZERO);
         assert_eq!(
-            scenario.transfer.cm_3,
+            scenario.transfer.cm_4,
             commit_for_address(&producer_addr0.payment, 1, &fixed_felt(0x25))
         );
 
@@ -367,7 +386,8 @@ mod tests {
         assert_eq!(scenario.transfer.fee, MIN_TX_FEE);
         tree.append(scenario.transfer.cm_1);
         tree.append(scenario.transfer.cm_2);
-        tree.append(scenario.transfer.cm_3);
+        // slot 3 (change_2) is empty; producer-fee is slot 4
+        tree.append(scenario.transfer.cm_4);
         assert_eq!(scenario.unshield.root, tree.root());
         assert_eq!(
             scenario.unshield.nullifiers,
