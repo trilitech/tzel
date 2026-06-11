@@ -326,10 +326,15 @@ WOTS+/XMSS/config unforgeability-for-the-real-format theorems
 alone — every collision-resistance / injectivity assumption they use
 (`node_injective`, the hash injectivities) appears as a universally
 quantified PREMISE, never a global axiom; `grand_conservation` and its
-three flow instances rest on `Felt` + `Felt_eq_dec`.  So nothing in the
-recent grounding work introduced a hidden axiom or `Admitted`: the whole
-theory's trusted base remains the two `Felt` parameters plus the
-explicitly-discharged local CR hypotheses.
+three flow instances rest on `Felt` + `Felt_eq_dec`.  The four headline
+spend/entry guarantees — `spend_authorized_by_owner` (theft),
+`no_double_spend`, `spend_binds_asset` (asset confusion), and
+`shield_note_bound_to_pubkey_hash` (entry binding) — each rest on `Felt`
+ALONE (Print Assumptions, verified), with their commitment / owner-tag /
+nk-tag / sighash injectivity hypotheses as explicit premises.  So
+nothing in the recent grounding work introduced a hidden axiom or
+`Admitted`: the whole theory's trusted base remains the two `Felt`
+parameters plus the explicitly-discharged local CR hypotheses.
 
 ## How faithfulness (model ↔ implementation) is established
 
