@@ -424,11 +424,17 @@ rests on three independent mechanisms, not on trust:
    inputs — so the executable parts of the model compute what an
    independent implementation computes.  NOTE on the reference: the
    differential's reference is the OCaml protocol port, which agrees
-   with the Rust protocol (`tzel_core`) via pinned cross-impl vectors —
-   it is NOT (yet) run directly against the Cairo.  The Cairo's tie to
-   the model is established by mechanisms 1 and 3 (SHA-pinned drift +
-   the assertion cross-check); a *direct* Cairo-vs-extracted-function
-   conformance runner is forthcoming.
+   with the Rust protocol (`tzel_core`) via pinned cross-impl vectors.
+   A FIRST direct `Cairo ↔ model` conformance check now exists
+   (`cairo/src/blake_hash.cairo::test_commit_conforms_to_pinned_model_vector`,
+   `scarb test`): the Cairo's `commit` on the `commitment_u64_max_v1`
+   inputs equals the model value, verified byte-identical to the port's
+   `hash_commit` and the pinned vector — closing `Coq ↔ port ↔ vector ↔
+   Cairo` for the commitment primitive and fixing the byte↔felt252
+   packing.  The remaining primitives and the relation-level full-witness
+   conformance follow this pattern and are forthcoming; until they land
+   the Cairo's tie to the model is established for them by mechanisms 1
+   and 3 (SHA-pinned drift + the assertion cross-check).
 3. **Systematic assertion cross-check** (manual, documented): every
    assertion in the three Cairo circuits, every check in the Michelson
    bridge contract, the kernel's deposit/config/capacity/valid-root

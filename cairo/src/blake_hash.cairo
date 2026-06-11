@@ -380,6 +380,24 @@ pub fn sighash_to_wots_digits(sighash: felt252) -> Array<u32> {
 mod tests {
     use super::{felt_to_u32x8, hash1, sighash_to_wots_digits, u32x8_to_felt};
 
+    // Cross-impl conformance (the first DIRECT Cairo<->model check): the OCaml
+    // protocol port and the Rocq-extracted model both compute
+    // commit(d_j=1, v=u64::MAX, asset=ASSET_TEZ=0, rcm=0x2a, owner_tag=0x63)
+    // = the pinned commitment_u64_max_v1 vector (little-endian bytes
+    // 667d2e8f...05; the felt is those bytes read little-endian, i.e.
+    // 0x051ef4...7d66). Verified byte-identical to the port via
+    // Tzel.Hash.hash_commit and to specs/test_vectors/commitment_u64_max_v1.json.
+    // Ties the Cairo circuit's commitment primitive DIRECTLY to that model value
+    // and pins the byte<->felt252 packing the full conformance harness needs.
+    #[test]
+    fn test_commit_conforms_to_pinned_model_vector() {
+        let cm = super::commit(1, 0xffffffffffffffff_u64, 0, 0x2a, 0x63);
+        assert(
+            cm == 0x051ef49553ae5c05eb6afee0301d9b5da68ef46a11064378ba93b5578f2e7d66,
+            'commit model conformance',
+        );
+    }
+
     fn checksum_value(digits: Span<u32>) -> u32 {
         let mut checksum: u32 = 0;
         let mut i: u32 = 0;

@@ -48,22 +48,31 @@ Each layer is what catches a different failure mode:
     `ocaml/coq_driver/test`) and its reference is the OCaml **port**,
     which is cross-impl-validated against the **Rust** protocol — NOT
     yet directly against the Cairo.
-  - There is no *direct* automated `extracted-function ↔ Cairo` or
-    `relation ↔ Cairo verifier` conformance test yet. The Cairo-side
-    `run_chain_step` / full-witness `run_*` runners that would close
-    that loop are FORTHCOMING (`coq.yml` notes they "land next"; the
-    `run_*.cairo` executables exist and are exercised end-to-end —
-    producing real STARK proofs the kernel verifies — in
+  - A FIRST *direct* `Cairo ↔ model` conformance check now exists:
+    `cairo/src/blake_hash.cairo::test_commit_conforms_to_pinned_model_vector`
+    (`scarb test`) asserts the Cairo's `commit` on the
+    `commitment_u64_max_v1` inputs equals the model value — verified
+    byte-identical to the OCaml port's `Tzel.Hash.hash_commit` and to
+    `specs/test_vectors/commitment_u64_max_v1.json`. This also pins the
+    **byte↔felt252 packing** (the felt is the 32 little-endian bytes
+    read as a number) that the full harness needs. So for the
+    *commitment* primitive the chain is now closed end-to-end:
+    `Coq ↔ port ↔ pinned-vector ↔ Cairo`.
+  - The REMAINING primitives (chain step, nullifier, sighash, Merkle,
+    L-tree) and the *relation-level* full-witness conformance
+    (`run_*.cairo` driven on random witnesses vs the certified model's
+    accept/reject) follow this same established pattern and are the next
+    step — still forthcoming. (The `run_*.cairo` executables already run
+    end-to-end producing real STARK proofs the kernel verifies in
     `services/tzel/tests/integration.rs`, but that is system-level, not
-    a primitive/relation conformance check).
-  - So the Cairo's faithfulness to this model rests on **two** things
-    today: (1) the **drift-pinned manual assertion cross-check** — every
-    Cairo `assert` enumerated and matched to a relation conjunct, with
-    the Cairo SHA pinned so any edit breaks CI and forces re-review; and
-    (2) the function differentials giving independent confidence the
-    Coq transcription of each primitive is correct (they match a
-    separate impl, the port/Rust). The *direct* Cairo-vs-model
-    conformance is the next step, not a current guarantee.
+    a primitive/relation conformance check.)
+  - So the Cairo's faithfulness to this model rests today on: (1) the
+    **drift-pinned manual assertion cross-check** (every Cairo `assert`
+    matched to a relation conjunct, SHA-pinned); (2) the function
+    differentials (independent confidence the Coq transcription matches
+    the port/Rust); and (3) now a direct Cairo-vs-model conformance for
+    the commitment primitive, with the others to follow the same
+    pattern.
 
   See `SECURITY_COVERAGE.md` ("How faithfulness is established") for the
   full account.
