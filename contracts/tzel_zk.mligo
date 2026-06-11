@@ -119,15 +119,31 @@ let spend (s : storage) (nullifier : bytes) : storage =
   if Big_map.mem nullifier s.nullifiers then failwith "TzEL: double spend"
   else { s with nullifiers = Big_map.add nullifier unit s.nullifiers }
 
+(* ── wallet-sync data availability ───────────────────────────────────────────
+   The commitment tree lives OFF-CHAIN; the contract stores only the root. So
+   each op must PUBLISH its leaves: the commitments (carried in output_preimage)
+   and the encrypted notes (for recipients). A wallet rebuilds the tree by
+   replaying these and trial-decrypts the notes to find its funds.
+   See docs/TZEL-TREE-AND-SYNC.md. *)
+let emit_sync (output_preimage : bytes list) (enc_notes : bytes list) : operation =
+  Tezos.emit "%tzel_notes" (output_preimage, enc_notes)
+
 (* ── entrypoints ─────────────────────────────────────────────────────────── *)
 
-(* A shield adds a commitment: verify the bound proof, advance the tree root to
-   the new root READ FROM the bound output_preimage. *)
+(* NOTE: `new_root` is read from the bound `output_preimage` — which requires the
+   circuit to OUTPUT it. The current single-value circuit does not yet; this
+   path is staged pending the (multi-asset) circuit extension that adds new_root
+   to the output. The OutHash binding already makes whatever the circuit outputs
+   trustworthy. See docs/TZEL-TREE-AND-SYNC.md. *)
+
+(* A shield adds commitments: verify the bound proof, advance the root to the
+   new root attested in the bound output_preimage, publish the leaves. *)
 type shield_param = {
   proof           : bytes ;
   tree_roots      : bytes ;        (* 128 bytes = 4 x 32 *)
   output_preimage : bytes list ;   (* bootloader output felts (32-byte BE) *)
   old_root        : bytes ;
+  enc_notes       : bytes list ;   (* note ciphertexts to publish *)
 }
 
 [@entry]
@@ -135,15 +151,16 @@ let shield (p : shield_param) (s : storage) : operation list * storage =
   let () = verify_bound s p.proof p.tree_roots p.output_preimage in
   let new_root = preimage_at p.output_preimage new_root_idx in
   let s = advance_root s p.old_root new_root in
-  ([] : operation list), s
+  [ emit_sync p.output_preimage p.enc_notes ], s
 
-(* A transfer spends one note (its nullifier is attested in the bound preimage)
+(* A transfer spends a note (its nullifier is attested in the bound preimage)
    and advances the root. *)
 type transfer_param = {
   proof           : bytes ;
   tree_roots      : bytes ;
   output_preimage : bytes list ;
   old_root        : bytes ;
+  enc_notes       : bytes list ;
 }
 
 [@entry]
@@ -153,16 +170,17 @@ let transfer (p : transfer_param) (s : storage) : operation list * storage =
   let new_root = preimage_at p.output_preimage new_root_idx in
   let s = spend s nullifier in
   let s = advance_root s p.old_root new_root in
-  ([] : operation list), s
+  [ emit_sync p.output_preimage p.enc_notes ], s
 
-(* An unshield spends a note and exits value. The outbound transfer/ticket is
-   omitted in this version (orthogonal to the zk binding); verification,
-   nullifier and root bookkeeping are identical to transfer. *)
+(* An unshield spends a note and exits value. The outbound transfer/ticket
+   (value custody) is omitted here — it will be multi-asset (per-asset tickets);
+   verification, nullifier and root bookkeeping are identical to transfer. *)
 type unshield_param = {
   proof           : bytes ;
   tree_roots      : bytes ;
   output_preimage : bytes list ;
   old_root        : bytes ;
+  enc_notes       : bytes list ;
 }
 
 [@entry]
@@ -172,4 +190,4 @@ let unshield (p : unshield_param) (s : storage) : operation list * storage =
   let new_root = preimage_at p.output_preimage new_root_idx in
   let s = spend s nullifier in
   let s = advance_root s p.old_root new_root in
-  ([] : operation list), s
+  [ emit_sync p.output_preimage p.enc_notes ], s

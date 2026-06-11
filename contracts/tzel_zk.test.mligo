@@ -43,7 +43,7 @@ let test_shield_reaches_gateway =
   let c = Test.to_contract orig.addr in
   let param : TzEL.shield_param =
     { proof = 0x ; tree_roots = tree_roots32 ;
-      output_preimage = preimage1 ; old_root = 0x00 } in
+      output_preimage = preimage1 ; old_root = 0x00 ; enc_notes = ([] : bytes list) } in
   let result = Test.transfer_to_contract c (Shield param) 0tez in
   let () = match result with
     | Success _ -> failwith "expected gateway view unavailable in Test"
@@ -56,7 +56,7 @@ let test_transfer_reaches_gateway =
   let c = Test.to_contract orig.addr in
   let param : TzEL.transfer_param =
     { proof = 0x ; tree_roots = tree_roots32 ;
-      output_preimage = preimage1 ; old_root = 0x00 } in
+      output_preimage = preimage1 ; old_root = 0x00 ; enc_notes = ([] : bytes list) } in
   let result = Test.transfer_to_contract c (Transfer param) 0tez in
   let () = match result with
     | Success _ -> failwith "expected gateway view unavailable in Test"
