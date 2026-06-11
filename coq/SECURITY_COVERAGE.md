@@ -132,7 +132,19 @@ audit").
   perform it — nobody can shield a victim's pool into a note they
   control.  The deposit→note creation-side companion to
   `spend_authorized_by_owner`.
-- `Spec.Hashes.replay_resistant` (cross-deployment replay via auth_domain).
+- `Spec.Hashes.replay_resistant` (cross-deployment replay via auth_domain):
+  proves the MECHANISM — a proof for one `auth_domain` does not verify
+  under another (the differing sighash invalidates the signature).
+  OPERATIONAL PRECONDITION (must be surfaced honestly): this gives
+  cross-deployment separation only if each deployment configures a
+  DISTINCT `auth_domain`.  `core::default_auth_domain()` is a FIXED dev
+  constant (`hash("tzel-auth-domain-local-dev-v1")`) whose own doc-comment
+  says "Production deployments should override this with a unique
+  per-deployment value" — set via `configure_verifier`'s
+  `config.auth_domain` (then frozen, `ConfigOnce`).  Two deployments that
+  both leave the default in place would share an `auth_domain` and the
+  theorem's hypothesis (distinct domains) would not hold.  The proof is
+  honest about its condition; the deployment must satisfy it.
 
 ## WOTS+ one-time / key-reuse safety
 
