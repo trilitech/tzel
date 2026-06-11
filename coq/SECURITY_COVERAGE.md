@@ -430,10 +430,13 @@ rests on three independent mechanisms, not on trust:
    `test_nullifier_conforms_to_model`, `scarb test`): the Cairo's `commit`
    and `nullifier` on fixed inputs equal the model values, verified
    byte-identical to the port (`hash_commit` / nested `hash_nf`) — closing
-   `Coq ↔ port ↔ Cairo` for ALL SIX core circuit primitives — commitment, nullifier, WOTS+
-   chain-step, Merkle-node-hash, sighash-fold, and L-tree compression
-   (the last exercising the full 133-endpoint odd-leaf carry) — and
-   fixing the byte↔felt252 packing.  Only the relation-level full-witness
+   `Coq ↔ port ↔ Cairo` for the full HASH-PRIMITIVE set the circuits use: commitment,
+   nullifier, WOTS+ chain-step, Merkle-node-hash, sighash-fold, L-tree
+   compression (full 133-endpoint odd-leaf carry), AND the three
+   commitment-input derivations owner_tag / nk_tag / rcm — each pinned
+   byte-exactly to the port, fixing the byte↔felt252 packing.  So the
+   Cairo's commitment construction (commit + its derivations) is now
+   conformance-tested end-to-end.  Only the relation-level full-witness
    conformance remains.  The remaining primitives and the relation-level full-witness
    conformance follow this pattern and are forthcoming; until they land
    the Cairo's tie to the model is established for them by mechanisms 1

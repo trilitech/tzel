@@ -416,6 +416,22 @@ mod tests {
         assert(super::sighash_fold(1, 2) == 0x07f0f8d6a4ea789d045e1cedf28c900413d82bc5af0f46af56a62329ff6d165e, 'sighash fold conformance');
     }
 
+    // Cross-impl conformance for the commitment-input derivation hashes:
+    // owner_tag / nk_tag / rcm. The Cairo derivations must match the port's
+    // hash_owner / hash_nk_tag / derive_rcm on fixed inputs.
+    #[test]
+    fn test_owner_tag_conforms_to_model() {
+        assert(super::owner_tag(1, 2, 3) == 0x07f111ea7d9dbd34f875c95d25f7cf12353d6262c040f671f096fd92fccba5f5, 'owner_tag conformance');
+    }
+    #[test]
+    fn test_nk_tag_conforms_to_model() {
+        assert(super::derive_nk_tag(1) == 0x02419a0b75110e8292b015874b556a4c9b201598cf8514656597985589000ba2, 'nk_tag conformance');
+    }
+    #[test]
+    fn test_rcm_conforms_to_model() {
+        assert(super::derive_rcm(1) == 0x0196c2d85de4b92b728836ddb61ee177e1e1ca23219a862cbc42cf03b19f1b98, 'rcm conformance');
+    }
+
     fn checksum_value(digits: Span<u32>) -> u32 {
         let mut checksum: u32 = 0;
         let mut i: u32 = 0;
