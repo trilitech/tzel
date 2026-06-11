@@ -1207,6 +1207,22 @@ nullifier/commitment binding.
   same nullifier. No witness choice lets the owner spend a note twice.
   Companion to [[spend_authorized_by_owner]] (theft resistance).
 
+- **SHIELD ENTRY-POINT BINDING — funds reach exactly the published
+  owner (`Impl/Shield.v` `shield_note_bound_to_pubkey_hash`):** the
+  output/creation-side analog of theft resistance. The deposit pool is
+  keyed by the public pubkey_hash = fold(tag_pkh, [auth_domain;
+  auth_root; auth_pub_seed; blind]). The relation feeds the SAME
+  (co_auth_root r, co_pub_seed r) of the recipient note into BOTH that
+  pubkey_hash fold AND the note commitment (s_output_cm_ok via co_otag),
+  and verifies the in-circuit XMSS under co_auth_root r. Theorem (zero
+  admits): under sighash-fold injectivity (injective_2 H_sighash), an
+  accepted shield to a published pubkey_hash whose owner is (R, PS)
+  forces co_auth_root r = R and co_pub_seed r = PS. So the shielded note
+  is owned by exactly the published pool key, and (with the signature
+  under co_auth_root r = R) only that key's holder can shield — nobody
+  can shield a victim's pool into a note they control. Companion to the
+  spend-side [[spend_authorized_by_owner]].
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

@@ -315,4 +315,46 @@ Section ShieldRelation.
       apply repeat_length.
   Qed.
 
+  (** ** Shield entry-point binding — funds reach exactly the published owner
+
+      The deposit pool is keyed by the public [pubkey_hash =
+      fold(tag_pkh, [auth_domain; auth_root; auth_pub_seed; blind])].
+      The relation feeds the SAME [(co_auth_root r, co_pub_seed r)] of
+      the recipient note [r] into BOTH that pubkey_hash fold AND the
+      note commitment ([s_output_cm_ok r] via [co_otag]), and verifies
+      the in-circuit XMSS signature under [co_auth_root r].  So an
+      accepted shield to a published [pubkey_hash] whose owner is
+      [(R, PS)] is forced to create a recipient note owned by exactly
+      [(R, PS)] — under sighash-fold injectivity, no other owner
+      reproduces the pubkey_hash.  Composed with the signature under
+      [co_auth_root r = R], this is the entry-point guarantee: deposit
+      funds become a note owned by the published pool key, and only that
+      key's holder can perform the shield.  Nobody can shield a
+      victim's pool into a note they control. *)
+  Theorem shield_note_bound_to_pubkey_hash :
+    Spec.Hashes.injective_2 H_sighash ->
+    forall (auth_domain pubkey_hash : Felt) (fee : nat)
+           (blind : Felt) (auth_idx : nat)
+           (wots_sig auth_siblings : list Felt)
+           (r p : CairoOutput) (R PS B : Felt),
+      pubkey_hash = Spec.Hashes.sighash_fold H_sighash tag_pkh_felt
+                      [auth_domain; R; PS; B] ->
+      ShieldRelation auth_domain pubkey_hash fee blind auth_idx
+                     wots_sig auth_siblings r p ->
+      co_auth_root r = R /\ co_pub_seed r = PS.
+  Proof.
+    intros Hinj auth_domain pubkey_hash fee blind auth_idx
+           wots_sig auth_siblings r p R PS B Hpkh HR.
+    unfold ShieldRelation in HR.
+    destruct HR as (_ & _ & _ & _ & _ & Hpk & _).
+    unfold relation_pubkey_hash in Hpk.
+    rewrite Hpkh in Hpk. symmetry in Hpk.
+    destruct (Spec.Hashes.sighash_fold_injective H_sighash Hinj
+                [auth_domain; co_auth_root r; co_pub_seed r; blind]
+                [auth_domain; R; PS; B]
+                tag_pkh_felt tag_pkh_felt eq_refl Hpk) as [_ Hlist].
+    injection Hlist as Har Hps _.
+    split; [exact Har | exact Hps].
+  Qed.
+
 End ShieldRelation.
