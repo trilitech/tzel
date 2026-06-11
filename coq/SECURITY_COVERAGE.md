@@ -390,6 +390,24 @@ manipulate.  An attacker who broke every hash could not violate the
 accounting invariants; they could only mis-bind a note to a value or
 owner — which is exactly what the CR-premised circuit theorems forbid.
 
+GRANULAR CRYPTO-DEPENDENCY MAP (which hash's collision-resistance is
+load-bearing for which guarantee — "if hash X is not CR, what breaks?"):
+
+| CR / injectivity premise        | Guarantees it underpins |
+|---------------------------------|-------------------------|
+| `injective_5 H_commit`          | commitment binds value / asset / owner; theft (`spend_authorized_by_owner`); asset-confusion (`spend_binds_asset`); double-spend (`no_double_spend`) |
+| `injective_3 H_owner`           | owner-tag binds auth_root; theft; double-spend |
+| `H_nktag` injective             | double-spend under witness variation (`no_double_spend`) |
+| `injective_2 H_nf`              | nullifier binding (no aliasing); position-distinct nullifiers; dedup soundness |
+| `injective_2 H_sighash`         | sighash non-malleability (all three flows); pubkey_hash / shield entry-point binding; config-governance unforgeability; cross-deployment replay; exit non-redirection |
+| `node_injective H_node`         | Merkle membership / faerie-gold (`merkle_binding`); XMSS auth-tree binding (`auth_binding`); L-tree injectivity |
+| `derive_asset_id` inj + `≠ tez` | asset-registry routing bijection (deposit/withdraw inverse) |
+| WOTS+ chain-hash preimage res.  | the forward-only attacker model under which `wots_`/`xmss_one_time_unforgeable` holds |
+
+So an auditor reviewing a single hash can read off exactly which
+guarantees rest on it; conversely every CR premise here is LOCAL (a
+Section hypothesis), never a global axiom (`Print Assumptions`).
+
 ## How faithfulness (model ↔ implementation) is established
 
 The Coq relations/state-machines are claimed to model the Cairo
