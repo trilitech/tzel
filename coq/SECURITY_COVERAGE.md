@@ -144,15 +144,38 @@ audit").
   cm — no asset substitution), `commitment_binds_value` (no per-note
   amount inflation), `commitment_binds_auth_root` (spending authority
   welded to cm — no authority substitution).
+- RELATION-LEVEL ENFORCEMENT (the circuit's witness cannot deviate from
+  the note's bound fields, because `ci_otag` is COMPUTED from
+  `ci_auth_root` and fed into `ci_cm`):
+  - `Impl.Transfer.spend_authorized_by_owner` — THEFT RESISTANCE: a
+    spend of a note owned by `R` forces the witness `ci_auth_root = R`
+    (and pub_seed / nk_tag); composed with the in-circuit XMSS check
+    under `ci_auth_root` and XMSS unforgeability, only `R`'s key-holder
+    can spend `R`'s note.
+  - `Impl.Transfer.spend_binds_asset` — ASSET-CONFUSION RESISTANCE
+    (multiasset): a spend whose commitment carries asset `a` forces the
+    declared `ci_asset = a`; with per-asset `grand_conservation`, no
+    cross-asset inflation.
+  - Both cover transfer AND unshield (shared `CairoInput`/`input_checks`).
 
 ## Double-spend / replay / faerie-gold
 
 - `Spec.KernelNullifier.reachable_nodup` / `respend_rejected`
   (no nullifier accepted twice), `note_spent_at_most_once`
   (composes with the circuit nullifier binding).
+- `Impl.Transfer.no_double_spend` — WITNESS-VARYING double-spend
+  resistance: two spends of the same note yield the SAME nullifier even
+  if the attacker varies `nk_spend`, because `owner_tag` binds
+  `H_nktag(nk_spend)` and `H_nktag` is injective — so the kernel's
+  dedup cannot be evaded by re-deriving the nullifier.
+- `Spec.Hashes.nullifier_binding` (distinct notes → distinct nullifiers:
+  no aliasing a victim's nullifier to block their spend).
+- `Spec.Merkle.merkle_binding` (FAERIE-GOLD: a verifying path uniquely
+  determines the leaf at its position — you cannot spend a note that
+  isn't a genuine tree leaf).
 - `Spec.ShieldReplay.no_duplicate_shielded_note` (a replayed shield
   cannot mint a duplicate note).
-- `Spec.Hashes.nullifier_position_distinct` (faerie-gold: the same note
+- `Spec.Hashes.nullifier_position_distinct` (the same note
   value at distinct positions has distinct nullifiers).
 
 ## Bridge / Michelson contract (fa2_bridge_ticketer.tz)
