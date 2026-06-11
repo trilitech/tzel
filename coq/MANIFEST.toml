@@ -34,7 +34,7 @@ sha256 = "020d322e550e498d160f3ab97eb5f99f561641cbffdb10ca33622ee57deae012"
 [[mirror]]
 cairo  = "cairo/src/merkle.cairo"
 coq    = ["coq/Impl/Merkle.v"]
-sha256 = "9b947d07ebd978f1985b7f9dba6dbe2acf24f061dc3826f2d09e300cd200d42f"
+sha256 = "2a0b5fa86049fb91fedbcf0baa3398d17292ef74945e52a0a766da628f622779"
 
 [[mirror]]
 cairo  = "cairo/src/xmss_common.cairo"

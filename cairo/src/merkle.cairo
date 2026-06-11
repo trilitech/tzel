@@ -97,6 +97,19 @@ mod tests {
         assert(hash2(1, 2) == 0x00981b69a5f29168d9f043960cf4f5be6e6ac75a4212ca11cc70ca6cb4b60f89, 'merkle node-hash conformance');
     }
 
+    // Cross-impl conformance for the commitment-tree Merkle WALK (verify):
+    // leaf -> root over TREE_DEPTH levels, sibling order per path_indices bit.
+    // Unlike the XMSS auth-walk, the port HAS a pre-existing independent
+    // oracle (Tzel.Merkle.root_from_path, validated Coq<->port in the
+    // differential), so this is a STRONG structural conformance, not a
+    // transcription. Expected root computed by the port for leaf=100,
+    // path_indices=0xABCDEF (varied bits), siblings=[1..TREE_DEPTH=48].
+    #[test]
+    fn test_merkle_walk_conforms_to_model() {
+        let siblings = array![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48];
+        verify(100, 0x006ab2a944a93468b4db1470974a44538972db35007291a9429dd2a09396d9ad, siblings.span(), 0xABCDEF);
+    }
+
     fn zero_siblings(depth: u32) -> Array<felt252> {
         let mut siblings: Array<felt252> = array![];
         let mut i: u32 = 0;

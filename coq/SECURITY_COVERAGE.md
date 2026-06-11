@@ -450,9 +450,12 @@ rests on three independent mechanisms, not on trust:
    validates the node-hash composition over AUTH_DEPTH=16 levels and is a
    regression guard, but is NOT an independent structural oracle (the
    walk structure's spec-fidelity rests on the Coq model + cross-check +
-   the Cairo negative tests).  Fourteen conformance tests total; the full
-   WOTS+/XMSS verification path is covered at the primitive level.  The
-   relation-level full-witness conformance remains.  The remaining primitives and the relation-level full-witness
+   the Cairo negative tests).  The commitment-tree Merkle WALK (verify: leaf -> root over
+   TREE_DEPTH=48 levels) is ALSO pinned, and unlike the auth-walk this is
+   a STRONG structural conformance: the port's Tzel.Merkle.root_from_path
+   is a pre-existing independent oracle (validated Coq<->port in the
+   differential), not a transcription.  Fifteen conformance tests total.
+   The relation-level full-witness conformance remains.  The remaining primitives and the relation-level full-witness
    conformance follow this pattern and are forthcoming; until they land
    the Cairo's tie to the model is established for them by mechanisms 1
    and 3 (SHA-pinned drift + the assertion cross-check).
