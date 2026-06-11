@@ -137,6 +137,16 @@ mod tests {
         assert(leaf == 0x02d49e9fc14f97af93271bde286a24ee3c5dd85392d3bfc5b299f88a4af46d0a, 'ltree model conformance');
     }
 
+    // Cross-impl conformance for the XMSS AUTH-TREE node hash, using the
+    // circuit's actual TAG_XMSS_TREE constant (so this also validates that
+    // tag value, which the L-tree test does NOT — it uses TAG_XMSS_LTREE).
+    // Port: hash4(pub_seed=1, pack_adrs(tag_tree, 0,0,0,0), 2, 3).
+    #[test]
+    fn test_auth_tree_node_hash_conforms_to_model() {
+        let nh = super::xmss_node_hash(1, super::TAG_XMSS_TREE, 0_u32, 0_u32, 0_u32, 2, 3);
+        assert(nh == 0x0610e41b20bff3ee7fb6ac26b0c64f5795dbc0f801cd8f3b527ddb5033e9308e, 'auth-tree node-hash conformance');
+    }
+
     use tzel::{blake_hash as hash, merkle};
     use super::{
         POW128, POW160, POW64, POW96, TAG_XMSS_LTREE, TAG_XMSS_TREE, WOTS_CHAINS, WOTS_W, pack_adrs,

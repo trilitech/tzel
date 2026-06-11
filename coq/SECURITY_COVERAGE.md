@@ -436,7 +436,10 @@ rests on three independent mechanisms, not on trust:
    commitment-input derivations owner_tag / nk_tag / rcm — each pinned
    byte-exactly to the port, fixing the byte↔felt252 packing.  So the
    Cairo's commitment construction (commit + its derivations) is now
-   conformance-tested end-to-end.  Only the relation-level full-witness
+   conformance-tested end-to-end.  The XMSS auth-tree node hash is also
+   pinned WITH the circuit's `TAG_XMSS_TREE` constant (the L-tree test
+   covers only `TAG_XMSS_LTREE`), so both XMSS tree tags are validated.
+   Ten primitives/derivations total; only the relation-level full-witness
    conformance remains.  The remaining primitives and the relation-level full-witness
    conformance follow this pattern and are forthcoming; until they land
    the Cairo's tie to the model is established for them by mechanisms 1
