@@ -34,17 +34,34 @@ Each layer is what catches a different failure mode:
   spec enumerates the protocol-level safety properties; if the
   refinement's executable definition can't discharge them, the proof
   gets stuck and we've localized the gap. **No `admit`s allowed.**
-- **Extracted-OCaml ↔ Cairo conformance fuzzing** catches *translation
-  divergence*. QCheck2 generates random witnesses, runs both the
-  certified OCaml model and the Cairo verifier, asserts they decide
-  the same way. AFL+crowbar would be an alternative but has issues
-  with downstream Tezos code (Lwt scheduler / GC); QCheck2 is
-  simpler and the recommended tool.
+- **Extracted-function differential fuzzing** catches *translation
+  divergence*. QCheck2 generates random inputs and checks the
+  Coq-extracted functions (chain step, commitment, nullifier, sighash,
+  Merkle path, L-tree, frontier root) byte-for-byte against the
+  cross-impl-tested OCaml protocol port — which is itself conformance-
+  tested against the Cairo, so the chain is `extracted-Coq ↔ port ↔
+  Cairo`.
 
-The two together are mutually reinforcing: the proof catches "the
-spec demands a property the refinement can't satisfy"; the fuzzer
-catches "the Cairo behaves differently from the certified model on
-some witness." Either alone is incomplete.
+  IMPLEMENTATION STATE (stated honestly): this differential is
+  *function-level* — it validates the building blocks of each circuit's
+  accept condition (the suite is the 15 cases in
+  `ocaml/coq_driver/test`). The *relation-level* conformance ideal —
+  random full witnesses run through the certified model's accept/reject
+  decision AND the Cairo verifier's, asserting they decide the same way
+  end-to-end — is the design goal; the Cairo-side `run_*` runners for it
+  are forthcoming. Until then, relation-level faithfulness (that the
+  conjunction of modeled conjuncts equals the Cairo's accept condition)
+  rests on the **manual, drift-pinned assertion cross-check** — every
+  Cairo `assert` enumerated and matched to a relation conjunct — plus
+  the function differentials above. See `SECURITY_COVERAGE.md`
+  ("How faithfulness is established") for the full three-mechanism
+  account.
+
+The layers are mutually reinforcing: the proof catches "the spec
+demands a property the refinement can't satisfy"; the function
+differentials catch "the Cairo computes a primitive differently from
+the certified model"; the assertion cross-check + drift pin catch "a
+Cairo assertion is missing from the relation." Each alone is incomplete.
 
 ## Directory layout
 
