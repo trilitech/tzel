@@ -177,23 +177,27 @@ audit").
   both leave the default in place would share an `auth_domain` and the
   theorem's hypothesis (distinct domains) would not hold.  The proof is
   honest about its condition; the deployment must satisfy it.
-- `Spec.Hashes.type_tag_separates_same_length` (cross-CIRCUIT replay via
-  the type-tag prefix: transfer 0x01 / unshield 0x02 / shield 0x03 /
-  pubkey-hash 0x04): under `injective_2 H_sighash`, two sighashes over
-  the SAME number of fields but DISTINCT tags are distinct — so a WOTS
-  signature for one circuit-type cannot validate another's of the same
-  shape.  HONESTLY SCOPED (this is a new theorem AND a surfaced subtlety):
-  the three circuits' sighashes have DIFFERENT field counts, so their
-  pairwise distinctness is NOT a corollary of this same-length lemma —
-  `injective_2` gives same-length injectivity only.  The cross-LENGTH,
-  cross-tag distinctness the deployed circuits actually rely on rests on
-  the sighash chain's COLLISION-RESISTANCE (the same CR underlying every
-  binding theorem) plus, in deployment, per-circuit verifier keys (an
-  independent primary defense).  The tag is a domain-separation prefix
-  whose cross-circuit guarantee is ultimately the hash's CR; the theorem
-  makes it structural for the same-length case and the docstring is
-  explicit that the one-line "the tag prevents cross-circuit replay" claim
-  glossed over the cross-length reliance on CR.
+- **Cross-CIRCUIT replay via the type-tag prefix** (transfer 0x01 /
+  unshield 0x02 / shield 0x03 / pubkey-hash 0x04) — TWO theorems, honestly
+  layered:
+  - `Spec.Hashes.type_tag_separates_same_length`: under
+    `injective_2 H_sighash`, two sighashes over the SAME number of fields
+    but DISTINCT tags are distinct — no extra assumption.
+  - `Spec.Hashes.type_tag_separates`: the FULL result for ANY field
+    lengths (the deployed circuits' sighashes differ in length: shield 11,
+    transfer 11+N, unshield more), under the additional explicit
+    hypothesis `not_a_sighash_output` on both tags.  This pins down the
+    exact extra assumption the cross-length case needs: PREIMAGE-resistance
+    of the reserved tags (an attacker cannot find fields whose fold equals
+    a tag), NOT generic collision-resistance — a precision the earlier
+    one-line "the tag prevents cross-circuit replay" doc and a looser "CR"
+    phrasing both blurred.  `injective_2` alone gives same-length
+    injectivity only (a hash output can equal a shorter run's raw
+    accumulator); `not_a_sighash_output` rules that out for the tag values.
+    It is a ~2^-252 domain-separation event modeled as a local hypothesis,
+    exactly as the `injective_N` premises model "no findable collision".
+    In deployment, per-circuit verifier keys are an independent primary
+    defense.
 
 ## WOTS+ one-time / key-reuse safety
 

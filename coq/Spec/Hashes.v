@@ -28,6 +28,7 @@
 *)
 
 From Stdlib Require Import List.
+From Stdlib Require Import Lia.
 From Common Require Import Felt.
 
 (** ** WOTS+ protocol parameters (whitepaper / RFC 8391)
@@ -227,13 +228,13 @@ Section SighashFold.
       in principle equal a longer one when the short tag coincides with the
       longer fold's intermediate accumulator.  So the cross-LENGTH,
       cross-tag distinctness the deployed circuits actually rely on rests
-      on the collision-resistance of the sighash chain (an attacker cannot
-      find cross-length fields that collide two tagged folds) — the SAME CR
-      assumption underlying every binding theorem here — plus, in
-      deployment, per-circuit verifier keys (an independent, primary
-      defense).  The tag is a domain-separation prefix whose cross-circuit
-      guarantee is ultimately the hash's CR; this lemma makes it STRUCTURAL
-      only for the same-length case. *)
+      on PREIMAGE-resistance of the tags — an attacker cannot find fields
+      whose fold equals a reserved tag (NOT generic collision-resistance,
+      as a looser phrasing might suggest) — plus, in deployment, per-circuit
+      verifier keys (an independent, primary defense).  That cross-length
+      case is DISCHARGED below in [type_tag_separates] under the explicit
+      [not_a_sighash_output] hypothesis; this corollary is the special case
+      needing no extra assumption (same length). *)
   Corollary type_tag_separates_same_length (Hinj : injective_2 H_sighash) :
     forall (tag1 tag2 : Felt) (xs ys : list Felt),
       tag1 <> tag2 ->
@@ -244,6 +245,83 @@ Section SighashFold.
     destruct (sighash_fold_injective Hinj xs ys tag1 tag2 Hlen Heq)
       as [Htageq _].
     exact (Htag Htageq).
+  Qed.
+
+  (** A fold over a NON-EMPTY field list is an [H_sighash] output (its
+      last step applies the hash).  Used to discharge the cross-length
+      case below. *)
+  Lemma sighash_fold_nonempty_output (acc : Felt) (l : list Felt) :
+    l <> nil -> exists a b, sighash_fold acc l = H_sighash a b.
+  Proof.
+    intro Hne.
+    destruct (exists_last Hne) as [init [x Hl]]. subst l.
+    exists (sighash_fold acc init), x.
+    rewrite sighash_fold_app. reflexivity.
+  Qed.
+
+  (** A type tag is OUTSIDE [H_sighash]'s range — no two field values
+      hash to it.  The four reserved tags (0x01..0x04) are tiny constants
+      and the hash output is ~uniform over [Felt], so a field-list folding
+      to a tag is a ~2^-252 event; we model "never" as a LOCAL hypothesis,
+      exactly as the [injective_N] collision-resistance premises model
+      "no findable collision".  Concretely this is *preimage*-style: an
+      attacker cannot find fields whose fold equals a reserved tag. *)
+  Definition not_a_sighash_output (t : Felt) : Prop :=
+    forall a b, H_sighash a b <> t.
+
+  (** ** FULL cross-circuit replay resistance (any field lengths).
+
+      The same-length corollary above needed equal lengths; the deployed
+      circuits' sighashes have DIFFERENT lengths.  Under the additional
+      domain-separation hypothesis that the two type tags are outside
+      [H_sighash]'s range, distinct tags give distinct sighashes for ANY
+      field-list lengths — so a WOTS signature for one circuit-type can
+      never validate another's, regardless of shape.  This is the honest
+      completion of the same-length result: the cross-length distinctness
+      rests on tag PREIMAGE-resistance ([not_a_sighash_output]), now made
+      an explicit, discharged hypothesis rather than hand-waved. *)
+  Theorem type_tag_separates
+      (Hinj : injective_2 H_sighash) :
+    forall (tag1 tag2 : Felt) (xs ys : list Felt),
+      tag1 <> tag2 ->
+      not_a_sighash_output tag1 ->
+      not_a_sighash_output tag2 ->
+      sighash_fold tag1 xs <> sighash_fold tag2 ys.
+  Proof.
+    intros tag1 tag2 xs ys Htag Ht1 Ht2 Heq.
+    assert (Htri : length xs < length ys \/ length xs = length ys
+                   \/ length ys < length xs) by lia.
+    destruct Htri as [Hlt | [Heqlen | Hgt]].
+    - (* |xs| < |ys|: peel a non-empty prefix off ys; tag1 = fold tag2 prefix,
+         an H_sighash output, contradicting [not_a_sighash_output tag1]. *)
+      set (k := length ys - length xs).
+      assert (Hys : ys = firstn k ys ++ skipn k ys) by (symmetry; apply firstn_skipn).
+      assert (Hslen : length (skipn k ys) = length xs)
+        by (rewrite length_skipn; unfold k; lia).
+      assert (Hpne : firstn k ys <> nil).
+      { intro Hn. assert (length (firstn k ys) = 0) by (rewrite Hn; reflexivity).
+        rewrite length_firstn in *. unfold k in *. lia. }
+      rewrite Hys, sighash_fold_app in Heq.
+      destruct (sighash_fold_injective Hinj xs (skipn k ys) tag1
+                  (sighash_fold tag2 (firstn k ys)) (eq_sym Hslen) Heq) as [Ht1eq _].
+      destruct (sighash_fold_nonempty_output tag2 (firstn k ys) Hpne) as [a [b Hab]].
+      apply (Ht1 a b). rewrite <- Hab, <- Ht1eq. reflexivity.
+    - (* equal lengths: tag distinctness directly. *)
+      destruct (sighash_fold_injective Hinj xs ys tag1 tag2 Heqlen Heq) as [Hteq _].
+      exact (Htag Hteq).
+    - (* |ys| < |xs|: symmetric, contradicting [not_a_sighash_output tag2]. *)
+      set (k := length xs - length ys).
+      assert (Hxs : xs = firstn k xs ++ skipn k xs) by (symmetry; apply firstn_skipn).
+      assert (Hslen : length (skipn k xs) = length ys)
+        by (rewrite length_skipn; unfold k; lia).
+      assert (Hpne : firstn k xs <> nil).
+      { intro Hn. assert (length (firstn k xs) = 0) by (rewrite Hn; reflexivity).
+        rewrite length_firstn in *. unfold k in *. lia. }
+      rewrite Hxs, sighash_fold_app in Heq.
+      destruct (sighash_fold_injective Hinj (skipn k xs) ys
+                  (sighash_fold tag1 (firstn k xs)) tag2 Hslen Heq) as [Ht2eq _].
+      destruct (sighash_fold_nonempty_output tag1 (firstn k xs) Hpne) as [a [b Hab]].
+      apply (Ht2 a b). rewrite <- Hab, Ht2eq. reflexivity.
   Qed.
 
   (** ** Cross-circuit replay resistance
