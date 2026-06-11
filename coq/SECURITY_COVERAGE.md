@@ -209,6 +209,29 @@ audit").
   fixed leaf verifies only for the *originally signed* message.  The
   single-use safety is the contrapositive of the documented reuse hazard;
   the only crypto assumption is chain-hash preimage resistance (explicit).
+- **OPERATIONAL PRECONDITION — XMSS stateful signing (security-critical,
+  surfaced honestly).**  The unforgeability above is PER LEAF, and it is
+  the *single-use* half only.  XMSS is a STATEFUL scheme: security requires
+  each one-time auth leaf (`key_idx`) be used AT MOST ONCE.  This is NOT
+  enforced on-chain, and there is a genuine design TENSION behind why.
+  The auth `key_idx` is a PRIVATE witness — verified this audit: shield's
+  public-output array omits it entirely, and transfer/unshield carry it
+  only inside the witness struct (`auth_index_list`), never in the public
+  outputs — kept private precisely so a spend does not reveal WHICH
+  auth-tree leaf it used (spend unlinkability).  But that privacy is
+  exactly why the kernel CANNOT track leaf usage: it sees only per-note
+  nullifiers — which stop the SAME note being spent twice but say nothing
+  about the leaf — so two DIFFERENT notes signed under the SAME leaf pass
+  every on-chain check.  And the note's `owner_tag` binds the auth-tree
+  ROOT, not a leaf, so the circuit pins no note to a leaf either.  Hence
+  leaf-reuse prevention rests ENTIRELY on the wallet being a correct
+  stateful signer (monotone leaf counter, never reused); a wallet that
+  reuses a leaf leaks chain preimages and enables forgery → theft.  The
+  proofs own the single-use half; the never-reuse half is operational —
+  and unavoidably so, given that unlinkability requires the leaf index be
+  private.  (Config-admin WOTS keys avoid this differently: each config
+  type uses a fixed DEDICATED `key_idx`, so there is one signature per
+  leaf by construction — see the governance section.)
 
 ## Note integrity: commitment binds its fields
 
