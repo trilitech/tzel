@@ -454,16 +454,31 @@ rests on three independent mechanisms, not on trust:
    TREE_DEPTH=48 levels) is ALSO pinned, and unlike the auth-walk this is
    a STRONG structural conformance: the port's Tzel.Merkle.root_from_path
    is a pre-existing independent oracle (validated Coq<->port in the
-   differential), not a transcription.  FINDING (caught by this conformance work): the OCaml port's
-   Transaction.shield_sighash had silently OMITTED the multiasset asset
-   fields (asset_new, asset_producer) that the Cairo circuit, the Rust
-   kernel (core::shield_sighash), and the Coq spec (phi_shield_sighash)
-   all bind.  Dead code (no callers) so no production impact, but a real
-   faithfulness gap the function differential never caught (it tests only
-   the sighash_fold STEP, not the full shield_sighash).  Fixed the port
-   and added test_shield_sighash_field_set_conforms_to_port, the
-   regression guard that would have caught it.  Sixteen conformance tests
-   total.  The relation-level full-witness conformance remains.  The remaining primitives and the relation-level full-witness
+   differential), not a transcription.  FINDING (caught by this conformance work — SYSTEMIC, all three flows):
+   the OCaml port (documented tez-only, note.ml) carries per-flow sighash
+   helpers whose field lists were NOT updated at the multiasset change,
+   while the deployed Cairo circuit, the Rust kernel (core::*_sighash),
+   and the Coq spec all were.  Concretely the port omits:
+   shield -> asset_new, asset_producer;
+   unshield -> asset_pub AND the 2nd change slot (cm_change_2, mh_change_2);
+   transfer -> the 4th commitment+memo slot (cm_4, mh_4).
+   The Cairo/Rust fold these EVEN FOR TEZ (as zero/tez), so the port's
+   sighashes diverge from the circuit even within the port's tez scope —
+   the OCaml port cannot produce a sighash the deployed circuit would
+   accept.  Severity is LOW/latent, stated honestly: the OCaml stack
+   (port + ocaml/services/ledger.ml) is self-consistent in the old format
+   and never verifies against the circuit (the cross-impl interop checks
+   ledger ACCOUNTING, not sighashes), and the production apps are Rust.
+   The function differential never caught it because it tests only the
+   sighash_fold STEP, not the assembled per-flow sighash.  Disposition:
+   shield_sighash was dead code (no callers) — fixed + pinned
+   (test_shield_sighash_field_set_conforms_to_port, the regression guard
+   that would have caught it).  unshield/transfer_sighash are USED by the
+   tez-only reference ledger; bringing them to the multiasset preimage
+   (incl. their public-record types) ripples through that ledger and is
+   flagged here as a larger reference-update, deliberately NOT done as a
+   drive-by.  Sixteen conformance tests total.  The relation-level
+   full-witness conformance remains.  The remaining primitives and the relation-level full-witness
    conformance follow this pattern and are forthcoming; until they land
    the Cairo's tie to the model is established for them by mechanisms 1
    and 3 (SHA-pinned drift + the assertion cross-check).
