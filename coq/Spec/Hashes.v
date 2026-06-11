@@ -390,9 +390,19 @@ End SighashFold.
     the same note at the same position always produces the same
     nullifier (double-spend detection) but spending different notes
     or the same note at different positions produces distinct
-    nullifiers (privacy).  The asset is bound through [cm] (which
-    appears in the inner hash) — there is no separate "asset
-    nullifier" because the same note cannot have two assets.
+    nullifiers.  NB (precision, per this file's integrity-vs-privacy
+    discipline): that "distinct (note, position) ⇒ distinct nullifier"
+    property is a SOUNDNESS guarantee — it is what stops one spend from
+    marking a DIFFERENT note spent (no-false-freeze / faerie-gold), and
+    it is proved deterministically as [batch_nullifier_set_faithful] /
+    [desc_nf_injective] below.  It is NOT a privacy property; the
+    nullifier's privacy (that the published value hides [nk_spend] and
+    [cm]) is a SEPARATE, probabilistic guarantee resting on the hash
+    being hiding — out of this deterministic model's scope (see
+    SECURITY_COVERAGE.md's integrity-vs-privacy scope note).  The asset
+    is bound through [cm] (which appears in the inner hash) — there is no
+    separate "asset nullifier" because the same note cannot have two
+    assets.
 
     Source: spec.md "Commitments and nullifiers". *)
 
