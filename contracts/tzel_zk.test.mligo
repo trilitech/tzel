@@ -29,25 +29,34 @@ let test_originate_storage =
   let () = assert (st.root = 0x00) in
   Test.println "test_originate_storage: PASS"
 
-(* ── test 2: %shield reaches the gateway view (fails: view unavailable) ──── *)
+(* A 32-byte tree-roots blob and a one-felt preimage: enough for the binding to
+   reach the FIRST gateway call (blake2s, inside the OutHash derivation), which
+   fails as "blake2s view unavailable" in the Test framework. *)
+let tree_roots32 : bytes =
+  0x0000000000000000000000000000000000000000000000000000000000000000
+let preimage1 : bytes list =
+  [ 0x0000000000000000000000000000000000000000000000000000000000000001 ]
+
+(* ── test 2: %shield reaches the gateway (OutHash binding -> blake2s) ─────── *)
 let test_shield_reaches_gateway =
   let orig = Test.originate (contract_of TzEL) base_storage 0tez in
   let c = Test.to_contract orig.addr in
   let param : TzEL.shield_param =
-    { proof = 0x ; publics = ([] : bytes list) ; old_root = 0x00 ; new_root = 0x01 } in
+    { proof = 0x ; tree_roots = tree_roots32 ;
+      output_preimage = preimage1 ; old_root = 0x00 } in
   let result = Test.transfer_to_contract c (Shield param) 0tez in
   let () = match result with
     | Success _ -> failwith "expected gateway view unavailable in Test"
     | Fail _ -> unit in
   Test.println "test_shield_reaches_gateway: PASS"
 
-(* ── test 3: %transfer reaches the gateway view ──────────────────────────── *)
+(* ── test 3: %transfer reaches the gateway ───────────────────────────────── *)
 let test_transfer_reaches_gateway =
   let orig = Test.originate (contract_of TzEL) base_storage 0tez in
   let c = Test.to_contract orig.addr in
   let param : TzEL.transfer_param =
-    { proof = 0x ; publics = ([] : bytes list) ;
-      nullifier_preimage = 0xc0ffee ; old_root = 0x00 ; new_root = 0x01 } in
+    { proof = 0x ; tree_roots = tree_roots32 ;
+      output_preimage = preimage1 ; old_root = 0x00 } in
   let result = Test.transfer_to_contract c (Transfer param) 0tez in
   let () = match result with
     | Success _ -> failwith "expected gateway view unavailable in Test"

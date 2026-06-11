@@ -12,7 +12,7 @@ module O = OutHash
 (* ── blake2s seam fixtures (preimage -> blake2s-256 digest, 32 LE bytes) ──
    Computed off-chain by the Rust reference / hashlib.blake2s. In production
    these are replaced by the Layer-1 BLAKE2S instruction. *)
-let blake_table : O.blake_table =
+let blake_table : blake_table =
   Map.literal [
     (* SHIELD leaf — STAGE 1a inner felt-encode blake *)
     ( 0x0000000001000000000000000b0000001dfab1831024cecad39a93b8fad1562a52bbe62a6bf4a82cbfeb39dadfd5ecf3000000000800000000000000400d030000000000a086010000000000010000007092da85d8b8262d1c667bccaeb7bd034314904cf15f62048af62cddca31a91019aa5b834766c10d2d33aef61562729dbc2c6902912c14e142824e6127b88ca14f6e4c80aee0d7f44eb9c9a12e98fe2bc7ecabbb4074edb685f79572ec13a28e0000000005c000000000000005c10000
@@ -37,7 +37,10 @@ let blake_table : O.blake_table =
     , 0x0b0a1e4f0693fc89fb1708022f665915200d581b2ca340a859fc07269f31397b )
   ]
 
-let b2s = O.blake2s blake_table
+(* The OutHash chain is now parametrized over `h : bytes -> bytes`; for the
+   golden vectors we close over the fixed preimage->digest table. *)
+let src : blake_src = Table blake_table
+let b2s = blake2s src
 
 (* ── golden inputs ──────────────────────────────────────────────────── *)
 
@@ -71,7 +74,7 @@ let assert_lanes (label : string) (got : nat list) (want : nat list) : unit =
 
 (* STAGE 1 end-to-end: leaf_junction shield output_preimage -> 8 leaf lanes. *)
 let test_stage1_leaf_junction_shield =
-  let got = O.compute_output_hash_values blake_table shield_felts in
+  let got = O.compute_output_hash_values src shield_felts in
   let want : nat list =
     [978423824n;1296894678n;337981983n;1090493975n;
      1318990943n;34913325n;2019415546n;380174573n] in
@@ -94,7 +97,7 @@ let test_stage2_mv_out_hash =
   let lanes : nat list =
     [802081382n;416909726n;1859869728n;63892159n;
      106802067n;1890177931n;1827850667n;1829696004n] in
-  let got = O.compute_expected_out_hash_mv blake_table root lanes in
+  let got = O.compute_expected_out_hash_mv src root lanes in
   let want : nat list =
     [440499038n;323128790n;518444590n;444371365n;
      603497046n;1594598412n;638277005n;1938560081n] in
@@ -111,7 +114,7 @@ let test_stage2_mv_fold =
   let rov : nat list =
     [1405712821n;543965878n;942313946n;142366770n;
      1542713610n;901705420n;1935673009n;587138056n] in
-  let got = O.compute_mv_output_values blake_table lroot lov lroot rov in
+  let got = O.compute_mv_output_values src lroot lov lroot rov in
   let want : nat list =
     [802081382n;416909726n;1859869728n;63892159n;
      106802067n;1890177931n;1827850667n;1829696004n] in
@@ -129,14 +132,14 @@ let test_leaf_mode_full =
     0x0000000000000000000000000000000000000000000000000000000000000064
   ] in
   (* STAGE 1 *)
-  let leaf = O.compute_output_hash_values blake_table felts in
+  let leaf = O.compute_output_hash_values src felts in
   let want_leaf : nat list =
     [1582265401n;1538535622n;2135620025n;1601248341n;
      1791917009n;204480096n;808409381n;1431869092n] in
   let () = assert_lanes "LEAF-MODE stage1 output_hash" leaf want_leaf in
   (* STAGE 2 leaf mode (appends U_VALUE) *)
   let root = 0xae20985c63c835435d346b78c87f8d61d8afe270ba30ab3e906f21456dc5e433 in
-  let got = O.compute_expected_out_hash blake_table root leaf in
+  let got = O.compute_expected_out_hash src root leaf in
   let want : nat list =
     [1327368715n;167547655n;34084859n;358180399n;
      458755360n;675324717n;638057561n;2067345823n] in

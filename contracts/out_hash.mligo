@@ -14,6 +14,33 @@
    logic — the actual empirical unknown of decision 2 — is validated against
    the golden vectors. Everything except the blake call is real LIGO. *)
 
+(* ── BLAKE2S-256 primitive, parametrized over a DATA source ─────────────
+   Top-level (not inside the module) so the constructors are usable unqualified
+   by files that `#include` this one. The OutHash chain takes a `blake_src` —
+   plain DATA, not a `bytes -> bytes` closure: Michelson lambdas cannot capture
+   a big_map, so a closure is rejected in a contract that holds the nullifier
+   set.
+     - `Gateway addr`: PRODUCTION — runtime BLAKE2S-256 via the gateway view
+       (empty 8-byte perso = standard BLAKE2S).
+     - `Table map`: golden-vector TESTS — a fixed preimage->digest map, which
+       isolates the M31/QM31 packing (the real derisk) from the hash. *)
+type blake_table = (bytes, bytes) map
+type blake_src =
+  | Gateway of address
+  | Table of blake_table
+
+let blake2s (src : blake_src) (input : bytes) : bytes =
+  match src with
+  | Table table -> (
+      match Map.find_opt input table with
+      | Some d -> d
+      | None -> (failwith "BLAKE2S table: unknown preimage" : bytes))
+  | Gateway gateway ->
+      let body = Bytes.concat 0x00000000 input in
+      (match (Tezos.call_view "zk" ("blake2s", body) gateway : bytes option) with
+       | Some d -> d
+       | None -> (failwith "TzEL: blake2s view unavailable" : bytes))
+
 module OutHash = struct
 
   (* ── field/word constants ─────────────────────────────────────────── *)
@@ -44,22 +71,8 @@ module OutHash = struct
            0x08000000000000110000000000000000
            0x00000000000000000000000000000001)
 
-  (* ── BLAKE2S SEAM (Layer-1 primitive `BLAKE2S :: bytes -> bytes`) ─────
-     STUB. LIGO/Michelson has BLAKE2B but no BLAKE2S today. The real deploy
-     replaces this body with the enshrined BLAKE2S instruction. For the
-     prototype we resolve the few preimages that appear in the golden-vector
-     tests to their known blake2s-256 digests (computed off-chain by the
-     reference). This isolates the derisk to the M31/QM31 packing around the
-     hash — which IS real LIGO below. *)
-  type blake_table = (bytes, bytes) map
-
-  let blake2s (table : blake_table) (input : bytes) : bytes =
-    match Map.find_opt input table with
-    | Some d -> d
-    | None ->
-        (* In production this is the BLAKE2S runtime instruction. The stub
-           must never be asked for an unknown preimage in the prototype. *)
-        (failwith "BLAKE2S seam: unknown preimage (replace with runtime BLAKE2S)" : bytes)
+  (* blake_src / blake2s are defined at top level (above) so the variant
+     constructors are usable unqualified by includers. *)
 
   (* ── byte/word helpers (all real LIGO) ───────────────────────────────
      `bytes n` (nat->bytes) and `nat b` (bytes->nat) are BIG-ENDIAN and
@@ -178,18 +191,18 @@ module OutHash = struct
     in go ([] : nat list) 7
 
   (* blake_m31(data) = reduce_to_m31(blake2s256(data)) -> 8 lanes. *)
-  let blake_m31 (table : blake_table) (data : bytes) : nat list =
-    digest_to_m31_lanes (blake2s table data)
+  let blake_m31 (src : blake_src) (data : bytes) : nat list =
+    digest_to_m31_lanes (blake2s src data)
 
   (* STAGE 1 end-to-end: output_preimage (felts as 32-byte BE) -> 8 M31 lanes.
      = compute_output_hash_values / compute_leaf_output_lanes. *)
-  let compute_output_hash_values (table : blake_table) (felts : bytes list) : nat list =
+  let compute_output_hash_values (src : blake_src) (felts : bytes list) : nat list =
     let inner_stream = encode_felts_le_stream felts in
-    let inner_digest = blake2s table inner_stream in        (* STAGE 1a blake *)
+    let inner_digest = blake2s src inner_stream in          (* STAGE 1a blake *)
     let felt = digest_le_to_felt inner_digest in            (* pack_256_le_to_felt *)
     let limbs = felt_to_28_limbs felt in                    (* STAGE 1b *)
     let outer_stream = lanes_to_le_stream limbs in          (* pack -> LE lanes *)
-    blake_m31 table outer_stream                            (* STAGE 1c blake_qm31 *)
+    blake_m31 src outer_stream                              (* STAGE 1c blake_qm31 *)
 
   (* ── STAGE 2: the wrap OutHash (snark.rs) ─────────────────────────────
      compute_expected_out_hash_mv: blake_m31( root32 || 8 lanes as LE u32 ).
@@ -199,29 +212,29 @@ module OutHash = struct
 
   (* mv mode: root (32 raw bytes) || 2 output QM31s (8 lanes) -> OutHash. *)
   let compute_expected_out_hash_mv
-      (table : blake_table) (root32 : bytes) (output_lanes : nat list) : nat list =
+      (src : blake_src) (root32 : bytes) (output_lanes : nat list) : nat list =
     let preimage = Bytes.concat root32 (lanes_to_le_stream output_lanes) in
-    blake_m31 table preimage
+    blake_m31 src preimage
 
   (* leaf mode: root || output_hash(8 lanes) || U_VALUE -> OutHash. *)
   let compute_expected_out_hash
-      (table : blake_table) (root32 : bytes) (output_lanes : nat list) : nat list =
+      (src : blake_src) (root32 : bytes) (output_lanes : nat list) : nat list =
     let preimage =
       Bytes.concat root32
         (Bytes.concat (lanes_to_le_stream output_lanes)
                       (lanes_to_le_stream u_value_lanes)) in
-    blake_m31 table preimage
+    blake_m31 src preimage
 
   (* one mv tree fold: parent.output = blake_m31(rootL||ovL||rootR||ovR),
      each as 8 LE u32 lanes (snark.rs compute_mv_output_values). *)
   let compute_mv_output_values
-      (table : blake_table)
+      (src : blake_src)
       (left_root : nat list) (left_ov : nat list)
       (right_root : nat list) (right_ov : nat list) : nat list =
     let s =
       Bytes.concat
         (Bytes.concat (lanes_to_le_stream left_root) (lanes_to_le_stream left_ov))
         (Bytes.concat (lanes_to_le_stream right_root) (lanes_to_le_stream right_ov)) in
-    blake_m31 table s
+    blake_m31 src s
 
 end

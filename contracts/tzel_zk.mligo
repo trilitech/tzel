@@ -1,23 +1,32 @@
-(* TzEL on Tezos X — shielded-pool contract that verifies operations by
-   calling the `zk` runtime THROUGH the enshrined cross-runtime gateway, and
-   keeps the pool bookkeeping (commitment-tree root + nullifier set) on-chain.
+(* TzEL on Tezos X — shielded-pool contract that verifies operations by calling
+   the `zk` runtime THROUGH the enshrined cross-runtime gateway, and keeps the
+   pool bookkeeping (commitment-tree root + nullifier set) on-chain.
 
-   The zk runtime exposes two privacy primitives as *synchronous* gateway
-   views — `Tezos.call_view "zk" (path, body) gateway : bytes option`:
+   The zk runtime exposes two privacy primitives as *synchronous* gateway views
+   — `Tezos.call_view "zk" (path, body) gateway : bytes option`:
 
-     - ("verify_snark", body) -> Some 0x01  iff the Groth16 wrap proof is valid
-                                  None       on a rejected/malformed proof
+     - ("verify_snark", body) -> Some 0x01 iff the Groth16 wrap proof is valid
      - ("blake2s", body)      -> Some digest (personalized BLAKE2S-256)
 
-   Wire framing (matches tezosx-zk-runtime), all length fields u32 big-endian:
+   ## The OutHash binding (the security core)
 
-     verify_snark : vkLen|vk  proofLen|proof  nPublics  (scLen|scalar)*nPublics
-     blake2s      : persoLen|perso  data
+   A proof attests a set of PUBLIC INPUTS: the 4 STARK tree roots (the circuit's
+   internal commitments) and an OutHash. The OutHash is a hash of the operation's
+   `output_preimage` (the bootloader output: new tree root, nullifier, amounts…).
 
-   For the wrap circuit these lengths are FIXED, so they are byte constants —
-   no on-chain u32 encoding is needed. The application semantics (what the
-   proof attests, replay protection, the tree transition) live HERE, in the
-   contract; the runtime only offers the generic primitives. *)
+   The contract does NOT trust a supplied OutHash. It DERIVES it from the declared
+   `output_preimage` using the real BLAKE2S primitive (the gateway view), builds
+   the wrap public inputs from (tree_roots, derived OutHash), and verifies the
+   proof against THOSE. So a valid proof cannot be replayed with a different
+   output: any change to `output_preimage` changes the derived OutHash and the
+   proof no longer verifies. The effects the contract then applies (new_root,
+   nullifier) are READ FROM the bound `output_preimage`, so they too are attested.
+
+   The OutHash derivation chain is `out_hash.mligo`, parametrized over the hash
+   function; here it runs on the gateway BLAKE2S (~3-5 synchronous view calls). *)
+
+#include "out_hash.mligo"
+module O = OutHash
 
 type storage = {
   gateway    : address ;                 (* enshrined gateway KT1<MERG> *)
@@ -27,26 +36,59 @@ type storage = {
 }
 
 (* ── fixed wire constants (wrap circuit shape) ───────────────────────────── *)
-let empty_bytes  : bytes = 0x
-let vk_len_be    : bytes = 0x000025d0   (* 9680 = len(vk)            *)
-let proof_len_be : bytes = 0x00000184   (* 388  = len(Groth16 proof) *)
-let n_publics_be : bytes = 0x00000088   (* 136  = #public scalars    *)
-let scalar_len_be: bytes = 0x00000020   (* 32   = bytes per scalar   *)
-let perso_len_0  : bytes = 0x00000000
-let perso_len_8  : bytes = 0x00000008
-let valid_byte   : bytes = 0x01
+let empty_bytes   : bytes = 0x
+let vk_len_be     : bytes = 0x000025d0   (* 9680 = len(vk)            *)
+let proof_len_be  : bytes = 0x00000184   (* 388  = len(Groth16 proof) *)
+let n_publics_be  : bytes = 0x00000088   (* 136  = 128 root bytes + 8 lanes *)
+let scalar_len_be : bytes = 0x00000020   (* 32   = bytes per scalar   *)
+let perso_len_0   : bytes = 0x00000000   (* empty perso = standard BLAKE2S *)
+let valid_byte    : bytes = 0x01
+let tree_roots_len : nat  = 128n         (* 4 roots x 32 bytes *)
 
-(* ── gateway primitive calls ─────────────────────────────────────────────── *)
+(* output_preimage felt indices of the effects (per circuit bootloader output).
+   PLACEHOLDER — must be pinned to the released TzEL circuit's output layout.
+   The binding (proof <-> output_preimage) is exact regardless; only WHICH felt
+   holds new_root / nullifier depends on the circuit spec. *)
+let new_root_idx  : nat = 0n
+let nullifier_idx : nat = 1n
 
-(* Length-prefix one 32-byte public scalar and append it. *)
-let frame_scalar ((acc, scalar) : bytes * bytes) : bytes =
-  Bytes.concat acc (Bytes.concat scalar_len_be scalar)
+(* The OutHash chain runs on the runtime BLAKE2S-256 reached through the
+   gateway: `Gateway s.gateway` (see out_hash.mligo `blake2s`). *)
 
-(* Verify the wrap proof against `vk` and `publics`; revert unless valid.
-   A `None` (4xx from the runtime) or a non-0x01 body aborts the operation —
-   the security property a shielded pool needs. *)
-let verify_snark (s : storage) (proof : bytes) (publics : bytes list) : unit =
-  let framed = List.fold_left frame_scalar empty_bytes publics in
+(* ── public-input framing ────────────────────────────────────────────────── *)
+
+(* Frame the 128 tree-root bytes as 128 length-prefixed 32-byte scalars (each
+   byte b becomes the field element b, big-endian, in gnark declaration order). *)
+let frame_root_bytes (tree_roots : bytes) : bytes =
+  let rec go (acc : bytes) (i : nat) : bytes =
+    if i = tree_roots_len then acc
+    else
+      let scalar = O.pad_left 32n (Bytes.sub i 1n tree_roots) in
+      go (Bytes.concat acc (Bytes.concat scalar_len_be scalar)) (i + 1n)
+  in go empty_bytes 0n
+
+(* Frame the 8 OutHash lanes as length-prefixed 32-byte scalars. *)
+let frame_lanes (lanes : nat list) : bytes =
+  List.fold_left
+    (fun ((acc, l) : bytes * nat) ->
+       let scalar = O.pad_left 32n (bytes l) in
+       Bytes.concat acc (Bytes.concat scalar_len_be scalar))
+    empty_bytes lanes
+
+(* ── the binding: derive the publics from the declared output, verify ──────── *)
+
+(* Verify the wrap proof against public inputs DERIVED from (tree_roots,
+   output_preimage). Reverts unless the proof is valid for those publics — which
+   binds it to this exact output_preimage (the OutHash is recomputed here, not
+   trusted). *)
+let verify_bound
+    (s : storage) (proof : bytes)
+    (tree_roots : bytes) (output_preimage : bytes list) : unit =
+  let src = Gateway s.gateway in
+  let root0 = Bytes.sub 0n 32n tree_roots in
+  let output_lanes = O.compute_output_hash_values src output_preimage in
+  let outhash_lanes = O.compute_expected_out_hash src root0 output_lanes in
+  let framed = Bytes.concat (frame_root_bytes tree_roots) (frame_lanes outhash_lanes) in
   let body =
     Bytes.concat (Bytes.concat vk_len_be s.vk)
       (Bytes.concat (Bytes.concat proof_len_be proof)
@@ -55,76 +97,79 @@ let verify_snark (s : storage) (proof : bytes) (publics : bytes list) : unit =
   | Some r -> if r = valid_byte then unit else failwith "TzEL: proof rejected"
   | None -> failwith "TzEL: verify_snark view unavailable"
 
-(* Personalized BLAKE2S-256 via the zk runtime (empty perso = standard). *)
-let blake2s (s : storage) (perso : bytes) (data : bytes) : bytes =
-  let plen = if Bytes.length perso = 0n then perso_len_0 else perso_len_8 in
-  let body = Bytes.concat (Bytes.concat plen perso) data in
-  match (Tezos.call_view "zk" ("blake2s", body) s.gateway : bytes option) with
-  | Some d -> d
-  | None -> (failwith "TzEL: blake2s view unavailable" : bytes)
+(* Read felt #idx (32-byte BE) from a bound output_preimage. *)
+let preimage_at (output_preimage : bytes list) (idx : nat) : bytes =
+  let (_, found) =
+    List.fold_left
+      (fun ((i, acc), felt : (nat * bytes option) * bytes) ->
+         if i = idx then (i + 1n, Some felt) else (i + 1n, acc))
+      (0n, (None : bytes option))
+      output_preimage in
+  match found with
+  | Some b -> b
+  | None -> (failwith "TzEL: output_preimage too short" : bytes)
 
 (* ── bookkeeping ─────────────────────────────────────────────────────────── *)
 
-(* The proof attests a transition from `old_root` to `new_root`; the contract
-   only advances if `old_root` is the pool's current root (replay/ordering). *)
 let advance_root (s : storage) (old_root : bytes) (new_root : bytes) : storage =
   if old_root <> s.root then failwith "TzEL: stale root"
   else { s with root = new_root }
 
-(* Spend a nullifier: reject double-spends, then record it. *)
 let spend (s : storage) (nullifier : bytes) : storage =
   if Big_map.mem nullifier s.nullifiers then failwith "TzEL: double spend"
   else { s with nullifiers = Big_map.add nullifier unit s.nullifiers }
 
 (* ── entrypoints ─────────────────────────────────────────────────────────── *)
 
-(* A shield adds a commitment: verify the proof, advance the tree root. *)
+(* A shield adds a commitment: verify the bound proof, advance the tree root to
+   the new root READ FROM the bound output_preimage. *)
 type shield_param = {
-  proof    : bytes ;
-  publics  : bytes list ;
-  old_root : bytes ;
-  new_root : bytes ;
+  proof           : bytes ;
+  tree_roots      : bytes ;        (* 128 bytes = 4 x 32 *)
+  output_preimage : bytes list ;   (* bootloader output felts (32-byte BE) *)
+  old_root        : bytes ;
 }
 
 [@entry]
 let shield (p : shield_param) (s : storage) : operation list * storage =
-  let () = verify_snark s p.proof p.publics in
-  let s = advance_root s p.old_root p.new_root in
+  let () = verify_bound s p.proof p.tree_roots p.output_preimage in
+  let new_root = preimage_at p.output_preimage new_root_idx in
+  let s = advance_root s p.old_root new_root in
   ([] : operation list), s
 
-(* A transfer spends one note and creates new ones: verify, derive the
-   nullifier on-chain via blake2s, reject double-spend, advance the root. *)
+(* A transfer spends one note (its nullifier is attested in the bound preimage)
+   and advances the root. *)
 type transfer_param = {
-  proof              : bytes ;
-  publics            : bytes list ;
-  nullifier_preimage : bytes ;
-  old_root           : bytes ;
-  new_root           : bytes ;
+  proof           : bytes ;
+  tree_roots      : bytes ;
+  output_preimage : bytes list ;
+  old_root        : bytes ;
 }
 
 [@entry]
 let transfer (p : transfer_param) (s : storage) : operation list * storage =
-  let () = verify_snark s p.proof p.publics in
-  let nullifier = blake2s s empty_bytes p.nullifier_preimage in
+  let () = verify_bound s p.proof p.tree_roots p.output_preimage in
+  let nullifier = preimage_at p.output_preimage nullifier_idx in
+  let new_root = preimage_at p.output_preimage new_root_idx in
   let s = spend s nullifier in
-  let s = advance_root s p.old_root p.new_root in
+  let s = advance_root s p.old_root new_root in
   ([] : operation list), s
 
 (* An unshield spends a note and exits value. The outbound transfer/ticket is
-   omitted in this first version (it is orthogonal to the zk integration);
-   verification, nullifier and root bookkeeping are identical to transfer. *)
+   omitted in this version (orthogonal to the zk binding); verification,
+   nullifier and root bookkeeping are identical to transfer. *)
 type unshield_param = {
-  proof              : bytes ;
-  publics            : bytes list ;
-  nullifier_preimage : bytes ;
-  old_root           : bytes ;
-  new_root           : bytes ;
+  proof           : bytes ;
+  tree_roots      : bytes ;
+  output_preimage : bytes list ;
+  old_root        : bytes ;
 }
 
 [@entry]
 let unshield (p : unshield_param) (s : storage) : operation list * storage =
-  let () = verify_snark s p.proof p.publics in
-  let nullifier = blake2s s empty_bytes p.nullifier_preimage in
+  let () = verify_bound s p.proof p.tree_roots p.output_preimage in
+  let nullifier = preimage_at p.output_preimage nullifier_idx in
+  let new_root = preimage_at p.output_preimage new_root_idx in
   let s = spend s nullifier in
-  let s = advance_root s p.old_root p.new_root in
+  let s = advance_root s p.old_root new_root in
   ([] : operation list), s
