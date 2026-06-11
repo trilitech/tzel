@@ -556,7 +556,18 @@ rests on three independent mechanisms, not on trust:
    (incl. their public-record types) ripples through that ledger and is
    flagged here as a larger reference-update, deliberately NOT done as a
    drive-by.  Sixteen conformance tests total.  The relation-level
-   full-witness conformance remains.  The remaining primitives and the relation-level full-witness
+   full-witness conformance remains.
+   SCOPE VERIFIED (this audit, by reading the Coq relations — not just
+   asserted): the divergence is PORT-ONLY.  `Impl.Transfer` models all
+   FOUR output slots (recipient, change_1, change_2, producer-fee) with
+   the producer pinned to tez and the others gated to `{tez, primary}`;
+   `Impl.Unshield` models BOTH change slots plus the public exit
+   `(asset_pub, v_pub)` with the load-bearing `Hgate_exit`
+   (`asset_pub ∈ {tez, primary}`) — the exact bug-#1 guard whose absence
+   would let a tez-only prover mint an FA2 exit.  So the multiasset
+   slot/asset structure that the port's sighashes dropped IS present and
+   conserved in the Coq spec as well as the Cairo circuit and Rust
+   kernel; the OCaml reference is the sole laggard.  The remaining primitives and the relation-level full-witness
    conformance follow this pattern and are forthcoming; until they land
    the Cairo's tie to the model is established for them by mechanisms 1
    and 3 (SHA-pinned drift + the assertion cross-check).
