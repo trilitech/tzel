@@ -253,6 +253,18 @@ audit").
   `Spec.KernelDeposit.credit_requires_owning_ticketer` (only the
   registered ticketer can credit a pool),
   `unregistered_sender_rejected`.
+  KERNEL FIDELITY (cross-checked vs the Rust, line-level, this audit):
+  `parse_bridge_deposit` + `validate_bridge_deposit` in the kernel enforce
+  exactly this set, in order: ticket `creator == transfer.sender`
+  (the `d_creator = d_sender` anti-relay — a ticket minted by X cannot be
+  forwarded by Y), `token_id == 0`, metadata `== None`,
+  `asset_for_ticketer(registry, sender)` must resolve (the registered-
+  ticketer gate — and the multiasset part: any registered tez OR FA2
+  ticketer routes to its own asset pool), and a canonical
+  `deposit:<hex(pubkey_hash)>` recipient.  Plus an operational guard not
+  in the Coq model: deposits are rejected before the verifier (hence
+  `auth_domain`) is configured, so a depositor never burns an L1 ticket
+  against a pool key the kernel cannot recompute.  Found faithful.
 - **Routing bijection:** `Spec.AssetRegistry.fa2_routes_correctly` (a
   registered FA2 asset's deposit and withdrawal routes are mutual
   inverses), `deposit_withdraw_roundtrip` / `withdraw_deposit_roundtrip`.
