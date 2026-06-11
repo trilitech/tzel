@@ -286,7 +286,17 @@ audit").
   the `TZEL_ROLLUP_*_HEX` env vars" on every config message in that mode.
   So the unforgeability theorem is honest about its premise (a secret
   admin key); the deployment must provide one (release build + env
-  vars), not the dev fallback.
+  vars), not the dev fallback.  CONTAINMENT (verified by tracing the
+  derivation): the fallback is gated `cfg!(any(test, debug_assertions))`,
+  so a RELEASE build can never silently use the dev key — a release
+  build lacking the env vars fails SAFE (`compiled_config_admin_*`
+  returns `Err`, the config is rejected, no operations proceed) rather
+  than falling back.  The verifier-config and bridge-config admin leaves
+  are SEPARATE WOTS keys (distinct `TZEL_ROLLUP_VERIFIER_…` /
+  `…_BRIDGE_…_LEAF_HEX`, shared pub seed), each its own one-time key, so
+  the two authorities are separable and a verifier-config signature
+  cannot install a bridge config (different leaf AND config-specific
+  sighash).
 
 ## Master kernel safety (joint invariants, non-interference)
 
