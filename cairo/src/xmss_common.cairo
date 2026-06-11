@@ -161,6 +161,20 @@ mod tests {
         assert(leaf == 0x026299b3956f1f58658ecdbfe5c17c3cae3a4a4e970d8a448aebaf8fbde7f1e7, 'recover_pk model conformance');
     }
 
+    // Cross-impl conformance for the XMSS AUTH-TREE Merkle walk
+    // (xmss_verify_auth): leaf -> auth_root over AUTH_DEPTH=16 levels, with
+    // sibling order chosen by each key_idx bit. The node hash is pinned
+    // separately; this validates the WALK STRUCTURE (levels, node_idx=idx/2,
+    // idx&1 left/right order). The expected root was computed by an
+    // INDEPENDENT OCaml replication of the walk (port pack_adrs + hash4,
+    // tree tag), with key_idx=0xAAAA to exercise both branches. If the
+    // Cairo walk diverged, its internal `current == auth_root` assert fails.
+    #[test]
+    fn test_auth_tree_walk_conforms_to_model() {
+        let siblings = array![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        super::xmss_verify_auth(100, 0x05cf527b6c5ace2488a1c8cbb9b182076b684cfa31c1ca48a2e7972a932a9f28, 1, 0xAAAA_u32, siblings.span());
+    }
+
     use tzel::{blake_hash as hash, merkle};
     use super::{
         POW128, POW160, POW64, POW96, TAG_XMSS_LTREE, TAG_XMSS_TREE, WOTS_CHAINS, WOTS_W, pack_adrs,

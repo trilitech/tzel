@@ -444,9 +444,14 @@ rests on three independent mechanisms, not on trust:
    sighash_to_wots_digits), which is forgery-relevant and was NOT
    covered by the function differential.  Also pinned the WOTS+ pubkey RECOVERY (recover_pk, the in-circuit
    signature-verification core) via the pinned ltree: recover -> compress
-   -> leaf matched to the port.  Thirteen primitives/derivations total;
-   the full WOTS+/XMSS verification path (chain step, digit encoding,
-   recovery, L-tree, both tree tags) is now conformance-tested.  Only the
+   -> leaf matched to the port.  The XMSS auth-tree Merkle WALK (xmss_verify_auth) is also checked, but
+   with a WEAKER guarantee stated honestly: the port has no auth-tree
+   impl, so its OCaml reference was transcribed FROM the circuit — it
+   validates the node-hash composition over AUTH_DEPTH=16 levels and is a
+   regression guard, but is NOT an independent structural oracle (the
+   walk structure's spec-fidelity rests on the Coq model + cross-check +
+   the Cairo negative tests).  Fourteen conformance tests total; the full
+   WOTS+/XMSS verification path is covered at the primitive level.  The
    relation-level full-witness conformance remains.  The remaining primitives and the relation-level full-witness
    conformance follow this pattern and are forthcoming; until they land
    the Cairo's tie to the model is established for them by mechanisms 1

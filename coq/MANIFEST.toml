@@ -39,7 +39,7 @@ sha256 = "9b947d07ebd978f1985b7f9dba6dbe2acf24f061dc3826f2d09e300cd200d42f"
 [[mirror]]
 cairo  = "cairo/src/xmss_common.cairo"
 coq    = ["coq/Impl/Wots.v", "coq/Impl/Xmss.v"]
-sha256 = "6289e4fe562d2ed3f70a4cfbbb801c4328e9964866ce5713151027ca87af644a"
+sha256 = "ed844aa85c30c18d511318056b4deb8a06347e721dd0a946867dff09d7d7ff53"
 
 [[mirror]]
 cairo  = "cairo/src/transfer.cairo"
