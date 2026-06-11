@@ -1192,6 +1192,21 @@ nullifier/commitment binding.
   CairoInput / input_checks verbatim). You cannot spend someone else's
   note.
 
+- **NO DOUBLE-SPEND, witness-varying attacker
+  (`Impl/Transfer.v` `no_double_spend`):** the kernel rejects duplicate
+  nullifiers, so double-spend prevention reduces to "two spends of the
+  same note yield the same nullifier". The subtle attack is to re-spend
+  a note with a DIFFERENT nk_spend to dodge the dedup. Defeated: the
+  note's commitment binds H_nktag(nk_spend) via owner_tag, so
+  spend_authorized_by_owner forces both spends' nk_spend to share the
+  same nk-tag, and with H_nktag injective they are the SAME nk_spend;
+  the nullifier is a function of (nk_spend, cm, pos), so the spends
+  collide and the second is rejected. Theorem (zero admits): under
+  injective_5 H_commit / injective_3 H_owner / H_nktag injective, two
+  spends of a note with the same commitment and position produce the
+  same nullifier. No witness choice lets the owner spend a note twice.
+  Companion to [[spend_authorized_by_owner]] (theft resistance).
+
 ## Not done
 
 ### Cairo runner for differential check (next concrete piece)

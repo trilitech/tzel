@@ -664,4 +664,40 @@ Section TransferRelation.
     exact Hotag.
   Qed.
 
+  (** ** No double-spend, even against a witness-varying attacker
+
+      The kernel rejects a duplicate nullifier, so double-spend
+      prevention reduces to: two spends of the SAME note produce the
+      SAME nullifier.  The subtle attack is to re-spend a note with a
+      DIFFERENT [nk_spend], hoping for a different nullifier that the
+      dedup misses.  That is defeated here: the note's commitment binds
+      [H_nktag(nk_spend)] (via [owner_tag]), so [spend_authorized_by_owner]
+      forces both spends' [nk_spend] to share the same nk-tag, and with
+      [H_nktag] injective they must be the SAME [nk_spend].  The
+      nullifier is a function of [(nk_spend, cm, pos)], so the two
+      spends collide — the second is rejected.  No choice of witness
+      lets the owner spend a note twice. *)
+  Theorem no_double_spend :
+    Spec.Hashes.injective_5 H_commit -> Spec.Hashes.injective_3 H_owner ->
+    (forall x y, H_nktag x = H_nktag y -> x = y) ->
+    forall (c1 c2 : CairoInput) (d v asset rcm R ps nkt : Felt),
+      ci_cm c1 = H_commit d v asset rcm (H_owner R ps nkt) ->
+      ci_cm c2 = H_commit d v asset rcm (H_owner R ps nkt) ->
+      ci_pos c1 = ci_pos c2 ->
+      ci_nf c1 = Spec.Hashes.nullifier H_nf
+                   (ci_nk_spend c1) (ci_cm c1) (felt_of_nat (ci_pos c1)) ->
+      ci_nf c2 = Spec.Hashes.nullifier H_nf
+                   (ci_nk_spend c2) (ci_cm c2) (felt_of_nat (ci_pos c2)) ->
+      ci_nf c1 = ci_nf c2.
+  Proof.
+    intros Hcom Hown Hnktag c1 c2 d v asset rcm R ps nkt Hcm1 Hcm2 Hpos Hnf1 Hnf2.
+    destruct (spend_authorized_by_owner Hcom Hown c1 d v asset rcm R ps nkt Hcm1)
+      as (_ & _ & Ht1).
+    destruct (spend_authorized_by_owner Hcom Hown c2 d v asset rcm R ps nkt Hcm2)
+      as (_ & _ & Ht2).
+    assert (Hnk : ci_nk_spend c1 = ci_nk_spend c2)
+      by (apply Hnktag; rewrite Ht1, Ht2; reflexivity).
+    rewrite Hnf1, Hnf2, Hcm1, Hcm2, Hpos, Hnk. reflexivity.
+  Qed.
+
 End TransferRelation.
