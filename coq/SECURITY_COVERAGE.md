@@ -284,6 +284,19 @@ detect an unsatisfiable *relation*).  The relations are proven inhabited:
 All five rest on only `Felt` + `Felt_eq_dec` (Print Assumptions).  So
 the circuit-relation soundness theorems are load-bearing, not hollow.
 
+The implementation-grounding theorems are likewise clean (Print
+Assumptions, verified): the pure checksum arithmetic
+(`checksum_encoding_wellformed`, `base4_val_encode5`) is AXIOM-FREE; the
+WOTS+/XMSS/config unforgeability-for-the-real-format theorems
+(`wots_`/`xmss_`/`config_update_concrete_checksum`) rest on `Felt`
+alone — every collision-resistance / injectivity assumption they use
+(`node_injective`, the hash injectivities) appears as a universally
+quantified PREMISE, never a global axiom; `grand_conservation` and its
+three flow instances rest on `Felt` + `Felt_eq_dec`.  So nothing in the
+recent grounding work introduced a hidden axiom or `Admitted`: the whole
+theory's trusted base remains the two `Felt` parameters plus the
+explicitly-discharged local CR hypotheses.
+
 ## How faithfulness (model ↔ implementation) is established
 
 The Coq relations/state-machines are claimed to model the Cairo
