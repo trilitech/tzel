@@ -117,6 +117,15 @@ pub fn xmss_verify_auth(
 
 #[cfg(test)]
 mod tests {
+    // Cross-impl conformance for the WOTS+ chain-step primitive: the OCaml
+    // port computes xmss_chain_step(x=1, pub_seed=2, key_idx=0, chain_idx=0,
+    // step=0) = little-endian bytes 21abb4...0303; the Cairo must agree.
+    #[test]
+    fn test_chain_step_conforms_to_model() {
+        let r = super::xmss_chain_step(1, 2, 0_u32, 0_u32, 0_u32);
+        assert(r == 0x03031ab01c1e9ff18b8d4d1487e6813dd4a8d3b2bb10bab0bb07f30787b4ab21, 'chain_step model conformance');
+    }
+
     use tzel::{blake_hash as hash, merkle};
     use super::{
         POW128, POW160, POW64, POW96, TAG_XMSS_LTREE, TAG_XMSS_TREE, WOTS_CHAINS, WOTS_W, pack_adrs,
