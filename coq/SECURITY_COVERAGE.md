@@ -372,6 +372,24 @@ nothing in the recent grounding work introduced a hidden axiom or
 `Admitted`: the whole theory's trusted base remains the two `Felt`
 parameters plus the explicitly-discharged local CR hypotheses.
 
+A CLEAN STRUCTURAL SEPARATION falls out of a system-level Print
+Assumptions (verified): the ACCOUNTING / SOLVENCY layer depends on no
+cryptographic assumption at all.  `Spec.KernelSoundness.kernel_state_sound`
+(master kernel safety) and `Spec.BridgeTicketer.bridge_solvency` are
+AXIOM-FREE (pure nat accounting); `Spec.KernelLedger.no_inflation`,
+`Spec.EndToEndMulti.l1_collateral_equals_l2_claims`, and
+`grand_conservation` rest on `Felt` + `Felt_eq_dec` ALONE.  The
+collision-resistance / injectivity hypotheses appear ONLY in the
+circuit-binding theorems (theft, double-spend, asset-confusion,
+commitment / nullifier / sighash binding), always as local premises.
+So the ledger conservation, kernel state invariants, bridge
+collateralization, and L1<->L2 backing are UNCONDITIONAL — they need no
+hash assumption; cryptographic hardness is required only to BIND those
+accounting quantities to the actual notes and signatures the circuits
+manipulate.  An attacker who broke every hash could not violate the
+accounting invariants; they could only mis-bind a note to a value or
+owner — which is exactly what the CR-premised circuit theorems forbid.
+
 ## How faithfulness (model ↔ implementation) is established
 
 The Coq relations/state-machines are claimed to model the Cairo
