@@ -52,6 +52,20 @@ audit").
   tez total (pools + notes + burned + withdrawn) never exceeds tez
   deposited.  The `producer_fee <= ks_pool asset_tez` premise is the
   load-bearing "no unbacked tez" check, required and used.
+  KERNEL FIDELITY (cross-checked vs the Rust, line-level, this audit):
+  `prepare_durable_shield_commit` in `tezos/rollup-kernel/src/lib.rs`
+  implements exactly this two-pool structure — an FA2 shield
+  (`is_tez_shield == false`) debits `v_note + fee` from the
+  `(asset_id, pubkey_hash)` pool AND **separately** reads the
+  `(ASSET_TEZ, pubkey_hash)` pool, *rejects* if it is absent
+  ("non-tez shields require a tez pool to fund producer_fee") or if
+  `tez_balance < producer_fee`, then debits `producer_fee` from it — the
+  Rust mirror of the two Coq premises.  A tez shield collapses both into
+  one pool (`asset_required = asset_debit + producer_fee_tez_debit`).  It
+  also validates `asset_id` against the bridge registry
+  (`ticketer_for_asset` must exist) and rejects `client_cm` replays via a
+  durable marker — matching `KernelDeposit`'s registered-ticketer gate
+  and `ShieldReplay` respectively.  Found faithful, no discrepancy.
 
 ## u64 / u128 overflow safety
 
