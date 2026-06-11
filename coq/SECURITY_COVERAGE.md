@@ -389,3 +389,16 @@ condition) is covered by the assertion cross-check.
   `KernelNullifier`, …), not byte-for-byte against the durable-storage
   imperative code.  The faithfulness boundary (transcription, not
   extraction) is stated per-module.
+- **Michelson contract interaction-robustness `FAILWITH`s:** a fresh
+  cross-check of `fa2_bridge_ticketer.tz` confirms every
+  SECURITY-relevant guard is modelled (zero-amount mint → `bstep_mint`
+  `0<n`; burn `creator==SELF` / `token_id==0` / metadata-`None` →
+  `BridgeBurn`).  The remaining `FAILWITH`s are interaction-robustness
+  against OUT-OF-SCOPE contracts and are intentionally not modelled:
+  "must not attach tez" (line 83 — the contract is non-payable, a
+  no-stuck-tez guard orthogonal to the FA2 collateralization the bridge
+  state machine tracks); "FA2 %transfer entrypoint not found" (the FA2
+  contract); "invalid rollup contract" (the caller-chosen rollup
+  destination — and the kernel independently credits only registered
+  ticketers, `KernelDeposit.credit_requires_owning_ticketer`, so a
+  mis-sent ticket is never credited).
