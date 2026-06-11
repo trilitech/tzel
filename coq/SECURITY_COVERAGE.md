@@ -7,6 +7,24 @@ listed is zero-admit and depends only on the abstract field type
 are explicit local hypotheses (see `STATUS.md`, "comprehensive axiom
 audit").
 
+> **SCOPE — INTEGRITY, not PRIVACY (stated up front so this map is not
+> over-read).**  The mechanized model is *deterministic*, so it proves the
+> **integrity** half of `specs/security.md` — what an attacker cannot
+> STEAL, FORGE, INFLATE, DOUBLE-SPEND, or MISROUTE — and the structural
+> facts privacy builds on (domain separation between commit/nullifier/
+> sighash hashes; the nullifier is per-position; `rcm` is a distinct
+> committed slot).  It does **NOT** prove the **privacy** properties that
+> `security.md` also lists — *commitment hiding* (`rcm`-blinding),
+> *on-chain spend unlinkability*, *zero-knowledge*, and detection-tag /
+> memo confidentiality.  Those are inherently *probabilistic*: they rest
+> on the hashes being **hiding** (not merely collision-resistant), on
+> `rcm`/blinding entropy, on the STARK's zero-knowledge property, and on
+> ML-KEM — cryptographic assumptions a deterministic Coq model cannot
+> express, and all out of the engagement's scope (STARK system + vendor
+> crypto).  In short: this audit shows the privacy rollup is *sound*
+> (no one can cheat the ledger), NOT that it is *private* (no one can
+> learn your data) — the latter rests on the listed crypto assumptions.
+
 ## Balance conservation (no inflation)
 
 > "values are u64, arithmetic in u128, circuits enforce exact
