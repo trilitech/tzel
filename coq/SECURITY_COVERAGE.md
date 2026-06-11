@@ -449,6 +449,19 @@ covered by the inhabitation theorems above; what drift+differential
 cannot establish (the relation *Props* match the Cairo accept
 condition) is covered by the assertion cross-check.
 
+COMPLEMENTARY (independent of the three mechanisms above — it concerns
+the circuit's BEHAVIOR, not the Coq↔Cairo correspondence): the Cairo
+carries its own **111-case negative test suite** (`scarb test`, all
+passing) — `rejects_mutated_sighash`, `rejects_mutated_merkle_path`,
+`rejects_mutated_auth_root` / `_sibling`, `rejects_input_asset_tag_flipped`,
+`rejects_asset_pub_mutation_via_sighash_binding`,
+`rejects_private_nullifier_preimage_mutation`, and more. These
+empirically confirm the circuit REJECTS exactly the malicious witnesses
+the Coq relations are proven to forbid — so the model's logical proofs
+and the circuit's tested behavior corroborate each other on the same
+attack set, even though the *direct* model↔circuit conformance runner is
+still forthcoming.
+
 ---
 
 ## Documented properties NOT formally verified (and why)
