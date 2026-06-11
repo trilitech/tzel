@@ -167,4 +167,32 @@ Section GrandConservation.
     - destruct (Felt_eq_dec a asset_tez); lia.
   Qed.
 
+  (** A TRANSFER operation: the third flow — neither deposit nor exit
+      lane (both zeroed, parked on [asset_tez]), so value only moves
+      among notes, minus the tez fee.  Its [op_conserves] is exactly
+      the transfer circuit relation's conservation
+      (sum_at in = sum_at out + fee@tez), completing the trichotomy:
+      shield (deposit lane), unshield (exit lane), transfer (neither). *)
+  Definition transfer_op
+      (in_a : list Felt) (in_v : list nat)
+      (out_a : list Felt) (out_v : list nat)
+      (fee : nat) : Op :=
+    mkOp in_a in_v out_a out_v asset_tez 0 asset_tez 0 fee.
+
+  Lemma transfer_is_op :
+    forall in_a in_v out_a out_v fee,
+      op_conserves (transfer_op in_a in_v out_a out_v fee)
+      <->
+      (forall a : Felt,
+        sum_at a in_a in_v
+        = sum_at a out_a out_v
+          + (if Felt_eq_dec a asset_tez then fee else 0)).
+  Proof.
+    intros. unfold op_conserves, transfer_op. cbn [op_in_assets op_in_values
+      op_out_assets op_out_values op_deposit_asset op_deposit_value
+      op_exit_asset op_exit_value op_fee].
+    split; intros HH a; specialize (HH a);
+      destruct (Felt_eq_dec a asset_tez); lia.
+  Qed.
+
 End GrandConservation.
