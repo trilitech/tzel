@@ -177,6 +177,23 @@ audit").
   both leave the default in place would share an `auth_domain` and the
   theorem's hypothesis (distinct domains) would not hold.  The proof is
   honest about its condition; the deployment must satisfy it.
+- `Spec.Hashes.type_tag_separates_same_length` (cross-CIRCUIT replay via
+  the type-tag prefix: transfer 0x01 / unshield 0x02 / shield 0x03 /
+  pubkey-hash 0x04): under `injective_2 H_sighash`, two sighashes over
+  the SAME number of fields but DISTINCT tags are distinct — so a WOTS
+  signature for one circuit-type cannot validate another's of the same
+  shape.  HONESTLY SCOPED (this is a new theorem AND a surfaced subtlety):
+  the three circuits' sighashes have DIFFERENT field counts, so their
+  pairwise distinctness is NOT a corollary of this same-length lemma —
+  `injective_2` gives same-length injectivity only.  The cross-LENGTH,
+  cross-tag distinctness the deployed circuits actually rely on rests on
+  the sighash chain's COLLISION-RESISTANCE (the same CR underlying every
+  binding theorem) plus, in deployment, per-circuit verifier keys (an
+  independent primary defense).  The tag is a domain-separation prefix
+  whose cross-circuit guarantee is ultimately the hash's CR; the theorem
+  makes it structural for the same-length case and the docstring is
+  explicit that the one-line "the tag prevents cross-circuit replay" claim
+  glossed over the cross-length reliance on CR.
 
 ## WOTS+ one-time / key-reuse safety
 

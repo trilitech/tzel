@@ -210,6 +210,42 @@ Section SighashFold.
     now destruct (sighash_fold_injective Hinj xs ys tag tag Hlen Heq).
   Qed.
 
+  (** ** Cross-circuit replay: the type-tag prefix (honestly scoped).
+
+      Each sighash starts from a circuit TYPE TAG (transfer 0x01, unshield
+      0x02, shield 0x03; pubkey-hash 0x04).  This proves the tag's
+      separating power for sighashes of the SAME length: equally-many
+      fields but DISTINCT tags give DISTINCT sighashes, so a WOTS signature
+      valid for one circuit-type's sighash cannot validate another's of the
+      same shape — the in-circuit cross-circuit-replay guard.
+
+      HONESTY caveat (do NOT over-read this as full cross-circuit replay
+      resistance): the three circuits' sighashes have DIFFERENT field
+      counts (shield = 11, transfer = 11+N inputs, unshield more), so their
+      pairwise distinctness is NOT a corollary of this same-length lemma.
+      [injective_2] yields same-length injectivity ONLY — a short fold can
+      in principle equal a longer one when the short tag coincides with the
+      longer fold's intermediate accumulator.  So the cross-LENGTH,
+      cross-tag distinctness the deployed circuits actually rely on rests
+      on the collision-resistance of the sighash chain (an attacker cannot
+      find cross-length fields that collide two tagged folds) — the SAME CR
+      assumption underlying every binding theorem here — plus, in
+      deployment, per-circuit verifier keys (an independent, primary
+      defense).  The tag is a domain-separation prefix whose cross-circuit
+      guarantee is ultimately the hash's CR; this lemma makes it STRUCTURAL
+      only for the same-length case. *)
+  Corollary type_tag_separates_same_length (Hinj : injective_2 H_sighash) :
+    forall (tag1 tag2 : Felt) (xs ys : list Felt),
+      tag1 <> tag2 ->
+      length xs = length ys ->
+      sighash_fold tag1 xs <> sighash_fold tag2 ys.
+  Proof.
+    intros tag1 tag2 xs ys Htag Hlen Heq.
+    destruct (sighash_fold_injective Hinj xs ys tag1 tag2 Hlen Heq)
+      as [Htageq _].
+    exact (Htag Htageq).
+  Qed.
+
   (** ** Cross-circuit replay resistance
 
       The sighash starts from a circuit TYPE TAG (transfer = 0x01,
