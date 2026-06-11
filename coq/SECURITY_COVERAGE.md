@@ -269,6 +269,24 @@ audit").
   `Spec.DepositKey.deposit_key_bytes_injective` (distinct pools never
   share a durable slot), `Spec.WithdrawalRecord.decode_encode`
   (lossless withdrawal-record codec — no misdirected/corrupted exit).
+- **KERNEL FIDELITY (cross-checked vs the Rust, line-level, this audit)**
+  for the two consensus-critical apply gates and the codec:
+  - *Double-spend* — `core/src/lib.rs` transfer/unshield validation runs,
+    BEFORE any state change: `has_valid_root` (root snapshot), per-nf
+    `has_nullifier` ("nullifier … already spent" — cross-tx), and an
+    O(n²) within-batch equality scan ("duplicate nullifier").  These are
+    exactly `Spec.KernelNullifier.acceptable spent nfs :=
+    NoDup nfs /\ (forall n, In n nfs -> ~ In n spent)` — the within-batch
+    `NoDup` and the cross-tx freshness, both present.
+  - *Withdrawal codec* — `encode_withdrawal_record`/`decode_withdrawal_record`
+    serialize `asset_id(32) || amount(u64 LE,8) || recipient_len(u32 LE,4)
+    || recipient`, with a hard `len == 44 + recipient_len` decode check.
+    This is byte-for-byte `Spec.WithdrawalRecord.encode`/`decode`.  Note
+    the **multiasset `asset_id` field is present and consistent in BOTH**
+    the kernel and the Coq codec — i.e. this multiasset-touched
+    serialization was updated faithfully on the production side, in
+    contrast to the OCaml-port `shield_sighash` drift (the FINDING above).
+    Found faithful, no discrepancy.
 
 ## Commitment tree
 
