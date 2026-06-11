@@ -273,6 +273,20 @@ audit").
   transfer / unshield is processed before the config is installed.
 - Together: config substitution is impossible from every angle (forge
   install, overwrite, or operate unconfigured).
+- **OPERATIONAL PRECONDITION (must be surfaced honestly):**
+  `config_update_unforgeable` reduces config-install security to WOTS+
+  unforgeability of the *compiled admin leaf* — which is only a real
+  secret in a PRODUCTION build.  The kernel has a `USES_DEV_ADMIN_FALLBACK`
+  path (`debug_assertions` build with no `TZEL_ROLLUP_*_HEX` env vars)
+  whose admin key is the PUBLIC constant `dev_config_admin_ask()` =
+  `hash("tzel-dev-rollup-config-admin")`; under it, anyone could forge a
+  config install (e.g. a malicious verifier that accepts any proof —
+  total compromise).  The kernel emits a loud "SECURITY WARNING … MUST
+  NOT be used in production. Rebuild with `cargo build --release` AND set
+  the `TZEL_ROLLUP_*_HEX` env vars" on every config message in that mode.
+  So the unforgeability theorem is honest about its premise (a secret
+  admin key); the deployment must provide one (release build + env
+  vars), not the dev fallback.
 
 ## Master kernel safety (joint invariants, non-interference)
 
