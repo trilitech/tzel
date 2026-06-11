@@ -411,6 +411,29 @@ condition) is covered by the assertion cross-check.
 
 ## Documented properties NOT formally verified (and why)
 
+- **THE FUNDAMENTAL BOUNDARY — what these proofs do and do not cover.**
+  The Coq proves the circuit RELATIONS are sound: *if* a witness
+  satisfies a relation (the conjunction of the circuit's accept
+  conditions), *then* the protocol safety property holds (no inflation,
+  no theft, etc.).  Full safety of the DEPLOYED system additionally
+  requires two things this model does NOT prove, both deliberately out
+  of scope:
+  (a) **The STARK proof system soundly enforces the relation** — that a
+      verifying proof implies the existence of a witness satisfying the
+      relation.  This is STARK soundness (the prover cannot prove a false
+      statement), explicitly out of scope per the engagement.
+  (b) **The deployed verifier key corresponds to THESE audited
+      circuits** — the verification key the kernel is configured with
+      (admin-set, then frozen) must be the one generated from the exact
+      Cairo circuits this model is faithful to (drift-pinned).  If a
+      different key were installed, the STARK would verify a DIFFERENT
+      circuit and none of the relation-soundness results would apply.
+      The deployment must generate the key from these circuits; the
+      admin-config trust root (above) gates who installs it.
+  So the chain is: [Coq: relation ⇒ safety] ∘ [drift+differential: Coq
+  relation = Cairo circuit] ∘ [STARK+key: verifying proof ⇒ satisfying
+  witness of that circuit].  This module owns the first link and the
+  faithfulness of the second; the third is the proof-system boundary.
 - **`validate_l1_ticketer_canonical` (b58check canonicalization):**
   string-level input validation (trim whitespace, require KT1, b58check
   parse + re-emit).  This is byte/parsing-level Tezos-address handling,
