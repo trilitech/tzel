@@ -61,7 +61,7 @@ coq    = ["coq/Impl/Shield.v"]
 # and `asset_producer` into the sighash and asserts
 # `asset_producer == ASSET_TEZ`. Spec/Shield.v has the matching
 # binding; Impl/Shield.v remains a stub.
-sha256 = "460fc3cf03b38307db29be82839d7fc58af33f51ff7529a82a96880c03e4d7e7"
+sha256 = "af7910a06a0758c1f0263931ad9196f02803b51d123912af408b44b01faddcbb"
 
 [[mirror]]
 cairo  = "cairo/src/unshield.cairo"

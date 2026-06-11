@@ -454,8 +454,16 @@ rests on three independent mechanisms, not on trust:
    TREE_DEPTH=48 levels) is ALSO pinned, and unlike the auth-walk this is
    a STRONG structural conformance: the port's Tzel.Merkle.root_from_path
    is a pre-existing independent oracle (validated Coq<->port in the
-   differential), not a transcription.  Fifteen conformance tests total.
-   The relation-level full-witness conformance remains.  The remaining primitives and the relation-level full-witness
+   differential), not a transcription.  FINDING (caught by this conformance work): the OCaml port's
+   Transaction.shield_sighash had silently OMITTED the multiasset asset
+   fields (asset_new, asset_producer) that the Cairo circuit, the Rust
+   kernel (core::shield_sighash), and the Coq spec (phi_shield_sighash)
+   all bind.  Dead code (no callers) so no production impact, but a real
+   faithfulness gap the function differential never caught (it tests only
+   the sighash_fold STEP, not the full shield_sighash).  Fixed the port
+   and added test_shield_sighash_field_set_conforms_to_port, the
+   regression guard that would have caught it.  Sixteen conformance tests
+   total.  The relation-level full-witness conformance remains.  The remaining primitives and the relation-level full-witness
    conformance follow this pattern and are forthcoming; until they land
    the Cairo's tie to the model is established for them by mechanisms 1
    and 3 (SHA-pinned drift + the assertion cross-check).
