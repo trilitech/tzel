@@ -417,12 +417,18 @@ rests on three independent mechanisms, not on trust:
 1. **SHA-pinned drift gate** (`Drift/check.sh`, `MANIFEST.toml`): every
    modeled Cairo file's SHA-256 is pinned; CI fails on any divergence,
    forcing a model review when the source changes (6/6 mirrors).
-2. **Differential fuzzing** (`ocaml/coq_driver/test`, 14 cases): the
+2. **Differential fuzzing** (`ocaml/coq_driver/test`, 15 cases): the
    *extracted* Coq functions (chain step, commitment, nullifier,
-   sighash, merkle path, O(depth) frontier root) are checked
-   byte-for-byte against the cross-impl-tested OCaml port on thousands
-   of random inputs — so the executable parts of the model compute what
-   the implementation computes.
+   sighash, merkle path, L-tree compression, O(depth) frontier root) are
+   checked byte-for-byte against the OCaml port on thousands of random
+   inputs — so the executable parts of the model compute what an
+   independent implementation computes.  NOTE on the reference: the
+   differential's reference is the OCaml protocol port, which agrees
+   with the Rust protocol (`tzel_core`) via pinned cross-impl vectors —
+   it is NOT (yet) run directly against the Cairo.  The Cairo's tie to
+   the model is established by mechanisms 1 and 3 (SHA-pinned drift +
+   the assertion cross-check); a *direct* Cairo-vs-extracted-function
+   conformance runner is forthcoming.
 3. **Systematic assertion cross-check** (manual, documented): every
    assertion in the three Cairo circuits, every check in the Michelson
    bridge contract, the kernel's deposit/config/capacity/valid-root

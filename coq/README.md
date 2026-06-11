@@ -37,25 +37,36 @@ Each layer is what catches a different failure mode:
 - **Extracted-function differential fuzzing** catches *translation
   divergence*. QCheck2 generates random inputs and checks the
   Coq-extracted functions (chain step, commitment, nullifier, sighash,
-  Merkle path, L-tree, frontier root) byte-for-byte against the
-  cross-impl-tested OCaml protocol port — which is itself conformance-
-  tested against the Cairo, so the chain is `extracted-Coq ↔ port ↔
-  Cairo`.
+  Merkle path, L-tree, frontier root) byte-for-byte against the OCaml
+  protocol port (`Tzel.*`). The port in turn agrees with the Rust
+  protocol (`tzel_core`) via pinned cross-impl vectors
+  (`specs/ocaml_vectors/protocol_v1*.json`).
 
-  IMPLEMENTATION STATE (stated honestly): this differential is
-  *function-level* — it validates the building blocks of each circuit's
-  accept condition (the suite is the 15 cases in
-  `ocaml/coq_driver/test`). The *relation-level* conformance ideal —
-  random full witnesses run through the certified model's accept/reject
-  decision AND the Cairo verifier's, asserting they decide the same way
-  end-to-end — is the design goal; the Cairo-side `run_*` runners for it
-  are forthcoming. Until then, relation-level faithfulness (that the
-  conjunction of modeled conjuncts equals the Cairo's accept condition)
-  rests on the **manual, drift-pinned assertion cross-check** — every
-  Cairo `assert` enumerated and matched to a relation conjunct — plus
-  the function differentials above. See `SECURITY_COVERAGE.md`
-  ("How faithfulness is established") for the full three-mechanism
-  account.
+  IMPLEMENTATION STATE (stated honestly — do not over-read this):
+
+  - The differential is *function-level* (the 15 cases in
+    `ocaml/coq_driver/test`) and its reference is the OCaml **port**,
+    which is cross-impl-validated against the **Rust** protocol — NOT
+    yet directly against the Cairo.
+  - There is no *direct* automated `extracted-function ↔ Cairo` or
+    `relation ↔ Cairo verifier` conformance test yet. The Cairo-side
+    `run_chain_step` / full-witness `run_*` runners that would close
+    that loop are FORTHCOMING (`coq.yml` notes they "land next"; the
+    `run_*.cairo` executables exist and are exercised end-to-end —
+    producing real STARK proofs the kernel verifies — in
+    `services/tzel/tests/integration.rs`, but that is system-level, not
+    a primitive/relation conformance check).
+  - So the Cairo's faithfulness to this model rests on **two** things
+    today: (1) the **drift-pinned manual assertion cross-check** — every
+    Cairo `assert` enumerated and matched to a relation conjunct, with
+    the Cairo SHA pinned so any edit breaks CI and forces re-review; and
+    (2) the function differentials giving independent confidence the
+    Coq transcription of each primitive is correct (they match a
+    separate impl, the port/Rust). The *direct* Cairo-vs-model
+    conformance is the next step, not a current guarantee.
+
+  See `SECURITY_COVERAGE.md` ("How faithfulness is established") for the
+  full account.
 
 The layers are mutually reinforcing: the proof catches "the spec
 demands a property the refinement can't satisfy"; the function
