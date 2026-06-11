@@ -1,38 +1,47 @@
-(* TzEL on Tezos X — shielded-pool contract that verifies operations by calling
-   the `zk` runtime THROUGH the enshrined cross-runtime gateway, and keeps the
-   pool bookkeeping (commitment-tree root + nullifier set) on-chain.
+(* TzEL on Tezos X — shielded-pool contract. Verifies operations by calling the
+   `zk` runtime through the enshrined gateway, keeps the nullifier set on-chain,
+   and delegates the commitment tree + valid-roots to the A' accumulator.
+   See docs/TZEL-TREE-AND-SYNC.md.
 
-   The zk runtime exposes two privacy primitives as *synchronous* gateway views
-   — `Tezos.call_view "zk" (path, body) gateway : bytes option`:
-
+   The zk runtime exposes, as synchronous gateway views / async calls
+   (`Tezos.call_view "zk" (path, body) gateway : bytes option`):
      - ("verify_snark", body) -> Some 0x01 iff the Groth16 wrap proof is valid
-     - ("blake2s", body)      -> Some digest (personalized BLAKE2S-256)
+     - ("blake2s", body)      -> personalized BLAKE2S-256 (OutHash binding)
+     - ("tree_known_root", …) / "tree_append" -> the A' Merkle accumulator
 
-   ## The OutHash binding (the security core)
+   ## Two independent security checks (BOTH required)
 
-   A proof attests a set of PUBLIC INPUTS: the 4 STARK tree roots (the circuit's
-   internal commitments) and an OutHash. The OutHash is a hash of the operation's
-   `output_preimage` (the bootloader output: new tree root, nullifier, amounts…).
+   1. **OutHash binding** — the contract does NOT trust a supplied OutHash. It
+      DERIVES it from the declared `output_preimage` via the real BLAKE2S, builds
+      the wrap public inputs from (tree_roots, derived OutHash), and verifies the
+      proof against those. So a valid proof is bound to its exact output_preimage.
 
-   The contract does NOT trust a supplied OutHash. It DERIVES it from the declared
-   `output_preimage` using the real BLAKE2S primitive (the gateway view), builds
-   the wrap public inputs from (tree_roots, derived OutHash), and verifies the
-   proof against THOSE. So a valid proof cannot be replayed with a different
-   output: any change to `output_preimage` changes the derived OutHash and the
-   proof no longer verifies. The effects the contract then applies (new_root,
-   nullifier) are READ FROM the bound `output_preimage`, so they too are attested.
+   2. **Circuit-identity pin** — the OutHash binding alone is NOT enough: the
+      stored vk pins only the UNIVERSAL wrap circuit. Without pinning the inner
+      circuit identity, an attacker wraps their OWN trivial circuit and forges any
+      output → pool theft. So the contract pins tree_roots[0] (inner STARK circuit
+      identity), program_hash, and auth_domain against storage constants.
+
+   Effects: the membership root the spend proved against is validated via the A'
+   accumulator (`tree_known_root`); ALL nullifiers are spent; new commitments are
+   published (EMIT) and appended to A' (TODO). The exact output felt offsets are
+   the transfer layout and are re-pinned with the multi-asset circuit pass.
 
    The OutHash derivation chain is `out_hash.mligo`, parametrized over the hash
-   function; here it runs on the gateway BLAKE2S (~3-5 synchronous view calls). *)
+   source; here it runs on the gateway BLAKE2S (~3-5 synchronous view calls). *)
 
 #include "out_hash.mligo"
 module O = OutHash
 
 type storage = {
-  gateway    : address ;                 (* enshrined gateway KT1<MERG> *)
-  vk         : bytes ;                   (* Groth16 wrap verifying key *)
-  root       : bytes ;                   (* current commitment-tree root *)
-  nullifiers : (bytes, unit) big_map ;   (* spent nullifier set *)
+  gateway      : address ;                 (* enshrined gateway KT1<MERG> *)
+  vk           : bytes ;                    (* Groth16 wrap verifying key *)
+  (* PINNED identities — set at origination. Without these the wrap vk only
+     pins the UNIVERSAL wrap circuit, and any inner circuit forges effects. *)
+  circuit_root : bytes ;                    (* tree_roots[0] = inner STARK circuit identity *)
+  program_hash : bytes ;                    (* bootloader program_hash (output_preimage[2]) *)
+  auth_domain  : bytes ;                    (* ledger domain (output_preimage[3]) *)
+  nullifiers   : (bytes, unit) big_map ;    (* spent nullifier set *)
 }
 
 (* ── fixed wire constants (wrap circuit shape) ───────────────────────────── *)
@@ -41,16 +50,20 @@ let vk_len_be     : bytes = 0x000025d0   (* 9680 = len(vk)            *)
 let proof_len_be  : bytes = 0x00000184   (* 388  = len(Groth16 proof) *)
 let n_publics_be  : bytes = 0x00000088   (* 136  = 128 root bytes + 8 lanes *)
 let scalar_len_be : bytes = 0x00000020   (* 32   = bytes per scalar   *)
-let perso_len_0   : bytes = 0x00000000   (* empty perso = standard BLAKE2S *)
 let valid_byte    : bytes = 0x01
 let tree_roots_len : nat  = 128n         (* 4 roots x 32 bytes *)
 
-(* output_preimage felt indices of the effects (per circuit bootloader output).
-   PLACEHOLDER — must be pinned to the released TzEL circuit's output layout.
-   The binding (proof <-> output_preimage) is exact regardless; only WHICH felt
-   holds new_root / nullifier depends on the circuit spec. *)
-let new_root_idx  : nat = 0n
-let nullifier_idx : nat = 1n
+(* output_preimage bootloader framing (verifier core/src/lib.rs:1512):
+   [0]=n_tasks=1, [1]=task_output_size, [2]=program_hash, [3..]=public_outputs.
+   So program_hash and the FIRST public output (auth_domain) are at STABLE
+   offsets across circuits. The remaining offsets (membership root, nullifiers,
+   commitments) are per-entrypoint and re-pinned with the multi-asset circuit. *)
+let boot_program_hash_idx : nat = 2n
+let boot_auth_domain_idx  : nat = 3n     (* public_outputs[0] *)
+(* transfer/unshield public layout = [auth_domain, membership_root, nf..]: *)
+let tr_membership_root_idx : nat = 4n    (* public_outputs[1] *)
+let tr_nf_start_idx        : nat = 5n    (* public_outputs[2..2+N] *)
+let tr_tail_after_nf       : nat = 7n    (* trailing felts after nf: fee+cm1..3+memo1..3 *)
 
 (* The OutHash chain runs on the runtime BLAKE2S-256 reached through the
    gateway: `Gateway s.gateway` (see out_hash.mligo `blake2s`). *)
@@ -86,6 +99,10 @@ let verify_bound
     (tree_roots : bytes) (output_preimage : bytes list) : unit =
   let src = Gateway s.gateway in
   let root0 = Bytes.sub 0n 32n tree_roots in
+  (* CRITICAL pin: tree_roots[0] = the inner STARK circuit identity. The stored
+     vk pins only the UNIVERSAL wrap circuit; without this an attacker wraps
+     their OWN inner circuit (arbitrary output_preimage) and drains the pool. *)
+  let () = if root0 <> s.circuit_root then failwith "TzEL: wrong circuit" else () in
   let output_lanes = O.compute_output_hash_values src output_preimage in
   let outhash_lanes = O.compute_expected_out_hash src root0 output_lanes in
   let framed = Bytes.concat (frame_root_bytes tree_roots) (frame_lanes outhash_lanes) in
@@ -109,85 +126,120 @@ let preimage_at (output_preimage : bytes list) (idx : nat) : bytes =
   | Some b -> b
   | None -> (failwith "TzEL: output_preimage too short" : bytes)
 
-(* ── bookkeeping ─────────────────────────────────────────────────────────── *)
+(* ── identity & root checks ──────────────────────────────────────────────── *)
 
-let advance_root (s : storage) (old_root : bytes) (new_root : bytes) : storage =
-  if old_root <> s.root then failwith "TzEL: stale root"
-  else { s with root = new_root }
+(* Pin the bootloader program_hash and the ledger auth_domain against storage.
+   program_hash kills "different malicious Cairo program in the genuine circuit";
+   auth_domain kills cross-ledger / cross-chain replay. *)
+let check_identity (s : storage) (output_preimage : bytes list) : unit =
+  let () =
+    if preimage_at output_preimage boot_program_hash_idx <> s.program_hash
+    then failwith "TzEL: wrong program_hash" else () in
+  if preimage_at output_preimage boot_auth_domain_idx <> s.auth_domain
+  then failwith "TzEL: wrong auth_domain" else ()
 
+(* Validate the membership root the spend proved against is a REAL historical
+   root of THIS pool — via the A' accumulator view `tree_known_root`. (Single
+   tree for now: tag = empty.) Until A' is deployed this view returns None and
+   the op fails closed — which is correct: no spend may pass an unvalidated
+   root. *)
+let require_known_root (s : storage) (root : bytes) : unit =
+  let tag = empty_bytes in
+  match (Tezos.call_view "zk" ("tree_known_root", Bytes.concat tag root) s.gateway
+         : bytes option) with
+  | Some r -> if r = valid_byte then unit else failwith "TzEL: unknown membership root"
+  | None -> failwith "TzEL: tree_known_root view unavailable (A' not deployed)"
+
+(* ── nullifiers ──────────────────────────────────────────────────────────── *)
+
+(* Spend ONE nullifier (reject double-spend). *)
 let spend (s : storage) (nullifier : bytes) : storage =
   if Big_map.mem nullifier s.nullifiers then failwith "TzEL: double spend"
   else { s with nullifiers = Big_map.add nullifier unit s.nullifiers }
 
-(* ── wallet-sync data availability ───────────────────────────────────────────
-   The commitment tree lives OFF-CHAIN; the contract stores only the root. So
-   each op must PUBLISH its leaves: the commitments (carried in output_preimage)
-   and the encrypted notes (for recipients). A wallet rebuilds the tree by
-   replaying these and trial-decrypts the notes to find its funds.
+(* Spend ALL N nullifiers the circuit output (transfer is N->2, N up to 7). The
+   circuit's `merkle::verify` path-index range check + nf = H(nk_spend, cm,
+   path_idx) make each nf unique to a real note; we reject replays across ops.
+   nf list = output_preimage[tr_nf_start .. len - tr_tail_after_nf). *)
+let spend_all (s : storage) (output_preimage : bytes list) : storage =
+  let n_total = List.length output_preimage in
+  let nf_end = abs (n_total - tr_tail_after_nf) in
+  let (_, s) =
+    List.fold_left
+      (fun ((i, s), felt : (nat * storage) * bytes) ->
+         if (i >= tr_nf_start_idx) && (i < nf_end)
+         then (i + 1n, spend s felt)
+         else (i + 1n, s))
+      (0n, s) output_preimage in
+  s
+
+(* ── wallet-sync data availability + tree append (A') ────────────────────────
+   The commitment tree lives OFF-CHAIN (A' accumulator holds it). Each op must
+   PUBLISH its leaves — commitments (in output_preimage) + encrypted notes — so
+   a wallet rebuilds the tree by replay and trial-decrypts to find its funds.
    See docs/TZEL-TREE-AND-SYNC.md. *)
 let emit_sync (output_preimage : bytes list) (enc_notes : bytes list) : operation =
   Tezos.emit "%tzel_notes" (output_preimage, enc_notes)
 
+(* TODO(A'): also emit a `%call http://zk/tree_append` op to advance the tree
+   in the accumulator (commitments cm_1..3 from output_preimage). Pending the
+   A' accumulator endpoints + the multi-asset output layout that fixes the
+   commitment offsets. Today the contract verifies + spends + publishes; the
+   tree advance is the A' hook. *)
+
 (* ── entrypoints ─────────────────────────────────────────────────────────── *)
 
-(* NOTE: `new_root` is read from the bound `output_preimage` — which requires the
-   circuit to OUTPUT it. The current single-value circuit does not yet; this
-   path is staged pending the (multi-asset) circuit extension that adds new_root
-   to the output. The OutHash binding already makes whatever the circuit outputs
-   trustworthy. See docs/TZEL-TREE-AND-SYNC.md. *)
+(* Every entrypoint: bind the proof (verify_bound, incl. the circuit-identity
+   pin), then pin program_hash + auth_domain. shield is a deposit (no spend);
+   transfer/unshield spend N nullifiers against a validated membership root.
+   Effect offsets (membership root, nf list, commitments) are the transfer
+   layout and are re-pinned with the multi-asset circuit. *)
 
-(* A shield adds commitments: verify the bound proof, advance the root to the
-   new root attested in the bound output_preimage, publish the leaves. *)
+(* A shield deposits value and creates commitments (no spend, no nullifier). *)
 type shield_param = {
   proof           : bytes ;
   tree_roots      : bytes ;        (* 128 bytes = 4 x 32 *)
   output_preimage : bytes list ;   (* bootloader output felts (32-byte BE) *)
-  old_root        : bytes ;
   enc_notes       : bytes list ;   (* note ciphertexts to publish *)
 }
 
 [@entry]
 let shield (p : shield_param) (s : storage) : operation list * storage =
   let () = verify_bound s p.proof p.tree_roots p.output_preimage in
-  let new_root = preimage_at p.output_preimage new_root_idx in
-  let s = advance_root s p.old_root new_root in
+  let () = check_identity s p.output_preimage in
   [ emit_sync p.output_preimage p.enc_notes ], s
 
-(* A transfer spends a note (its nullifier is attested in the bound preimage)
-   and advances the root. *)
+(* A transfer spends N notes against a validated membership root and creates new
+   commitments. *)
 type transfer_param = {
   proof           : bytes ;
   tree_roots      : bytes ;
   output_preimage : bytes list ;
-  old_root        : bytes ;
   enc_notes       : bytes list ;
 }
 
 [@entry]
 let transfer (p : transfer_param) (s : storage) : operation list * storage =
   let () = verify_bound s p.proof p.tree_roots p.output_preimage in
-  let nullifier = preimage_at p.output_preimage nullifier_idx in
-  let new_root = preimage_at p.output_preimage new_root_idx in
-  let s = spend s nullifier in
-  let s = advance_root s p.old_root new_root in
+  let () = check_identity s p.output_preimage in
+  let () = require_known_root s (preimage_at p.output_preimage tr_membership_root_idx) in
+  let s = spend_all s p.output_preimage in
   [ emit_sync p.output_preimage p.enc_notes ], s
 
-(* An unshield spends a note and exits value. The outbound transfer/ticket
-   (value custody) is omitted here — it will be multi-asset (per-asset tickets);
-   verification, nullifier and root bookkeeping are identical to transfer. *)
+(* An unshield spends notes and exits value. The outbound transfer/ticket (value
+   custody — per-asset tickets) is deferred to the multi-asset pass; the zk
+   binding, membership and nullifier logic are identical to transfer. *)
 type unshield_param = {
   proof           : bytes ;
   tree_roots      : bytes ;
   output_preimage : bytes list ;
-  old_root        : bytes ;
   enc_notes       : bytes list ;
 }
 
 [@entry]
 let unshield (p : unshield_param) (s : storage) : operation list * storage =
   let () = verify_bound s p.proof p.tree_roots p.output_preimage in
-  let nullifier = preimage_at p.output_preimage nullifier_idx in
-  let new_root = preimage_at p.output_preimage new_root_idx in
-  let s = spend s nullifier in
-  let s = advance_root s p.old_root new_root in
+  let () = check_identity s p.output_preimage in
+  let () = require_known_root s (preimage_at p.output_preimage tr_membership_root_idx) in
+  let s = spend_all s p.output_preimage in
   [ emit_sync p.output_preimage p.enc_notes ], s

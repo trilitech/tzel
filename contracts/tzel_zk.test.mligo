@@ -14,10 +14,20 @@
 
 let gateway_addr : address = ("KT18oDJJKXMKhfE1bSuAPGp92pYcwVDiqsPw" : address)
 
+(* A 32-byte tree-roots blob; circuit_root in storage is set to match so the
+   identity pin passes and the op reaches the FIRST gateway call (blake2s in the
+   OutHash derivation), which fails "view unavailable" in the Test framework. *)
+let tree_roots32 : bytes =
+  0x0000000000000000000000000000000000000000000000000000000000000000
+let preimage1 : bytes list =
+  [ 0x0000000000000000000000000000000000000000000000000000000000000001 ]
+
 let base_storage : TzEL.storage = {
   gateway = gateway_addr ;
   vk = 0x ;
-  root = 0x00 ;
+  circuit_root = tree_roots32 ;   (* matches the test's tree_roots[0] *)
+  program_hash = 0x00 ;
+  auth_domain = 0x00 ;
   nullifiers = (Big_map.empty : (bytes, unit) big_map) ;
 }
 
@@ -26,24 +36,16 @@ let test_originate_storage =
   let orig = Test.originate (contract_of TzEL) base_storage 0tez in
   let st = Test.get_storage orig.addr in
   let () = assert (st.gateway = gateway_addr) in
-  let () = assert (st.root = 0x00) in
+  let () = assert (st.circuit_root = tree_roots32) in
   Test.println "test_originate_storage: PASS"
 
-(* A 32-byte tree-roots blob and a one-felt preimage: enough for the binding to
-   reach the FIRST gateway call (blake2s, inside the OutHash derivation), which
-   fails as "blake2s view unavailable" in the Test framework. *)
-let tree_roots32 : bytes =
-  0x0000000000000000000000000000000000000000000000000000000000000000
-let preimage1 : bytes list =
-  [ 0x0000000000000000000000000000000000000000000000000000000000000001 ]
-
-(* ── test 2: %shield reaches the gateway (OutHash binding -> blake2s) ─────── *)
+(* ── test 2: %shield passes the identity pin, reaches the gateway blake2s ─── *)
 let test_shield_reaches_gateway =
   let orig = Test.originate (contract_of TzEL) base_storage 0tez in
   let c = Test.to_contract orig.addr in
   let param : TzEL.shield_param =
     { proof = 0x ; tree_roots = tree_roots32 ;
-      output_preimage = preimage1 ; old_root = 0x00 ; enc_notes = ([] : bytes list) } in
+      output_preimage = preimage1 ; enc_notes = ([] : bytes list) } in
   let result = Test.transfer_to_contract c (Shield param) 0tez in
   let () = match result with
     | Success _ -> failwith "expected gateway view unavailable in Test"
@@ -56,9 +58,23 @@ let test_transfer_reaches_gateway =
   let c = Test.to_contract orig.addr in
   let param : TzEL.transfer_param =
     { proof = 0x ; tree_roots = tree_roots32 ;
-      output_preimage = preimage1 ; old_root = 0x00 ; enc_notes = ([] : bytes list) } in
+      output_preimage = preimage1 ; enc_notes = ([] : bytes list) } in
   let result = Test.transfer_to_contract c (Transfer param) 0tez in
   let () = match result with
     | Success _ -> failwith "expected gateway view unavailable in Test"
     | Fail _ -> unit in
   Test.println "test_transfer_reaches_gateway: PASS"
+
+(* ── test 4: wrong circuit_root is rejected BEFORE any gateway call ──────── *)
+let test_wrong_circuit_root_rejected =
+  let bad_storage = { base_storage with circuit_root = 0x01 } in
+  let orig = Test.originate (contract_of TzEL) bad_storage 0tez in
+  let c = Test.to_contract orig.addr in
+  let param : TzEL.shield_param =
+    { proof = 0x ; tree_roots = tree_roots32 ;
+      output_preimage = preimage1 ; enc_notes = ([] : bytes list) } in
+  let result = Test.transfer_to_contract c (Shield param) 0tez in
+  let () = match result with
+    | Success _ -> failwith "expected wrong-circuit rejection"
+    | Fail _ -> unit in
+  Test.println "test_wrong_circuit_root_rejected: PASS"

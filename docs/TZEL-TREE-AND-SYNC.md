@@ -1,95 +1,114 @@
-# TzEL — commitment tree & wallet sync (design)
+# TzEL — commitment tree, valid roots & wallet sync (design)
 
-Status: DECIDED 2026-06-11 (with François). Supersedes the on-chain
-Merkle-frontier / `merkle_append` primitive idea.
+Status: DECIDED 2026-06-11 (with François), CORRECTED 2026-06-11 after reading
+the actual circuits. This supersedes the earlier (wrong) "circuit outputs
+new_root" draft.
 
-## Decision in one line
+## The actual circuit model (read first)
 
-**The commitment tree lives off-chain; only its root is on-chain. The circuit
-proves the insertion and outputs the new root. The leaves (commitments) and the
-encrypted notes are published on-chain so any wallet can rebuild the tree.**
+The TzEL spend circuits (`cairo/src/merkle.cairo`, `transfer.cairo`,
+`shield.cairo`) do **membership-only** Merkle verification:
 
-## Why (not on-chain tree, not a `merkle_append` primitive)
+> *"The tree is append-only: new commitments are added at the next available
+> leaf position, and old roots remain valid forever. The on-chain contract
+> accepts any historical root, so a proof against a stale root is fine —
+> double-spend is prevented by the global nullifier set, not by root
+> freshness."* (merkle.cairo:5-15)
 
-The transfer/shield circuits output the *new commitments* (`cm_1/2/3`), not the
-new tree root. Computing the new root means inserting them into a depth-48
-incremental Merkle tree = 48 `blake2s` per commitment.
+So a spend proves *"my note is a leaf of a tree with root R"* where **R is any
+historical root**. The circuit does **not** append and does **not** output a
+new root. Transfer's public output is
+`[auth_domain, R(membership root), nf_1..nf_N, fee, cm_1..3, memo_hashes]`;
+shield's output has **no root at all**.
 
-- Doing it **in the contract** via the gateway `blake2s` view = 48 view calls
-  per commitment (144 per transfer). Prohibitive.
-- Exposing a **`merkle_append` runtime primitive** removes that, but the tree
-  *state* (the ~1.5 KB frontier) would then shuttle in/out of contract storage
-  every op: storage gas + burn on changing data, plus serialise/deserialise on
-  both sides. That cost is the symptom of putting the tree in the wrong place.
+## Consequences for the on-chain side
 
-The right place for the tree is **the circuit** (as in Zcash/Sapling, Aztec):
-the prover already touches the tree to prove spends, so proving the append and
-outputting `new_root` is marginal. Then:
+Someone must maintain (1) the **append-only commitment tree** and (2) the
+**set of valid historical roots** the contract accepts. Computing one append =
+48 personalized-blake2s (depth-48 tree); doing that on-chain via the gateway
+`blake2s` view = ~48 calls/commitment = prohibitive. The circuit doesn't help
+(membership-only).
 
-- the contract stores only the **32-byte root** (+ the nullifier set);
-- **no frontier on-chain, no shuttling, no `merkle_append` primitive**;
-- the OutHash binding (already wired) ties `new_root` to the proof, so the
-  contract reads it from the bound `output_preimage` and trusts it.
+**Decision: a generic append-only Merkle accumulator, exposed by the zk runtime
+(same runtime for now), holds the tree in the runtime's durable storage and
+does the append in Rust.** The contract sends only 32-byte leaves and reads
+roots — nothing shuttles. See `A′` below.
 
-## Data availability — leaves are on-chain
+The tree being "off-chain" only means the contract does not store the derived
+tree. The leaves (commitments) and encrypted notes are PUBLISHED on-chain (op
+calldata + an `EMIT` event), so any wallet rebuilds the tree by replay (the DA
+argument is unchanged from the earlier draft).
 
-"Off-chain tree" means the contract does not store the *derived* tree. The
-underlying data is fully on-chain:
+## A′ — the accumulator (zk runtime, stateful)
 
-- every op publishes its **commitments** (`cm_1/2/3`) and the **encrypted
-  notes** (note ciphertext for recipients), both in the operation calldata and
-  via a contract **`EMIT` event** (so indexers/light wallets can subscribe);
-- the tree is a deterministic replay of the commitment stream — anyone can
-  rebuild it and gets the same root.
+Generic, asset-agnostic, leaves opaque. Trees are namespaced
+`tree_id = (caller_contract, tag)` — `caller` from `X-Tezos-Sender` (gateway
+provides identity → contract A cannot touch B's tree); `tag` contract-chosen
+(multiple trees per contract → **one tree per asset** for multi-asset, `tag =
+asset_id`).
 
-So there is no data-availability problem: the contract is just a
-root-register + nullifier-set; the leaves live in the chain history/events.
+State: `trees[(caller, tag)] = { frontier:[32]*48, count:u64, roots:Set<[32]> }`.
 
-## Wallet bootstrap (fresh wallet)
+| Endpoint | Kind | I/O |
+|---|---|---|
+| `tree_append` | `%call` (mutating) | `tag ‖ n ‖ leaf*n` → `new_root ‖ new_count`; appends (kernel `append_note` walk, blake2s perso `mrklSP__`), records `new_root` in `roots` |
+| `tree_known_root` | `VIEW` (read-only) | `tag ‖ root` → `Some 0x01` iff `root ∈ roots[(caller,tag)]` |
 
-1. **Scan** the contract's shield/transfer ops from genesis (or a signed
-   checkpoint).
-2. **Replay** the commitments in order → rebuild the full tree + frontier
-   locally.
-3. **Trial-decrypt** the published encrypted notes → find the notes addressed
-   to this wallet (its funds).
-4. For each owned note, compute the **Merkle authentication path** from the
-   reconstructed tree — this is the witness handed to the prover to spend.
-5. **Check** the reconstructed root equals the on-chain root (consistency).
+**Atomicity**: the `tree_append` durable write and the contract op are atomic by
+**NAC** when both are in one transaction — the write is staged in the journaled
+layered-state and reverts with the frame (same mechanism proved for
+NAC-ALIAS-G8 / NAC-CREDIT; end-to-end MIR lift still in FV). No state shuttling.
 
-## Wallet sync (incremental)
+**Cost**: compute = 48·n hashes/append (bounded); frontier storage ~1.5 KB/tree
+(fixed); `roots` set grows with history — **same profile as a Zcash/Sapling
+anchor history**, acceptable; a sliding window of recent anchors is an available
+optimisation (Zcash has it too) to revisit at pricing time.
 
-Process only new ops: append new commitments to the local tree, trial-decrypt
-new note ciphertexts. O(Δ), no full re-scan.
+## Contract responsibilities (application semantics — stay here)
 
-## The prover's frontier
+Per op, after binding the proof (OutHash binding, already wired):
 
-Whoever builds a proof (wallet or operator) already reconstructed the tree by
-the sync above, so it has the frontier and the auth-paths on hand. No special
-data is shuttled — everything derives from the on-chain commitment stream.
+1. **Pin the circuit identity** — `tree_roots[0]` (STARK preprocessed root) ==
+   the pinned circuit root in storage. *Without this, the wrap vk only pins the
+   universal wrap circuit and ANY inner circuit forges effects → pool theft.*
+2. **Pin** `program_hash` (output_preimage[2]) and `auth_domain`
+   (output_preimage[3]) against stored constants (circuit + ledger identity;
+   kills cross-circuit and cross-ledger replay).
+3. **Validate the membership root** — read `R` from the bound output and require
+   `tree_known_root(tag, R)` (A′). *The proof proves membership in a tree with
+   root R; the contract must check R is a real historical root of THIS pool,
+   else a fabricated tree passes.*
+4. **Spend ALL nullifiers** the circuit output (transfer is N→2, up to 7
+   inputs) — reject any already in the nullifier big_map; reject in-batch dups.
+5. **Append** the new commitments via `tree_append` (A′) → tree advances, new
+   root becomes valid.
+6. **`EMIT` (commitments, encrypted notes)** for wallet sync.
 
-## Costs (inherent to the privacy model)
+Contract storage: `{ gateway, vk, circuit_root, program_hash, auth_domain,
+nullifiers:big_map }` — **no on-chain tree, no single "current root" register**
+(the valid-roots set lives in A′).
 
-- **Initial scan** = O(all commitments) — like Zcash. Mitigated by signed
-  **checkpoints/snapshots**: an operator serves a tree state at a height, the
-  wallet verifies the root and continues from there.
-- **Trial-decryption** = O(all notes) — the classic shielded-pool cost
-  (Zcash/Aztec the same). Mitigated by detection tags / light-wallet protocols;
-  the trust-minimised fallback is always "scan + decrypt".
+## Wallet bootstrap / sync (unchanged)
 
-## What this means for each layer
+Fresh wallet: scan ops from genesis/checkpoint → replay commitments → rebuild
+the tree + frontier locally → trial-decrypt published note ciphertexts → find
+its notes → compute auth-paths for the prover. Sync = process new ops only.
+Costs (initial scan O(commitments), trial-decrypt O(notes)) are the standard
+shielded-pool costs (Zcash/Aztec), mitigated by checkpoints / detection tags.
+
+## Per-layer split
 
 | Layer | Responsibility |
 |---|---|
-| **Circuit** (Cairo) | Prove the spend AND the insertion; **output `new_root`** in `output_preimage`. *(extension — folds into the upcoming multi-asset circuit work)* |
-| **Runtime (zk)** | Unchanged: `verify_snark` + `blake2s` (for the OutHash binding) suffice. **No `merkle_append` primitive.** |
-| **Contract (Michelson)** | Trivial: verify the bound proof → read `new_root` from the bound `output_preimage` → `current := new_root` → spend nullifiers → **`EMIT` (commitments, encrypted notes)** for wallet sync. Stores only `(root, nullifiers)`. |
-| **Wallet / operator** | Holds the tree off-chain; bootstraps/syncs by scanning the on-chain commitment + note stream; builds auth-paths and proofs. |
+| **Circuit** (Cairo) | Prove spend = membership against a historical root + well-formed new commitments. Outputs membership root + nullifiers + commitments. **No new_root output, no in-circuit append.** (Multi-asset extension forthcoming.) |
+| **Runtime (zk)** | `verify_snark` + `blake2s` (binding) + **A′ accumulator** (`tree_append` / `tree_known_root`). |
+| **Contract** | Bind proof; **pin identities**; validate membership root via A′; spend all nullifiers; append commitments via A′; EMIT. Stores only identities + nullifier set. |
+| **Wallet / operator** | Tree off-chain; bootstrap/sync by scanning the on-chain commitment + note stream; build auth-paths and proofs. |
 
-## Dependency
+## Status / dependencies
 
-The contract reading `new_root` from `output_preimage` requires the circuit to
-**output it** — which the current single-value circuit does NOT (it outputs the
-old root + the new commitments). This extension is pinned to the upcoming
-multi-asset circuit pass. Until then the contract path that reads `new_root` is
-staged but cannot be exercised against real proofs.
+- A′ accumulator: to build (zk runtime endpoints).
+- Contract identity pins + nullifier-list + membership-root check: do now
+  (security-critical, asset-independent).
+- Exact output felt offsets per entrypoint, wire-length constants, value
+  custody (per-asset tickets): pinned to the upcoming multi-asset circuit pass.
