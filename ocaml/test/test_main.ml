@@ -936,7 +936,7 @@ let test_note_create_from_parts () =
   let n1 = Tzel.Note.create addr 1000L rseed in
   let n2 = Tzel.Note.create_from_parts
     ~d_j:addr.d_j ~auth_root:addr.auth_root ~auth_pub_seed:addr.auth_pub_seed ~nk_tag:addr.nk_tag
-    ~v:1000L ~rseed in
+    ~v:1000L ~rseed () in
   Alcotest.(check bool) "create matches create_from_parts" true
     (Tzel.Felt.equal n1.cm n2.cm)
 
@@ -1069,7 +1069,25 @@ let test_sighash_matches_rust_core_golden () =
   } in
   Alcotest.(check string) "unshield sighash == Rust core golden"
     "360b52a6051b21dbe78b12baf6a933f769b9a4b081481e9186c78aeaa07ca507"
-    (Tzel.Felt.to_hex un)
+    (Tzel.Felt.to_hex un);
+  (* Multiasset: a shield whose recipient note carries a real FA2 asset_id
+     (asset_producer stays ASSET_TEZ). Pins the nonzero asset_new fold so
+     the FA2 shield sighash is byte-identical to Rust core. *)
+  let fa2 = Tzel.Asset_registry.derive_asset_id "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc" in
+  let sh_fa2 = Tzel.Transaction.shield_sighash
+    ~auth_domain:(f 1) ~pubkey_hash:(f 2) ~v_pub:10L ~fee:3L ~producer_fee:4L
+    ~asset_new:fa2 ~asset_producer:(f 0) ~cm_new:(f 5) ~cm_producer:(f 6)
+    ~memo_ct_hash:(f 7) ~producer_memo_ct_hash:(f 8) in
+  Alcotest.(check string) "FA2 shield sighash == Rust core golden"
+    "bcc633ff2b15f460d810b0e307a6ab6e0001521645bc7c404eb1071a5e75b603"
+    (Tzel.Felt.to_hex sh_fa2);
+  (* A note commitment binding a nonzero FA2 asset tag. The tez protocol
+     vectors only cover asset = ASSET_TEZ (zero); this pins the FA2
+     commitment so hash_commit is verified byte-identical for FA2 notes. *)
+  let cm_fa2 = Tzel.Hash.hash_commit (f 1) (Tzel.Felt.of_u64 10) fa2 (f 2) (f 3) in
+  Alcotest.(check string) "FA2 commitment == Rust core golden"
+    "fce43f618a4cb4dfcabb5a7d1b472125d025f98899c4c2a350b0c7c8a65b3807"
+    (Tzel.Felt.to_hex cm_fa2)
 
 let test_build_shield () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 200) in
@@ -1091,7 +1109,7 @@ let test_build_shield () =
     ~auth_domain ~pubkey_hash
     ~recipient:alice ~v_pub:5000L ~fee:100L ~producer_fee:1L
     ~rseed ~memo_ct_hash:mch
-    ~producer ~producer_rseed ~producer_memo_ct_hash:prod_mch in
+    ~producer ~producer_rseed ~producer_memo_ct_hash:prod_mch () in
   Alcotest.(check bool) "cm_new matches" true (Tzel.Felt.equal pub.cm_new note.cm);
   Alcotest.(check bool) "cm_producer matches" true
     (Tzel.Felt.equal pub.cm_producer prod_note.cm);
@@ -1107,7 +1125,7 @@ let test_build_output () =
   let rseed = Tzel.Felt.of_u64 555 in
   let note = Tzel.Transaction.build_output
     ~d_j:addr.d_j ~auth_root:addr.auth_root ~auth_pub_seed:addr.auth_pub_seed ~nk_tag:addr.nk_tag
-    ~v:1000L ~rseed in
+    ~v:1000L ~rseed () in
   Alcotest.(check bool) "cm non-zero" true (not (Tzel.Felt.is_zero note.cm))
 
 let test_build_transfer_public () =
@@ -1118,14 +1136,14 @@ let test_build_transfer_public () =
   let rseed = Tzel.Felt.of_u64 555 in
   let out1 = Tzel.Transaction.build_output
     ~d_j:addr.d_j ~auth_root:addr.auth_root ~auth_pub_seed:addr.auth_pub_seed ~nk_tag:addr.nk_tag
-    ~v:600L ~rseed in
+    ~v:600L ~rseed () in
   let out2 = Tzel.Transaction.build_output
     ~d_j:addr.d_j ~auth_root:addr.auth_root ~auth_pub_seed:addr.auth_pub_seed ~nk_tag:addr.nk_tag
-    ~v:400L ~rseed:(Tzel.Felt.of_u64 666) in
+    ~v:400L ~rseed:(Tzel.Felt.of_u64 666) () in
   let out3 = Tzel.Transaction.build_output
     ~d_j:producer.d_j ~auth_root:producer.auth_root
     ~auth_pub_seed:producer.auth_pub_seed ~nk_tag:producer.nk_tag
-    ~v:1L ~rseed:(Tzel.Felt.of_u64 777) in
+    ~v:1L ~rseed:(Tzel.Felt.of_u64 777) () in
   let auth_domain = Tzel.Felt.of_u64 1 in
   let root = Tzel.Hash.hash_tag "root" in
   let nfs = [Tzel.Hash.hash_tag "nf0"] in
@@ -1148,18 +1166,18 @@ let test_build_unshield_public () =
   let producer = derive_test_address producer_keys 0 in
   let change = Tzel.Transaction.build_output
     ~d_j:addr.d_j ~auth_root:addr.auth_root ~auth_pub_seed:addr.auth_pub_seed ~nk_tag:addr.nk_tag
-    ~v:200L ~rseed:(Tzel.Felt.of_u64 888) in
+    ~v:200L ~rseed:(Tzel.Felt.of_u64 888) () in
   let fee_note = Tzel.Transaction.build_output
     ~d_j:producer.d_j ~auth_root:producer.auth_root
     ~auth_pub_seed:producer.auth_pub_seed ~nk_tag:producer.nk_tag
-    ~v:1L ~rseed:(Tzel.Felt.of_u64 999) in
+    ~v:1L ~rseed:(Tzel.Felt.of_u64 999) () in
   let (pub, sighash) = Tzel.Transaction.build_unshield_public
     ~auth_domain:(Tzel.Felt.of_u64 1)
     ~root:(Tzel.Hash.hash_tag "root")
     ~nullifiers:[Tzel.Hash.hash_tag "nf0"]
     ~v_pub:800L ~fee:100L ~recipient_string:"bob"
     ~change_note:(Some change) ~memo_ct_hash_change:Tzel.Felt.zero
-    ~fee_note ~memo_ct_hash_fee:Tzel.Felt.zero in
+    ~fee_note ~memo_ct_hash_fee:Tzel.Felt.zero () in
   Alcotest.(check bool) "cm_change matches" true (Tzel.Felt.equal pub.cm_change change.cm);
   Alcotest.(check bool) "cm_fee matches" true (Tzel.Felt.equal pub.cm_fee fee_note.cm);
   Alcotest.(check int64) "fee" 100L pub.fee;
@@ -1173,14 +1191,14 @@ let test_build_unshield_no_change () =
   let fee_note = Tzel.Transaction.build_output
     ~d_j:producer.d_j ~auth_root:producer.auth_root
     ~auth_pub_seed:producer.auth_pub_seed ~nk_tag:producer.nk_tag
-    ~v:1L ~rseed:(Tzel.Felt.of_u64 999) in
+    ~v:1L ~rseed:(Tzel.Felt.of_u64 999) () in
   let (pub, _) = Tzel.Transaction.build_unshield_public
     ~auth_domain:(Tzel.Felt.of_u64 1)
     ~root:(Tzel.Hash.hash_tag "root")
     ~nullifiers:[Tzel.Hash.hash_tag "nf0"]
     ~v_pub:1000L ~fee:100L ~recipient_string:"bob"
     ~change_note:None ~memo_ct_hash_change:Tzel.Felt.zero
-    ~fee_note ~memo_ct_hash_fee:Tzel.Felt.zero in
+    ~fee_note ~memo_ct_hash_fee:Tzel.Felt.zero () in
   Alcotest.(check bool) "cm_change is zero" true (Tzel.Felt.is_zero pub.cm_change);
   Alcotest.(check bool) "mh_change is zero" true (Tzel.Felt.is_zero pub.memo_ct_hash_change);
   Alcotest.(check bool) "cm_fee matches" true (Tzel.Felt.equal pub.cm_fee fee_note.cm)
@@ -1576,6 +1594,7 @@ let build_test_shield ~auth_domain ~recipient ~producer ~v_pub ~fee ~producer_fe
     ~rseed:(Tzel.Felt.of_u64 555) ~memo_ct_hash:mch
     ~producer ~producer_rseed:(Tzel.Felt.of_u64 999)
     ~producer_memo_ct_hash:prod_mch
+    ()
   in
   (pub, mch, prod_mch)
 
@@ -1591,7 +1610,7 @@ let test_shield_flow () =
       ~v_pub:5000L ~fee:100L ~producer_fee:1L
   in
   Tzel.Ledger.credit_deposit ledger
-    ~pubkey_hash:pub.pubkey_hash ~amount:5101L;
+    ~pubkey_hash:pub.pubkey_hash ~amount:5101L ();
   let result =
     Tzel.Ledger.apply_shield ledger ~pub
       ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
@@ -1599,8 +1618,7 @@ let test_shield_flow () =
   Alcotest.(check bool) "shield ok" true (Result.is_ok result);
   Alcotest.(check bool) "pool drained" true
     (Option.is_none
-       (Hashtbl.find_opt ledger.deposit_balances
-          (Tzel.Felt.to_hex pub.pubkey_hash)));
+       (Tzel.Ledger.deposit_balance ledger ~pubkey_hash:pub.pubkey_hash ()));
   Alcotest.(check int) "tree size (recipient + producer)" 2
     (Tzel.Ledger.tree_size ledger);
   let root = Tzel.Ledger.current_root ledger in
@@ -1618,7 +1636,7 @@ let test_shield_balance_underfund () =
       ~v_pub:500L ~fee:50L ~producer_fee:1L
   in
   Tzel.Ledger.credit_deposit ledger
-    ~pubkey_hash:pub.pubkey_hash ~amount:100L;
+    ~pubkey_hash:pub.pubkey_hash ~amount:100L ();
   let result =
     Tzel.Ledger.apply_shield ledger ~pub
       ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
@@ -1639,15 +1657,14 @@ let test_shield_balance_overfund_keeps_residual () =
       ~v_pub:500L ~fee:50L ~producer_fee:1L
   in
   (* Exact debit is 551; overfund the pool to 552. Shield drains 551, leaves 1. *)
-  Tzel.Ledger.credit_deposit ledger ~pubkey_hash:pub.pubkey_hash ~amount:552L;
+  Tzel.Ledger.credit_deposit ledger ~pubkey_hash:pub.pubkey_hash ~amount:552L ();
   let result =
     Tzel.Ledger.apply_shield ledger ~pub
       ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
   in
   Alcotest.(check bool) "shield ok" true (Result.is_ok result);
   Alcotest.(check bool) "1 mutez residual in pool" true
-    (Hashtbl.find_opt ledger.deposit_balances
-       (Tzel.Felt.to_hex pub.pubkey_hash) = Some 1L)
+    (Tzel.Ledger.deposit_balance ledger ~pubkey_hash:pub.pubkey_hash () = Some 1L)
 
 let test_shield_memo_mismatch () =
   let auth_domain = Tzel.Hash.hash_tag "test-domain" in
@@ -1661,7 +1678,7 @@ let test_shield_memo_mismatch () =
       ~v_pub:500L ~fee:50L ~producer_fee:1L
   in
   Tzel.Ledger.credit_deposit ledger
-    ~pubkey_hash:pub.pubkey_hash ~amount:551L;
+    ~pubkey_hash:pub.pubkey_hash ~amount:551L ();
   let wrong_mch = Tzel.Felt.of_u64 999 in
   let result =
     Tzel.Ledger.apply_shield ledger ~pub
@@ -1893,6 +1910,135 @@ let test_ledger_unshield_fee_memo_mismatch () =
   Alcotest.(check withdrawal_list) "no withdrawal queued" []
     (Tzel.Ledger.withdrawals ledger);
   Alcotest.(check int) "tree unchanged" 0 (Tzel.Ledger.tree_size ledger)
+
+(* ───────────────────────── Multiasset (FA2) ───────────────────────── *)
+
+(* A real KT1 ticketer whose derive_asset_id we pin against the Rust
+   core::derive_asset_id (computed via `derive_asset_id_cli`). If the OCaml
+   and Rust hashes ever diverge, FA2 commitments and withdrawal routing
+   would silently disagree across implementations. *)
+let fa2_ticketer = "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc"
+let fa2_asset_golden_hex =
+  "4ee94a93b01b04fe33415f56165884e3ab20f3357a1fee5bc84412c7ccc9cc00"
+
+let test_asset_registry_derive_asset_id_golden () =
+  let asset = Tzel.Asset_registry.derive_asset_id fa2_ticketer in
+  Alcotest.(check string) "derive_asset_id matches Rust core golden"
+    fa2_asset_golden_hex (Tzel.Felt.to_hex asset);
+  Alcotest.(check bool) "ASSET_TEZ is zero" true
+    (Tzel.Felt.is_zero Tzel.Asset_registry.asset_tez)
+
+let test_asset_registry_compose_and_lookup () =
+  let tez = "KT1Tez" and fa2a = "KT1FA2X" and fa2b = "KT1FA2Y" in
+  (* The trailing [tez] in the FA2 list must be deduped (skipped). *)
+  let registry = Tzel.Asset_registry.compose_with ~tez_ticketer:tez [fa2a; fa2b; tez] in
+  Alcotest.(check int) "registry = tez + 2 FA2 (tez dedup'd)" 3 (List.length registry);
+  let id_a = Tzel.Asset_registry.derive_asset_id fa2a in
+  Alcotest.(check bool) "tez ticketer -> ASSET_TEZ" true
+    (match Tzel.Asset_registry.asset_for_ticketer registry tez with
+     | Some a -> Tzel.Felt.is_zero a | None -> false);
+  Alcotest.(check bool) "fa2a ticketer -> derive_asset_id(fa2a)" true
+    (match Tzel.Asset_registry.asset_for_ticketer registry fa2a with
+     | Some a -> Tzel.Felt.equal a id_a | None -> false);
+  Alcotest.(check (option string)) "ASSET_TEZ -> tez ticketer" (Some tez)
+    (Tzel.Asset_registry.ticketer_for_asset registry Tzel.Asset_registry.asset_tez);
+  Alcotest.(check (option string)) "id_a -> fa2a ticketer" (Some fa2a)
+    (Tzel.Asset_registry.ticketer_for_asset registry id_a);
+  Alcotest.(check (option string)) "unknown asset -> None" None
+    (Tzel.Asset_registry.ticketer_for_asset registry (Tzel.Hash.hash_tag "nope"))
+
+let build_fa2_shield ~auth_domain ~asset_new ~recipient ~producer ~v_pub ~fee ~producer_fee =
+  let mch = Tzel.Hash.hash_tag "fa2-shield-mch" in
+  let prod_mch = Tzel.Hash.hash_tag "fa2-shield-prod-mch" in
+  let blind = Tzel.Hash.hash_tag "fa2-shield-blind" in
+  let pubkey_hash =
+    Tzel.Transaction.deposit_pubkey_hash
+      ~auth_domain ~auth_root:(recipient : Tzel.Keys.address).auth_root
+      ~auth_pub_seed:recipient.auth_pub_seed ~blind
+  in
+  let (pub, recipient_note, producer_note) = Tzel.Transaction.build_shield
+    ~asset_new ~auth_domain ~pubkey_hash
+    ~recipient ~v_pub ~fee ~producer_fee
+    ~rseed:(Tzel.Felt.of_u64 4242) ~memo_ct_hash:mch
+    ~producer ~producer_rseed:(Tzel.Felt.of_u64 8484)
+    ~producer_memo_ct_hash:prod_mch ()
+  in
+  (pub, recipient_note, producer_note, mch, prod_mch)
+
+let test_fa2_shield_dual_pool () =
+  let auth_domain = Tzel.Hash.hash_tag "test-domain" in
+  let ledger = Tzel.Ledger.create ~auth_domain in
+  let recipient = derive_test_address (Tzel.Keys.derive (Tzel.Felt.of_u64 11)) 0 in
+  let producer = derive_test_address (Tzel.Keys.derive (Tzel.Felt.of_u64 700)) 0 in
+  let fa2 = Tzel.Asset_registry.derive_asset_id fa2_ticketer in
+  let (pub, recipient_note, producer_note, mch, prod_mch) =
+    build_fa2_shield ~auth_domain ~asset_new:fa2 ~recipient ~producer
+      ~v_pub:5000L ~fee:100L ~producer_fee:3L
+  in
+  (* The recipient note commits to the FA2 asset; the producer-fee note
+     stays tez (asset_producer pinned to ASSET_TEZ). *)
+  Alcotest.(check bool) "pub.asset_new = fa2" true (Tzel.Felt.equal pub.asset_new fa2);
+  Alcotest.(check bool) "pub.asset_producer = tez" true (Tzel.Felt.is_zero pub.asset_producer);
+  Alcotest.(check bool) "recipient note carries fa2" true (Tzel.Felt.equal recipient_note.asset fa2);
+  Alcotest.(check bool) "producer note carries tez" true (Tzel.Felt.is_zero producer_note.asset);
+  (* Fund the FA2 pool with v+fee=5100 and the tez pool with producer_fee=3. *)
+  Tzel.Ledger.credit_deposit ledger ~asset_id:fa2 ~pubkey_hash:pub.pubkey_hash ~amount:5100L ();
+  Tzel.Ledger.credit_deposit ledger ~pubkey_hash:pub.pubkey_hash ~amount:3L ();
+  let result =
+    Tzel.Ledger.apply_shield ledger ~pub ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
+  in
+  Alcotest.(check bool) "fa2 shield ok" true (Result.is_ok result);
+  Alcotest.(check bool) "fa2 pool drained" true
+    (Option.is_none (Tzel.Ledger.deposit_balance ledger ~asset_id:fa2 ~pubkey_hash:pub.pubkey_hash ()));
+  Alcotest.(check bool) "tez pool drained" true
+    (Option.is_none (Tzel.Ledger.deposit_balance ledger ~pubkey_hash:pub.pubkey_hash ()));
+  Alcotest.(check int) "tree = recipient + producer" 2 (Tzel.Ledger.tree_size ledger)
+
+let test_fa2_shield_requires_tez_pool () =
+  (* An FA2 shield with no tez pool to cover producer_fee must be rejected;
+     otherwise it would mint producer_fee tez out of nothing. The FA2 pool
+     must be left untouched (no partial debit). *)
+  let auth_domain = Tzel.Hash.hash_tag "test-domain" in
+  let ledger = Tzel.Ledger.create ~auth_domain in
+  let recipient = derive_test_address (Tzel.Keys.derive (Tzel.Felt.of_u64 12)) 0 in
+  let producer = derive_test_address (Tzel.Keys.derive (Tzel.Felt.of_u64 700)) 0 in
+  let fa2 = Tzel.Asset_registry.derive_asset_id fa2_ticketer in
+  let (pub, _rn, _pn, mch, prod_mch) =
+    build_fa2_shield ~auth_domain ~asset_new:fa2 ~recipient ~producer
+      ~v_pub:5000L ~fee:100L ~producer_fee:3L
+  in
+  Tzel.Ledger.credit_deposit ledger ~asset_id:fa2 ~pubkey_hash:pub.pubkey_hash ~amount:5100L ();
+  let result =
+    Tzel.Ledger.apply_shield ledger ~pub ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
+  in
+  Alcotest.(check bool) "rejected: no tez pool" true (Result.is_error result);
+  Alcotest.(check bool) "fa2 pool intact after rejection" true
+    (Tzel.Ledger.deposit_balance ledger ~asset_id:fa2 ~pubkey_hash:pub.pubkey_hash () = Some 5100L);
+  Alcotest.(check int) "tree unchanged" 0 (Tzel.Ledger.tree_size ledger)
+
+let test_fa2_unshield_records_asset () =
+  let auth_domain = Tzel.Hash.hash_tag "domain" in
+  let ledger = Tzel.Ledger.create ~auth_domain in
+  let root = Tzel.Ledger.current_root ledger in
+  let mch = Tzel.Felt.zero in
+  let cm_fee = Tzel.Hash.hash_tag "fa2-fee-cm" in
+  let nf = Tzel.Hash.hash_tag "fa2-nf" in
+  let fa2 = Tzel.Asset_registry.derive_asset_id fa2_ticketer in
+  let upub = make_unshield_pub ~auth_domain ~root ~nullifiers:[nf]
+    ~v_pub:4000L ~asset_pub:fa2 ~fee:1L ~recipient_string:test_l1_recipient
+    ~cm_fee () in
+  let result = Tzel.Ledger.apply_unshield ledger
+    ~recipient_string:test_l1_recipient upub
+    ~memo_ct_hash_change:mch ~memo_ct_hash_fee:mch in
+  Alcotest.(check bool) "fa2 unshield ok" true (Result.is_ok result);
+  (* The withdrawal record carries the FA2 asset_id so the L1 outbox routes
+     it to the FA2 ticketer rather than the tez bridge. *)
+  (match Tzel.Ledger.withdrawal_records ledger with
+   | [(asset, recipient, amount)] ->
+     Alcotest.(check bool) "withdrawal asset = fa2" true (Tzel.Felt.equal asset fa2);
+     Alcotest.(check string) "withdrawal recipient" test_l1_recipient recipient;
+     Alcotest.(check int64) "withdrawal amount" 4000L amount
+   | _ -> Alcotest.fail "expected exactly one FA2 withdrawal record")
 
 let test_ledger_root_history () =
   let auth_domain = Tzel.Hash.hash_tag "domain" in
@@ -2211,9 +2357,10 @@ let test_multi_shield_transfer_unshield () =
       ~memo_ct_hash:mch_r ~producer
       ~producer_rseed:(Tzel.Felt.of_u64 (2000 + rseed_offset))
       ~producer_memo_ct_hash:mch_p
+      ()
     in
     let amount = Int64.add v_pub (Int64.add fee producer_fee) in
-    Tzel.Ledger.credit_deposit ledger ~pubkey_hash ~amount;
+    Tzel.Ledger.credit_deposit ledger ~pubkey_hash ~amount ();
     (pub, mch_r, mch_p)
   in
   let (pub1, mch1, prod_mch1) =
@@ -2434,6 +2581,11 @@ let () =
       Alcotest.test_case "unshield wrong domain" `Quick test_ledger_unshield_wrong_domain;
       Alcotest.test_case "unshield change memo mismatch" `Quick test_ledger_unshield_change_memo_mismatch;
       Alcotest.test_case "unshield fee memo mismatch" `Quick test_ledger_unshield_fee_memo_mismatch;
+      Alcotest.test_case "fa2 derive_asset_id golden" `Quick test_asset_registry_derive_asset_id_golden;
+      Alcotest.test_case "fa2 registry compose+lookup" `Quick test_asset_registry_compose_and_lookup;
+      Alcotest.test_case "fa2 shield dual pool" `Quick test_fa2_shield_dual_pool;
+      Alcotest.test_case "fa2 shield requires tez pool" `Quick test_fa2_shield_requires_tez_pool;
+      Alcotest.test_case "fa2 unshield records asset" `Quick test_fa2_unshield_records_asset;
       Alcotest.test_case "root history" `Quick test_ledger_root_history;
       Alcotest.test_case "root history prunes oldest" `Quick test_ledger_root_history_prunes_oldest;
       Alcotest.test_case "empty nullifiers" `Quick test_ledger_check_nullifiers_empty;

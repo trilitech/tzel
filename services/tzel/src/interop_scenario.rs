@@ -491,6 +491,25 @@ mod tests {
             )),
             "360b52a6051b21dbe78b12baf6a933f769b9a4b081481e9186c78aeaa07ca507"
         );
+        // Multiasset: a shield whose recipient note carries a real FA2
+        // asset_id (asset_producer stays ASSET_TEZ). Pins the nonzero
+        // asset_recipient fold so the OCaml port's FA2 shield sighash is
+        // verified byte-identical (mirror in ocaml test_main.ml).
+        let fa2 = derive_asset_id("KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc");
+        assert_eq!(
+            hex::encode(shield_sighash(
+                &f(1), &f(2), 10, 3, 4, &f(5), &f(6), &f(7), &f(8), &fa2, &ZERO
+            )),
+            "bcc633ff2b15f460d810b0e307a6ab6e0001521645bc7c404eb1071a5e75b603"
+        );
+        // Multiasset: a note commitment binding a nonzero FA2 asset tag.
+        // The tez protocol vectors only exercise asset = ASSET_TEZ (zero);
+        // this pins the FA2 (nonzero asset) commitment so the OCaml port's
+        // hash_commit is verified byte-identical for FA2 notes too.
+        assert_eq!(
+            hex::encode(commit(&f(1), 10, &fa2, &f(2), &f(3))),
+            "fce43f618a4cb4dfcabb5a7d1b472125d025f98899c4c2a350b0c7c8a65b3807"
+        );
     }
 
 }

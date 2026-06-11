@@ -90,7 +90,7 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     Int64.add shield_v (Int64.add shield_fee shield_producer_fee)
   in
   Tzel.Ledger.credit_deposit ledger
-    ~pubkey_hash:shield_pubkey_hash ~amount:exact_debit;
+    ~pubkey_hash:shield_pubkey_hash ~amount:exact_debit ();
   begin match Tzel.Ledger.apply_shield ledger ~pub:shield_pub
                 ~memo_ct_hash:shield_mch
                 ~producer_memo_ct_hash:shield_prod_mch with

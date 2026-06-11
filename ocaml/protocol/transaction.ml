@@ -15,14 +15,14 @@
                 recipient_id, cm_change, memo_ct_hash_change,
                 cm_change_2, memo_ct_hash_change_2, cm_fee, memo_ct_hash_fee]
 
-   This port is tez-only (notes commit with asset = Felt.zero), so the
-   multiasset asset fields are always ASSET_TEZ (Felt.zero) and the unused
-   change/output slots are Felt.zero here — but the FIELDS and their fold
-   ORDER are present so the sighashes are byte-identical to the deployed
-   circuit's, which folds those zeros too.  The asset fields and the extra
-   slots were added in the multiasset change; an earlier version of this
-   file silently dropped them, which the per-flow sighash conformance test
-   (test below) now catches.
+   Multiasset: the asset fields carry real L2 asset_ids. A shield's
+   [asset_new] is the asset of the recipient note (ASSET_TEZ for a tez
+   shield, derive_asset_id(ticketer) for an FA2 shield); [asset_producer]
+   is always ASSET_TEZ because the producer fee is pinned to tez. An
+   unshield's [asset_pub] is the asset being released to L1. The fold
+   ORDER of these fields matches the deployed circuit exactly; an earlier
+   version of this file silently dropped them, which the per-flow sighash
+   conformance test (test below) now catches.
 
    Sighashes use the sighash_fold primitive (BLAKE2s with personalization
    "sighSP__"). The leading type tag is 0x01 / 0x02 / 0x03 respectively
@@ -182,32 +182,38 @@ let unshield_sighash (pub : unshield_public) =
    shield time and bound by the in-circuit WOTS+ signature (not modeled in
    this OCaml mirror — it trusts that the corresponding STARK has already
    validated). *)
-let build_shield ~auth_domain ~pubkey_hash ~(recipient : Keys.address)
+let build_shield ?(asset_new = asset_tez) ~auth_domain ~pubkey_hash
+    ~(recipient : Keys.address)
     ~(v_pub : int64) ~(fee : int64) ~(producer_fee : int64)
     ~(rseed : Felt.t) ~memo_ct_hash
-    ~(producer : Keys.address) ~(producer_rseed : Felt.t) ~producer_memo_ct_hash =
-  let note = Note.create recipient v_pub rseed in
+    ~(producer : Keys.address) ~(producer_rseed : Felt.t) ~producer_memo_ct_hash () =
+  (* The recipient note carries the shielded asset; the producer-fee note
+     is always tez (the producer fee is pinned to ASSET_TEZ). *)
+  let note = Note.create ~asset:asset_new recipient v_pub rseed in
   let producer_note = Note.create producer producer_fee producer_rseed in
   let pub = {
     auth_domain;
     pubkey_hash;
     v_pub; fee; producer_fee;
-    (* tez-only port: both notes are tez (asset = ASSET_TEZ). *)
-    asset_new = asset_tez; asset_producer = asset_tez;
+    asset_new; asset_producer = asset_tez;
     cm_new = note.cm; cm_producer = producer_note.cm;
     memo_ct_hash; producer_memo_ct_hash;
   } in
   (pub, note, producer_note)
 
-(* Build output notes for transfer *)
-let build_output ~(d_j : Felt.t) ~(auth_root : Felt.t) ~(auth_pub_seed : Felt.t) ~(nk_tag : Felt.t)
-    ~(v : int64) ~(rseed : Felt.t) =
-  Note.create_from_parts ~d_j ~auth_root ~auth_pub_seed ~nk_tag ~v ~rseed
+(* Build output notes for transfer. [asset] defaults to ASSET_TEZ; a
+   transfer of an FA2 note passes the note's asset so the output cm binds
+   the same asset as the spent inputs. *)
+let build_output ?(asset = asset_tez) ~(d_j : Felt.t) ~(auth_root : Felt.t)
+    ~(auth_pub_seed : Felt.t) ~(nk_tag : Felt.t)
+    ~(v : int64) ~(rseed : Felt.t) () =
+  Note.create_from_parts ~asset ~d_j ~auth_root ~auth_pub_seed ~nk_tag ~v ~rseed ()
 
 (* Build transfer public outputs and sighash.
    [out1] = recipient (slot 1), [out2] = change_1 (slot 2),
-   [out3] = producer-fee (slot 4).  This tez-only port has no second-asset
-   change, so slot 3 (change_2) is empty (Felt.zero). *)
+   [out3] = producer-fee (slot 4).  This helper drives a single-asset
+   transfer, so slot 3 (the second-asset change_2) is left empty
+   (Felt.zero); each note still binds its own asset via its commitment. *)
 let build_transfer_public ~auth_domain ~root ~nullifiers ~(fee : int64)
     ~(out1 : Note.t) ~(out2 : Note.t) ~(out3 : Note.t)
     ~memo_ct_hash_1 ~memo_ct_hash_2 ~memo_ct_hash_3 =
@@ -220,20 +226,20 @@ let build_transfer_public ~auth_domain ~root ~nullifiers ~(fee : int64)
   let sighash = transfer_sighash pub in
   (pub, sighash)
 
-(* Build unshield public outputs and sighash *)
-let build_unshield_public ~auth_domain ~root ~nullifiers
+(* Build unshield public outputs and sighash. [asset_pub] is the asset
+   released to L1 (ASSET_TEZ for a tez exit, an FA2 asset_id otherwise);
+   the change note carries that same asset, while the fee note is tez. *)
+let build_unshield_public ?(asset_pub = asset_tez) ~auth_domain ~root ~nullifiers
     ~(v_pub : int64) ~(fee : int64) ~recipient_string
     ~change_note ~memo_ct_hash_change
-    ~(fee_note : Note.t) ~memo_ct_hash_fee =
+    ~(fee_note : Note.t) ~memo_ct_hash_fee () =
   let recipient_id = Hash.account_id recipient_string in
   let (cm_change, memo_ct_hash_change) = match change_note with
     | Some (n : Note.t) -> (n.cm, memo_ct_hash_change)
     | None -> (Felt.zero, Felt.zero) in
   let pub = {
     auth_domain; root; nullifiers;
-    (* tez-only port: the public exit and change are tez; no second-asset
-       change slot is used. *)
-    v_pub; asset_pub = asset_tez; fee; recipient_id;
+    v_pub; asset_pub; fee; recipient_id;
     cm_change; memo_ct_hash_change;
     cm_change_2 = Felt.zero; memo_ct_hash_change_2 = Felt.zero;
     cm_fee = fee_note.cm; memo_ct_hash_fee;
