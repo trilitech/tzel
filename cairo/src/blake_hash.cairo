@@ -398,6 +398,15 @@ mod tests {
         );
     }
 
+    // Cross-impl conformance for the nullifier primitive: the OCaml port
+    // computes nullifier(nk=1, cm=2, pos=3) = H_nf(nk, H_nf(cm, pos)) =
+    // little-endian bytes dd888f...a002; the Cairo circuit must agree.
+    #[test]
+    fn test_nullifier_conforms_to_model() {
+        let nf = super::nullifier(1, 2, 3_u64);
+        assert(nf == 0x02a0506477f37357b2ae26d93b75df6edbecb9db08ce3688e8018065778f88dd, 'nullifier model conformance');
+    }
+
     fn checksum_value(digits: Span<u32>) -> u32 {
         let mut checksum: u32 = 0;
         let mut i: u32 = 0;

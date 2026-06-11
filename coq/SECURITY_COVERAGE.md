@@ -426,12 +426,12 @@ rests on three independent mechanisms, not on trust:
    differential's reference is the OCaml protocol port, which agrees
    with the Rust protocol (`tzel_core`) via pinned cross-impl vectors.
    A FIRST direct `Cairo ↔ model` conformance check now exists
-   (`cairo/src/blake_hash.cairo::test_commit_conforms_to_pinned_model_vector`,
-   `scarb test`): the Cairo's `commit` on the `commitment_u64_max_v1`
-   inputs equals the model value, verified byte-identical to the port's
-   `hash_commit` and the pinned vector — closing `Coq ↔ port ↔ vector ↔
-   Cairo` for the commitment primitive and fixing the byte↔felt252
-   packing.  The remaining primitives and the relation-level full-witness
+   (`blake_hash.cairo::test_commit_conforms_to_pinned_model_vector` and
+   `test_nullifier_conforms_to_model`, `scarb test`): the Cairo's `commit`
+   and `nullifier` on fixed inputs equal the model values, verified
+   byte-identical to the port (`hash_commit` / nested `hash_nf`) — closing
+   `Coq ↔ port ↔ Cairo` for the commitment AND nullifier primitives and
+   fixing the byte↔felt252 packing.  The remaining primitives and the relation-level full-witness
    conformance follow this pattern and are forthcoming; until they land
    the Cairo's tie to the model is established for them by mechanisms 1
    and 3 (SHA-pinned drift + the assertion cross-check).

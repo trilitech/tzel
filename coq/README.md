@@ -56,10 +56,10 @@ Each layer is what catches a different failure mode:
     `specs/test_vectors/commitment_u64_max_v1.json`. This also pins the
     **byte↔felt252 packing** (the felt is the 32 little-endian bytes
     read as a number) that the full harness needs. So for the
-    *commitment* primitive the chain is now closed end-to-end:
-    `Coq ↔ port ↔ pinned-vector ↔ Cairo`.
-  - The REMAINING primitives (chain step, nullifier, sighash, Merkle,
-    L-tree) and the *relation-level* full-witness conformance
+    *commitment* AND *nullifier* primitives the chain is now closed
+    end-to-end (`test_commit_conforms_to_pinned_model_vector` /
+    `test_nullifier_conforms_to_model`).
+  - The REMAINING primitives (chain step, sighash, Merkle, L-tree) and the *relation-level* full-witness conformance
     (`run_*.cairo` driven on random witnesses vs the certified model's
     accept/reject) follow this same established pattern and are the next
     step — still forthcoming. (The `run_*.cairo` executables already run
@@ -70,9 +70,9 @@ Each layer is what catches a different failure mode:
     **drift-pinned manual assertion cross-check** (every Cairo `assert`
     matched to a relation conjunct, SHA-pinned); (2) the function
     differentials (independent confidence the Coq transcription matches
-    the port/Rust); and (3) now a direct Cairo-vs-model conformance for
-    the commitment primitive, with the others to follow the same
-    pattern.
+    the port/Rust); and (3) now direct Cairo-vs-model conformance for
+    the commitment and nullifier primitives, with the others to follow
+    the same pattern.
 
   See `SECURITY_COVERAGE.md` ("How faithfulness is established") for the
   full account.
