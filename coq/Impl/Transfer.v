@@ -700,4 +700,32 @@ Section TransferRelation.
     rewrite Hnf1, Hnf2, Hcm1, Hcm2, Hpos, Hnk. reflexivity.
   Qed.
 
+  (** ** Asset-confusion resistance (multiasset integrity)
+
+      A spent note's asset is FIXED by its commitment.  The
+      multiasset-specific attack is to spend a note of one asset (say
+      tez) while declaring it as another (say a high-value FA2), to
+      drain the wrong pool / break the per-asset conservation.  That is
+      structurally impossible: the relation feeds the SAME [ci_asset c]
+      into both the commitment ([ci_cm]) and the value-conservation
+      lanes, and the commitment is pinned to a real tree leaf by Merkle
+      membership.  So if a spend's commitment is a well-formed note
+      commitment carrying asset [asset], the spender's declared
+      [ci_asset c] MUST equal [asset] — by commitment injectivity.
+      Composed with the per-asset [grand_conservation], value of each
+      asset is conserved against the TRUE asset of every spent note: no
+      cross-asset inflation. *)
+  Theorem spend_binds_asset :
+    Spec.Hashes.injective_5 H_commit ->
+    forall (c : CairoInput) (d v asset rcm owner : Felt),
+      ci_cm c = H_commit d v asset rcm owner ->
+      ci_asset c = asset.
+  Proof.
+    intros Hcom c d v asset rcm owner Hcm.
+    unfold ci_cm in Hcm.
+    apply Hcom in Hcm.
+    destruct Hcm as (_ & _ & Hasset & _ & _).
+    exact Hasset.
+  Qed.
+
 End TransferRelation.
