@@ -598,6 +598,20 @@ still forthcoming.
       circuit and none of the relation-soundness results would apply.
       The deployment must generate the key from these circuits; the
       admin-config trust root (above) gates who installs it.
+  (c) **The kernel actually INVOKES the verifier in production** — a
+      subtle but IN-SCOPE point that (a)/(b) silently assume: links
+      (a)/(b) are vacuous if the kernel skips the check.  Verified
+      line-level this audit: the two proof-skip paths are cfg-gated to
+      non-prod — `validate_transition_proof`'s early-return is
+      `#[cfg(any(test, tzel_insecure_sandbox))]`, and the
+      `Proof::TrustMeBro` *output-binding* bypass is `#[cfg(test)]` ONLY.
+      The CI/e2e sandbox (`tzel_insecure_sandbox`) skips only the
+      expensive STARK math and STILL runs the full output-binding checks
+      (auth_domain / root / nullifiers / fee / cm vs the real
+      `output_preimage` the prover stub emits).  No prod/bundle build sets
+      either cfg, so a deployed kernel always runs BOTH the STARK verify
+      and the output-binding — closing the "did the kernel even check?"
+      gap.
   So the chain is: [Coq: relation ⇒ safety] ∘ [drift+differential: Coq
   relation = Cairo circuit] ∘ [STARK+key: verifying proof ⇒ satisfying
   witness of that circuit].  This module owns the first link and the
