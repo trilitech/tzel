@@ -88,6 +88,15 @@ pub fn verify(leaf: felt252, root: felt252, siblings: Span<felt252>, path_indice
 mod tests {
     use super::{TREE_DEPTH, hash2, verify};
 
+    // Cross-impl conformance for the Merkle node hash: the OCaml port computes
+    // hash_merkle(1, 2) = little-endian bytes 890fb6...9800; the Cairo's merkle
+    // node hash (hash2, merkle-IV) must agree. This pins the building block of
+    // the tree-root computation directly to the model.
+    #[test]
+    fn test_merkle_node_hash_conforms_to_model() {
+        assert(hash2(1, 2) == 0x00981b69a5f29168d9f043960cf4f5be6e6ac75a4212ca11cc70ca6cb4b60f89, 'merkle node-hash conformance');
+    }
+
     fn zero_siblings(depth: u32) -> Array<felt252> {
         let mut siblings: Array<felt252> = array![];
         let mut i: u32 = 0;

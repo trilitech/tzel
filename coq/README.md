@@ -58,7 +58,7 @@ Each layer is what catches a different failure mode:
     read as a number) that the full harness needs. So for the
     *commitment*, *nullifier*, and WOTS+ *chain-step* primitives the
     chain is now closed end-to-end.
-  - The REMAINING primitives (sighash, Merkle, L-tree) and the *relation-level* full-witness conformance
+  - The REMAINING primitives (sighash, full Merkle path, L-tree) and the *relation-level* full-witness conformance
     (`run_*.cairo` driven on random witnesses vs the certified model's
     accept/reject) follow this same established pattern and are the next
     step — still forthcoming. (The `run_*.cairo` executables already run
@@ -70,8 +70,8 @@ Each layer is what catches a different failure mode:
     matched to a relation conjunct, SHA-pinned); (2) the function
     differentials (independent confidence the Coq transcription matches
     the port/Rust); and (3) now direct Cairo-vs-model conformance for
-    the commitment, nullifier, and chain-step primitives, with the others
-    to follow
+    the commitment, nullifier, chain-step, and Merkle-node-hash
+    primitives, with the others to follow
     the same pattern.
 
   See `SECURITY_COVERAGE.md` ("How faithfulness is established") for the
