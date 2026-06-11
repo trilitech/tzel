@@ -28,6 +28,8 @@ let base_storage : TzEL.storage = {
   circuit_root = tree_roots32 ;   (* matches the test's tree_roots[0] *)
   program_hash = 0x00 ;
   auth_domain = 0x00 ;
+  leaf_circuit_root = ([] : nat list) ;
+  internal_roots = ([] : (nat list) list) ;
   nullifiers = (Big_map.empty : (bytes, unit) big_map) ;
 }
 
@@ -45,7 +47,7 @@ let test_shield_reaches_gateway =
   let c = Test.to_contract orig.addr in
   let param : TzEL.shield_param =
     { proof = 0x ; tree_roots = tree_roots32 ;
-      root_output_lanes = ([] : nat list) ; output_preimage = preimage1 ; enc_notes = ([] : bytes list) } in
+      leaves = [ preimage1 ] ; output_preimage = preimage1 ; enc_notes = ([] : bytes list) } in
   let result = Test.transfer_to_contract c (Shield param) 0tez in
   let () = match result with
     | Success _ -> failwith "expected gateway view unavailable in Test"
@@ -58,7 +60,7 @@ let test_transfer_reaches_gateway =
   let c = Test.to_contract orig.addr in
   let param : TzEL.transfer_param =
     { proof = 0x ; tree_roots = tree_roots32 ;
-      root_output_lanes = ([] : nat list) ; output_preimage = preimage1 ; enc_notes = ([] : bytes list) } in
+      leaves = [ preimage1 ] ; output_preimage = preimage1 ; enc_notes = ([] : bytes list) } in
   let result = Test.transfer_to_contract c (Transfer param) 0tez in
   let () = match result with
     | Success _ -> failwith "expected gateway view unavailable in Test"
@@ -72,7 +74,7 @@ let test_wrong_circuit_root_rejected =
   let c = Test.to_contract orig.addr in
   let param : TzEL.shield_param =
     { proof = 0x ; tree_roots = tree_roots32 ;
-      root_output_lanes = ([] : nat list) ; output_preimage = preimage1 ; enc_notes = ([] : bytes list) } in
+      leaves = [ preimage1 ] ; output_preimage = preimage1 ; enc_notes = ([] : bytes list) } in
   let result = Test.transfer_to_contract c (Shield param) 0tez in
   let () = match result with
     | Success _ -> failwith "expected wrong-circuit rejection"

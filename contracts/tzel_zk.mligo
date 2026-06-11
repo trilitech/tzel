@@ -38,9 +38,14 @@ type storage = {
   vk           : bytes ;                    (* Groth16 wrap verifying key *)
   (* PINNED identities — set at origination. Without these the wrap vk only
      pins the UNIVERSAL wrap circuit, and any inner circuit forges effects. *)
-  circuit_root : bytes ;                    (* tree_roots[0] = inner STARK circuit identity *)
+  circuit_root : bytes ;                    (* tree_roots[0] = mv ROOT circuit identity *)
   program_hash : bytes ;                    (* bootloader program_hash (output_preimage[2]) *)
   auth_domain  : bytes ;                    (* ledger domain (output_preimage[3]) *)
+  (* mv aggregation-tree circuit-root constants (per-release protocol consts,
+     8 M31 lanes each): the leaf circuit's preprocessed root, and the internal
+     levels bottom-up [leaf_to_mv, …, mv_to_mv]. The last == circuit_root lanes. *)
+  leaf_circuit_root : nat list ;
+  internal_roots    : (nat list) list ;
   nullifiers   : (bytes, unit) big_map ;    (* spent nullifier set *)
 }
 
@@ -88,26 +93,58 @@ let frame_lanes (lanes : nat list) : bytes =
        Bytes.concat acc (Bytes.concat scalar_len_be scalar))
     empty_bytes lanes
 
-(* ── the binding: derive the publics from the mv root output, verify ────────
+(* ── mv aggregation-tree walk (mirrors verifier derive_mv_root_publics) ──────
+   Each declared leaf op's output_preimage → its 8 output lanes
+   (compute_output_hash_values); fold pairwise up the tree
+   (compute_mv_output_values) using the pinned internal circuit-root constants;
+   the mv ROOT's output lanes are returned. Both blakes are golden-tested. *)
+type mv_node = { root : nat list ; ov : nat list }
+
+let rec fold_pairs
+    (src : blake_src) (internal_root : nat list)
+    (level : mv_node list) : mv_node list =
+  match level with
+  | [] -> ([] : mv_node list)
+  | [_] -> (failwith "TzEL: mv level not a power of two" : mv_node list)
+  | l :: r :: rest ->
+      let ov = O.compute_mv_output_values src l.root l.ov r.root r.ov in
+      { root = internal_root ; ov } :: fold_pairs src internal_root rest
+
+let derive_mv_root_ov
+    (src : blake_src) (leaf_root : nat list)
+    (internal_roots : (nat list) list) (leaves : bytes list list) : nat list =
+  let leaf_nodes : mv_node list =
+    List.map
+      (fun (pre : bytes list) ->
+         { root = leaf_root ; ov = O.compute_output_hash_values src pre })
+      leaves in
+  let root_level =
+    List.fold_left
+      (fun ((level, internal_root) : mv_node list * nat list) ->
+         fold_pairs src internal_root level)
+      leaf_nodes internal_roots in
+  match root_level with
+  | [ n ] -> n.ov
+  | _ -> (failwith "TzEL: mv tree did not reduce to a single root" : nat list)
+
+(* ── the binding: derive the publics from the declared leaves, verify ───────
    PRODUCTION proofs are mv-mode (circuit_multiverifier root, services/tzel
    submit_v18.rs): OutHash = compute_expected_out_hash_mv(TreeRoots[0],
-   mv_root.output_values). NOT leaf-mode. See docs/TZEL-TREE-AND-SYNC.md §mv.
-
-   STEP 1 (single-op): the mv root's 8 output lanes are taken as a parameter
-   (`root_output_lanes`). STEP 2 will DERIVE them from the declared leaves'
-   output_preimages via the aggregation tree walk (compute_output_hash_values
-   per leaf, compute_mv_output_values folds — both golden-tested), binding the
-   proof to the actual ops. Until then root_output_lanes is unbound (insecure);
-   this step only makes the real mv proof VERIFY. *)
+   mv_root.output_values). The mv root output values are DERIVED here from the
+   declared leaves via the aggregation tree walk — so the proof is bound to the
+   exact declared ops (changing any leaf changes the root → OutHash → verify
+   fails). See docs/TZEL-TREE-AND-SYNC.md §mv. *)
 let verify_bound
     (s : storage) (proof : bytes)
-    (tree_roots : bytes) (root_output_lanes : nat list) : unit =
+    (tree_roots : bytes) (leaves : bytes list list) : unit =
   let src = Gateway s.gateway in
   let root0 = Bytes.sub 0n 32n tree_roots in
   (* CRITICAL pin: tree_roots[0] = the mv ROOT circuit identity. The stored vk
      pins only the UNIVERSAL wrap circuit; without this an attacker wraps their
      OWN inner circuit (arbitrary output) and drains the pool. *)
   let () = if root0 <> s.circuit_root then failwith "TzEL: wrong circuit" else () in
+  let root_output_lanes =
+    derive_mv_root_ov src s.leaf_circuit_root s.internal_roots leaves in
   let outhash_lanes = O.compute_expected_out_hash_mv src root0 root_output_lanes in
   let framed = Bytes.concat (frame_root_bytes tree_roots) (frame_lanes outhash_lanes) in
   let body =
@@ -199,37 +236,39 @@ let emit_sync (output_preimage : bytes list) (enc_notes : bytes list) : operatio
    Effect offsets (membership root, nf list, commitments) are the transfer
    layout and are re-pinned with the multi-asset circuit. *)
 
-(* `root_output_lanes` = the mv aggregation root's 8 output values (STEP 1:
-   supplied; STEP 2 will derive them from the declared leaves' preimages). *)
+(* `leaves` = the declared aggregation-tree leaves' output_preimages (the
+   TreeBinding); the proof is bound to them via the mv walk. `output_preimage`
+   is the PRIMARY op of this entrypoint (identity + effects); a step-3 check
+   will assert it is one of `leaves`. *)
 
 (* A shield deposits value and creates commitments (no spend, no nullifier). *)
 type shield_param = {
-  proof             : bytes ;
-  tree_roots        : bytes ;        (* 128 bytes = 4 x 32 *)
-  root_output_lanes : nat list ;     (* mv root output values (8 lanes) *)
-  output_preimage   : bytes list ;   (* bootloader output felts (32-byte BE) *)
-  enc_notes         : bytes list ;   (* note ciphertexts to publish *)
+  proof           : bytes ;
+  tree_roots      : bytes ;             (* 128 bytes = 4 x 32 *)
+  leaves          : (bytes list) list ; (* declared leaf output_preimages *)
+  output_preimage : bytes list ;        (* the primary op (identity + effects) *)
+  enc_notes       : bytes list ;        (* note ciphertexts to publish *)
 }
 
 [@entry]
 let shield (p : shield_param) (s : storage) : operation list * storage =
-  let () = verify_bound s p.proof p.tree_roots p.root_output_lanes in
+  let () = verify_bound s p.proof p.tree_roots p.leaves in
   let () = check_identity s p.output_preimage in
   [ emit_sync p.output_preimage p.enc_notes ], s
 
 (* A transfer spends N notes against a validated membership root and creates new
    commitments. *)
 type transfer_param = {
-  proof             : bytes ;
-  tree_roots        : bytes ;
-  root_output_lanes : nat list ;
-  output_preimage   : bytes list ;
-  enc_notes         : bytes list ;
+  proof           : bytes ;
+  tree_roots      : bytes ;
+  leaves          : (bytes list) list ;
+  output_preimage : bytes list ;
+  enc_notes       : bytes list ;
 }
 
 [@entry]
 let transfer (p : transfer_param) (s : storage) : operation list * storage =
-  let () = verify_bound s p.proof p.tree_roots p.root_output_lanes in
+  let () = verify_bound s p.proof p.tree_roots p.leaves in
   let () = check_identity s p.output_preimage in
   let () = require_known_root s (preimage_at p.output_preimage tr_membership_root_idx) in
   let s = spend_all s p.output_preimage in
@@ -239,16 +278,16 @@ let transfer (p : transfer_param) (s : storage) : operation list * storage =
    custody — per-asset tickets) is deferred to the multi-asset pass; the zk
    binding, membership and nullifier logic are identical to transfer. *)
 type unshield_param = {
-  proof             : bytes ;
-  tree_roots        : bytes ;
-  root_output_lanes : nat list ;
-  output_preimage   : bytes list ;
-  enc_notes         : bytes list ;
+  proof           : bytes ;
+  tree_roots      : bytes ;
+  leaves          : (bytes list) list ;
+  output_preimage : bytes list ;
+  enc_notes       : bytes list ;
 }
 
 [@entry]
 let unshield (p : unshield_param) (s : storage) : operation list * storage =
-  let () = verify_bound s p.proof p.tree_roots p.root_output_lanes in
+  let () = verify_bound s p.proof p.tree_roots p.leaves in
   let () = check_identity s p.output_preimage in
   let () = require_known_root s (preimage_at p.output_preimage tr_membership_root_idx) in
   let s = spend_all s p.output_preimage in
