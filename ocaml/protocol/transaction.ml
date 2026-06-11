@@ -101,10 +101,19 @@ let deposit_pubkey_hash ~auth_domain ~auth_root ~auth_pub_seed ~blind =
 
 (* Compute the in-circuit shield sighash bound by the WOTS+ signature.
    sighash = fold(0x03, auth_domain, pubkey_hash, v_pub, fee, producer_fee,
-                  cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash) *)
+                  asset_new, asset_producer, cm_new, cm_producer,
+                  memo_ct_hash, producer_memo_ct_hash)
+
+   The two asset fields are bound BECAUSE they are public at the L1 bridge
+   boundary (see shield.cairo::verify, core::shield_sighash, and
+   Spec.Shield.phi_shield_sighash, which all include them).  They were
+   added to the circuit / kernel / Coq spec in the multiasset change but
+   were originally omitted here; this function had no callers, so the
+   stale omission silently diverged from the real circuit.  Kept faithful
+   so that any future use signs the SAME preimage the Cairo verifies. *)
 let shield_sighash ~auth_domain ~pubkey_hash ~(v_pub : int64) ~(fee : int64)
-    ~(producer_fee : int64) ~cm_new ~cm_producer ~memo_ct_hash
-    ~producer_memo_ct_hash =
+    ~(producer_fee : int64) ~asset_new ~asset_producer ~cm_new ~cm_producer
+    ~memo_ct_hash ~producer_memo_ct_hash =
   let items =
     [
       Felt.of_int 0x03;
@@ -113,6 +122,8 @@ let shield_sighash ~auth_domain ~pubkey_hash ~(v_pub : int64) ~(fee : int64)
       Felt.of_u64 (Int64.to_int v_pub);
       Felt.of_u64 (Int64.to_int fee);
       Felt.of_u64 (Int64.to_int producer_fee);
+      asset_new;
+      asset_producer;
       cm_new;
       cm_producer;
       memo_ct_hash;

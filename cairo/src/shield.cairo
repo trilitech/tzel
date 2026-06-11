@@ -311,6 +311,21 @@ mod tests {
         sighash
     }
 
+    // Cross-impl conformance for the FULL shield sighash field set (the
+    // non-malleability binding). This pins the helper -- which the passing
+    // fixture tests prove equals production verify's INLINE sighash -- to
+    // the OCaml port's Transaction.shield_sighash. It is the regression
+    // guard for the multiasset asset-field binding: the port had silently
+    // OMITTED asset_new/asset_producer (dead code, never exercised by the
+    // function differential); had this test existed, it would have failed.
+    // Inputs: auth_domain=1 pubkey_hash=2 v=10 fee=3 producer_fee=4
+    // asset_new=5 asset_producer=0 cm_new=6 cm_producer=7 memo=8 pmemo=9.
+    #[test]
+    fn test_shield_sighash_field_set_conforms_to_port() {
+        let sh = shield_sighash(1, 2, 10_u64, 3_u64, 4_u64, 6, 7, 8, 9, 5, 0);
+        assert(sh == 0x0391e90c832477cc8e2fc07481a22be92fc15cf044a33fe7d994e286e92ad4bc, 'shield sighash field-set');
+    }
+
     fn sign_shield(
         sighash: felt252,
         auth_pub_seed: felt252,
