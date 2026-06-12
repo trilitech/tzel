@@ -78,6 +78,15 @@ pub struct AggregationNode {
     pub proof: CircuitProof<Blake2sM31MerkleHasher>,
     /// The shape the proof has (its `PreprocessedCircuit` family).
     pub shape: AggregationShape,
+    /// Per-component `log_sizes` of the multiverifier node that produced
+    /// this proof, captured during `aggregate_pair` when the
+    /// `TZEL_DUMP_LOG_SIZES=1` env var is set (otherwise `None`).
+    ///
+    /// These are the values the gnark BenchCircuit hardcodes as
+    /// `l2ComponentLogSizes` and Fiat-Shamir-binds; the fixture exporter
+    /// emits them into the shape sidecar. `None` for leaf inputs (which
+    /// are not produced by `aggregate_pair`).
+    pub component_log_sizes: Option<Vec<u32>>,
 }
 
 /// Per-level resources reused across all nodes at the same level (or, for
@@ -266,17 +275,18 @@ pub fn aggregate_pair(
     // preprocessed root — the data the gnark BenchCircuit hardcodes
     // (`l2ComponentLogSizes`, `L2PreprocessedRoot`) for the SNARK-wrap chip
     // rebuild. Gated by env var so the prod path is unaffected.
+    let mut component_log_sizes = None;
     if std::env::var("TZEL_DUMP_LOG_SIZES").as_deref() == Ok("1") {
         let label = match left.shape {
             AggregationShape::Leaf => "leaf_to_mv",
             AggregationShape::Internal => "mv_to_mv",
         };
-        debug_dump_component_log_sizes(
+        component_log_sizes = Some(debug_dump_component_log_sizes(
             node_ctx.values(),
             mv_preprocessed,
             ctx.internal_shared_config.pcs_config,
             label,
-        );
+        ));
     }
 
     let proof = prove_circuit_assignment(
@@ -290,6 +300,7 @@ pub fn aggregate_pair(
     Ok(AggregationNode {
         proof,
         shape: AggregationShape::Internal,
+        component_log_sizes,
     })
 }
 
@@ -303,12 +314,12 @@ pub fn aggregate_pair(
 /// (stwo-gnark-tzel/tools/witness-extractor/src/main.rs:720-800) — the
 /// recipe mirrors `prove_circuit_with_precompute` up to (and excluding)
 /// the interaction draw, then discards the tree builder.
-pub(crate) fn debug_dump_component_log_sizes(
+pub fn debug_dump_component_log_sizes(
     values: &[QM31],
     preprocessed_circuit: &PreprocessedCircuit,
     pcs_config: PcsConfig,
     label: &str,
-) {
+) -> Vec<u32> {
     use circuit_common::Qm31OpsTraceGenerator;
     use circuit_prover::witness::trace::{TraceGenerator, write_trace};
     use stwo::core::channel::{Channel, MerkleChannel};
@@ -414,6 +425,7 @@ pub(crate) fn debug_dump_component_log_sizes(
 
     eprintln!("[TZEL_DUMP {label}] component_log_sizes = {component_log_sizes:?}");
     // tree_builder + commitment_scheme dropped here — no side effects.
+    component_log_sizes.to_vec()
 }
 
 /// Reduce N leaf nodes to a single root via a binary tree of pairwise
