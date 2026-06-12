@@ -229,6 +229,14 @@ pub struct CustomProofOutput {
     /// the same data zstd-compressed for storage/transport.
     pub proof_uncompressed: Vec<u8>,
     pub output_preimage: Vec<Felt>,
+    /// The L2 prover's `claim.output_values` (each QM31 as 4 LE M31 limbs).
+    /// These are absorbed into the L2 Fiat-Shamir channel, so the gnark wrap
+    /// needs the *matching* values in its shape sidecar — otherwise the
+    /// verifier transcript diverges (Block 6). Emitted via `--shape-output`
+    /// so a fresh proof can be wrapped without reusing a stale shape.
+    pub output_values_qm31s: Vec<[u32; 4]>,
+    /// L1 component log sizes — the inner trace shape (op-dependent).
+    pub component_log_sizes: Vec<u32>,
     pub cairo_prove_ms: u128,
     pub circuit_prove_ms: u128,
     pub verify_ms: u128,
@@ -464,6 +472,18 @@ fn run_leaf_pipeline_internal(
         fri_config: circuit_fri_config,
         lifting_log_size: Some(circuit_lifting),
     };
+    // Diagnostic: dump THIS op's L2 component_log_sizes (the values the gnark
+    // BenchCircuit hardcodes + Fiat-Shamir-binds). Compare against the chip's
+    // hardcoded [15,21,18,19,21,16,20,8,14,18,16] to see if a chip rebuild is
+    // needed for the real tzel shape. Gated by env so it adds no normal cost.
+    if std::env::var("TZEL_DUMP_L2").is_ok() {
+        crate::aggregate::debug_dump_component_log_sizes(
+            &context_values,
+            &preprocessed_circuit,
+            circuit_pcs_config,
+            "tzel_op_l2",
+        );
+    }
     let circuit_config = CircuitConfig {
         config: circuit_pcs_config,
         n_outputs: preprocessed_circuit.params.n_outputs,
@@ -551,6 +571,22 @@ pub fn custom_recursive_prove(
         circuit_prove_ms,
     } = artifacts;
 
+    // Capture the L2 prover's claim.output_values BEFORE `circuit_proof` is
+    // moved into `prepare_circuit_proof_for_circuit_verifier`. These are
+    // absorbed into the L2 Fiat-Shamir channel; the gnark wrap's shape sidecar
+    // must carry these exact values (see CustomProofOutput doc / Block 6).
+    let output_values_qm31s: Vec<[u32; 4]> = circuit_proof
+        .claim
+        .output_values
+        .iter()
+        .map(|q| q.to_m31_array().map(|m| m.0))
+        .collect();
+
+    // Also capture the L1 component_log_sizes — these describe the inner
+    // trace shape and drive how the wrap parses/verifies the proof. They are
+    // op-dependent, so a fresh proof needs its own (not the fixture's).
+    let component_log_sizes: Vec<u32> = cairo_proof.claim.flatten_claim().component_log_sizes;
+
     // ── Serialize and compress ────────────────────────────────────────
     info!("Serializing circuit proof");
     let (proof_qm31s, circuit_public_data) =
@@ -582,6 +618,8 @@ pub fn custom_recursive_prove(
         proof: compressed,
         proof_uncompressed,
         output_preimage,
+        output_values_qm31s,
+        component_log_sizes,
         cairo_prove_ms,
         circuit_prove_ms,
         verify_ms,

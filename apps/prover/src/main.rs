@@ -38,6 +38,13 @@ struct Cli {
     #[arg(long)]
     bin_output: Option<PathBuf>,
 
+    /// Write the L2 prover's `claim.output_values` (op-specific, absorbed
+    /// into Fiat-Shamir) as JSON `{"output_values_qm31s": [...]}`. Merge this
+    /// into the wrap's shape sidecar so a FRESH proof can be wrapped without
+    /// reusing a stale fixture shape. Only meaningful with `--bin-output`.
+    #[arg(long)]
+    shape_output: Option<PathBuf>,
+
     /// Use the chip-compat L2 PcsConfig (n_queries=23, log_blowup=1,
     /// fold_step=1, pow_bits=10) instead of the prod one (n_queries=35,
     /// log_blowup=2, fold_step=4, pow_bits=26). This aligns the produced
@@ -213,6 +220,22 @@ fn main() -> Result<()> {
                 "Raw proof bytes written to {:?} ({} bytes uncompressed)",
                 path,
                 proof_output.proof_uncompressed.len()
+            );
+        }
+
+        // Write the L2 claim.output_values sidecar so the gnark wrap's shape
+        // can be made to MATCH this fresh proof (avoids the stale-shape /
+        // Fiat-Shamir-divergence failure).
+        if let Some(path) = cli.shape_output {
+            let json = serde_json::to_string(&serde_json::json!({
+                "output_values_qm31s": proof_output.output_values_qm31s,
+                "component_log_sizes": proof_output.component_log_sizes,
+            }))?;
+            fs::write(&path, &json)?;
+            eprintln!(
+                "Shape sidecar (output_values_qm31s, n={}) written to {:?}",
+                proof_output.output_values_qm31s.len(),
+                path
             );
         }
 

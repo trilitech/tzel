@@ -303,7 +303,7 @@ pub fn aggregate_pair(
 /// (stwo-gnark-tzel/tools/witness-extractor/src/main.rs:720-800) — the
 /// recipe mirrors `prove_circuit_with_precompute` up to (and excluding)
 /// the interaction draw, then discards the tree builder.
-fn debug_dump_component_log_sizes(
+pub(crate) fn debug_dump_component_log_sizes(
     values: &[QM31],
     preprocessed_circuit: &PreprocessedCircuit,
     pcs_config: PcsConfig,
