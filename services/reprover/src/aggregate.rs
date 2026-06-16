@@ -428,6 +428,170 @@ pub fn debug_dump_component_log_sizes(
     component_log_sizes.to_vec()
 }
 
+/// SPIKE (item-d, BN254 outer recursion layer) — build the OUTER multiverifier
+/// circuit that VERIFIES two `Internal`-shape (Blake2sM31-committed) inner
+/// proofs, then prove + commit the OUTER proof with an arbitrary
+/// `MerkleChannel` (e.g. `Poseidon2Bn254MerkleChannel`).
+///
+/// This is the only field-change recursion step: the inner mv-root proof(s)
+/// stay Blake2sM31-committed (they are finished `CircuitProof<Blake2sM31…>`),
+/// and the outer AIR verifies them exactly as `aggregate_pair` does today
+/// (`build_multiverifier_circuit` over the same `internal_shared_config`).
+/// Only the OUTER proof's Merkle commitment + Fiat-Shamir transcript become
+/// `MC`. The two-channel mismatch is sound because the inner proof's verifier
+/// transcript is replayed *inside the circuit* as Blake constraints (the
+/// outer commitment hash is independent of the inner one).
+///
+/// Returns the raw `CircuitProof<MC::H>` plus the witness `values` (needed by
+/// [`stwo_verify_outer`] to rebuild the verifier-side components).
+#[allow(clippy::type_complexity)]
+pub fn aggregate_pair_outer_with_channel<MC>(
+    ctx: &AggregationContext,
+    left: CircuitProof<Blake2sM31MerkleHasher>,
+    right: CircuitProof<Blake2sM31MerkleHasher>,
+) -> Result<(
+    circuit_verifier::circuit_proof::CircuitProof<MC::H>,
+    Vec<QM31>,
+)>
+where
+    MC: stwo::core::channel::MerkleChannel,
+    SimdBackend: stwo::prover::backend::BackendForChannel<MC>,
+{
+    use circuit_prover::prover::prove_circuit_assignment_with_channel;
+
+    // Inner proofs are Internal (mv) shape.
+    let shared_config = &ctx.internal_shared_config;
+    let mv_preprocessed = &ctx.mv_to_mv_preprocessed;
+
+    let mv_input_left = circuit_proof_to_mv_input(left, shared_config);
+    let mv_input_right = circuit_proof_to_mv_input(right, shared_config);
+
+    let mut node_ctx = build_multiverifier_circuit(mv_input_left, mv_input_right, shared_config);
+    if !node_ctx.is_circuit_valid() {
+        return Err(anyhow!(
+            "outer multiverifier constraints failed — inner mv proofs do not verify inside the aggregator"
+        ));
+    }
+    finalize_context(&mut node_ctx);
+
+    let values: Vec<QM31> = node_ctx.values().to_vec();
+
+    let proof = prove_circuit_assignment_with_channel::<MC>(
+        &values,
+        mv_preprocessed,
+        &BaseColumnPool::<SimdBackend>::new(),
+        ctx.internal_shared_config.pcs_config,
+    )
+    .map_err(|e| anyhow!("prove outer multiverifier node (BN254 channel): {e}"))?;
+
+    Ok((proof, values))
+}
+
+/// SPIKE — full stwo STARK verification of an OUTER multiverifier proof
+/// committed/transcripted with `MC` (mirrors the channel-generic recipe of
+/// stwo-circuits' `prover_test::stwo_verify`, specialised to the
+/// multiverifier / `circuit_verifier` component family).
+///
+/// Re-derives the verifier transcript over `MC::C`, commits the 3 trees with
+/// `MC`, replays the interaction PoW + draw, then calls
+/// `stwo::core::verifier::verify_ex::<MC>` against the outer `stark_proof`.
+pub fn stwo_verify_outer<MC>(
+    proof: circuit_verifier::circuit_proof::CircuitProof<MC::H>,
+    preprocessed_circuit: &PreprocessedCircuit,
+) -> Result<()>
+where
+    MC: stwo::core::channel::MerkleChannel,
+{
+    use circuit_verifier::circuit_claim::{
+        CircuitInteractionElements, column_log_sizes_per_tree, lookup_sum,
+    };
+    use circuit_verifier::circuit_components::N_COMPONENTS;
+    use circuit_verifier::statement::{INTERACTION_POW_BITS, all_circuit_components};
+    use circuit_prover::circuit_air::circuit_components::CircuitComponents;
+    use stwo::core::air::Component;
+    use stwo::core::channel::Channel;
+    use stwo::core::pcs::CommitmentSchemeVerifier;
+
+    let circuit_verifier::circuit_proof::CircuitProof {
+        claim,
+        interaction_claim,
+        pcs_config,
+        stark_proof,
+        interaction_pow_nonce,
+        channel_salt,
+    } = proof;
+
+    let preprocessed_column_log_sizes = preprocessed_circuit.preprocessed_trace.log_sizes();
+    let log_sizes: [u32; N_COMPONENTS] = all_circuit_components::<circuits::ivalue::NoValue>()
+        .values()
+        .map(|c| {
+            c.log_size(&preprocessed_column_log_sizes)
+                .expect("circuit components must have a static log_size")
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| anyhow!("component count != N_COMPONENTS"))?;
+
+    let verifier_channel = &mut MC::C::default();
+    verifier_channel.mix_felts(&[channel_salt.into()]);
+    pcs_config.mix_into(verifier_channel);
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<MC>::new(pcs_config);
+
+    let [trace_log_sizes, interaction_log_sizes] = column_log_sizes_per_tree(&log_sizes);
+
+    commitment_scheme.commit(
+        stark_proof.proof.commitments[0],
+        &preprocessed_column_log_sizes
+            .values()
+            .copied()
+            .collect::<Vec<_>>(),
+        verifier_channel,
+    );
+    claim.mix_into(verifier_channel);
+    commitment_scheme.commit(
+        stark_proof.proof.commitments[1],
+        &trace_log_sizes,
+        verifier_channel,
+    );
+
+    if !verifier_channel.verify_pow_nonce(INTERACTION_POW_BITS, interaction_pow_nonce) {
+        return Err(anyhow!("outer interaction PoW nonce verification failed"));
+    }
+    verifier_channel.mix_u64(interaction_pow_nonce);
+    let interaction_elements = CircuitInteractionElements::draw(verifier_channel);
+    interaction_claim.mix_into(verifier_channel);
+    commitment_scheme.commit(
+        stark_proof.proof.commitments[2],
+        &interaction_log_sizes,
+        verifier_channel,
+    );
+
+    let components = CircuitComponents::new(
+        &interaction_elements,
+        &interaction_claim,
+        &log_sizes,
+        &preprocessed_circuit.preprocessed_trace.ids(),
+    )
+    .components();
+
+    stwo::core::verifier::verify_ex::<MC>(
+        &components
+            .iter()
+            .map(|c| c.as_ref())
+            .collect::<Vec<&dyn Component>>(),
+        verifier_channel,
+        commitment_scheme,
+        stark_proof.proof,
+        true,
+    )
+    .map_err(|e| anyhow!("outer stwo verify_ex: {e:?}"))?;
+
+    if lookup_sum(&claim, &interaction_claim, &interaction_elements) != QM31::default() {
+        return Err(anyhow!("outer lookup_sum != 0"));
+    }
+    Ok(())
+}
+
 /// Reduce N leaf nodes to a single root via a binary tree of pairwise
 /// multiverifier proofs.
 ///
