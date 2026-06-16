@@ -174,12 +174,17 @@ impl AggregationContext {
         // (pow_bits=26, log_blowup=2, n_queries=35 = 96 conjectured bits);
         // default is the 33-bit chip-compat config (pow_bits=10, lb=1, q=23).
         let base_internal_pcs_config = if std::env::var("TZEL_SEC").as_deref() == Ok("96") {
+            // Optional per-axis override for the 96-bit DA sweep (all combos must
+            // satisfy log_blowup*n_queries + pow_bits >= 96).
+            let lb = std::env::var("TZEL_LB").ok().and_then(|v| v.parse().ok()).unwrap_or(2u32);
+            let q = std::env::var("TZEL_Q").ok().and_then(|v| v.parse().ok()).unwrap_or(35usize);
+            let pow = std::env::var("TZEL_POW").ok().and_then(|v| v.parse().ok()).unwrap_or(26u32);
             PcsConfig {
-                pow_bits: 26,
+                pow_bits: pow,
                 fri_config: stwo::core::fri::FriConfig {
-                    log_blowup_factor: 2,
+                    log_blowup_factor: lb,
                     log_last_layer_degree_bound: 0,
-                    n_queries: 35,
+                    n_queries: q,
                     fold_step: 1,
                 },
                 lifting_log_size: None,
@@ -237,6 +242,52 @@ impl AggregationContext {
             internal_shared_config,
             mv_to_mv_preprocessed,
         })
+    }
+
+    /// COMPRESSION-SPIKE probe: given the preprocessed of the *inner* proof a
+    /// multiverifier node will verify, build the `SharedConfig` for that inner
+    /// shape and the resulting multiverifier-node preprocessed. Returns
+    /// `(inner_shared_config, node_preprocessed)`.
+    ///
+    /// Iterating this (feed the node_preprocessed back in as `inner_pp`) walks
+    /// the recursion ladder: each step is "the verifier circuit that verifies a
+    /// proof of `inner_pp`'s shape". A fixed point is reached when
+    /// `node_preprocessed.params.trace_log_size == inner_pp.params.trace_log_size`
+    /// (and column shapes match) — i.e. the node that verifies shape S is itself
+    /// shape S, so the ladder stops growing.
+    pub fn mv_node_for_inner_shape(
+        inner_pp: &Arc<PreprocessedCircuit>,
+        internal_pcs_config_base: PcsConfig,
+    ) -> Result<(SharedConfig, Arc<PreprocessedCircuit>)> {
+        let components = all_circuit_components::<QM31>();
+        let enabled_bits = vec![true; components.len()];
+
+        let internal_lifting = inner_pp.params.trace_log_size
+            + internal_pcs_config_base.fri_config.log_blowup_factor;
+        let internal_pcs_config = PcsConfig {
+            lifting_log_size: Some(internal_lifting),
+            ..internal_pcs_config_base
+        };
+        let internal_proof_config = ProofConfig::new(
+            &components,
+            enabled_bits,
+            inner_pp.preprocessed_trace.n_columns(),
+            &internal_pcs_config,
+            INTERACTION_POW_BITS,
+        );
+        let inner_shared_config = SharedConfig {
+            pcs_config: internal_pcs_config,
+            proof_config: internal_proof_config,
+            preprocessed_column_log_sizes: inner_pp.preprocessed_trace.log_sizes(),
+        };
+
+        let mut nv = build_multiverifier_circuit::<NoValue>(
+            empty_mv_input(&inner_shared_config),
+            empty_mv_input(&inner_shared_config),
+            &inner_shared_config,
+        );
+        let node_pp = Arc::new(PreprocessedCircuit::preprocess_circuit(&mut nv));
+        Ok((inner_shared_config, node_pp))
     }
 }
 
