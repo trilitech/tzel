@@ -170,15 +170,31 @@ impl AggregationContext {
         // against the existing 110M-constraint chip. For prod (96 bits) bump
         // n_queries=35 + log_blowup=2 (option β per MULTIVERIFIER-REBUILD-PLAN
         // in the stwo-gnark-tzel sibling repo) and re-Setup the chip.
-        let base_internal_pcs_config = PcsConfig {
-            pow_bits: 10,
-            fri_config: stwo::core::fri::FriConfig {
-                log_blowup_factor: 1,
-                log_last_layer_degree_bound: 0,
-                n_queries: 23,
-                fold_step: 1,
-            },
-            lifting_log_size: None,
+        // TZEL_SEC=96 selects the production 96-bit FRI config
+        // (pow_bits=26, log_blowup=2, n_queries=35 = 96 conjectured bits);
+        // default is the 33-bit chip-compat config (pow_bits=10, lb=1, q=23).
+        let base_internal_pcs_config = if std::env::var("TZEL_SEC").as_deref() == Ok("96") {
+            PcsConfig {
+                pow_bits: 26,
+                fri_config: stwo::core::fri::FriConfig {
+                    log_blowup_factor: 2,
+                    log_last_layer_degree_bound: 0,
+                    n_queries: 35,
+                    fold_step: 1,
+                },
+                lifting_log_size: None,
+            }
+        } else {
+            PcsConfig {
+                pow_bits: 10,
+                fri_config: stwo::core::fri::FriConfig {
+                    log_blowup_factor: 1,
+                    log_last_layer_degree_bound: 0,
+                    n_queries: 23,
+                    fold_step: 1,
+                },
+                lifting_log_size: None,
+            }
         };
         let internal_lifting = leaf_to_mv_preprocessed.params.trace_log_size
             + base_internal_pcs_config.fri_config.log_blowup_factor;

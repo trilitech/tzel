@@ -37,7 +37,7 @@ stwo-cairo-adapter = { git = "https://github.com/starkware-libs/stwo-cairo", rev
 stwo-cairo-prover = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
 stwo-cairo-serialize = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
 stwo-cairo-common = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
-stwo = { version = "2.2.0", features = ["parallel", "prover", "poseidon2_bn254"] }
+stwo = { version = "2.2.0", features = ["parallel", "prover", "poseidon2_bn254", "poseidon2_m31"] }
 stwo-constraint-framework = "2.2.0"
 
 # stwo circuits — bumped to 2bf051f to surface circuit-multiverifier
@@ -54,14 +54,17 @@ circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits
 opt-level = 3
 
 [patch.crates-io]
-# SPIKE (item-d bn254 outer layer): re-point stwo onto our fork
-# (~/git/stwo @ feat/item-d-poseidon2-bn254, v2.2.0 + feature-gated additions).
-# poseidon2_bn254 feature ENABLED on the direct stwo dep above (line 40) so the
-# Bn254Channel / Poseidon2Bn254MerkleChannel types + SimdBackend BackendForChannel
-# impls are in scope for the outer recursion layer.
-# Reproducible form: our fork branch (pushed @ 25ad672b). For local fork iteration,
-# swap these for `path = "/abs/path/to/stwo/crates/{stwo,constraint-framework}"`.
-stwo = { git = "https://github.com/trilitech/stwo", branch = "feat/item-d-poseidon2-bn254" }
-stwo-constraint-framework = { git = "https://github.com/trilitech/stwo", branch = "feat/item-d-poseidon2-bn254" }
+# SPIKE (item-b/item-d outer layers): re-point stwo onto our fork.
+# feat/item-b-poseidon2-m31 is branched off feat/item-d-poseidon2-bn254, so it is a
+# SUPERSET: it carries BOTH the BN254 channel (poseidon2_bn254) AND the Poseidon2-M31
+# channel (poseidon2_m31) + the SIMD perf work. Both features ENABLED on the direct
+# stwo dep above (line 40) so the Bn254Channel / Poseidon2Bn254MerkleChannel AND the
+# Poseidon2M31MerkleChannel types + their SimdBackend BackendForChannel impls are in
+# scope for the outer recursion layer (the M31 outer node round-trips over a real
+# mv-root @96-bit; the BN254 outer node is the small final re-commit stage).
+# Reproducible form: our fork branch. For local fork iteration, swap these for
+# `path = "/abs/path/to/stwo/crates/{stwo,constraint-framework}"`.
+stwo = { git = "https://github.com/trilitech/stwo", branch = "feat/item-b-poseidon2-m31" }
+stwo-constraint-framework = { git = "https://github.com/trilitech/stwo", branch = "feat/item-b-poseidon2-m31" }
 
 [workspace]
