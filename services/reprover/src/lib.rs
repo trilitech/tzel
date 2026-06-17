@@ -7,6 +7,7 @@
 //! - `CustomProofOutput` struct with proof data and timing
 
 pub mod aggregate;
+pub mod bn254_serialize;
 pub mod custom_circuit;
 
 use std::fs::read_to_string;

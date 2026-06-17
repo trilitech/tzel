@@ -112,6 +112,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "ark-bn254"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d69eab57e8d2663efa5c63135b2af4f396d66424f88954c21104125ab6b3e6bc"
+dependencies = [
+ "ark-ec",
+ "ark-ff 0.5.0",
+ "ark-std 0.5.0",
+]
+
+[[package]]
 name = "ark-ec"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1535,7 +1546,7 @@ version = "0.1.0"
 source = "git+https://github.com/starkware-libs/stwo-circuits?rev=2bf051f#2bf051f09f4d0ba1b886abb00299f2e6bdbf89b7"
 dependencies = [
  "blake2",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "indexmap",
  "itertools 0.12.1",
  "num-traits",
@@ -1549,7 +1560,7 @@ version = "0.1.0"
 source = "git+https://github.com/starkware-libs/stwo-circuits?rev=2bf051f#2bf051f09f4d0ba1b886abb00299f2e6bdbf89b7"
 dependencies = [
  "circuits",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "indexmap",
  "itertools 0.12.1",
  "num-traits",
@@ -2347,7 +2358,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.1.5",
- "serde",
 ]
 
 [[package]]
@@ -2382,7 +2392,7 @@ dependencies = [
  "hash32",
  "rustc_version 0.4.1",
  "serde",
- "spin",
+ "spin 0.9.8",
  "stable_deref_trait",
 ]
 
@@ -3101,6 +3111,176 @@ dependencies = [
  "ecdsa",
  "elliptic-curve",
  "sha2 0.9.9",
+]
+
+[[package]]
+name = "p3-challenger"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8972ccd1d5dc90e46cdb1f2ab4ee2bae49b3917e5e98aa533f0c2b779c010445"
+dependencies = [
+ "p3-field",
+ "p3-maybe-rayon",
+ "p3-monty-31",
+ "p3-symmetric",
+ "p3-util",
+ "tracing",
+]
+
+[[package]]
+name = "p3-dft"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17771aca44632f9cc11f2718d7ea7ec06794946c4190ef3a985bfc893f14c18a"
+dependencies = [
+ "itertools 0.14.0",
+ "p3-field",
+ "p3-matrix",
+ "p3-maybe-rayon",
+ "p3-util",
+ "spin 0.10.0",
+ "tracing",
+]
+
+[[package]]
+name = "p3-field"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f3eb24d0591fd4d282d89cbe4e4efba5571c699375006f80b2cbf53ce83461c"
+dependencies = [
+ "itertools 0.14.0",
+ "num-bigint 0.4.6",
+ "p3-maybe-rayon",
+ "p3-util",
+ "paste",
+ "rand 0.10.1",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "p3-matrix"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea9c94c0714944e7b8a9a62e6340b1e3e1d3f8ecfd3e35c08798360200e73eff"
+dependencies = [
+ "itertools 0.14.0",
+ "p3-field",
+ "p3-maybe-rayon",
+ "p3-util",
+ "rand 0.10.1",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "p3-maybe-rayon"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eebc233a34b1ab0273f35b4052fa2eeb3114b22ba4575bd7da00716e878ffb77"
+
+[[package]]
+name = "p3-mds"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b5441fa8116246ec9e6c835f15273cb27777ca572960ec87476b67fef13e01e"
+dependencies = [
+ "p3-dft",
+ "p3-field",
+ "p3-symmetric",
+ "p3-util",
+ "rand 0.10.1",
+]
+
+[[package]]
+name = "p3-mersenne-31"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "012351fb727ba404175ea1cc159fb6234fa370ce9399317ba04d38ca43e55bfa"
+dependencies = [
+ "itertools 0.14.0",
+ "num-bigint 0.4.6",
+ "p3-challenger",
+ "p3-dft",
+ "p3-field",
+ "p3-matrix",
+ "p3-mds",
+ "p3-poseidon2",
+ "p3-symmetric",
+ "p3-util",
+ "paste",
+ "rand 0.10.1",
+ "serde",
+]
+
+[[package]]
+name = "p3-monty-31"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8724f330ea6d19dd4f2436aa0f88b5fcbf88f0f55ca7fccd3fea8b736dbcddad"
+dependencies = [
+ "itertools 0.14.0",
+ "num-bigint 0.4.6",
+ "p3-dft",
+ "p3-field",
+ "p3-matrix",
+ "p3-maybe-rayon",
+ "p3-mds",
+ "p3-poseidon1",
+ "p3-poseidon2",
+ "p3-symmetric",
+ "p3-util",
+ "paste",
+ "rand 0.10.1",
+ "serde",
+ "spin 0.10.0",
+ "tracing",
+]
+
+[[package]]
+name = "p3-poseidon1"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04e2a562fea210baae390a32f9ecf0dd8724ae3f4352d1c8e413077b6f00a162"
+dependencies = [
+ "p3-field",
+ "p3-symmetric",
+ "rand 0.10.1",
+]
+
+[[package]]
+name = "p3-poseidon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06394851c161d17e4aa4ad2aad5557d32f14cadd1dc838f965d8e1821a63b8c5"
+dependencies = [
+ "p3-field",
+ "p3-mds",
+ "p3-symmetric",
+ "p3-util",
+ "rand 0.10.1",
+]
+
+[[package]]
+name = "p3-symmetric"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ac1a276d421f8ef3361bb7d8c39a02c93c6b3f10eeaa559cc4c50222f9a5b82"
+dependencies = [
+ "itertools 0.14.0",
+ "p3-field",
+ "p3-util",
+ "serde",
+]
+
+[[package]]
+name = "p3-util"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08a58162a4c264269ef454f0b28dcda89939490eecacb2b2cf5b00f719b80f6"
+dependencies = [
+ "serde",
+ "transpose",
 ]
 
 [[package]]
@@ -4221,6 +4401,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
 name = "sprs"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4346,6 +4535,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "strength_reduce"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe895eb47f22e2ddd4dabc02bce419d2e643c8e3b585c78158b349195bc24d82"
+
+[[package]]
 name = "string_cache"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4384,9 +4579,10 @@ dependencies = [
 [[package]]
 name = "stwo"
 version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d400ae91acbeafa6f80070a03e1117a794a95f295050f44538a4c7dd55abd491"
+source = "git+https://github.com/trilitech/stwo?branch=feat%2Fitem-b-poseidon2-m31#e8599f7781a1acc0832d07359f8928410f61e137"
 dependencies = [
+ "ark-bn254",
+ "ark-ff 0.5.0",
  "blake2",
  "blake3",
  "bytemuck",
@@ -4394,11 +4590,14 @@ dependencies = [
  "dashmap",
  "educe 0.5.11",
  "fnv",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "hex",
  "indexmap",
  "itertools 0.12.1",
  "num-traits",
+ "p3-field",
+ "p3-mersenne-31",
+ "p3-symmetric",
  "rand 0.8.6",
  "rayon",
  "serde",
@@ -4534,10 +4733,9 @@ dependencies = [
 [[package]]
 name = "stwo-constraint-framework"
 version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47aca0d5d36d4b015703fb14f162a23cb685e67f8aa08dbe7faf39bd66fe93f1"
+source = "git+https://github.com/trilitech/stwo?branch=feat%2Fitem-b-poseidon2-m31#e8599f7781a1acc0832d07359f8928410f61e137"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "itertools 0.12.1",
  "num-traits",
  "rand 0.8.6",
@@ -4989,6 +5187,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "transpose"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad61aed86bc3faea4300c7aee358b4c6d0c8d6ccc36524c96e4c92ccf26e77e"
+dependencies = [
+ "num-integer",
+ "strength_reduce",
+]
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5045,6 +5253,8 @@ name = "tzel-reprover"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ark-bn254",
+ "ark-ff 0.5.0",
  "cairo-air",
  "cairo-program-runner-lib",
  "cairo-vm",

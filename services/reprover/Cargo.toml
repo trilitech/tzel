@@ -31,6 +31,10 @@ privacy-circuit-verify = { path = "/home/saroupille/git/proving-utils/crates/pri
 serde = { version = "1.0", features = ["derive"] }
 tzel-core = { path = "../../core" }
 
+# D-g4 BN254 serializer: `Bn254Hash.0.into_bigint()` (PrimeField). Version MUST
+# match stwo's `poseidon2_bn254` feature (ark-ff 0.5) so the `Fr` type unifies.
+ark-ff = { version = "0.5", default-features = false }
+
 # stwo cairo (same revs as proving-utils v1.2.2)
 cairo-air = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
 stwo-cairo-adapter = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "0a5e70b7" }
@@ -49,6 +53,12 @@ circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", r
 circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
 circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
 circuit-multiverifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2bf051f" }
+
+[dev-dependencies]
+# D-g4 round-trip test: construct synthetic `Bn254Hash` values. Version MUST
+# match stwo's `poseidon2_bn254` feature (ark-bn254 0.5) so the `Fr` type
+# unifies with `Bn254Hash`'s (ark-ff is a regular dep above).
+ark-bn254 = { version = "0.5", default-features = false, features = ["scalar_field"] }
 
 [profile.release]
 opt-level = 3
