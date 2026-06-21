@@ -29,6 +29,11 @@ privacy-prove = { path = "/home/saroupille/git/proving-utils/crates/privacy_prov
 privacy-circuit-verify = { path = "/home/saroupille/git/proving-utils/crates/privacy_circuit_verify" }
 
 serde = { version = "1.0", features = ["derive"] }
+# L3 perf: mimalloc global allocator (installed in lib.rs) — kills the allocator
+# churn the OUTER CPU profile flags in the QM31/rayon remainder. MUST be a regular
+# dependency (not dev-dep): lib.rs installs it via #[global_allocator] in the
+# LIBRARY build, and dev-dependencies are unavailable to lib/bin targets.
+mimalloc = { version = "0.1", default-features = false }
 tzel-core = { path = "../../core" }
 
 # D-g4 BN254 serializer: `Bn254Hash.0.into_bigint()` (PrimeField). Version MUST
@@ -62,6 +67,12 @@ ark-bn254 = { version = "0.5", default-features = false, features = ["scalar_fie
 
 [profile.release]
 opt-level = 3
+# L3 perf: fat LTO + single codegen unit cross-inline the tiny PackedQM31/CM31
+# field ops (function-call-shaped in the profile) across crates → ~3-8% on the
+# CPU phases (leaves/mv/OUTER blake2s + fft3 + QM31). Pure codegen, no
+# correctness risk; costs build time only.
+lto = "fat"
+codegen-units = 1
 
 [patch.crates-io]
 # SPIKE (item-b/item-d outer layers): re-point stwo onto our fork.

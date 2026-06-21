@@ -1,0 +1,12 @@
+# L3 perf: build the M31/QM31 SIMD field ops with the host's full ISA (AVX-512 on
+# the prover boxes). CPU codegen only — does NOT touch the bespoke CUDA static
+# libs (libp2commit.a / libcfft.a are linked pre-built via build.rs, not
+# recompiled here).
+#
+# CAVEAT: target-cpu=native ties the binary to the BUILD machine's CPU features.
+# The prover builds and runs on the SAME box (the GPU VM boot script does
+# `cargo build` then runs on that VM), so this is safe. If you ever build on one
+# machine and run on a different/older CPU, drop this line or set an explicit
+# target-cpu (e.g. "x86-64-v3").
+[build]
+rustflags = ["-C", "target-cpu=native"]

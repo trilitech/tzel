@@ -6,6 +6,12 @@
 //! - `compute_executable_program_hash(executable_path)` → bootloader-authenticated program hash
 //! - `CustomProofOutput` struct with proof data and timing
 
+// L3 perf: mimalloc as the process-wide allocator, set in the library so every
+// reprover binary/test inherits it — kills the malloc churn the OUTER CPU
+// profile flags in the QM31/rayon remainder.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod aggregate;
 pub mod bn254_serialize;
 pub mod custom_circuit;

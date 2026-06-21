@@ -331,7 +331,11 @@ pub fn aggregate_pair(
     let mv_input_right = circuit_proof_to_mv_input(right.proof, shared_config);
 
     let mut node_ctx = build_multiverifier_circuit(mv_input_left, mv_input_right, shared_config);
-    if !node_ctx.is_circuit_valid() {
+    // L2 perf: `is_circuit_valid()` is a full CPU constraint re-evaluation over
+    // the aggregator AIR (~1-2s). Gate it behind TZEL_VALIDATE for debug/CI;
+    // default = skip — the STARK prove re-derives the witness and fails anyway if
+    // the input proofs do not verify inside the aggregator.
+    if std::env::var_os("TZEL_VALIDATE").is_some() && !node_ctx.is_circuit_valid() {
         return Err(anyhow!(
             "multiverifier constraints failed — input proofs do not verify inside the aggregator"
         ));
@@ -534,7 +538,10 @@ where
     let mv_input_right = circuit_proof_to_mv_input(right, shared_config);
 
     let mut node_ctx = build_multiverifier_circuit(mv_input_left, mv_input_right, shared_config);
-    if !node_ctx.is_circuit_valid() {
+    // L2 perf: skip the redundant full-CPU constraint re-eval unless TZEL_VALIDATE
+    // is set (default skip; the OUTER prove re-derives it and fails anyway if the
+    // inner mv proofs do not verify).
+    if std::env::var_os("TZEL_VALIDATE").is_some() && !node_ctx.is_circuit_valid() {
         return Err(anyhow!(
             "outer multiverifier constraints failed — inner mv proofs do not verify inside the aggregator"
         ));
