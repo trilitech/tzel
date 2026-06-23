@@ -1,6 +1,7 @@
 mod bundle;
 pub mod groth16;
 mod out_hash;
+mod poseidon2_bn254;
 pub mod snark;
 mod verify_meta_codec;
 

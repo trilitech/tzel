@@ -33,31 +33,52 @@
 //!    `kSum = K[0] + Σ publicWitness[i]·K[i+1] + Σ Commitments[i]`,
 //!    then check `e(Ar, Bs) · e(Krs, -δ) · e(kSum, -γ) == e(α, β)`.
 //!
-//! # Public input layout of the TzEL wrap circuit
+//! # Public input layout of the TzEL wrap circuit (item-D ABI)
 //!
 //! The wrap circuit (`stwo-gnark-tzel/cmd/measure_circuit_verifier/main.go`,
-//! `BenchCircuit`) declares exactly two public fields, in this order:
+//! `BenchCircuit`, populated by `BuildBenchCircuitBn254`) declares exactly
+//! two public fields, in this order:
 //!
 //! ```text
-//! TreeRoots [4][32]uints.U8  `gnark:",public"`   // first declared field
+//! TreeRoots [4]fri.Bn254Element  `gnark:",public"`   // first declared field
 //! ...all-secret fields...
-//! OutHash   [2]m31.QM31      `gnark:",public"`   // last declared field
+//! OutHash   [2]m31.QM31          `gnark:",public"`   // last declared field
 //! ```
 //!
-//! gnark orders the public witness by struct-field declaration order
-//! (depth-first), so the 136 public scalars are:
+//! `fri.Bn254Element = frontend.Variable` (a single BN254 scalar) and
+//! `m31.QM31 = {AReal, AImag, BReal, BImag}` (4 M31 lanes). gnark orders the
+//! public witness by struct-field declaration order (depth-first), so the 12
+//! public scalars are:
 //!
-//! * indices `0..128`: `TreeRoots[t][b]` for `t in 0..4`, `b in 0..32` —
-//!   each **byte** of each 32-byte Merkle root is its own field element
-//!   (tree order: 0=preprocessed, 1=trace, 2=interaction, 3=composition);
-//! * indices `128..136`: the 8 M31 lanes of `OutHash[0]`, `OutHash[1]`
+//! * indices `0..4`: `TreeRoots[t]` for `t in 0..4` — each Merkle root is a
+//!   single BN254 `Fr` scalar (tree order: 0=preprocessed, 1=trace,
+//!   2=interaction, 3=composition);
+//! * indices `4..12`: the 8 M31 lanes of `OutHash[0]`, `OutHash[1]`
 //!   (per QM31: `AReal, AImag, BReal, BImag`).
 //!
-//! This ordering was confirmed against the dumped gnark public witness of
-//! the sprint 3.4b leaf fixture (`testdata/sprint34b_public_witness.txt`):
-//! its first 32 values byte-match `l2_preprocessed_root_hex` of the leaf
-//! shape sidecar, and its last 8 values match an independent off-circuit
-//! recomputation of `OutHash` from the sidecar's `output_values_qm31s`.
+//! With the 1-commitment BSB22 wrap, the VK therefore has
+//! `1 (ONE) + 12 (publics) + 1 (commitment) = 14` K-points.
+//!
+//! ## item-D change (was: 136-input blake2s ABI)
+//!
+//! Prior to item-D the wrap circuit declared `TreeRoots [4][32]uints.U8`
+//! (`TreeRoots[t][b]` = one field element per root BYTE → 128 scalars) and a
+//! blake2s `OutHash`, for `128 + 8 = 136` public scalars and a 138-K-point VK.
+//! The item-D wrap changed `TreeRoots[t]` to a single BN254 `Fr` (4 scalars)
+//! and `OutHash` to the Poseidon2-BN254 gadget. This module's public-witness
+//! construction follows: each `TreeRoots[t]` is fed as ONE `Fr` scalar
+//! (`Fr::from_be_bytes_mod_order` of the 32 big-endian root bytes — the gnark
+//! `fr.Element.SetBytes` wire encoding), not 32 byte-scalars. The `tree_roots`
+//! API/envelope still carries the 32 big-endian bytes of each root Fr; that is
+//! also exactly what the Poseidon2 `outputHash` derivation absorbs
+//! (`poseidon2_bn254::out_hash_poseidon2`), so the OutHash binding path is
+//! unchanged.
+//!
+//! This ordering was confirmed against the dumped gnark public witness of the
+//! item-D `BuildBenchCircuitBn254` wrap (`testdata/wrap_public_witness.txt`,
+//! 12 lines): the first 4 values are the `Fr` roots, the last 8 the OutHash
+//! lanes — the EXACT public witness the `/tmp/wrap-ceremony` sound proof was
+//! proven for.
 
 use ark_bn254::{Bn254, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine};
 use ark_ec::pairing::Pairing;
@@ -69,12 +90,11 @@ use sha2::{Digest, Sha256};
 /// The embedded gnark verifying key for the TzEL wrap circuit
 /// (`VerifyingKey.WriteRawTo` bytes).
 ///
-/// TODO(track-A): this is currently the **sprint 3.4b leaf-shape** VK
-/// (`/home/saroupille/sprint34b-artifacts/vk.bin`, 9680 bytes, 138 K points
-/// = 1 + 136 public scalars + 1 commitment). It MUST be replaced by the
-/// mv-target VK once the Track A Setup completes — the swap is a drop-in
-/// file replacement of `src/wrap_vk.bin` (same shape: 136 publics +
-/// 1 commitment), no code change.
+/// This is the **item-D** Poseidon2-BN254 wrap VK (`/tmp/wrap-ceremony/vk.bin`,
+/// 1744 bytes, 14 K points = `1 (ONE) + 12 public scalars + 1 commitment`),
+/// matching the `BuildBenchCircuitBn254` public ABI (4 `TreeRoots` Fr scalars
+/// + 8 `OutHash` lanes). The pinned `/tmp/wrap-ceremony` proof verifies in
+/// gnark against this VK (skips=false, `TestMpcCeremonyProveVerify`).
 pub const WRAP_VK_BYTES: &[u8] = include_bytes!("wrap_vk.bin");
 
 /// Number of lifted Merkle trees committed by the wrap circuit
@@ -83,8 +103,9 @@ pub const N_TREES: usize = 4;
 /// Number of M31 lanes in the wrap circuit's `OutHash` public output
 /// (2 QM31s × 4 lanes).
 pub const OUT_HASH_LANES: usize = 8;
-/// Total number of gnark public scalars: 4×32 root bytes + 8 OutHash lanes.
-pub const N_PUBLIC_INPUTS: usize = N_TREES * 32 + OUT_HASH_LANES;
+/// Total number of gnark public scalars (item-D ABI): 4 `TreeRoots` Fr
+/// scalars + 8 `OutHash` lanes = 12.
+pub const N_PUBLIC_INPUTS: usize = N_TREES + OUT_HASH_LANES;
 
 /// Domain separation tag used by gnark to hash a BSB22 commitment into a
 /// public-input scalar (`constraint.CommitmentDst`,
@@ -549,9 +570,9 @@ pub fn verify_gnark_proof(
 /// * `out_hash_lanes` — the 8 M31 lanes of `OutHash[0..2]`
 ///   (per QM31: `AReal, AImag, BReal, BImag`).
 ///
-/// Builds the 136 public scalars in the gnark declaration order documented
-/// at the top of this module (128 individual root bytes, then the 8 lanes)
-/// and runs the commitment-aware verification.
+/// Builds the 12 public scalars in the gnark declaration order documented
+/// at the top of this module (4 `TreeRoots` Fr scalars, then the 8 OutHash
+/// lanes) and runs the commitment-aware verification.
 pub fn verify_groth16_wrap(
     gnark_proof_bytes: &[u8],
     tree_roots: &[[u8; 32]; N_TREES],
@@ -571,10 +592,12 @@ pub fn verify_groth16_wrap_with_vk(
     let vk = parse_gnark_vk(vk_bytes)?;
 
     let mut publics: Vec<Fr> = Vec::with_capacity(N_PUBLIC_INPUTS);
+    // item-D ABI: each TreeRoots[t] is ONE BN254 Fr scalar. The 32 root bytes
+    // are its big-endian wire encoding (gnark `fr.Element.SetBytes`), so we
+    // reduce them mod r — identical to how `out_hash_poseidon2` absorbs the
+    // root, keeping the public witness and the OutHash derivation consistent.
     for root in tree_roots {
-        for &b in root {
-            publics.push(Fr::from(b as u64));
-        }
+        publics.push(Fr::from_be_bytes_mod_order(root));
     }
     for &lane in out_hash_lanes {
         publics.push(Fr::from(lane as u64));
@@ -727,13 +750,14 @@ mod tests {
         );
     }
 
-    /// The embedded VK must parse and carry the expected wrap-circuit shape:
-    /// K = 1 (ONE) + 136 public scalars + 1 commitment wire = 138 points,
+    /// The embedded VK must parse and carry the expected item-D wrap-circuit
+    /// shape: K = 1 (ONE) + 12 public scalars + 1 commitment wire = 14 points,
     /// 1 Pedersen commitment key.
     #[test]
     fn embedded_wrap_vk_parses_with_expected_shape() {
         let vk = parse_gnark_vk(WRAP_VK_BYTES).expect("embedded wrap VK must parse");
         assert_eq!(vk.vk.gamma_abc_g1.len(), 1 + N_PUBLIC_INPUTS + 1);
+        assert_eq!(vk.vk.gamma_abc_g1.len(), 14, "item-D 14-K-point VK");
         assert_eq!(vk.commitment_keys.len(), 1);
         assert_eq!(vk.public_and_commitment_committed.len(), 1);
     }

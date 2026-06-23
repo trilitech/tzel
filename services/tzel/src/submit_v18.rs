@@ -37,6 +37,31 @@
 //! a real prover here; tests use [`StubGroth16Prover`] (returns the captured
 //! `verifier/testdata/proof.bin` raw gnark bytes, or the kernel skip-verify
 //! token). See [`Groth16WrapProver`] for the seam contract.
+//!
+//! ## item-D wire-format note (TreeRoots as BN254 Fr)
+//!
+//! The kernel wire carries `tree_roots: [[u8; 32]; 4]` and the item-D ABI port
+//! kept that BYTE layout: each `TreeRoots[t]` is the 32 big-endian bytes of a
+//! single BN254 `Fr` scalar (the gnark `fr.Element.SetBytes` encoding the
+//! verifier feeds straight into the 12-input public witness). So `SubmitOps`'s
+//! `tree_roots`/`out_hash` wire fields and `prove_wrap`'s signature are
+//! UNCHANGED by item-D — no kernel-wire encoding change is required.
+//!
+//! What [`build_tree_binding`] derives, however, is the OLD blake-topology
+//! binding: it folds the aggregation tree in 8-M31-lane space via
+//! [`derive_mv_root_publics`] and sets `tree_roots[0] =
+//! root_lanes_to_bytes(mv_to_mv root lanes)`. The item-D production wrap is the
+//! OUTER-over-Poseidon2-BN254 layer, whose preprocessed root (`TreeRoots[0]`)
+//! is a single BN254 `Fr` — NOT the blake 8-lane `mv_to_mv` root (7/8 of that
+//! Fr's LE bytes exceed 2^31-1, so it is not even a valid lane tuple). The
+//! blake-lane tree-walk (`derive_mv_root_publics` / `verify_snark_tree` /
+//! `build_tree_binding` + the pinned `*_CIRCUIT_ROOT_LANES` constants) must be
+//! reworked to the item-D OUTER topology (bn254-Fr root at the OUTER level,
+//! blake lanes only below) before this producer emits item-D-bindable
+//! submissions. That is a SEPARATE, scoped change; the verifier crate's
+//! Groth16 ABI + the **mv-mode** OutHash binding
+//! (`compute_expected_out_hash_mv(TreeRoots[0], output_values)`) are already
+//! item-D-correct and validated end to end.
 
 use tzel_core::kernel_wire::{
     encode_staged_note_payload, KernelInboxMessage, KernelLeafSlot, KernelOpDecl,

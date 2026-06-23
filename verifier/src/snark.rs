@@ -42,24 +42,26 @@
 //! `crates/circuit_verifier/src/verify.rs:67-74`):
 //!
 //! ```text
+//! // Stage 1 (blake2s) — unchanged:
 //! output_felt   = Blake2Felt252::encode_felt252_data_and_calc_blake_hash(output_preimage)
 //! limbs         = Felt252(output_felt).get_limbs()          // 28 × 9-bit M31 limbs
 //! output_qm31s  = pack_into_qm31s(limbs)                    // 7 QM31s
 //! output_hash   = blake_m31(output_qm31s)                   // 2 QM31s (8 lanes)
-//! output_values = [output_hash.0, output_hash.1, U_VALUE]   // U_VALUE = (0,0,1,0)
-//! preimage      = TreeRoots[0] (32 raw bytes)
-//!              ‖ output_values as QM31 bytes (per QM31: 4 lanes × u32 LE)
-//!               = 80 bytes total
-//! OutHash       = blake_m31(preimage)                       // 8 lanes
+//! output_values = [output_hash.0, output_hash.1]            // Claim.OutputValues, len=N_RESERVED=2 (NO U_VALUE)
+//! // Stage 2 (Poseidon2-BN254, item-D ABI):
+//! sponge        = Poseidon2-BN254 t=3 rate-1: state=[0,0,0];
+//!                 absorb Fr(TreeRoots[0]); for each output_value:
+//!                   absorb its 4 M31 limbs as Fr (each: state[0]+=x; permute);
+//!                 digestFr = state[0]
+//! OutHash       = frToM31Lanes(digestFr)                    // 8 lanes
 //! ```
 //!
-//! where `blake_m31(x) = reduce_to_m31(blake2s-256(x))` — **standard**
-//! blake2s-256, then each of the 8 LE u32 lanes of the digest reduced mod
-//! `P = 2^31 - 1` (the chip's `ChannelLifted.ReduceDigestM31`,
-//! `stwo-gnark-tzel/channel/channel_lifted.go:69-101`; upstream
-//! `circuits::blake::blake_qm31`, stwo-circuits
-//! `crates/circuits/src/blake.rs:67-87` + stwo
-//! `core/vcs/blake2_hash.rs:111` `reduce_to_m31`).
+//! Stage 1 still uses `blake_m31(x) = reduce_to_m31(blake2s-256(x))` — standard
+//! blake2s-256 reduced mod `P = 2^31 - 1`. Stage 2 changed from blake2s to the
+//! Poseidon2-BN254 sponge to match the wrap chip's item-D ABI
+//! (`fri.Poseidon2Bn254Hasher.HashLeafQM31Lanes`); `frToM31Lanes` takes 254
+//! canonical LE bits of the digest Fr, regroups into 8 × 32-bit words (last
+//! clamped to the 254-bit span), each reduced mod `P`.
 //!
 //! The first stage (`output_felt → output_hash`) reuses the host crate's
 //! `bundle::compute_output_hash_values`, which delegates to the same
@@ -75,13 +77,23 @@
 //! circuit verified:
 //!
 //! **Leaf mode** ([`compute_expected_out_hash`]) — the wrap verifies a
-//! privacy-recursion *leaf* statement: `output_values = [output_hash.0,
-//! output_hash.1, U_VALUE]` (3 QM31s, `CIRCUIT_OUTPUT_ADDRESSES = [3, 4,
-//! 2]` in `privacy_circuit_verify/src/consts.rs`, output values built at
-//! `privacy_circuit_verify/src/lib.rs:114`), where `output_hash` derives
-//! from the Cairo bootloader `output_preimage`. Only this statement type
-//! lists `U_VALUE` (the logup anchor at wire 2, stwo-circuits
-//! `crates/circuits/src/context.rs:20`) as an *explicit* output value.
+//! recursion *leaf* statement whose `output_values = [output_hash.0,
+//! output_hash.1]` (2 QM31s), where `output_hash` derives from the Cairo
+//! bootloader `output_preimage`. The `u` logup anchor (wire 2, stwo-circuits
+//! `crates/circuits/src/context.rs:20`) is NOT an explicit output value here:
+//! it is enforced through the public logup sum, matching the Go chip's
+//! `Claim.OutputValues` (length `N_RESERVED = 2`) and the `CairoStatement`
+//! `set_outputs(&[output_hash.0, output_hash.1])` (stwo-circuits 2bf051f
+//! `crates/cairo_verifier/src/statement.rs:355-357`).
+//!
+//! NOTE: prior to the item-D ABI change, Stage 2 was blake2s over
+//! `[output_hash.0, output_hash.1, U_VALUE]` (the standalone
+//! `privacy_circuit_verify` 3-output shape, `CIRCUIT_OUTPUT_ADDRESSES =
+//! [3,4,2]`). The Poseidon2-BN254 `outputHash` gadget
+//! (`circuit_verifier_chip.go`) absorbs only the 2 claim output_values, so the
+//! `U_VALUE` term is dropped. If the leaf wrap is ever re-pointed at the
+//! standalone 3-output `privacy_circuit_verify` statement (rather than the
+//! circuit_verifier/Cairo-leaf chip), this Stage-2 must absorb 3 values again.
 //!
 //! **mv mode** ([`compute_expected_out_hash_mv`]) — the production shape:
 //! the wrap verifies a `circuit_multiverifier` *root* proof aggregating a
@@ -105,14 +117,23 @@
 //! (`crates/circuit_multiverifier/src/verify.rs:64-96`: preimage build at
 //! :79-88, `blake(.., 16 * len)` at :90-94), each QM31 framed as 4 u32 LE
 //! lanes (`crates/circuits/src/blake.rs:47-54` `to_bytes`, mirrored by the
-//! witness `blake_qm31` at `blake.rs:67-85`). The chip then hashes
-//! `TreeRoots[preprocessed] ‖ Claim.OutputValues` — 32 + 2×16 = 64 bytes
-//! for the mv root (`stwo-gnark-tzel/verifier/circuit_verifier_chip.go:
-//! 119-150`, call site `:672-676`) — into `OutHash`.
+//! witness `blake_qm31` at `blake.rs:67-85`). These tree-fold blake2s steps
+//! ([`compute_mv_output_values`]) are UNCHANGED by item-D.
 //!
-//! Both modes are pinned by golden vectors; mv mode additionally by the
-//! real 2026-06-10 mv-target fixture (see tests +
-//! `tests/snark_wrap_acceptance.rs`).
+//! The chip then computes the FINAL `OutHash` over `TreeRoots[preprocessed] ‖
+//! Claim.OutputValues` with the item-D **Poseidon2-BN254** `outputHash` gadget
+//! (the SAME single gadget used for the leaf path —
+//! `stwo-gnark-tzel/verifier/circuit_verifier_chip.go` `outputHash`, mv-root
+//! call site `:912-915`): the t=3 rate-1 sponge absorbs `Fr(root)` then the 2
+//! output values' M31 limbs, then `frToM31Lanes(digest)`. See
+//! [`compute_expected_out_hash_mv`].
+//!
+//! Both modes' Poseidon2 final-OutHash derivation is pinned by golden vectors
+//! validated byte-exact against the Go reference `offcircuit.OutHashPoseidon2`.
+//! NOTE: the real 2026-06-10 `proof.bin` fixture is blake2s-era (its pinned
+//! OutHash predates item-D), so the real-proof *binding* acceptance tests are
+//! `#[ignore]`d pending an item-D Poseidon2 mv wrap fixture (see
+//! `tests/snark_wrap_acceptance.rs` module docs).
 //!
 //! ## The leaf↔mv junction (aggregation-tree leaves)
 //!
@@ -159,11 +180,6 @@ const TREE_ROOTS_BYTES: usize = N_TREES * 32;
 const OUT_HASH_BYTES: usize = OUT_HASH_LANES * 4;
 /// Total header (public inputs) length before the raw gnark proof.
 const ENVELOPE_HEADER_BYTES: usize = TREE_ROOTS_BYTES + OUT_HASH_BYTES;
-
-/// `U_VALUE` — the logup anchor constant output by `finalize_constants` at
-/// wire address 2 (stwo-circuits rev 2bf051f
-/// `crates/circuits/src/context.rs:20`): `QM31(0, 0, 1, 0)`.
-const U_VALUE_LANES: [u32; 4] = [0, 0, 1, 0];
 
 // ── Pinned circuit-identity constants (per-TzEL-release) ────────────────
 //
@@ -280,18 +296,21 @@ pub fn compute_expected_out_hash(
     let output_hash_lanes = compute_output_hash_values(output_preimage);
     debug_assert_eq!(output_hash_lanes.len(), OUT_HASH_LANES);
 
-    // Stage 2 — the wrap circuit's outputHash over
-    // root_bytes ‖ output_values (each QM31 = 4 lanes × u32 LE) = 80 bytes.
-    let mut preimage = [0u8; 32 + 3 * 16];
-    preimage[..32].copy_from_slice(preprocessed_root);
-    for (i, lane) in output_hash_lanes
-        .iter()
-        .chain(U_VALUE_LANES.iter())
-        .enumerate()
-    {
-        preimage[32 + i * 4..32 + (i + 1) * 4].copy_from_slice(&lane.to_le_bytes());
-    }
-    blake_m31_lanes(&preimage)
+    // Stage 2 — the wrap circuit's `outputHash` (item-D ABI: Poseidon2-BN254).
+    //
+    // Absorbs the preprocessed root (`TreeRoots[0]` as a BN254 Fr) then the
+    // claim's `output_values` 4-M31-limb-each, through a t=3 rate-1 Poseidon2
+    // sponge, then maps the digest Fr to 8 M31 lanes. This is the EXACT gadget
+    // `CircuitVerifierChipLifted.outputHash` (verifier/circuit_verifier_chip.go)
+    // / off-circuit `offcircuit.OutHashPoseidon2`.
+    //
+    // `Claim.OutputValues` has length `N_RESERVED = 2` (the multiverifier root's
+    // emitted outputs == Stage-1 `output_hash` = these 8 lanes). U_VALUE is NOT
+    // absorbed here — it only appears in `derivePublicLogupSum`, a distinct
+    // computation, never in `outputHash`. (Resolves the prior 2-vs-3 question:
+    // the blake2s Stage-2 appended U_VALUE as a 3rd QM31; the Poseidon2 ABI does
+    // not — it absorbs exactly the 2 claim output_values.)
+    crate::poseidon2_bn254::out_hash_poseidon2(preprocessed_root, &output_hash_lanes)
 }
 
 /// Public data of one aggregation-tree node as seen by its PARENT
@@ -481,23 +500,26 @@ pub fn root_lanes_to_bytes(lanes: &[u32; 8]) -> [u8; 32] {
 /// root's preprocessed root (`TreeRoots[0]`, 32 raw bytes) and its 2 claim
 /// output values (8 M31 lanes, e.g. from [`compute_mv_output_values`]).
 ///
-/// Mirrors the chip's `outputHash` over `TreeRoots[preprocessed] ‖
-/// Claim.OutputValues` (`stwo-gnark-tzel/verifier/circuit_verifier_chip.go:
-/// 119-150`, called at `:672-676`), which itself mirrors upstream
-/// `build_verification_circuit` (stwo-circuits 2bf051f
-/// `crates/circuit_verifier/src/verify.rs`, step 3). The mv claim has
-/// exactly 2 output values and NO trailing `U_VALUE` (see module docs) —
-/// preimage = 32 + 2 × 16 = 64 bytes.
+/// This is the FINAL OutHash-over-root. The item-D chip computes it with the
+/// SAME single `outputHash` gadget it uses for the leaf path — Poseidon2-BN254
+/// (`stwo-gnark-tzel/verifier/circuit_verifier_chip.go` `outputHash`, the only
+/// OutHash gadget, called at the mv-root level `:912-915` on
+/// `inputs.TreeRoots[Preprocessed]` + `inputs.Claim.OutputValues`). So the
+/// final OutHash uses Poseidon2, IDENTICAL to [`compute_expected_out_hash`].
+///
+/// IMPORTANT: only this FINAL hash is Poseidon2. The tree-fold steps that build
+/// the mv root's `output_values` (`parent.output_values = blake_m31(childL.root
+/// ‖ childL.ov ‖ childR.root ‖ childR.ov)`, see [`compute_mv_output_values`])
+/// STAY blake2s — they are upstream `circuit_multiverifier` `set_outputs` and
+/// are unchanged by item-D.
+///
+/// The mv claim has exactly 2 output values and NO trailing `U_VALUE`
+/// (see module docs) — the sponge absorbs `Fr(root) ‖ 8 M31 lanes`.
 pub fn compute_expected_out_hash_mv(
     preprocessed_root: &[u8; 32],
     root_output_lanes: &[u32; 8],
 ) -> [u32; OUT_HASH_LANES] {
-    let mut preimage = [0u8; 32 + 2 * 16];
-    preimage[..32].copy_from_slice(preprocessed_root);
-    for (i, lane) in root_output_lanes.iter().enumerate() {
-        preimage[32 + i * 4..32 + (i + 1) * 4].copy_from_slice(&lane.to_le_bytes());
-    }
-    blake_m31_lanes(&preimage)
+    crate::poseidon2_bn254::out_hash_poseidon2(preprocessed_root, root_output_lanes)
 }
 
 /// `reduce_to_m31(blake2s-256(data))` as 8 u32 lanes — the
@@ -820,12 +842,16 @@ mod tests {
         );
     }
 
-    /// Golden vector for the full mv-target derivation, generated by an
-    /// independent Python implementation (hashlib.blake2s + manual felt
-    /// encoding per starknet-types-core `blake2s.rs:62-130` + 9-bit limb
-    /// split per stwo-cairo `cpu.rs:450-485`). Guards every stage:
-    /// felt encoding, inner blake, limb split, QM31 packing, U_VALUE
-    /// placement, outer blake, M31 lane reduction.
+    /// Golden vector for the full two-stage mv-target derivation. Stage 1
+    /// (blake2s: felt encoding, inner blake, 9-bit limb split, QM31 packing,
+    /// M31 lane reduction) is unchanged. Stage 2 is the item-D Poseidon2-BN254
+    /// `outputHash` (root Fr ‖ 2 output_values' M31 limbs → t=3 rate-1 sponge →
+    /// frToM31Lanes); NO U_VALUE.
+    ///
+    /// The expected 8 lanes are the Go off-circuit `offcircuit.OutHashPoseidon2`
+    /// for `root = ae20…e433` (big-endian, reduced mod r) + the Stage-1 lanes
+    /// from `output_hash_values_golden_vector`. Regenerate via the Go harness
+    /// `channel/offcircuit/outhash_golden_print_test.go` (case "snarkrs").
     #[test]
     fn compute_expected_out_hash_golden_vector() {
         let mut root = [0u8; 32];
@@ -846,8 +872,8 @@ mod tests {
         assert_eq!(
             compute_expected_out_hash(&root, &preimage),
             [
-                1327368715, 167547655, 34084859, 358180399, 458755360, 675324717, 638057561,
-                2067345823
+                1272457859, 1685065576, 251687680, 707557363, 1129927841, 850660069, 2022909033,
+                22565545
             ],
         );
     }
@@ -876,14 +902,24 @@ mod tests {
         );
     }
 
-    /// mv-mode stage 2 pinned by the REAL 2026-06-10 mv-target wrap fixture:
-    /// `TreeRoots[0]` + `OutHash` come from the chip-dumped public witness
-    /// (`testdata/wrap_public_witness.txt`, indices 0..32 and 128..136), and
-    /// the root `output_values` lanes are the mv root proof's
-    /// `claim.output_values` observed during the fixture export run
-    /// (`services/reprover/tests/export_mv_fixture.rs`) and re-captured by
-    /// `mv_output_derivation.rs`. Pins the 64-byte preimage layout
-    /// (root ‖ 2 QM31s, NO U_VALUE) against chip-validated ground truth.
+    /// mv-mode FINAL OutHash (item-D Poseidon2-BN254) pinned by the REAL
+    /// 2026-06-10 mv-target wrap fixture inputs: `TreeRoots[0]` (the fixture's
+    /// preprocessed root) + the mv root proof's tree-folded `claim.output_values`
+    /// (8 lanes, blake2s tree-fold, observed during the fixture export run
+    /// `services/reprover/tests/export_mv_fixture.rs`, re-captured by
+    /// `mv_output_derivation.rs`).
+    ///
+    /// The INPUTS (root + folded output lanes) are unchanged real ground truth.
+    /// The expected OutHash is the **Poseidon2** result for those inputs,
+    /// regenerated from the authoritative Go reference `offcircuit.OutHashPoseidon2`
+    /// (harness `channel/offcircuit/outhash_golden_print_test.go`, case "mvwrap").
+    ///
+    /// NOTE: the fixture's own dumped `OutHash` public witness
+    /// (`testdata/wrap_public_witness.txt`) is BLAKE2S-era (pre-item-D) and no
+    /// longer matches this Poseidon2 derivation — that is expected. There is no
+    /// item-D Poseidon2 mv wrap fixture available (the 2026-06-21 e2e-derisk
+    /// proof ran with `SkipOutputHash`, so it carries no Poseidon2 OutHash), so
+    /// this golden is pinned against the Go gadget, not a real item-D proof.
     #[test]
     fn mv_out_hash_matches_wrap_fixture() {
         let mut root = [0u8; 32];
@@ -898,10 +934,10 @@ mod tests {
         assert_eq!(
             compute_expected_out_hash_mv(&root, &root_output_lanes),
             [
-                440499038, 323128790, 518444590, 444371365, 603497046, 1594598412, 638277005,
-                1938560081
+                1497266488, 325154675, 946505096, 1208787576, 1466909141, 414348525, 1258147338,
+                98023563
             ],
-            "must match OutHash lanes of the dumped mv-target public witness"
+            "must match Go offcircuit.OutHashPoseidon2 for the mv wrap fixture inputs"
         );
     }
 
