@@ -77,6 +77,43 @@ let tr_membership_root_idx : nat = 4n    (* public_outputs[1] *)
 let tr_nf_start_idx        : nat = 5n    (* public_outputs[2..2+N] *)
 let tr_tail_after_nf       : nat = 7n    (* trailing felts after nf: fee+cm1..3+memo1..3 *)
 
+(* ── new-commitment offsets per entrypoint (item-D single-asset layout) ───────
+   These are the CURRENT single-asset run_shield / run_transfer / run_unshield
+   circuit output layouts (tzel/cairo/src/run_*.cairo + the *::verify output
+   arrays). They are re-pinned with the multi-asset circuit pass.
+   (* item-D single-asset offsets; revisit for multi-asset *)
+
+   All offsets are into the bootloader-framed output_preimage, where
+   public_outputs[k] sits at preimage index k+3 (boot prefix
+   [n_tasks, task_output_size, program_hash] = 3 felts; boot_auth_domain_idx=3
+   confirms public_outputs[0] is at index 3).
+
+   SHIELD public outputs (run_shield.cairo:4-5):
+     [auth_domain, pubkey_hash, v_note, fee, producer_fee,
+      cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash]
+   → cm_new = public[5] = preimage 8 ; cm_producer = public[6] = preimage 9.
+
+   TRANSFER public outputs (transfer.cairo verify output array):
+     [auth_domain, root, nf_1..nf_N, fee, cm_1, cm_2, cm_3, memo_1, memo_2, memo_3]
+   → after the nf list ends at nf_end = len - tr_tail_after_nf, the tail is
+     [fee, cm_1, cm_2, cm_3, memo_1, memo_2, memo_3]:
+       cm_1 = nf_end+1 ; cm_2 = nf_end+2 ; cm_3 = nf_end+3.
+
+   UNSHIELD public outputs (unshield.cairo verify output array) — tail DIFFERS
+   from transfer (still 7 felts, so spend_all is unaffected, but cm positions
+   differ):
+     [auth_domain, root, nf_1..nf_N,
+      v_pub, fee, recipient, cm_change, memo_change, cm_fee, memo_fee]
+   → tail = [v_pub, fee, recipient, cm_change, memo_change, cm_fee, memo_fee]:
+       cm_change = nf_end+3 ; cm_fee = nf_end+5. *)
+let sh_cm_new_idx       : nat = 8n
+let sh_cm_producer_idx  : nat = 9n
+let tr_cm1_off          : nat = 1n   (* offsets from nf_end *)
+let tr_cm2_off          : nat = 2n
+let tr_cm3_off          : nat = 3n
+let un_cm_change_off    : nat = 3n   (* offsets from nf_end *)
+let un_cm_fee_off       : nat = 5n
+
 (* The OutHash chain runs through the gateway (`Gateway s.gateway`): the STAGE-1
    mv tree walk on the runtime BLAKE2S-256 (out_hash.mligo `blake2s`), then the
    item-D FINAL re-commit on Poseidon2-BN254 (out_hash.mligo
@@ -196,7 +233,11 @@ let check_identity (s : storage) (output_preimage : bytes list) : unit =
    the op fails closed — which is correct: no spend may pass an unvalidated
    root. *)
 let require_known_root (s : storage) (root : bytes) : unit =
-  let tag = empty_bytes in
+  (* tag is length-prefixed (runtime tree_known_root does take_lp), so the empty
+     single-pool tag is 0x00000000 (u32 BE 0) — MUST match tree_append's tag
+     framing, else the appended root is filed under a different tag and never
+     found. *)
+  let tag = 0x00000000 in
   match (Tezos.call_view "zk" ("tree_known_root", Bytes.concat tag root) s.gateway
          : bytes option) with
   | Some r -> if r = valid_byte then unit else failwith "TzEL: unknown membership root"
@@ -233,11 +274,87 @@ let spend_all (s : storage) (output_preimage : bytes list) : storage =
 let emit_sync (output_preimage : bytes list) (enc_notes : bytes list) : operation =
   Tezos.emit "%tzel_notes" (output_preimage, enc_notes)
 
-(* TODO(A'): also emit a `%call http://zk/tree_append` op to advance the tree
-   in the accumulator (commitments cm_1..3 from output_preimage). Pending the
-   A' accumulator endpoints + the multi-asset output layout that fixes the
-   commitment offsets. Today the contract verifies + spends + publishes; the
-   tree advance is the A' hook. *)
+(* ── A' tree append (the async write counterpart of require_known_root) ───────
+   tree_append is STATE-MUTATING (durable accumulator), so it is reached via the
+   gateway's async `%call` (HTTP) entrypoint — NOT the synchronous `Tezos.call_view`
+   used for the pure primitives (verify_snark / blake2s / poseidon2_bn254 /
+   tree_known_root). The runtime records the new root in its durable accumulator;
+   `require_known_root` reads it on a later spend. Fire-and-forget (no callback).
+
+   The gateway `%call` entrypoint type (etherlink/michelson_test_scripts/
+   mini_scenarios/cross_runtime_http_call_tez.tz):
+     pair string                                         (* url *)
+          (pair (list (pair string string))             (* headers *)
+                (pair bytes                              (* body *)
+                      (pair nat                          (* method: 1 = POST *)
+                            (option (contract bytes))))) (* callback *)
+
+   tree_append request body (zk runtime handle_tree_append, lib.rs):
+     tag(lp) ‖ n:u32 BE ‖ leaf(32)*n
+   where tag is length-prefixed (`take_lp` = u32 BE len ‖ bytes). For the single
+   pool the tag is EMPTY, so the length prefix is 0x00000000 (4 zero bytes — the
+   u32 BE length of an empty tag), followed by 0 bytes of tag.
+
+   NOTE: require_known_root (line ~199) concats a BARE `0x` tag with no u32 length
+   prefix, but the tree_known_root handler ALSO calls `take_lp()` for its tag —
+   so that send is missing the 4-byte length prefix. tree_append below sends the
+   correct length-prefixed empty tag (`tree_append_tag_lp`). The require_known_root
+   tag should be fixed to match (out of scope for this hook; flagged). *)
+
+(* gateway %call (HTTP) entrypoint parameter, mirrored from cross_runtime_http_call_tez.tz *)
+type gateway_call_param =
+  string
+  * ((string * string) list
+     * (bytes
+        * (nat
+           * (bytes contract) option)))
+
+let tree_append_url      : string = "http://zk/tree_append"
+let http_method_post     : nat    = 1n   (* gateway convention: 1 = POST *)
+let tree_append_tag_lp   : bytes  = 0x00000000  (* len-prefixed EMPTY tag: u32 BE 0 ‖ 0 bytes *)
+
+(* Build the tree_append request body: tag(lp) ‖ n:u32 BE ‖ leaf(32)*n.
+   Each commitment is an output_preimage felt = exactly 32 BE bytes (same repr
+   the proof binding uses), so leaves need no padding. *)
+let build_tree_append_body (commitments : bytes list) : bytes =
+  let n_be = O.pad_left 4n (bytes (List.length commitments)) in   (* u32 BE *)
+  let leaves =
+    List.fold_left
+      (fun ((acc, cm) : bytes * bytes) -> Bytes.concat acc cm)
+      empty_bytes commitments in
+  Bytes.concat tree_append_tag_lp (Bytes.concat n_be leaves)
+
+(* Emit the async gateway `%call http://zk/tree_append` op that advances the A'
+   commitment tree with this op's new commitments. Fire-and-forget (callback None);
+   the runtime records the new root for a later require_known_root. *)
+let emit_tree_append (s : storage) (commitments : bytes list) : operation =
+  let call : gateway_call_param contract =
+    match (Tezos.get_entrypoint_opt "%call" s.gateway : gateway_call_param contract option) with
+    | Some c -> c
+    | None -> (failwith "TzEL: gateway %call entrypoint unavailable" : gateway_call_param contract) in
+  let body = build_tree_append_body commitments in
+  let headers : (string * string) list = [] in
+  let callback : (bytes contract) option = None in
+  let param : gateway_call_param =
+    (tree_append_url, (headers, (body, (http_method_post, callback)))) in
+  Tezos.transaction param 0mutez call
+
+(* New commitments per entrypoint (item-D single-asset layout; see the offset
+   consts above). nf_end = len - tr_tail_after_nf locates the trailing tail. *)
+let shield_commitments (output_preimage : bytes list) : bytes list =
+  [ preimage_at output_preimage sh_cm_new_idx ;
+    preimage_at output_preimage sh_cm_producer_idx ]
+
+let transfer_commitments (output_preimage : bytes list) : bytes list =
+  let nf_end = abs (List.length output_preimage - tr_tail_after_nf) in
+  [ preimage_at output_preimage (nf_end + tr_cm1_off) ;
+    preimage_at output_preimage (nf_end + tr_cm2_off) ;
+    preimage_at output_preimage (nf_end + tr_cm3_off) ]
+
+let unshield_commitments (output_preimage : bytes list) : bytes list =
+  let nf_end = abs (List.length output_preimage - tr_tail_after_nf) in
+  [ preimage_at output_preimage (nf_end + un_cm_change_off) ;
+    preimage_at output_preimage (nf_end + un_cm_fee_off) ]
 
 (* ── entrypoints ─────────────────────────────────────────────────────────── *)
 
@@ -265,7 +382,8 @@ type shield_param = {
 let shield (p : shield_param) (s : storage) : operation list * storage =
   let () = verify_bound s p.proof p.tree_roots p.leaves in
   let () = check_identity s p.output_preimage in
-  [ emit_sync p.output_preimage p.enc_notes ], s
+  [ emit_sync p.output_preimage p.enc_notes ;
+    emit_tree_append s (shield_commitments p.output_preimage) ], s
 
 (* A transfer spends N notes against a validated membership root and creates new
    commitments. *)
@@ -283,7 +401,8 @@ let transfer (p : transfer_param) (s : storage) : operation list * storage =
   let () = check_identity s p.output_preimage in
   let () = require_known_root s (preimage_at p.output_preimage tr_membership_root_idx) in
   let s = spend_all s p.output_preimage in
-  [ emit_sync p.output_preimage p.enc_notes ], s
+  [ emit_sync p.output_preimage p.enc_notes ;
+    emit_tree_append s (transfer_commitments p.output_preimage) ], s
 
 (* An unshield spends notes and exits value. The outbound transfer/ticket (value
    custody — per-asset tickets) is deferred to the multi-asset pass; the zk
@@ -302,4 +421,5 @@ let unshield (p : unshield_param) (s : storage) : operation list * storage =
   let () = check_identity s p.output_preimage in
   let () = require_known_root s (preimage_at p.output_preimage tr_membership_root_idx) in
   let s = spend_all s p.output_preimage in
-  [ emit_sync p.output_preimage p.enc_notes ], s
+  [ emit_sync p.output_preimage p.enc_notes ;
+    emit_tree_append s (unshield_commitments p.output_preimage) ], s
