@@ -19,7 +19,16 @@ DAL-pointer submission path for proof-bearing operations.
 ## Why this works now
 
 - The mv-target chip wraps an aggregated multiverifier root; the
-  Groth16 proof is 388 bytes (verified: Prove 3m21s, Verify 1.76 ms).
+  Groth16 proof is 388 bytes, Verify ≈ 1.6 ms. After the fold2 wrap
+  rewrite the circuit is 10,594,113 R1CS; the Groth16 **Prove** is
+  CPU-bound and hardware-sensitive — measured **9.3 s** on a 96-core
+  c4-highcpu (the knee; witness-solve is a ~6.2 s serial floor, MSM
+  ~3.1 s scales with cores), **21 s** on a 24-vCPU box. (The earlier
+  "3m21s" was a pre-fold2 single-thread number, superseded.) The GPU
+  (icicle) wrap is ~12 s but currently emits an INVALID proof — not
+  usable until the icicle BSB22 commitment bug is fixed. See
+  TZEL-ON-TEZOS-X-ARCHITECTURE.md § Proving performance for the full
+  pipeline E2E.
 - `verify_snark_mv` (verifier/src/snark.rs) already binds a Groth16
   proof to the mv root's children data (15/15 acceptance incl. the
   positive happy path on real artifacts).

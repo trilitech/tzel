@@ -40,10 +40,18 @@ runtime primitive performs.
 
 The Tezos X MIR runtime today has hashes (BLAKE2b, Keccak, SHA-256/3/512),
 `CHECK_SIGNATURE`, and `PAIRING_CHECK` (BLS12-381 via `blst`). It has **no**
-generic SNARK/STARK verification and **no** BLAKE2s. The new instructions
-follow the established `PAIRING_CHECK` pattern (AST enum + lexer +
-typechecker + interpreter + gas; no new Michelson *type* needed — proofs
-and keys are `bytes`).
+generic SNARK/STARK verification and **no** BLAKE2s.
+
+> **Decision (validated 2026-06-23): the verify is a runtime *precompile*,
+> NOT a new Michelson instruction.** The runtime exports a fixed
+> BN254-Groth16 verification service (the existing wasm-clean
+> `tzel-verifier::verify_snark`), callable from Michelson like a contract /
+> host-function — **no Michelson-language amendment** (no new opcode/lexer/
+> typechecker/type). This reuses the locked "kernel Groth16 precompile,
+> permissionless `verify_snark(proof, public_inputs)`" design. The
+> signatures below describe the verify/hash *service interface* regardless
+> of exposure mechanism. (`BLAKE2S` for the binding is the one genuinely new
+> hashing primitive — trivial next to the existing BLAKE2b/Keccak.)
 
 ### 1.1 `VERIFY_SNARK` (required)
 
@@ -89,10 +97,29 @@ it). Empty personalization = standard BLAKE2s (used by the OutHash
 
 Scope note: TzEL uses several personalizations (`mrklSP__`, `nulfSP__`,
 `cmmtSP__`, …), but the **contract** only needs `mrklSP__` (the tree) and
-the empty one (OutHash). The others — nullifier/commitment derivation —
-live *inside the proof*; the contract receives those values and only
-checks set-membership/uniqueness, never recomputes them. Trivial addition
-next to the existing BLAKE2b/Keccak instructions.
+the empty one (the multiverifier-level `output_values`). The others —
+nullifier/commitment derivation — live *inside the proof*; the contract
+receives those values and only checks set-membership/uniqueness, never
+recomputes them. Trivial addition next to the existing BLAKE2b/Keccak
+instructions.
+
+### 1.2b `POSEIDON2_BN254` (required for the OutHash binding)
+
+```
+POSEIDON2_BN254 :: list bytes   -- field elements to absorb (BN254 Fr, 32B BE each)
+                -> bytes        -- sponge digest (a BN254 Fr, 32B)
+```
+
+The **item-D** wrap re-commits its OutHash in BN254 (not blake2s): the
+chip's `out_hash` public output is
+`POSEIDON2_BN254(preprocessed_root ‖ output_values M31 limbs)` mapped to 8
+M31 lanes (chip `outputHash`, crosscheck-validated against the off-circuit
+reference). So the contract's binding (§2.3 check 2) recomputes through this
+sponge. Reference impl = the same Poseidon2-BN254 the wrap verify already
+uses (wasm-clean). A new hashing primitive **alongside** `BLAKE2S` — both
+are needed: `BLAKE2S` for the commitment tree + the `output_values` level,
+`POSEIDON2_BN254` for the final re-commit. (This is a v1-required primitive,
+not future/optional.)
 
 ### 1.3 `VERIFY_STARK` (future / optional)
 
@@ -181,10 +208,14 @@ proof:
    The wrap's public inputs are the 4 STARK tree roots (128 bytes) + the
    8-lane `OutHash`.
 2. **Proof↔operation binding** — recompute `expected_out_hash` from
-   `op_publics` with `BLAKE2S` (the chip's `OutHash` = blake over
-   `preprocessed_root ‖ output_values`, `output_values = blake(output_preimage)`)
-   and assert it equals the proof's `out_hash`. Prevents pairing a valid
-   proof with a different op's data (a blake2s second-preimage attack,
+   `op_publics` and assert it equals the proof's `out_hash`. The **item-D
+   ABI** is `out_hash = POSEIDON2_BN254(preprocessed_root ‖ output_values)`
+   with `output_values = BLAKE2S(output_preimage)` — so the recompute needs
+   **both** primitives: `BLAKE2S` for the multiverifier-level `output_values`,
+   then `POSEIDON2_BN254` for the wrap's BN254 re-commit. (The wrap's OutHash
+   was blake2s pre-item-D; the Poseidon2-BN254 sponge replaced it so the
+   BN254 wrap re-commits in its own field — see chip `outputHash`.) Prevents
+   pairing a valid proof with a different op's data (second-preimage,
    ~2⁻¹²⁸).
 3. **Circuit binding** — parse `program_hash` from `op_publics`, assert it
    equals `program_hashes.{shield|transfer|unshield}` for this entrypoint,
@@ -325,3 +356,73 @@ Michelson (the least-certain part of the feasibility study).
 These four are settled; the prototype (LIGO contract + stubbed verify)
 can proceed. The one empirical unknown is decision 2's M31-lane packing in
 Michelson — the first thing the prototype validates.
+
+---
+
+## Proving performance (measured 2026-06-22)
+
+The proof system shape is unchanged, but the recursion → wrap pipeline has
+been measured end-to-end and optimised since the 2026-06-10 design freeze.
+All numbers below are **measured** (not estimated) at production security
+(96-bit, `TZEL_SEC=96`), and every change is **byte-identical** — the OUTER
+proof SHA is invariant (`ad426dbb…`), so none of the perf work alters the
+proof.
+
+### Pipeline stages
+
+A TzEL operation proves as: **4 leaf STARKs → 2 mv-inner aggregations →
+1 OUTER aggregation** (Poseidon2-BN254 channel, so the BN254 wrap can verify
+it cheaply) **→ Groth16-BN254 wrap** (388 bytes, 10,594,113 R1CS). The leaf
+and aggregation STARKs are GPU-resident (bespoke A100 CUDA: Poseidon2-BN254
+commit + Circle-FFT + Blake2s, behind `gpu_commit/gpu_fft/gpu_blake` +
+`TZEL_RESIDENT=1`). The wrap is CPU-bound (gnark Groth16).
+
+### Levers landed this cycle
+
+- **fold2** (FRI `fold_step=2`): collapsed the OUTER FRI layers 21→11 →
+  **OUTER 104.5 s → 49 s**. fold3 is *not* viable — an 8-wide coset spans 2
+  packed Merkle leaves (`LOG_PACKED_LEAF_SIZE = 2` ⇒ 4 QM31/leaf), a
+  decommit-topology change, not a knob.
+- **L2/L3 reprover perf** (committed `5274d93`, byte-identical): skip the
+  redundant `is_circuit_valid()` re-eval (L2) + fat-LTO/codegen-units=1/
+  mimalloc/`target-cpu=native` AVX-512 (L3) → **mv-inner 26.5 s → 17.4 s,
+  leaves 68.8 s → 44.4 s** (the leaf gain is pure L3 AVX-512).
+
+### Measured E2E
+
+The full chain was run **continuously, stitched** (leaf→mv→OUTER→BN254
+emit→Go witness-extract→Groth16 prove→verify) — the OUTER→wrap seam
+**verifies end-to-end**, and the inter-stage glue is negligible (every
+serialize handoff sub-ms; Go witness-extract **25 ms** — there is no hidden
+integration cost). Per-stage, on the best validated hardware (A100-80GB
+GPU + 96-core c4 for the wrap), fanned (4 leaf boxes ∥, 2 mv ∥):
+
+| stage | A100 | **H100** |
+|---|---|---|
+| leaf (1 unit, 4 fanned) | ~11.7 s | ~7.1 s |
+| mv-inner (1 unit, 2 fanned) | ~9.0 s | ~5.1 s |
+| **OUTER** | 43.2 s | **28.4 s** |
+| wrap (Groth16, 96-core CPU) | 9.3 s | 9.3 s |
+| glue (agg-ctx + verify + handoffs) | ~2.4 s | ~1.4 s |
+| **fanned E2E** | ≈ 76 s | **≈ 51 s** |
+
+(Single-box sequential Rust chain is ~107 s on A100 / ~65 s on H100, + the
+wrap.) **OUTER dominates** the fanned E2E. The **H100 `sm_90` port is done
+and byte-exact** — the bespoke CUDA kernels are arch-clean (no Hopper
+intrinsics), so it was a pure recompile, and the OUTER proof SHA is
+unchanged (`ad426dbb…`). H100 measured **OUTER 28.4 s** (from 43.2 s on
+A100, ~1.52× via higher memory bandwidth), taking the fanned E2E to
+**≈ 51 s**. Hopper capacity is scarce (on-demand stockout; DWS flex-start is
+preemptible and a full ~45-min build does not survive it) — the number was
+obtained by pre-building the binary off-Hopper into a disk image, then
+running a build-free ~5-min job via DWS flex-start. The wrap is CPU-bound:
+cost scales with core count (witness-solve ~6.2 s is a serial floor); the
+icicle GPU wrap is faster (~12 s) but emits an invalid proof today.
+
+### Open soundness caveat
+
+The current BN254 wrap runs with **2 documented skips active**
+(`SkipOutputHash`, `SkipOodsCompositionAssert`) — the proof verifies *with
+them skipped*, so the wrap is **not yet fully sound**. Closing them (adds a
+modest R1CS bump) is a prerequisite before production, tracked separately
+from the external audit.
