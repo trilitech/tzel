@@ -5,16 +5,21 @@
 
    The zk runtime exposes, as synchronous gateway views / async calls
    (`Tezos.call_view "zk" (path, body) gateway : bytes option`):
-     - ("verify_snark", body) -> Some 0x01 iff the Groth16 wrap proof is valid
-     - ("blake2s", body)      -> personalized BLAKE2S-256 (OutHash binding)
+     - ("verify_snark", body)    -> Some 0x01 iff the Groth16 wrap proof is valid
+                                    (item-D ABI: vk = 1744 B, 12 public inputs)
+     - ("blake2s", body)         -> BLAKE2S-256 (OutHash STAGE-1 tree walk)
+     - ("poseidon2_bn254", body) -> item-D FINAL OutHash re-commit (replaces the
+                                    blake2s final step); see out_hash.mligo
      - ("tree_known_root", …) / "tree_append" -> the A' Merkle accumulator
 
    ## Two independent security checks (BOTH required)
 
    1. **OutHash binding** — the contract does NOT trust a supplied OutHash. It
-      DERIVES it from the declared `output_preimage` via the real BLAKE2S, builds
-      the wrap public inputs from (tree_roots, derived OutHash), and verifies the
-      proof against those. So a valid proof is bound to its exact output_preimage.
+      DERIVES it from the declared `output_preimage`: a BLAKE2S STAGE-1 mv tree
+      walk followed by the item-D Poseidon2-BN254 FINAL re-commit. It then builds
+      the wrap public inputs from (4 TreeRoots as Fr scalars + 8 OutHash lanes)
+      and verifies the proof against those. So a valid proof is bound to its
+      exact output_preimage.
 
    2. **Circuit-identity pin** — the OutHash binding alone is NOT enough: the
       stored vk pins only the UNIVERSAL wrap circuit. Without pinning the inner
@@ -28,7 +33,8 @@
    the transfer layout and are re-pinned with the multi-asset circuit pass.
 
    The OutHash derivation chain is `out_hash.mligo`, parametrized over the hash
-   source; here it runs on the gateway BLAKE2S (~3-5 synchronous view calls). *)
+   source; here the STAGE-1 walk runs on the gateway BLAKE2S and the item-D FINAL
+   re-commit on the gateway Poseidon2-BN254 (~3-5 synchronous view calls). *)
 
 #include "out_hash.mligo"
 module O = OutHash
@@ -51,12 +57,13 @@ type storage = {
 
 (* ── fixed wire constants (wrap circuit shape) ───────────────────────────── *)
 let empty_bytes   : bytes = 0x
-let vk_len_be     : bytes = 0x000025d0   (* 9680 = len(vk)            *)
+let vk_len_be     : bytes = 0x000006d0   (* 1744 = len(vk), item-D ABI *)
 let proof_len_be  : bytes = 0x00000184   (* 388  = len(Groth16 proof) *)
-let n_publics_be  : bytes = 0x00000088   (* 136  = 128 root bytes + 8 lanes *)
+let n_publics_be  : bytes = 0x0000000c   (* 12   = 4 TreeRoots Fr + 8 OutHash lanes *)
 let scalar_len_be : bytes = 0x00000020   (* 32   = bytes per scalar   *)
 let valid_byte    : bytes = 0x01
-let tree_roots_len : nat  = 128n         (* 4 roots x 32 bytes *)
+let tree_roots_len : nat  = 128n         (* input tree_roots size = 4 roots x 32 bytes *)
+let n_tree_roots   : nat  = 4n           (* 4 TreeRoots framed as Fr scalars (item-D) *)
 
 (* output_preimage bootloader framing (verifier core/src/lib.rs:1512):
    [0]=n_tasks=1, [1]=task_output_size, [2]=program_hash, [3..]=public_outputs.
@@ -70,19 +77,23 @@ let tr_membership_root_idx : nat = 4n    (* public_outputs[1] *)
 let tr_nf_start_idx        : nat = 5n    (* public_outputs[2..2+N] *)
 let tr_tail_after_nf       : nat = 7n    (* trailing felts after nf: fee+cm1..3+memo1..3 *)
 
-(* The OutHash chain runs on the runtime BLAKE2S-256 reached through the
-   gateway: `Gateway s.gateway` (see out_hash.mligo `blake2s`). *)
+(* The OutHash chain runs through the gateway (`Gateway s.gateway`): the STAGE-1
+   mv tree walk on the runtime BLAKE2S-256 (out_hash.mligo `blake2s`), then the
+   item-D FINAL re-commit on Poseidon2-BN254 (out_hash.mligo
+   `compute_expected_out_hash_mv` -> "poseidon2_bn254" view). *)
 
 (* ── public-input framing ────────────────────────────────────────────────── *)
 
-(* Frame the 128 tree-root bytes as 128 length-prefixed 32-byte scalars (each
-   byte b becomes the field element b, big-endian, in gnark declaration order). *)
+(* Frame the 4 TreeRoots as 4 length-prefixed 32-byte Fr scalars (item-D ABI):
+   each 32-byte root is taken as a full big-endian Fr field element (NOT
+   byte-decomposed), emitted as `scalar_len_be ‖ root32` in gnark declaration
+   order. So 4 scalars, not 128. *)
 let frame_root_bytes (tree_roots : bytes) : bytes =
-  let rec go (acc : bytes) (i : nat) : bytes =
-    if i = tree_roots_len then acc
+  let rec go (acc : bytes) (t : nat) : bytes =
+    if t = n_tree_roots then acc
     else
-      let scalar = O.pad_left 32n (Bytes.sub i 1n tree_roots) in
-      go (Bytes.concat acc (Bytes.concat scalar_len_be scalar)) (i + 1n)
+      let scalar = Bytes.sub (t * 32n) 32n tree_roots in
+      go (Bytes.concat acc (Bytes.concat scalar_len_be scalar)) (t + 1n)
   in go empty_bytes 0n
 
 (* Frame the 8 OutHash lanes as length-prefixed 32-byte scalars. *)

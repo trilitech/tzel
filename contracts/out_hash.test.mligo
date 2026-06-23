@@ -91,7 +91,13 @@ let test_stage1b_limbs =
      340n;374n;206n;435n;277n;341n;329n;141n;89n;169n;403n;305n;471n;16n] in
   assert_lanes "STAGE1b felt->28 limbs" got want
 
-(* STAGE 2 mv-mode wrap OutHash (snark.rs mv_out_hash_matches_wrap_fixture). *)
+(* STAGE 2 mv-mode wrap OutHash.
+   TODO(item-D): the PRODUCTION mv re-commit is now Poseidon2-BN254 (via the
+   gateway "poseidon2_bn254" view), which has no Table golden vector yet. In
+   Table mode `compute_expected_out_hash_mv` falls back to the LEGACY
+   blake_m31(root ‖ lanes_LE) recombine as a deterministic stand-in, so the
+   vector below still checks that legacy path — it is NOT the item-D OutHash.
+   Wire a poseidon2 golden table (or a tezt Gateway E2E) to validate item-D. *)
 let test_stage2_mv_out_hash =
   let root = 0x0b38551b4456ef029086970a2f0ee7415a7e052ab5c5f526344ad2439942fc51 in
   let lanes : nat list =
@@ -101,7 +107,7 @@ let test_stage2_mv_out_hash =
   let want : nat list =
     [440499038n;323128790n;518444590n;444371365n;
      603497046n;1594598412n;638277005n;1938560081n] in
-  assert_lanes "STAGE2 mv wrap OutHash" got want
+  assert_lanes "STAGE2 mv wrap OutHash (LEGACY blake stand-in; poseidon2 TODO)" got want
 
 (* STAGE 2 mv fold (snark.rs mv_output_values_golden_vector). *)
 let test_stage2_mv_fold =

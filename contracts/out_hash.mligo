@@ -41,6 +41,21 @@ let blake2s (src : blake_src) (input : bytes) : bytes =
        | Some d -> d
        | None -> (failwith "TzEL: blake2s view unavailable" : bytes))
 
+(* ── item-D OutHash re-commit: Poseidon2-BN254 via the gateway view ──────────
+   Replaces the old blake2s FINAL OutHash step (root32 || output_values -> 8 M31
+   lanes). The runtime exposes a NEW gateway view:
+     ("poseidon2_bn254", body) where body = root(32 bytes) || lane(u32 BE)*n
+   and the response = 32 bytes = lane(u32 BE)*8 (the 8 M31 lanes of the item-D
+   OutHash). The contract feeds root32 ‖ (each of the 8 mv-root output_values as
+   4-byte BE u32) and parses the 32-byte response into 8 nat lanes.
+
+   The Stage-1 tree-walk (compute_output_hash_values / compute_mv_output_values
+   / blake_m31) STAYS blake2s; only this final re-commit moves to Poseidon2.
+
+   Defined inside the OutHash module (below) alongside blake_m31 — the lltz
+   codegen backend chokes ("slot not found") on extra top-level recursive
+   helpers, so the poseidon2 path reuses the module's existing byte helpers. *)
+
 module OutHash = struct
 
   (* ── field/word constants ─────────────────────────────────────────── *)
@@ -210,11 +225,52 @@ module OutHash = struct
      U_VALUE(0,0,1,0) as LE u32 -> blake_m31. *)
   let u_value_lanes : nat list = [0n; 0n; 1n; 0n]
 
-  (* mv mode: root (32 raw bytes) || 2 output QM31s (8 lanes) -> OutHash. *)
+  (* Serialise lanes as a BE u32 stream (mirrors lanes_to_le_stream but BE;
+     be32(n) = pad_left 4 (bytes n) since `bytes` is minimal BE). *)
+  let lanes_to_be_stream (lanes : nat list) : bytes =
+    List.fold_left
+      (fun (acc, l : bytes * nat) -> Bytes.concat acc (pad_left 4n (bytes l)))
+      0x lanes
+
+  (* Parse a 32-byte response = 8 BE u32 lanes into 8 nats. *)
+  let be_digest_to_lanes (digest : bytes) : nat list =
+    let rec go (acc : nat list) (i : int) : nat list =
+      if i < 0 then acc
+      else go (nat (Bytes.sub ((abs i) * 4n) 4n digest) :: acc) (i - 1)
+    in go ([] : nat list) 7
+
+  (* mv mode (item-D): FINAL OutHash re-commit = Poseidon2-BN254 via the new
+     gateway view, over body = root32 ‖ (8 mv-root output lanes as BE u32).
+     Replaces the old blake_m31(root32 ‖ lanes_LE) re-commit. Response = 32 bytes
+     = 8 BE u32 lanes.
+
+       - Gateway: PRODUCTION — the real item-D Poseidon2-BN254 re-commit.
+
+       - Table: TESTS — there is NO Poseidon2 golden vector yet (TODO item-D),
+         so the Table variant CANNOT reproduce the production OutHash. It returns
+         the LEGACY blake_m31(root32 ‖ lanes_LE) recombine purely as a
+         deterministic test stand-in (NOT the item-D OutHash). The blake2s golden
+         harness in out_hash.test.mligo therefore no longer matches a production
+         OutHash on this path; see the TODO in that test. Wiring a poseidon2
+         golden table is the follow-up.
+         (Returning blake_m31 here is also required for codegen: the experimental
+         lltz backend drops blake_m31's stack slot — "slot not found" — if NO
+         branch of this function references it while a sibling call path
+         (derive_mv_root_ov) still needs it. A bare `failwith` Table branch
+         triggers exactly that. See the lltz notes at the top of this file.) *)
   let compute_expected_out_hash_mv
       (src : blake_src) (root32 : bytes) (output_lanes : nat list) : nat list =
-    let preimage = Bytes.concat root32 (lanes_to_le_stream output_lanes) in
-    blake_m31 src preimage
+    match src with
+    | Table _ ->
+        (* TODO(item-D): replace with a poseidon2 golden-table lookup. *)
+        blake_m31 src (Bytes.concat root32 (lanes_to_le_stream output_lanes))
+    | Gateway gateway ->
+        let body = Bytes.concat root32 (lanes_to_be_stream output_lanes) in
+        (match (Tezos.call_view "zk" ("poseidon2_bn254", body) gateway
+                : bytes option) with
+         | Some d -> be_digest_to_lanes d
+         | None -> (failwith "TzEL: poseidon2_bn254 view unavailable"
+                    : nat list))
 
   (* leaf mode: root || output_hash(8 lanes) || U_VALUE -> OutHash. *)
   let compute_expected_out_hash
