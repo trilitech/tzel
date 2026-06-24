@@ -215,6 +215,25 @@ let preimage_at (output_preimage : bytes list) (idx : nat) : bytes =
   | Some b -> b
   | None -> (failwith "TzEL: output_preimage too short" : bytes)
 
+(* ── value custody (native L2 tez) ──────────────────────────────────────────
+   The contract's tez balance IS the pool. shield escrows the deposit; unshield
+   pays out. LIGO (this version) has no bytes->nat, so values arrive as Michelson
+   nats in the param and are BOUND to the proof: the preimage felt (32-byte BE)
+   must equal nat->bytes (minimal BE, left-padded to 32) — so the amount stays
+   PROVEN while we can do tez arithmetic. Assumes the felt value unit = mutez. *)
+let bind_value (output_preimage : bytes list) (idx : nat) (v : nat) : unit =
+  if preimage_at output_preimage idx = O.pad_left 32n (bytes v) then unit
+  else failwith "TzEL: value does not match the proven felt"
+
+(* shield value offsets (preimage): auth_domain=3, pubkey_hash=4, v_note=5,
+   fee=6, producer_fee=7, cm_new=8, cm_producer=9. unshield value offsets are
+   relative to nf_end: v_pub=nf_end+0, fee=nf_end+1, recipient=nf_end+2. *)
+let sh_v_note_idx       : nat = 5n
+let sh_fee_idx          : nat = 6n
+let sh_producer_fee_idx : nat = 7n
+let un_v_pub_off        : nat = 0n
+let un_fee_off          : nat = 1n
+
 (* ── identity & root checks ──────────────────────────────────────────────── *)
 
 (* Pin the bootloader program_hash and the ledger auth_domain against storage.
@@ -399,6 +418,9 @@ type shield_param = {
   leaves          : (bytes list) list ; (* declared leaf output_preimages *)
   output_preimage : bytes list ;        (* the primary op (identity + effects) *)
   enc_notes       : bytes list ;        (* note ciphertexts to publish *)
+  v_note          : nat ;               (* L2-tez (mutez) values, bound to the proof *)
+  fee             : nat ;
+  producer_fee    : nat ;
 }
 
 [@entry]
@@ -406,6 +428,16 @@ let shield (p : shield_param) (s : storage) : operation list * storage =
   let () = verify_bound s p.proof p.tree_roots p.leaves in
   let () = check_identity s p.output_preimage in
   let () = assert_primary_in_leaves p.output_preimage p.leaves in
+  (* value custody: the deposit MUST equal every value the op creates, else the
+     pool is under-collateralised (unbacked notes minted → drain). The values are
+     bound to the proof, so the depositor cannot understate. *)
+  let () = bind_value p.output_preimage sh_v_note_idx p.v_note in
+  let () = bind_value p.output_preimage sh_fee_idx p.fee in
+  let () = bind_value p.output_preimage sh_producer_fee_idx p.producer_fee in
+  let () =
+    if Tezos.get_amount () = (p.v_note + p.fee + p.producer_fee) * 1mutez
+    then unit
+    else failwith "TzEL: shield deposit must equal v_note + fee + producer_fee" in
   [ emit_sync p.output_preimage p.enc_notes ;
     emit_tree_append s (shield_commitments p.output_preimage) ], s
 
@@ -424,6 +456,9 @@ let transfer (p : transfer_param) (s : storage) : operation list * storage =
   let () = verify_bound s p.proof p.tree_roots p.leaves in
   let () = check_identity s p.output_preimage in
   let () = assert_primary_in_leaves p.output_preimage p.leaves in
+  let () =
+    if Tezos.get_amount () = 0tez then unit
+    else failwith "TzEL: transfer takes no deposit" in
   let () = require_known_root s (preimage_at p.output_preimage tr_membership_root_idx) in
   let s = spend_all s p.output_preimage in
   [ emit_sync p.output_preimage p.enc_notes ;
@@ -438,6 +473,11 @@ type unshield_param = {
   leaves          : (bytes list) list ;
   output_preimage : bytes list ;
   enc_notes       : bytes list ;
+  v_pub           : nat ;               (* withdrawn value (mutez), bound to the proof *)
+  fee             : nat ;
+  recipient       : address ;           (* payout dest. Binding it to the proof's
+                                           recipient felt is a follow-up — OK under
+                                           the honest-sequencer threat model. *)
 }
 
 [@entry]
@@ -447,5 +487,19 @@ let unshield (p : unshield_param) (s : storage) : operation list * storage =
   let () = assert_primary_in_leaves p.output_preimage p.leaves in
   let () = require_known_root s (preimage_at p.output_preimage tr_membership_root_idx) in
   let s = spend_all s p.output_preimage in
-  [ emit_sync p.output_preimage p.enc_notes ;
+  (* value custody: pay the PROVEN v_pub out; accept no deposit. nf_end mirrors
+     spend_all — the tail (v_pub, fee, recipient, …) starts there. *)
+  let nf_end = abs (List.length p.output_preimage - tr_tail_after_nf) in
+  let () = bind_value p.output_preimage (nf_end + un_v_pub_off) p.v_pub in
+  let () = bind_value p.output_preimage (nf_end + un_fee_off) p.fee in
+  let () =
+    if Tezos.get_amount () = 0tez then unit
+    else failwith "TzEL: unshield takes no deposit" in
+  let dest : unit contract =
+    match Tezos.get_contract_opt p.recipient with
+    | Some c -> c
+    | None -> (failwith "TzEL: unshield recipient not a contract" : unit contract) in
+  let payout = Tezos.transaction () (p.v_pub * 1mutez) dest in
+  [ payout ;
+    emit_sync p.output_preimage p.enc_notes ;
     emit_tree_append s (unshield_commitments p.output_preimage) ], s
