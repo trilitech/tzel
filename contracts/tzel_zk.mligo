@@ -227,6 +227,29 @@ let check_identity (s : storage) (output_preimage : bytes list) : unit =
   if preimage_at output_preimage boot_auth_domain_idx <> s.auth_domain
   then failwith "TzEL: wrong auth_domain" else ()
 
+(* SOUNDNESS-CRITICAL binding: the SUBMITTED output_preimage — whose effects
+   (nullifiers spent, commitments minted, tree_append) this entrypoint APPLIES —
+   MUST be one of the proven `leaves`. The proof binds only to `leaves` (via the
+   mv-walk OutHash); without this check a valid proof for benign leaves plus an
+   arbitrary output_preimage (matching the public program_hash/auth_domain
+   constants) would apply UNPROVEN effects (mint/spend at will → pool drain).
+   `bytes list` is not Michelson-comparable, so compare felt-by-felt. *)
+let rec felts_eq (a : bytes list) (b : bytes list) : bool =
+  match a, b with
+  | [], [] -> true
+  | x :: xs, y :: ys -> if x = y then felts_eq xs ys else false
+  | _, _ -> false
+
+let assert_primary_in_leaves
+    (output_preimage : bytes list) (leaves : bytes list list) : unit =
+  let found =
+    List.fold_left
+      (fun ((acc, leaf) : bool * bytes list) ->
+         acc || felts_eq leaf output_preimage)
+      false leaves in
+  if found then unit
+  else failwith "TzEL: output_preimage is not one of the proven leaves"
+
 (* Validate the membership root the spend proved against is a REAL historical
    root of THIS pool — via the A' accumulator view `tree_known_root`. (Single
    tree for now: tag = empty.) Until A' is deployed this view returns None and
@@ -382,6 +405,7 @@ type shield_param = {
 let shield (p : shield_param) (s : storage) : operation list * storage =
   let () = verify_bound s p.proof p.tree_roots p.leaves in
   let () = check_identity s p.output_preimage in
+  let () = assert_primary_in_leaves p.output_preimage p.leaves in
   [ emit_sync p.output_preimage p.enc_notes ;
     emit_tree_append s (shield_commitments p.output_preimage) ], s
 
@@ -399,6 +423,7 @@ type transfer_param = {
 let transfer (p : transfer_param) (s : storage) : operation list * storage =
   let () = verify_bound s p.proof p.tree_roots p.leaves in
   let () = check_identity s p.output_preimage in
+  let () = assert_primary_in_leaves p.output_preimage p.leaves in
   let () = require_known_root s (preimage_at p.output_preimage tr_membership_root_idx) in
   let s = spend_all s p.output_preimage in
   [ emit_sync p.output_preimage p.enc_notes ;
@@ -419,6 +444,7 @@ type unshield_param = {
 let unshield (p : unshield_param) (s : storage) : operation list * storage =
   let () = verify_bound s p.proof p.tree_roots p.leaves in
   let () = check_identity s p.output_preimage in
+  let () = assert_primary_in_leaves p.output_preimage p.leaves in
   let () = require_known_root s (preimage_at p.output_preimage tr_membership_root_idx) in
   let s = spend_all s p.output_preimage in
   [ emit_sync p.output_preimage p.enc_notes ;
