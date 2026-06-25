@@ -158,26 +158,34 @@ fn mv_output_values_derive_from_children() {
         )
         .try_init();
 
+    // GUARD: the golden vectors (preprocessed_root_lanes) are FRI-CONFIG-DEPENDENT
+    // — the preprocessed_root is the Merkle root of the LDE'd preprocessed trace,
+    // sized by log_blowup_factor (and fold_step). Production proves the OUTER at
+    // TZEL_SEC=96 + TZEL_FOLD=2; capturing this golden at the 33-bit default
+    // silently produces roots that DO NOT match production (this exact drift
+    // broke the value-custody binding once). Fail loudly unless the production
+    // config is set, so the golden can never drift from the proven OUTER again.
+    let sec = std::env::var("TZEL_SEC").unwrap_or_default();
+    let fold = std::env::var("TZEL_FOLD").unwrap_or_default();
+    assert_eq!(
+        (sec.as_str(), fold.as_str()),
+        ("96", "2"),
+        "mv_output_derivation captures FRI-config-dependent goldens; run with the \
+         PRODUCTION config: TZEL_SEC=96 TZEL_FOLD=2 (got TZEL_SEC={sec:?} TZEL_FOLD={fold:?})"
+    );
+
     let out_dir = PathBuf::from("/tmp/tzel-mv-fixture");
     std::fs::create_dir_all(&out_dir).expect("mkdir out_dir");
 
     // Same 4 leaves as export_mv_fixture.rs — the tree whose root the
     // 2026-06-10 gnark mv-target proof (verifier/testdata/proof.bin) wraps.
-    eprintln!("[MV-DERIVE] generating 2 shield + 2 transfer leaves …");
+    eprintln!("[MV-DERIVE] generating 4 shield leaves (matches mv_parallel e2e proof) …");
     let t0 = std::time::Instant::now();
     let leaves: Vec<LeafArtifacts> = vec![
         ("shield-A", "run_shield.executable.json", "run_shield_args.json"),
         ("shield-B", "run_shield.executable.json", "run_shield_args.json"),
-        (
-            "transfer-A",
-            "run_transfer.executable.json",
-            "run_transfer_args.json",
-        ),
-        (
-            "transfer-B",
-            "run_transfer.executable.json",
-            "run_transfer_args.json",
-        ),
+        ("shield-C", "run_shield.executable.json", "run_shield_args.json"),
+        ("shield-D", "run_shield.executable.json", "run_shield_args.json"),
     ]
     .into_iter()
     .map(|(label, exe, args)| {
@@ -198,6 +206,7 @@ fn mv_output_values_derive_from_children() {
         .map(|l| AggregationNode {
             proof: l.circuit_proof,
             shape: AggregationShape::Leaf,
+            component_log_sizes: None,
         })
         .collect();
 
@@ -235,10 +244,12 @@ fn mv_output_values_derive_from_children() {
     // Dump the golden vectors (kernel-side tzel-verifier checks the root
     // node's entry into verifier/testdata/mv_root_children.json).
     let doc = json!({
-        "comment": "Captured by services/reprover/tests/mv_output_derivation.rs on the \
-                    export_mv_fixture tree (2 shield + 2 transfer leaves). Every node's \
-                    parent_output_lanes == blake_qm31(left.root ‖ left.ov ‖ right.root ‖ \
-                    right.ov) was asserted off-circuit during capture.",
+        "comment": "Captured by services/reprover/tests/mv_output_derivation.rs on a \
+                    4-shield tree at the PRODUCTION FRI config (TZEL_SEC=96 TZEL_FOLD=2). \
+                    preprocessed_root_lanes are FRI-config-dependent — see the in-test \
+                    guard. Every node's parent_output_lanes == blake_qm31(left.root ‖ \
+                    left.ov ‖ right.root ‖ right.ov) was asserted off-circuit during capture.",
+        "fri_config": { "tzel_sec": 96, "tzel_fold": 2 },
         "nodes": [node0_json, node1_json, root_json],
     });
     let out_path = out_dir.join("mv_root_children.json");

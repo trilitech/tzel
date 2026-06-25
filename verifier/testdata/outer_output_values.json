@@ -1,7 +1,16 @@
 {
-  "comment": "OUTER multiverifier claim.output_values of the l2_proof_bn254 statement that the /tmp/wrap-ceremony (testdata/proof.bin) item-D wrap proves. Authoritative ground truth, copied verbatim from stwo-gnark-tzel tools/witness-extractor/fixtures/l2_proof_bn254.shape.json `output_values_qm31s` (the values the proven OUTER claim — and thus the gnark Poseidon2 OutHash — was built from). 2 QM31s = 8 M31 lanes (a.0,a.1,b.0,b.1 each).",
   "output_values_qm31s": [
-    [1482205925, 1224080734, 422000347, 770043551],
-    [1470588146, 716900524, 273334556, 347170781]
+    [
+      1935392679,
+      983823157,
+      1641232928,
+      1480793736
+    ],
+    [
+      395859232,
+      171628194,
+      1053870244,
+      207160986
+    ]
   ]
 }

@@ -203,15 +203,17 @@ pub const LEAF_CIRCUIT_ROOT_LANES: [u32; 8] = [
 ];
 
 /// Preprocessed root of the level-1 multiverifier circuit (`leaf_to_mv`,
-/// verifies two leaf proofs).
+/// verifies two leaf proofs). FRI-config-dependent (preprocessed LDE Merkle
+/// root) — captured at the PRODUCTION config TZEL_SEC=96 TZEL_FOLD=2.
 pub const LEAF_TO_MV_CIRCUIT_ROOT_LANES: [u32; 8] = [
-    1329128718, 79407594, 317031791, 1097889202, 829834258, 737675984, 793553350, 583776393,
+    327071585, 1981680103, 733719417, 886400460, 805003444, 384535660, 1686938097, 1077085843,
 ];
 
 /// Preprocessed root of the level-≥2 multiverifier circuit (`mv_to_mv`,
-/// verifies two mv proofs).
+/// verifies two mv proofs). FRI-config-dependent — captured at TZEL_SEC=96
+/// TZEL_FOLD=2.
 pub const MV_TO_MV_CIRCUIT_ROOT_LANES: [u32; 8] = [
-    458569739, 49239620, 177702544, 1105661487, 705003098, 653641141, 1137855028, 1375486617,
+    595696919, 1910171649, 2139503746, 1553759560, 1553561027, 1362531168, 719029369, 85600087,
 ];
 
 /// The pinned per-level internal preprocessed roots for a tree of `depth`
