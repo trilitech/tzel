@@ -1,44 +1,24 @@
 {
-  "comment": "Captured by services/reprover/tests/leaf_junction_capture.rs (bootloader-only re-run of the export_mv_fixture leaves). expected_leaf_output_lanes are the REAL leaf proofs' claim.output_values (mv_root_children.json); the junction derivation pack_into_qm31s(Blake2Felt252-limbs) -> blake_qm31 was asserted equal during capture.",
   "leaves": [
     {
-      "expected_leaf_output_lanes": [
-        978423824,
-        1296894678,
-        337981983,
-        1090493975,
-        1318990943,
-        34913325,
-        2019415546,
-        380174573
-      ],
       "label": "shield",
       "output_preimage_hex": [
         "0x1",
-        "0xb",
-        "0x3b1fa1dcace2410b8939ad32a56d1fa2ae6bb522ca8f46bda39ebbff3ecd5df",
-        "0x8",
-        "0x30d40",
+        "0xc",
+        "0x15997618c903d31db3315bd8aac14baac48737b0d24143c8a41de8474d24e62",
+        "0x9",
+        "0xf101",
+        "0x6735b3f556acf45757aae409bf9f697507c8910b97f76d7894a8a78271f3417",
+        "0x61a80",
         "0x186a0",
         "0x1",
-        "0x5da92702d26b8d8cc7b661c03bdb7ae4c90144304625ff1dd2cf68a10a931ca",
-        "0x35baa190dc16647f6ae332d9d72621502692cbce1142c91614e8242a18cb827",
-        "0x4c6e4ff4d7e0aea1c9b94e2bfe982ebbabecc7b6ed74407295f7858ea213ec",
-        "0xc005",
-        "0xc105"
+        "0x7630bee86c90160ba88d2721569d75bd91a23980d1f9754d309918ce834b0ed",
+        "0xc938dcf358f394e94eba44bfc56620dddc566abd458df9386d8fed65aa32c8",
+        "0x4fb6e23be7274acee5834acd58c4349e03fd20b38c561f882fa14e7fe49ad2a",
+        "0xe105"
       ]
     },
     {
-      "expected_leaf_output_lanes": [
-        2073000406,
-        1409692151,
-        1297781539,
-        851970458,
-        866671971,
-        1790092888,
-        1205592385,
-        1316010105
-      ],
       "label": "transfer",
       "output_preimage_hex": [
         "0x1",

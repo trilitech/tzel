@@ -65,16 +65,17 @@ let valid_byte    : bytes = 0x01
 let tree_roots_len : nat  = 128n         (* input tree_roots size = 4 roots x 32 bytes *)
 let n_tree_roots   : nat  = 4n           (* 4 TreeRoots framed as Fr scalars (item-D) *)
 
-(* output_preimage bootloader framing (verifier core/src/lib.rs:1512):
-   [0]=n_tasks=1, [1]=task_output_size, [2]=program_hash, [3..]=public_outputs.
-   So program_hash and the FIRST public output (auth_domain) are at STABLE
-   offsets across circuits. The remaining offsets (membership root, nullifiers,
-   commitments) are per-entrypoint and re-pinned with the multi-asset circuit. *)
+(* output_preimage bootloader framing (REAL run_*.cairo, captured from the live
+   bootloader via leaf_junction_capture):
+   [0]=n_tasks=1, [1]=task_output_size, [2]=program_hash, [3]=output_count,
+   [4..]=public_outputs. So public_outputs[k] sits at preimage index k+4.
+   (The earlier stand-in fixture had NO output_count field at [3], hence the
+   contract's original offsets were one too low — fixed to the real layout.) *)
 let boot_program_hash_idx : nat = 2n
-let boot_auth_domain_idx  : nat = 3n     (* public_outputs[0] *)
+let boot_auth_domain_idx  : nat = 4n     (* real op: [2]=program_hash,[3]=output_count,[4]=auth_domain *)
 (* transfer/unshield public layout = [auth_domain, membership_root, nf..]: *)
-let tr_membership_root_idx : nat = 4n    (* public_outputs[1] *)
-let tr_nf_start_idx        : nat = 5n    (* public_outputs[2..2+N] *)
+let tr_membership_root_idx : nat = 5n    (* real op +1 (output_count@3): root *)
+let tr_nf_start_idx        : nat = 6n    (* real op +1: nf list start *)
 let tr_tail_after_nf       : nat = 7n    (* trailing felts after nf: fee+cm1..3+memo1..3 *)
 
 (* ── new-commitment offsets per entrypoint (item-D single-asset layout) ───────
@@ -106,8 +107,8 @@ let tr_tail_after_nf       : nat = 7n    (* trailing felts after nf: fee+cm1..3+
       v_pub, fee, recipient, cm_change, memo_change, cm_fee, memo_fee]
    → tail = [v_pub, fee, recipient, cm_change, memo_change, cm_fee, memo_fee]:
        cm_change = nf_end+3 ; cm_fee = nf_end+5. *)
-let sh_cm_new_idx       : nat = 8n
-let sh_cm_producer_idx  : nat = 9n
+let sh_cm_new_idx       : nat = 9n   (* real op +1 (output_count@3) *)
+let sh_cm_producer_idx  : nat = 10n  (* real op +1 *)
 let tr_cm1_off          : nat = 1n   (* offsets from nf_end *)
 let tr_cm2_off          : nat = 2n
 let tr_cm3_off          : nat = 3n
@@ -201,7 +202,7 @@ let verify_bound
         (Bytes.concat n_publics_be framed)) in
   match (Tezos.call_view "zk" ("verify_snark", body) s.gateway : bytes option) with
   | Some r -> if r = valid_byte then unit else failwith "TzEL: proof rejected"
-  | None -> failwith "TzEL: verify_snark view unavailable"
+  | None -> failwith "TzEL: verify_snark rejected or view unavailable"
 
 (* Read felt #idx (32-byte BE) from a bound output_preimage. *)
 let preimage_at (output_preimage : bytes list) (idx : nat) : bytes =
@@ -228,9 +229,9 @@ let bind_value (output_preimage : bytes list) (idx : nat) (v : nat) : unit =
 (* shield value offsets (preimage): auth_domain=3, pubkey_hash=4, v_note=5,
    fee=6, producer_fee=7, cm_new=8, cm_producer=9. unshield value offsets are
    relative to nf_end: v_pub=nf_end+0, fee=nf_end+1, recipient=nf_end+2. *)
-let sh_v_note_idx       : nat = 5n
-let sh_fee_idx          : nat = 6n
-let sh_producer_fee_idx : nat = 7n
+let sh_v_note_idx       : nat = 6n   (* real op +1 (output_count@3) *)
+let sh_fee_idx          : nat = 7n   (* real op +1 *)
+let sh_producer_fee_idx : nat = 8n   (* real op +1 *)
 let un_v_pub_off        : nat = 0n
 let un_fee_off          : nat = 1n
 
