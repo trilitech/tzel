@@ -36,22 +36,30 @@ runtime primitive performs.
 
 ---
 
-## Layer 1 — Runtime primitives (what Tezos X must enshrine)
+## Layer 1 — the privacy runtime's verify (a cross-runtime call, NOT a Michelson primitive)
 
-The Tezos X MIR runtime today has hashes (BLAKE2b, Keccak, SHA-256/3/512),
-`CHECK_SIGNATURE`, and `PAIRING_CHECK` (BLS12-381 via `blst`). It has **no**
-generic SNARK/STARK verification and **no** BLAKE2s.
+> **Decision (validated 2026-06-23). The verify is a FUNCTION exported by a
+> privacy RUNTIME, invoked from Michelson via Tezos X's cross-runtime
+> composition (CRAC) — the same mechanism as EVM↔Michelson calls.** It is
+> NOT a new Michelson instruction, NOT an EVM-style precompile, and NOT an
+> enshrined MIR primitive. The "privacy runtime" = the existing wasm-clean
+> `tzel-verifier::verify_snark` packaged as a callable runtime. Reuses what
+> we already have + Tezos X's native multi-runtime composability — no
+> Michelson-language amendment, no protocol-level primitive work.
+>
+> **One call does everything.** `verify_snark(vk, proof, output_preimage)`
+> bundles, inside the runtime: (a) the Groth16-BN254 pairing check, (b) the
+> proof↔op binding — re-derive the OutHash from `output_preimage`
+> (`BLAKE2S` for `output_values`, then `POSEIDON2_BN254` for the wrap
+> re-commit) and assert it equals the proof's pinned OutHash, (c) parse and
+> **return `(program_hash, public_outputs)`** (or an error). So the
+> **Michelson contract needs NO `VERIFY_SNARK`/`BLAKE2S`/`POSEIDON2_BN254`
+> primitives of its own** — the binding lives inside the runtime call; the
+> contract just cross-runtime-calls verify, then compares the returned
+> `program_hash` and runs its ledger checks.
 
-> **Decision (validated 2026-06-23): the verify is a runtime *precompile*,
-> NOT a new Michelson instruction.** The runtime exports a fixed
-> BN254-Groth16 verification service (the existing wasm-clean
-> `tzel-verifier::verify_snark`), callable from Michelson like a contract /
-> host-function — **no Michelson-language amendment** (no new opcode/lexer/
-> typechecker/type). This reuses the locked "kernel Groth16 precompile,
-> permissionless `verify_snark(proof, public_inputs)`" design. The
-> signatures below describe the verify/hash *service interface* regardless
-> of exposure mechanism. (`BLAKE2S` for the binding is the one genuinely new
-> hashing primitive — trivial next to the existing BLAKE2b/Keccak.)
+The signatures in §1.1–§1.2b below describe what the runtime verify does
+**internally** (the service ABI), not separate Michelson opcodes.
 
 ### 1.1 `VERIFY_SNARK` (required)
 
