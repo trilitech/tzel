@@ -1,7 +1,7 @@
 # TzEL v2 — Cross-Implementation Test Vector Specification
 
-**Version:** 1  
-**Purpose:** Any independent implementation of the TzEL v2 protocol can generate and consume these vectors to verify byte-exact compatibility with the reference implementation.
+**Spec version:** 2 (multiasset; matches canonical-wire fixture v4)
+**Purpose:** Any independent implementation of the TzEL v2 protocol can generate and consume these vectors to verify byte-exact compatibility with the reference implementation. The previous spec version (1) covered canonical wire v3 and the 4-ary commitment; this version describes the v4 wire bump and the 5-ary multiasset commitment `H_commit(d_j, v, asset_id, rcm, owner_tag)`.
 
 ## Overview
 
@@ -389,7 +389,8 @@ Tests note commitment and nullifier computation.
 | `nk_tag` | hex felt | From address j=0 |
 | `rcm` | hex felt | `H(TAG_RCM, rseed)` |
 | `owner_tag` | hex felt | `H_owner(auth_root, auth_pub_seed, nk_tag)` |
-| `cm` | hex felt | `H_commit(d_j, felt_of_int(v), rcm, owner_tag)` |
+| `asset_id` | hex felt | Asset class carried by the note. `ASSET_TEZ = 0x00..00` for tez; for FA2 assets, `hash("tzel:asset:" \|\| ticketer_kt1_address)`. Wire fixtures in this v4 set use `ASSET_TEZ` throughout. |
+| `cm` | hex felt | `H_commit(d_j, felt_of_int(v), asset_id, rcm, owner_tag)` — 5-ary as of canonical wire v4 (was 4-ary in v3). The asset is bound into the commitment so two notes that differ only by asset_id resolve to distinct cms. |
 | `nk_spend` | hex felt | From address j=0 |
 | `pos` | int | Leaf position |
 | `nf` | hex felt | `H_nf(nk_spend, H_nf(cm, felt_of_int(pos)))` |

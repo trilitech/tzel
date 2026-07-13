@@ -126,7 +126,42 @@ See also:
 ## Operational Notes
 
 - detection-only mode is intentionally lossy and can emit candidate false positives
+  (false-positive rate per garbage note ≈ 2^-DETECT_K = 2^-10, ~0.1% — bounded
+  paid noise, not a privacy guarantee)
 - viewing mode validates recovered note commitments using exported address metadata
 - neither mode can infer spent status without the spend key
 - the HTTP service intentionally returns status only; the watch wallet file
   remains the only place where viewing or detection material is stored
+
+## Multiasset Notes
+
+Watch wallets are multi-asset-aware as of the Phase E multiasset upgrade:
+
+- The encrypted note payload does NOT carry `asset_id` — that would force a
+  wire-format bump and a Cairo change. Instead, recovery iterates the registered
+  candidate-asset list (tez first, then each compile-time FA2 entry) and recomputes
+  the note commitment under each candidate `asset_id`. The asset whose commitment
+  matches the on-chain `cm` is the asset that note carries.
+- Both view-mode and outgoing-mode watchers do this iteration (`view_record_for_note`
+  and `outgoing_record_for_note` in the wallet codebase). Pre-fix watchers hardcoded
+  `ASSET_TEZ` and silently dropped every FA2 note — bugs W1/W2, fixed in commit
+  `6973d82`. Watch-mode UX was broken (auditors / outgoing-history viewers lost
+  visibility of FA2 receipts and sends), though there was no fund loss because
+  full wallets always iterated candidate assets.
+- The `tzel-detect` daemon supports all three watch modes (Detect, View, Outgoing).
+  The binary name only telegraphs the most-restricted mode; the daemon logs the
+  loaded watch wallet's mode at startup (one of `DETECT mode` / `VIEW mode` /
+  `OUTGOING mode`) so operators see which key class is actually in the daemon's
+  address space. Running `tzel-detect` against a View-mode watch file means full
+  memo decryption runs on the daemon host — treat that host accordingly.
+- The recovered `ViewedNoteRecord` and `OutgoingNoteRecord` carry the matched
+  `asset_id` field so downstream tooling (balance widgets, export pipelines)
+  can label receipts and sends correctly by asset.
+
+### Watcher resource limits
+
+The daemon caps HTTP JSON response bodies at 64 MiB (`HTTP_JSON_MAX_BYTES`) so a
+malicious operator returning a multi-GB feed cannot OOM the watcher. The
+background scan tick logs errors via stderr instead of swallowing them silently,
+so a misconfigured daemon surfaces failures rather than spinning indefinitely
+in a broken state.

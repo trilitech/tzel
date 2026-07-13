@@ -6,8 +6,8 @@ use crate::{
     derive_auth_pub_seed, derive_kem_detect_seed, derive_kem_keys, derive_kem_view_seed,
     derive_nk_spend, derive_nk_tag, derive_note_aead_nonce, derive_rcm, hash, hash_merkle,
     hash_two, kem_keygen_from_seed, memo_ct_hash, nullifier, owner_tag, sighash_fold, wots_pk,
-    wots_pk_to_leaf, wots_sign, Account, EncryptedNote, NoteMemo, PaymentAddress, DETECT_K,
-    ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES,
+    wots_pk_to_leaf, wots_sign, Account, EncryptedNote, NoteMemo, PaymentAddress, ASSET_TEZ,
+    DETECT_K, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES,
     OUTGOING_RECOVERY_CT_BYTES, ZERO,
 };
 use blake2s_simd::Params;
@@ -462,6 +462,7 @@ pub fn generate_protocol_v1_value() -> Value {
             "nonce": hex_bytes(&nonce),
             "encrypted_data": hex_bytes(&encrypted_data),
             "tag": enc.tag,
+            "outgoing_ct": hex_bytes(&enc.outgoing_ct),
             "memo_ct_hash": hex_felt(&memo_ct_hash(&enc)),
         })
     };
@@ -523,7 +524,7 @@ pub fn generate_protocol_v1_value() -> Value {
                 .map(|(v, rseed_i, pos)| {
                     let rseed = felt_of_u64(rseed_i);
                     let rcm = derive_rcm(&rseed);
-                    let cm = commit(&addr_j0.d_j, v, &rcm, &addr_j0.owner_tag);
+                    let cm = commit(&addr_j0.d_j, v, &ASSET_TEZ, &rcm, &addr_j0.owner_tag);
                     json!({
                         "d_j": hex_felt(&addr_j0.d_j),
                         "v": v.to_string(),

@@ -93,15 +93,22 @@ let hash_nf a b =
   Bytes.blit b 0 buf 32 32;
   hash_personalized "nulfSP__" buf
 
-(* H_commit(d, v, rcm, owner_tag): Note commitment.
-   v uses the canonical Rust wire/layout: the low 8 bytes store the u64
-   value in little-endian form and bytes [40..64) are zero. *)
-let hash_commit d v_felt rcm owner_tag =
-  let buf = Bytes.make 128 '\x00' in
+(* H_commit(d, v, asset, rcm, owner_tag): Note commitment.
+   Multiasset 160-byte layout, mirroring Rust core `commit()` and the
+   Cairo `hash5` in blake_hash.cairo:
+     [  0.. 32) d
+     [ 32.. 40) v as u64 little-endian (the canonical Rust wire layout;
+                bytes [40..64) are zero padding for v's felt slot)
+     [ 64.. 96) asset tag (Felt.zero = ASSET_TEZ)
+     [ 96..128) rcm
+     [128..160) owner_tag *)
+let hash_commit d v_felt asset rcm owner_tag =
+  let buf = Bytes.make 160 '\x00' in
   Bytes.blit d 0 buf 0 32;
   Bytes.blit v_felt 0 buf 32 8;
-  Bytes.blit rcm 0 buf 64 32;
-  Bytes.blit owner_tag 0 buf 96 32;
+  Bytes.blit asset 0 buf 64 32;
+  Bytes.blit rcm 0 buf 96 32;
+  Bytes.blit owner_tag 0 buf 128 32;
   hash_personalized "cmmtSP__" buf
 
 (* H_nksp(nk, d_j): Per-address nullifier spend key *)

@@ -80,7 +80,7 @@ async fn deposit_handler(
     ledger.deposit(&req.recipient, req.amount).map_err(err)?;
     let pubkey_hash = parse_deposit_recipient_pubkey_hash(&req.recipient).map_err(err)?;
     let balance = ledger
-        .deposit_balance(&pubkey_hash)
+        .deposit_balance(&ASSET_TEZ, &pubkey_hash)
         .map_err(err)?
         .unwrap_or(0);
     eprintln!(
@@ -97,7 +97,7 @@ async fn balance_handler(
     let pubkey_hash = parse_pubkey_hash_hex(&params.pubkey_hash).map_err(err)?;
     let ledger = st.ledger.lock().unwrap();
     let balance = ledger
-        .deposit_balance(&pubkey_hash)
+        .deposit_balance(&ASSET_TEZ, &pubkey_hash)
         .map_err(err)?
         .unwrap_or(0);
     Ok(Json(DepositBalanceResp { balance }))
@@ -583,6 +583,7 @@ mod tests {
         let err = shield_handler(
             State(st),
             Json(ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash: hash(b"alice"),
                 v: 5,
                 fee: MIN_TX_FEE,
@@ -614,7 +615,9 @@ mod tests {
                 cm_3: u64_to_felt(4),
                 enc_1: dummy_note(7),
                 enc_2: dummy_note(8),
-                enc_3: dummy_note(9),
+                enc_3: dummy_note(9).clone(),
+                cm_4: ZERO, // Phase C placeholder
+                enc_4: dummy_note(9).clone(),
                 proof: Proof::TrustMeBro,
             }),
         )
@@ -637,6 +640,8 @@ mod tests {
                 recipient: "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx".into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee: u64_to_felt(2),
                 enc_fee: dummy_note(8),
                 proof: Proof::TrustMeBro,
@@ -661,6 +666,8 @@ mod tests {
                 recipient: "bob_pub".into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee: u64_to_felt(2),
                 enc_fee: dummy_note(8),
                 proof: Proof::TrustMeBro,
@@ -694,6 +701,8 @@ mod tests {
                 recipient: " tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx ".into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee: u64_to_felt(2),
                 enc_fee: dummy_note(8),
                 proof: Proof::TrustMeBro,
@@ -708,6 +717,7 @@ mod tests {
         assert_eq!(
             ledger.withdrawals,
             vec![WithdrawalRecord {
+                asset_id: ASSET_TEZ,
                 recipient: "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx".into(),
                 amount: 7,
             }]

@@ -1,0 +1,23 @@
+# dev_null_fa2.tz — permissive null FA2 used ONLY for shadownet
+# round-trip testing of fa2_bridge_ticketer.tz. NOT a real FA2:
+# the %transfer entrypoint accepts the canonical FA2-2.1 transfer-
+# list shape but performs no balance bookkeeping — it just
+# increments a call counter. Used to validate that the bridge
+# ticketer's CONTRACT %transfer lookup resolves correctly and the
+# FA2 dispatch op is well-formed and accepted by a contract with
+# the right entrypoint shape.
+#
+# A production deployment would replace this with a real FA2
+# implementation (e.g. an oxheadalpha/smart-contracts FA2 token)
+# whose %transfer actually moves balances. The bridge ticketer is
+# agnostic to which it talks to — both expose the same parameter
+# type.
+
+parameter (list %transfer (pair (address %from_) (list %txs (pair (address %to_) (pair (nat %token_id) (nat %amount)))))) ;
+storage nat ;
+code
+  { CDR ;
+    PUSH nat 1 ;
+    ADD ;
+    NIL operation ;
+    PAIR }

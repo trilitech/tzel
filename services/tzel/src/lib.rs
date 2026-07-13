@@ -361,7 +361,7 @@ mod tests {
         rseed[0] = 0x01;
         rseed[1] = 0x10; // 0x1001
         let rcm = derive_rcm(&rseed);
-        let cm = commit(&addr.d_j, 1000, &rcm, &otag);
+        let cm = commit(&addr.d_j, 1000, &ASSET_TEZ, &rcm, &otag);
         let nf = nullifier(&nk_sp, &cm, 0);
         let ask_j = derive_ask(&acc.ask_base, 0);
         let pub_seed = derive_auth_pub_seed(&ask_j);
@@ -523,7 +523,7 @@ mod tests {
         let rseed = u(0xABCD);
         let rcm = derive_rcm(&rseed);
         let otag = owner_tag(&auth_root, &auth_pub_seed, &nk_tg);
-        let cm_recipient = commit(&d_j, v, &rcm, &otag);
+        let cm_recipient = commit(&d_j, v, &ASSET_TEZ, &rcm, &otag);
         let enc_recipient = encrypt_note_deterministic(
             v,
             &rseed,
@@ -543,6 +543,7 @@ mod tests {
             .unwrap();
         ledger
             .shield(&ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash,
                 v,
                 fee: TEST_FEE,
@@ -578,7 +579,7 @@ mod tests {
 
         // Build output_preimage as if the proof proved (root, nf, real_cm_1, cm_2, mh1, mh2)
         // but submit the request with fake_cm_1
-        let preimage = vec![root, nf, fee_f(), real_cm_1, cm_2, cm_3, ZERO, ZERO, mh_3];
+        let preimage = vec![root, nf, fee_f(), real_cm_1, cm_2, cm_3, ZERO, ZERO, ZERO, mh_3, ZERO];
 
         let result = ledger.transfer(&TransferReq {
             root,
@@ -589,7 +590,9 @@ mod tests {
             cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: fake_stark(preimage),
         });
         assert!(
@@ -619,7 +622,7 @@ mod tests {
         let (ek_atk, _) = kem_keygen_from_seed(&seed_atk);
         let fake_enc = encrypt_note(999, &random_felt(), None, &ek_atk, &ek_atk);
         // Output_preimage commits to mh_1 (real note's hash)
-        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, mh_1, ZERO, mh_3];
+        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, ZERO, mh_1, ZERO, mh_3, ZERO];
 
         let result = ledger.transfer(&TransferReq {
             root,
@@ -630,7 +633,9 @@ mod tests {
             cm_3,
             enc_1: fake_enc, // attacker swaps in a DIFFERENT encrypted note
             enc_2: enc.clone(),
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: fake_stark(preimage),
         });
         assert!(
@@ -658,10 +663,13 @@ mod tests {
             root,
             nf,
             u(1000),
+            ASSET_TEZ, // asset_pub (Phase B)
             fee_f(),
             alice_recipient,
             ZERO,
             ZERO,
+            ZERO, // cm_change_2 (Phase C)
+            ZERO, // mh_change_2
             cm_fee,
             mh_fee,
         ];
@@ -674,6 +682,8 @@ mod tests {
             recipient: TEST_ALT_L1_RECIPIENT.into(), // attacker redirects to themselves
             cm_change: ZERO,
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee,
             enc_fee,
             proof: fake_stark(preimage),
@@ -700,8 +710,11 @@ mod tests {
             root,
             nf,
             u(100),
+            ASSET_TEZ,
             fee_f(),
             hash(TEST_L1_RECIPIENT.as_bytes()),
+            ZERO,
+            ZERO,
             ZERO,
             ZERO,
             cm_fee,
@@ -716,6 +729,8 @@ mod tests {
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee,
             enc_fee,
             proof: fake_stark(preimage),
@@ -746,7 +761,7 @@ mod tests {
         let mh = ZERO;
 
         // Proof commits to the REAL nullifier
-        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, mh, mh, mh_3];
+        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, ZERO, mh, mh, mh_3, ZERO];
 
         let result = ledger.transfer(&TransferReq {
             root,
@@ -757,7 +772,9 @@ mod tests {
             cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: fake_stark(preimage),
         });
         assert!(
@@ -788,7 +805,9 @@ mod tests {
             cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -810,7 +829,9 @@ mod tests {
             cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -833,7 +854,9 @@ mod tests {
                 cm_3: cm_3a,
                 enc_1: enc.clone(),
                 enc_2: enc.clone(),
-                enc_3: enc_3a,
+                enc_3: enc_3a.clone(),
+                cm_4: ZERO, // Phase C placeholder
+                enc_4: enc_3a.clone(),
                 proof: Proof::TrustMeBro,
             })
             .unwrap();
@@ -848,7 +871,9 @@ mod tests {
             cm_3: cm_3b,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3: enc_3b,
+            enc_3: enc_3b.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3b.clone(),
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -869,7 +894,9 @@ mod tests {
             cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err());
@@ -889,6 +916,8 @@ mod tests {
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee,
             enc_fee,
             proof: Proof::TrustMeBro,
@@ -911,6 +940,8 @@ mod tests {
                 recipient: TEST_L1_RECIPIENT.into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee: cm_fee_a,
                 enc_fee: enc_fee_a,
                 proof: Proof::TrustMeBro,
@@ -925,6 +956,8 @@ mod tests {
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee: cm_fee_b,
             enc_fee: enc_fee_b,
             proof: Proof::TrustMeBro,
@@ -946,6 +979,8 @@ mod tests {
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee,
             enc_fee,
             proof: Proof::TrustMeBro,
@@ -970,7 +1005,7 @@ mod tests {
         let mh = memo_ct_hash(&enc);
 
         // Proof commits to fake_root
-        let preimage = vec![fake_root, nf, fee_f(), cm_1, cm_2, cm_3, mh, mh, mh_3];
+        let preimage = vec![fake_root, nf, fee_f(), cm_1, cm_2, cm_3, ZERO, mh, mh, mh_3, ZERO];
 
         let r = ledger.transfer(&TransferReq {
             root, // request uses the REAL root
@@ -981,7 +1016,9 @@ mod tests {
             cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: fake_stark(preimage),
         });
         assert!(r.is_err());
@@ -1007,9 +1044,11 @@ mod tests {
                 cm_1,
                 cm_2,
                 cm_3,
+                ZERO, // cm_4 (Phase C placeholder)
                 mh,
                 mh,
                 mh_3,
+                ZERO, // mh_4
             ],
         };
 
@@ -1022,7 +1061,9 @@ mod tests {
             cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof,
         });
         assert!(r.is_err());
@@ -1040,7 +1081,7 @@ mod tests {
         let (cm_3, enc_3, mh_3) = test_output_note(0x32);
         let mh = memo_ct_hash(&enc);
 
-        let preimage = vec![root, nf, fee_f(), cm_1, real_cm_2, cm_3, mh, mh, mh_3];
+        let preimage = vec![root, nf, fee_f(), cm_1, real_cm_2, cm_3, ZERO, mh, mh, mh_3, ZERO];
 
         let r = ledger.transfer(&TransferReq {
             root,
@@ -1051,7 +1092,9 @@ mod tests {
             cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: fake_stark(preimage),
         });
         assert!(r.is_err());
@@ -1071,12 +1114,15 @@ mod tests {
             fake_root,
             nf,
             u(1000),
+            ASSET_TEZ,
             fee_f(),
             recipient,
             ZERO,
             ZERO,
+            ZERO,
+            ZERO,
             cm_fee,
-            mh_fee,
+            mh_fee
         ];
 
         let r = ledger.unshield(&UnshieldReq {
@@ -1087,6 +1133,8 @@ mod tests {
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee,
             enc_fee,
             proof: fake_stark(preimage),
@@ -1110,12 +1158,15 @@ mod tests {
             root,
             nf,
             u(500),
+            ASSET_TEZ,
             fee_f(),
             recipient,
             real_cm_change,
             ZERO,
+            ZERO,
+            ZERO,
             cm_fee,
-            mh_fee,
+            mh_fee
         ];
 
         let result = ledger.unshield(&UnshieldReq {
@@ -1126,6 +1177,8 @@ mod tests {
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: fake_cm_change, // attacker substitutes a DIFFERENT change commitment
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee,
             enc_fee,
             proof: fake_stark(preimage),
@@ -1260,10 +1313,13 @@ mod tests {
             root,
             nf,
             u(1000),
+            ASSET_TEZ,
             fee_f(),
             recipient,
             ZERO,
             u(12345),
+            ZERO, // cm_change_2
+            ZERO, // mh_change_2
             cm_fee,
             ZERO,
         ];
@@ -1276,6 +1332,8 @@ mod tests {
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee,
             enc_fee,
             proof: fake_stark(preimage),
@@ -1337,9 +1395,11 @@ mod tests {
             &cm_1,
             &cm_2,
             &cm_3,
+            &cm_3,
             &mh,
             &mh,
             &mh_3,
+            &mh_3
         );
 
         // Unshield with same values (treating cm_1 as v_pub felt, cm_2 as recipient, etc.)
@@ -1348,12 +1408,16 @@ mod tests {
             &root,
             &[nf],
             0,
+            &ASSET_TEZ,
             0,
             &cm_2,
             &mh,
             &cm_3,
+            &ZERO,
+            &ZERO,
             &mh_3,
-            &mh,
+            &mh
+        
         );
 
         assert_ne!(
@@ -1382,9 +1446,11 @@ mod tests {
             &cm_1,
             &cm_2,
             &cm_3,
+            &cm_3,
             &mh,
             &mh,
             &mh_3,
+            &mh_3
         );
         let sh_b = transfer_sighash(
             &auth_domain_b,
@@ -1394,9 +1460,11 @@ mod tests {
             &cm_1,
             &cm_2,
             &cm_3,
+            &cm_3,
             &mh,
             &mh,
             &mh_3,
+            &mh_3
         );
 
         assert_ne!(
@@ -1481,6 +1549,7 @@ mod tests {
             cm: random_felt(),
             index: 7,
             addr_index: 3,
+            asset_id: ASSET_TEZ,
         };
         let json = serde_json::to_string(&note).unwrap();
         let back: Note = serde_json::from_str(&json).unwrap();
@@ -1510,6 +1579,7 @@ mod tests {
             cm_1: random_felt(),
             cm_2: random_felt(),
             cm_3: random_felt(),
+            cm_4: ZERO,
             enc_1: EncryptedNote {
                 ct_d: vec![0; 1088],
                 tag: 42,
@@ -1529,6 +1599,14 @@ mod tests {
             enc_3: EncryptedNote {
                 ct_d: vec![0; 1088],
                 tag: 7,
+                ct_v: vec![0; 1088],
+                nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
+                encrypted_data: vec![0; 1080],
+                outgoing_ct: empty_outgoing_recovery_ct(),
+            },
+            enc_4: EncryptedNote {
+                ct_d: vec![0; 1088],
+                tag: 0,
                 ct_v: vec![0; 1088],
                 nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
@@ -1673,6 +1751,7 @@ mod tests {
 
         let err = ledger
             .shield(&ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash: test_pubkey_hash("alice"),
                 v: 100,
                 fee: TEST_FEE,
@@ -1703,7 +1782,9 @@ mod tests {
                 cm_3: random_felt(),
                 enc_1: bad_enc,
                 enc_2: enc,
-                enc_3: test_encrypted_note(0x41),
+                enc_3: test_encrypted_note(0x41).clone(),
+                cm_4: ZERO, // Phase C placeholder
+                enc_4: test_encrypted_note(0x41).clone(),
                 proof: Proof::TrustMeBro,
             })
             .unwrap_err();
@@ -1723,6 +1804,8 @@ mod tests {
                 recipient: TEST_L1_RECIPIENT.into(),
                 cm_change: ZERO,
                 enc_change: Some(enc),
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee: random_nonzero_felt(),
                 enc_fee: test_encrypted_note(0x42),
                 proof: Proof::TrustMeBro,
@@ -1747,7 +1830,7 @@ mod tests {
         let (ek, _) = kem_keygen_from_seed(&seed);
         let fake_enc_2 = encrypt_note(100, &random_felt(), None, &ek, &ek);
 
-        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, mh_1, real_mh_2, mh_3];
+        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, ZERO, mh_1, real_mh_2, mh_3, ZERO];
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
@@ -1757,7 +1840,9 @@ mod tests {
             cm_3,
             enc_1: enc.clone(),
             enc_2: fake_enc_2, // attacker swaps enc_2
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: fake_stark(preimage),
         });
         assert!(r.is_err());
@@ -1777,6 +1862,8 @@ mod tests {
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee,
             enc_fee,
             proof: Proof::TrustMeBro,
@@ -1799,7 +1886,9 @@ mod tests {
             cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: fake_stark(vec![u(1), u(2)]),
         });
         assert!(r.is_err());
@@ -1836,9 +1925,11 @@ mod tests {
             &cm_1,
             &cm_2,
             &cm_3,
+            &cm_3,
             &mh_1,
             &mh_2,
             &mh_3,
+            &mh_3
         );
         assert_ne!(sh, ZERO, "transfer_sighash must not be zero");
         // Pin the value — any mutation that changes the fold will break this
@@ -1853,9 +1944,11 @@ mod tests {
             &cm_1,
             &cm_2,
             &cm_3,
+            &cm_3,
             &mh_1,
             &mh_2,
             &mh_3,
+            &mh_3
         );
         assert_eq!(sh, sh2, "sighash must be deterministic");
 
@@ -1868,9 +1961,11 @@ mod tests {
             &cm_2,
             &cm_1,
             &cm_3,
+            &cm_3,
             &mh_1,
             &mh_2,
             &mh_3,
+            &mh_3
         );
         assert_ne!(sh, sh3, "swapping cm_1/cm_2 must change sighash");
 
@@ -1881,12 +1976,16 @@ mod tests {
             &root,
             &[nf],
             1000,
+            &ASSET_TEZ,
             0,
             &recipient,
             &ZERO,
             &ZERO,
+            &ZERO,
+            &ZERO,
             &cm_3,
-            &mh_3,
+            &mh_3
+        
         );
         assert_ne!(ush, ZERO, "unshield_sighash must not be zero");
         assert_ne!(ush, sh, "transfer and unshield sighash must differ");
@@ -1897,12 +1996,16 @@ mod tests {
             &root,
             &[nf],
             1000,
+            &ASSET_TEZ,
             0,
             &recipient,
             &ZERO,
             &ZERO,
+            &ZERO,
+            &ZERO,
             &cm_3,
-            &mh_3,
+            &mh_3
+        
         );
         assert_eq!(ush, ush2);
 
@@ -1912,12 +2015,16 @@ mod tests {
             &root,
             &[nf],
             999,
+            &ASSET_TEZ,
             0,
             &recipient,
             &ZERO,
             &ZERO,
+            &ZERO,
+            &ZERO,
             &cm_3,
-            &mh_3,
+            &mh_3
+        
         );
         assert_ne!(ush, ush3, "different v_pub must change sighash");
 
@@ -2081,7 +2188,9 @@ mod tests {
             cm_3: cm_3a,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3: enc_3a,
+            enc_3: enc_3a.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3a.clone(),
             proof: Proof::TrustMeBro,
         });
         assert!(r.is_err(), "N=8 transfer must be rejected");
@@ -2099,7 +2208,9 @@ mod tests {
             cm_3: cm_3b,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3: enc_3b,
+            enc_3: enc_3b.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3b.clone(),
             proof: Proof::TrustMeBro,
         });
         // Should NOT fail with "bad nullifier count" — may fail with "nullifier spent" or "invalid root"
@@ -2127,6 +2238,8 @@ mod tests {
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee: cm_fee_a,
             enc_fee: enc_fee_a,
             proof: Proof::TrustMeBro,
@@ -2144,6 +2257,8 @@ mod tests {
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee: cm_fee_b,
             enc_fee: enc_fee_b,
             proof: Proof::TrustMeBro,
@@ -2171,8 +2286,11 @@ mod tests {
         let mh_1 = memo_ct_hash(&enc);
         let mh_2 = memo_ct_hash(&enc);
 
-        // N=1: tail layout is [root, nf, fee, cm_1, cm_2, cm_3, mh_1, mh_2, mh_3]
-        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, mh_1, mh_2, mh_3];
+        // Phase C N=1 tail layout: auto-prepended auth_domain, then
+        // [root, nf, fee, cm_1, cm_2, cm_3, cm_4, mh_1, mh_2, mh_3, mh_4].
+        // The wallet uses cm_4: ZERO and enc_4: enc_3 as placeholders, so
+        // mh_4 = memo_ct_hash(enc_3) = mh_3.
+        let preimage = vec![root, nf, fee_f(), cm_1, cm_2, cm_3, ZERO, mh_1, mh_2, mh_3, mh_3];
 
         // This should succeed — all fields at correct positions
         let r = ledger.transfer(&TransferReq {
@@ -2185,6 +2303,8 @@ mod tests {
             enc_1: enc.clone(),
             enc_2: enc.clone(),
             enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: fake_stark(preimage.clone()),
         });
         assert!(
@@ -2194,7 +2314,7 @@ mod tests {
         );
 
         // Now test with preimage that has cm_1 and cm_2 SWAPPED in position
-        let bad_preimage = vec![root, nf, fee_f(), cm_2, cm_1, cm_3, mh_1, mh_2, mh_3];
+        let bad_preimage = vec![root, nf, fee_f(), cm_2, cm_1, cm_3, ZERO, mh_1, mh_2, mh_3, mh_3];
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
@@ -2204,7 +2324,9 @@ mod tests {
             cm_3,
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            enc_3,
+            enc_3: enc_3.clone(),
+            cm_4: ZERO, // Phase C placeholder
+            enc_4: enc_3.clone(),
             proof: fake_stark(bad_preimage),
         });
         assert!(r.is_err(), "swapped cm_1/cm_2 positions must be caught");
@@ -2569,6 +2691,8 @@ exit 2
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee,
             enc_fee,
             proof: Proof::TrustMeBro,
@@ -2580,6 +2704,7 @@ exit 2
         assert_eq!(
             ledger.withdrawals,
             vec![WithdrawalRecord {
+                asset_id: ASSET_TEZ,
                 recipient: TEST_L1_RECIPIENT.into(),
                 amount: 1,
             }]
@@ -2609,6 +2734,8 @@ exit 2
             recipient: TEST_L1_RECIPIENT.into(),
             cm_change: random_felt(),
             enc_change: Some(enc_change),
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee,
             enc_fee,
             proof: Proof::TrustMeBro,
@@ -2622,6 +2749,7 @@ exit 2
         assert_eq!(
             ledger.withdrawals,
             vec![WithdrawalRecord {
+                asset_id: ASSET_TEZ,
                 recipient: TEST_L1_RECIPIENT.into(),
                 amount: 1,
             }]

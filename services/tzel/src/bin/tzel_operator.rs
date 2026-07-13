@@ -20,7 +20,7 @@ use tezos_smart_rollup_encoding::{inbox::ExternalMessageFrame, smart_rollup::Sma
 #[cfg(any(test, debug_assertions))]
 use tzel_core::{auth_leaf_hash, derive_auth_pub_seed};
 use tzel_core::{
-    commit, decrypt_memo, derive_kem_keys, derive_rcm, detect, hash,
+    commit, decrypt_memo, derive_kem_keys, derive_rcm, detect, hash, ASSET_TEZ,
     kernel_wire::{
         decode_kernel_inbox_message, encode_kernel_inbox_message, kernel_bridge_config_sighash,
         kernel_verifier_config_sighash, KernelDalChunkPointer, KernelDalPayloadKind,
@@ -568,7 +568,7 @@ fn validate_fee_note_against_policy(
         &policy.address.auth_pub_seed,
         &policy.address.nk_tag,
     );
-    let expected = commit(&policy.address.d_j, value, &rcm, &otag);
+    let expected = commit(&policy.address.d_j, value, &ASSET_TEZ, &rcm, &otag);
     if &expected != commitment {
         return Err(
             "DAL fee note commitment does not match the configured operator fee address".into(),
@@ -593,7 +593,14 @@ fn enforce_dal_fee_policy(
             req.producer_fee,
         ),
         KernelInboxMessage::Transfer(req) => {
-            validate_fee_note_against_policy(policy, &req.cm_3, &req.enc_3, policy.amount)
+            // Phase C: 4 output slots in fixed order — cm_1
+            // (recipient), cm_2 (change_1), cm_3 (change_2
+            // placeholder; zero-value when not used), cm_4 (producer
+            // fee, permanently tez). The producer fee lives in slot
+            // 4; checking slot 3 would inspect the change_2
+            // placeholder which never decrypts under the operator's
+            // key, causing every Phase-C transfer to be rejected.
+            validate_fee_note_against_policy(policy, &req.cm_4, &req.enc_4, policy.amount)
         }
         KernelInboxMessage::Unshield(req) => {
             validate_fee_note_against_policy(policy, &req.cm_fee, &req.enc_fee, policy.amount)
@@ -1630,7 +1637,7 @@ mod tests {
             &policy.address.auth_pub_seed,
             &policy.address.nk_tag,
         );
-        let cm = commit(&policy.address.d_j, policy.amount, &rcm, &otag);
+        let cm = commit(&policy.address.d_j, policy.amount, &ASSET_TEZ, &rcm, &otag);
         (enc, cm)
     }
 
@@ -1649,6 +1656,7 @@ mod tests {
         let client_enc = producer_enc.clone();
         encode_kernel_inbox_message(&KernelInboxMessage::Shield(
             tzel_core::kernel_wire::KernelShieldReq {
+                asset_id: tzel_core::ASSET_TEZ,
                 pubkey_hash,
                 fee: 100_000,
                 v: 25,
@@ -2005,6 +2013,111 @@ mod tests {
             RollupSubmissionStatus::CommitmentIncluded
         );
         assert_eq!(submission.dal_chunks.len(), 1);
+    }
+
+    /// Phase E.5 regression: the operator's `enforce_dal_fee_policy`
+    /// for KernelInboxMessage::Transfer must inspect cm_4/enc_4 (the
+    /// producer-fee slot in Phase C), not cm_3/enc_3 (the change_2
+    /// placeholder). Earlier drafts of `enforce_dal_fee_policy`
+    /// inspected slot 3, which never decrypts under the operator's
+    /// key — making every Phase-C transfer with a configured fee
+    /// policy fail to publish (a hard liveness bug, not a
+    /// vulnerability, but a complete block on transfer throughput).
+    ///
+    /// We test `enforce_dal_fee_policy` directly rather than running
+    /// the full DAL-publish pipeline so the assertion stays focused
+    /// on the cm_4 inspection invariant.
+    #[test]
+    fn enforce_dal_fee_policy_transfer_accepts_matching_fee_note_in_slot_4() {
+        let script_dir = make_client_script("#!/bin/sh\nexit 0\n");
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        let policy = sample_fee_policy();
+        config.dal_fee_policy = Some(policy.clone());
+
+        let (fee_enc, fee_cm) = sample_fee_note(&policy, [0x73; 32]);
+        let placeholder_enc = fee_enc.clone();
+        let message = KernelInboxMessage::Transfer(tzel_core::kernel_wire::KernelTransferReq {
+            root: [0x10; 32],
+            nullifiers: vec![[0x20; 32]],
+            fee: 100_000,
+            cm_1: [0x31; 32],
+            cm_2: [0x32; 32],
+            // cm_3 is the change_2 placeholder. Earlier drafts of
+            // `enforce_dal_fee_policy` inspected this slot, which
+            // never decrypts under the operator's key. To pin down
+            // that the check looks at slot 4, we deliberately put a
+            // garbage placeholder here.
+            cm_3: [0x33; 32],
+            cm_4: fee_cm,
+            enc_1: placeholder_enc.clone(),
+            enc_2: placeholder_enc.clone(),
+            enc_3: placeholder_enc,
+            enc_4: fee_enc,
+            proof: tzel_core::kernel_wire::KernelStarkProof {
+                proof_bytes: vec![],
+                output_preimage: vec![],
+            },
+        });
+
+        enforce_dal_fee_policy(&config, &message).expect(
+            "operator must accept a Phase-C transfer whose cm_4 decrypts under the policy key — \
+             this test fails if `enforce_dal_fee_policy` regresses to inspecting cm_3 (the \
+             change_2 placeholder)",
+        );
+    }
+
+    /// Phase E.5 regression: the operator must REJECT a Phase-C
+    /// transfer whose producer-fee note (in slot 4) is owned by a
+    /// different address than the policy. Complements the
+    /// slot-4-accept test above; together they pin down "operator
+    /// inspects slot 4" as the load-bearing invariant.
+    #[test]
+    fn enforce_dal_fee_policy_transfer_rejects_fee_note_for_wrong_owner_in_slot_4() {
+        let script_dir = make_client_script("#!/bin/sh\nexit 0\n");
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.dal_fee_policy = Some(sample_fee_policy());
+
+        let wrong_incoming_seed = [0x52; 32];
+        let (wrong_ek_v, _, wrong_ek_d, _) = derive_kem_keys(&wrong_incoming_seed, 0);
+        let wrong_policy = OperatorDalFeePolicy {
+            amount: 7,
+            incoming_seed: wrong_incoming_seed,
+            address_index: 0,
+            address: PaymentAddress {
+                d_j: [0x65; 32],
+                auth_root: [0x66; 32],
+                auth_pub_seed: [0x67; 32],
+                nk_tag: [0x68; 32],
+                ek_v: wrong_ek_v.to_bytes().to_vec(),
+                ek_d: wrong_ek_d.to_bytes().to_vec(),
+            },
+        };
+        let (wrong_enc, wrong_cm) = sample_fee_note(&wrong_policy, [0x74; 32]);
+        let placeholder_enc = wrong_enc.clone();
+        let message = KernelInboxMessage::Transfer(tzel_core::kernel_wire::KernelTransferReq {
+            root: [0x10; 32],
+            nullifiers: vec![[0x20; 32]],
+            fee: 100_000,
+            cm_1: [0x31; 32],
+            cm_2: [0x32; 32],
+            cm_3: [0x33; 32],
+            cm_4: wrong_cm,
+            enc_1: placeholder_enc.clone(),
+            enc_2: placeholder_enc.clone(),
+            enc_3: placeholder_enc,
+            enc_4: wrong_enc,
+            proof: tzel_core::kernel_wire::KernelStarkProof {
+                proof_bytes: vec![],
+                output_preimage: vec![],
+            },
+        });
+
+        let err = enforce_dal_fee_policy(&config, &message).unwrap_err();
+        assert!(
+            err.contains("configured operator fee address"),
+            "rejection must surface the fee-address mismatch from slot 4: {}",
+            err,
+        );
     }
 
     #[test]

@@ -270,7 +270,7 @@ let test_note_vectors json =
     let auth_pub_seed = felt_of_hex (json_string (json_field "auth_pub_seed" v)) in
     let nk_tag = felt_of_hex (json_string (json_field "nk_tag" v)) in
     let prefix = Printf.sprintf "note[%d]" i in
-    let note = Tzel.Note.create_from_parts ~d_j ~auth_root ~auth_pub_seed ~nk_tag ~v:v_val ~rseed in
+    let note = Tzel.Note.create_from_parts ~d_j ~auth_root ~auth_pub_seed ~nk_tag ~v:v_val ~rseed () in
     check_hex (prefix ^ ".rcm") (json_string (json_field "rcm" v)) note.rcm;
     check_hex (prefix ^ ".owner_tag") (json_string (json_field "owner_tag" v)) note.owner_tag;
     check_hex (prefix ^ ".cm") (json_string (json_field "cm" v)) note.cm;

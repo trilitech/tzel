@@ -223,3 +223,49 @@ fn test_transfer_7_inputs_proof_roundtrip() {
         .expect("n=7 transfer proof should verify with canonical metadata");
 }
 
+/// Slow, ignored by default: prove a MIXED-ASSET transfer witness
+/// directly. Two inputs (one tez, one primary non-tez); recipient
+/// receives the primary asset, tez covers fees + producer + tez
+/// change. The 2-accumulator per-asset balance constraint must
+/// accept BOTH lanes strictly positive — the configuration that
+/// every other slow-prove test (tez-only) cannot exercise.
+///
+/// This is the canonical "FA2 STARK proof exists" guard. Without
+/// this, the Cairo multi-asset constraint had only unit-level Cairo
+/// tests and the pure-tez 7-input slow guard; the prover had never
+/// been asked to discharge a witness whose primary_in is non-zero
+/// against a non-tez primary_non_tez_asset. Now it has.
+#[test]
+#[ignore = "slow real-proof mixed-asset proof"]
+fn test_transfer_mixed_assets_proof_roundtrip() {
+    let _guard = integration_test_guard();
+    if !has_reprover() {
+        eprintln!("SKIP: reprover binary or Cairo executables not found.");
+        return;
+    }
+
+    // A synthetic primary asset_id derived from a fake KT1. The
+    // circuit treats it as an opaque felt; the kernel-binary
+    // registry isn't consulted at this layer.
+    let primary_asset = tzel_services::derive_asset_id("KT1Jg4fj5wwnKHuW8aa9uDX6dRYBdjXhm2sJ");
+    let witness = proof_bench::build_transfer_mixed_assets_bench_witness(primary_asset);
+    let bundle = generate_stark_bundle("run_transfer.executable.json", &witness.args);
+    let public_outputs = bootloader_cairo_array_public_outputs(&bundle.output_preimage);
+
+    assert_eq!(
+        public_outputs,
+        witness.expected_public_outputs.as_slice(),
+        "mixed-asset transfer proof public outputs must match the witness — \
+         the recipient cm carries the primary asset and the change_1 cm carries tez",
+    );
+    assert!(!bundle.proof_bytes.is_empty(), "proof bytes should be nonempty");
+    let proof = Proof::Stark {
+        proof_bytes: bundle.proof_bytes,
+        output_preimage: bundle.output_preimage,
+    };
+    DirectProofVerifier::from_executables_dir(false, &executables_dir())
+        .expect("test executables should provide program hashes")
+        .validate(&proof, CircuitKind::Transfer)
+        .expect("mixed-asset transfer proof should verify with canonical metadata");
+}
+

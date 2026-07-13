@@ -588,3 +588,57 @@ We can say "Ushuaianet shielded tx is working" when all of the following are tru
 - one live `send` succeeds (Bob can independently sync and observe the received note)
 - one live `unshield -> execute-outbox` round-trip lands the funds back on L1
 - the flow is reproducible on the public Ushuaianet host from a clean wallet directory
+
+## 14. Multiasset / FA2 Flows
+
+All commands in sections 6–10 default to tez. To exercise an FA2 token the
+wallet exposes an `--asset` flag on `deposit`, `shield`, `send`, and `unshield`.
+Accepted values:
+
+- omitted / `""` / `tez` / `0` / `0x0000...0000` → `ASSET_TEZ` (the default)
+- 32-byte hex (with or without `0x` prefix) → that asset_id literal
+- the asset_id is `H("tzel:asset:" || ticketer_kt1)`; the CLI helper
+  `derive-asset-id` (`services/tzel/src/bin/derive_asset_id_cli.rs`) computes
+  it from the ticketer KT1 string.
+
+### Differences from the tez flow
+
+The FA2 deposit / shield / unshield flow has one operationally important
+difference: the rollup's producer-fee output is permanently tez. Concretely:
+
+- **FA2 deposit**: requires the FA2 bridge ticketer to be in the kernel's
+  registered set (`COMPILE_TIME_FA2_BRIDGES`). Off-chain, the user must call
+  the FA2 contract's `%update_operators` to authorise the bridge ticketer to
+  pull `amount` of the configured `token_id` from them, THEN call the bridge
+  ticketer's `%mint(amount, receiver, rollup)`. The bridge handles the FA2
+  `%transfer` and L2 ticket emission.
+
+- **FA2 shield**: requires the user to have BOTH an FA2 pool AND a tez pool
+  at the same `pubkey_hash`. The wallet debits `v + tx_fee` from the FA2
+  pool and `producer_fee` from the tez pool (because the producer-fee output
+  note is permanently tez, regardless of which asset the shield moved). If
+  the user only has an FA2 pool, the shield rejects with a clear error
+  pointing at the missing tez pool. The wallet's `cmd_shield_rollup` enforces
+  this client-side; the kernel re-enforces it on prepare-shield.
+
+- **FA2 send / transfer**: any transfer that moves an FA2 amount must ALSO
+  spend some tez (to pay the burned `fee` and the producer fee). The wallet's
+  `select_notes_of_asset` picks both an FA2 input set covering the recipient
+  amount and a tez input set covering the fees. Combined input count must be
+  ≤ 7 (the circuit's input cap); if the user's notes can't be packed under
+  that limit, the wallet asks them to consolidate first.
+
+- **FA2 unshield**: dispatches the L1 burn via the FA2 ticketer registered
+  for the asset. The recipient string is the user's L1 address (tz1/tz2/tz3
+  or KT1 — the kernel accepts both). The producer-fee note is, again, tez.
+
+### Operational sanity
+
+- `cmd_scan` (the demo HTTP scan path) is tez-only. Use `cmd_rollup_sync`
+  instead for FA2 wallets — it routes through the rollup node's asset-aware
+  RPC.
+- Watch wallets (view / outgoing modes) recover FA2 notes correctly as of
+  the W1/W2 fixes — they iterate the candidate-asset registry when
+  recomputing commitments. Old (pre-fix) watch wallets silently dropped
+  every FA2 receipt; upgrade the wallet binary if you observe missing FA2
+  balances on a view-mode export.

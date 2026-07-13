@@ -20,6 +20,300 @@ use tezos_smart_rollup_encoding::contract::Contract as TezosContract;
 
 pub type F = [u8; 32];
 pub const ZERO: F = [0u8; 32];
+
+/// Canonical tez asset tag. The multiasset commitment scheme binds an
+/// asset field inside every note commitment. `ASSET_TEZ` is reserved
+/// for tez (felt 0) — every commitment built against the tez bridge
+/// uses this constant. Non-tez assets are FA2 tokens reached through
+/// per-asset L1 ticketer contracts; their `asset_id` is derived from
+/// the ticketer's L1 address via `derive_asset_id` so an L2 commitment
+/// transparently identifies which L1 contract may release the
+/// underlying token on exit. The kernel's bridge config carries an
+/// explicit `Vec<AssetEntry>` registry — only entries in that list are
+/// accepted for shield (deposit) and unshield (exit). Producer fees
+/// stay tez permanently (liquidity argument for DAL inclusion).
+pub const ASSET_TEZ: F = ZERO;
+
+/// Domain-separated derivation of an L2 asset_id from its L1 ticketer
+/// contract address. Using a hash of the ticketer means two FA2
+/// tokens served by different ticketers cannot collide on asset_id,
+/// and the L1 → L2 binding is structural rather than registered. The
+/// tez bridge keeps `asset_id = ASSET_TEZ` (ZERO) for backward
+/// compatibility with everywhere ZERO is treated as "tez" in commits
+/// and the 2-accumulator constraint.
+///
+/// SAFETY NOTE: `derive_asset_id` hashes raw bytes — if the caller
+/// passes `" KT1..."` (leading whitespace) vs `"KT1..."` they get
+/// DIFFERENT asset_ids, and any L1 deposit from the canonical
+/// ticketer wouldn't match the non-canonical registry entry. Today
+/// every production caller passes already-canonical strings
+/// (`transfer.sender.to_base58_check()`, `COMPILE_TIME_FA2_BRIDGES`
+/// constants), so this is safe. Future entry points reading
+/// ticketer strings from untrusted sources (CLI args, JSON config,
+/// env vars) MUST canonicalize via `validate_l1_ticketer_canonical`
+/// before hashing — otherwise a stranded-funds bug is one
+/// whitespace-padded paste away.
+pub fn derive_asset_id(ticketer: &str) -> F {
+    let mut buf = Vec::with_capacity(11 + ticketer.len());
+    buf.extend_from_slice(b"tzel:asset:");
+    buf.extend_from_slice(ticketer.as_bytes());
+    hash(&buf)
+}
+
+/// Validate and canonicalize an L1 ticketer string before it's used
+/// to derive an asset_id. Mirrors `validate_l1_withdrawal_recipient`
+/// for ticketers: trims whitespace, then runs the b58check parser to
+/// reject non-canonical encodings (case-mismatched, padded,
+/// truncated). Returns the canonical form on success.
+///
+/// Callers reading ticketers from UNTRUSTED sources (CLI args, JSON
+/// config, env vars, RPC responses) must run inputs through this
+/// validator before calling `derive_asset_id` or comparing against a
+/// registry. Without it, two semantically-identical-looking
+/// ticketers can produce different asset_ids and silently strand
+/// user funds.
+///
+/// Production callers that already produce canonical b58 strings
+/// (`TezosContract::to_base58_check()`, `COMPILE_TIME_FA2_BRIDGES`)
+/// do not need to call this — it's an idempotent no-op for those
+/// inputs. The defensive value is at the system boundary.
+pub fn validate_l1_ticketer_canonical(ticketer: &str) -> Result<String, String> {
+    let ticketer = ticketer.trim();
+    if ticketer.is_empty() {
+        return Err("L1 ticketer address must not be empty".into());
+    }
+    let parsed = TezosContract::from_b58check(ticketer)
+        .map_err(|_| format!("invalid L1 ticketer (b58check parse failed): {}", ticketer))?;
+    // Reject Implicit (tz1/tz2/tz3) ticketers. A ticketer mints
+    // and burns Tezos tickets, which only smart contracts (KT1) can
+    // do — Tezos's protocol-level Transfer.sender is statically
+    // typed `ContractKt1Hash`. Accepting an Implicit address here
+    // would just produce an asset_id that the kernel could never
+    // observe on the wire.
+    if !matches!(parsed, TezosContract::Originated(_)) {
+        return Err(format!(
+            "L1 ticketer must be an Originated (KT1) address; got Implicit: {}",
+            ticketer,
+        ));
+    }
+    // Re-emit via b58check to reject any encoding that parsed but
+    // doesn't round-trip exactly. This catches subtle variants the
+    // raw parser might accept but the canonical kernel-side
+    // comparison would later reject (e.g., differently-padded
+    // legacy formats).
+    let canonical = parsed.to_b58check();
+    if canonical != ticketer {
+        return Err(format!(
+            "L1 ticketer is not in canonical b58check form: got {}, canonical {}",
+            ticketer, canonical,
+        ));
+    }
+    Ok(canonical)
+}
+
+/// One registered bridge endpoint. The kernel's `BridgeConfig` carries
+/// a `Vec<AssetEntry>` and refuses to credit deposits or release
+/// withdrawals for any asset not in the list. Entry 0 is conventionally
+/// the tez bridge (`asset_id = ASSET_TEZ`); subsequent entries are FA2
+/// bridges with `asset_id = derive_asset_id(ticketer)`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AssetEntry {
+    /// L2 asset identity carried in commitments and sighashes.
+    pub asset_id: F,
+    /// L1 contract address of the ticketer that mints/burns this asset's
+    /// tickets. Both deposits (mint) and exits (burn) route through it.
+    pub ticketer: String,
+}
+
+impl AssetEntry {
+    /// The canonical tez entry for index 0 of any bridge config.
+    /// asset_id is fixed at ASSET_TEZ regardless of the ticketer
+    /// address, because every pre-multiasset commitment in the system
+    /// hardcodes ZERO for tez.
+    pub fn tez(ticketer: String) -> Self {
+        Self { asset_id: ASSET_TEZ, ticketer }
+    }
+
+    /// An FA2 entry whose asset_id is derived from its ticketer
+    /// address (one ticketer = one asset).
+    pub fn fa2(ticketer: String) -> Self {
+        let asset_id = derive_asset_id(&ticketer);
+        Self { asset_id, ticketer }
+    }
+}
+
+/// Compile-time FA2 bridge registry. Changing this list is a kernel
+/// upgrade (same governance surface as any other protocol change).
+/// Each entry must be a distinct L1 ticketer address; asset_ids are
+/// structurally derived from the address by `derive_asset_id` so two
+/// entries cannot collide unless their ticketer strings collide.
+///
+/// The tez bridge is NOT included here — its ticketer address is
+/// instance-specific (deployed per network) and lives in the durable
+/// `BridgeConfig`. Compose the full registry at runtime with
+/// `compose_asset_registry(tez_ticketer)`.
+///
+/// Currently-registered FA2 bridges:
+///
+/// - `KT1Um36QJyoMhLNWRohmZAszpaLhQKZRSuo7` (shadownet) — demo FA2
+///   ticketer originated 2026-06-08 by `tz1hfLgWHKNtJE5HhizdY2LvqnQJGd5oQ82K`
+///   with storage `(Pair "KT1HbQepzV1nVGg8QVznG7z4RcHseD5kwqBn" 0)`.
+///   The underlying FA2 contract address in the storage is a
+///   placeholder; for any real bridge deployment, originate a fresh
+///   ticketer pointing at the production FA2 contract and add its
+///   KT1 here. Derived asset_id:
+///   `b7d8096d79337ace4125ac100f3b2270d9ba5c2ac2300b2916c970ade16b9105`.
+///
+///   This entry is "live" on shadownet only — mainnet builds should
+///   remove it via a kernel upgrade once a production FA2 ticketer
+///   replaces it. We keep the demo entry pinned in the source so
+///   shadownet's wallet/kernel-test workflows have a real KT1 to
+///   target through `gh.gitlab.com/tezos/tezos`-grade origination,
+///   not just a synthetic test override.
+pub const COMPILE_TIME_FA2_BRIDGES: &[&str] = &[
+    "KT1Um36QJyoMhLNWRohmZAszpaLhQKZRSuo7",
+];
+
+/// Build the full asset registry for the running kernel: tez entry
+/// first (using the durable BridgeConfig's ticketer), followed by the
+/// compile-time FA2 bridges. Used by apply_shield / apply_unshield
+/// for membership checks and by the outbox dispatcher (E.4) for
+/// asset → ticketer lookups.
+pub fn compose_asset_registry(tez_ticketer: &str) -> Vec<AssetEntry> {
+    #[cfg(feature = "test-fa2-bridges")]
+    {
+        let override_list = test_fa2_bridges::current();
+        if !override_list.is_empty() {
+            return compose_asset_registry_with(tez_ticketer, &override_list);
+        }
+    }
+    compose_asset_registry_with(tez_ticketer, COMPILE_TIME_FA2_BRIDGES)
+}
+
+/// Test-only FA2 bridge override. Enabled by the `test-fa2-bridges`
+/// cargo feature; tests in downstream crates flip it on, register
+/// synthetic ticketers via `test_fa2_bridges::set`, and exercise the
+/// kernel's deposit / shield / unshield routing paths against them.
+/// The override is a thread-local so parallel test runners don't
+/// interfere with each other.
+///
+/// **Do not enable this feature in release builds.** A kernel compiled
+/// with the override active is one `set()` call away from accepting
+/// arbitrary FA2 ticketer addresses.
+#[cfg(feature = "test-fa2-bridges")]
+pub mod test_fa2_bridges {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static OVERRIDE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Replace the thread-local FA2 ticketer list. Pass an empty
+    /// slice to clear (after which compose_asset_registry falls back
+    /// to the compile-time const).
+    pub fn set<S: AsRef<str>>(ticketers: &[S]) {
+        OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = ticketers.iter().map(|s| s.as_ref().to_string()).collect();
+        });
+    }
+
+    /// Clear the override.
+    pub fn clear() {
+        OVERRIDE.with(|cell| cell.borrow_mut().clear());
+    }
+
+    /// Internal: snapshot of the current override. Public so the
+    /// `compose_asset_registry` body can read it without re-entering
+    /// the module; not meant for direct test use.
+    pub fn current() -> Vec<String> {
+        OVERRIDE.with(|cell| cell.borrow().clone())
+    }
+}
+
+/// Like `compose_asset_registry` but takes an explicit FA2 ticketer
+/// list — letting tests and tooling exercise the routing helpers
+/// without having to mutate the kernel-binary const.
+///
+/// Defense-in-depth: skips any FA2 ticketer string that equals the
+/// `tez_ticketer`. The registry's `find`-based lookups return the
+/// first match, so if the tez ticketer appeared again as an FA2
+/// entry, FA2 deposits at that address would silently route to the
+/// tez pool. Skipping (rather than erroring) keeps the function
+/// total — kernel binaries with a misconfigured const fall back to
+/// the safe "this address only serves tez" interpretation rather
+/// than refusing to boot.
+pub fn compose_asset_registry_with<S: AsRef<str>>(
+    tez_ticketer: &str,
+    fa2_ticketers: &[S],
+) -> Vec<AssetEntry> {
+    let mut entries = Vec::with_capacity(1 + fa2_ticketers.len());
+    entries.push(AssetEntry::tez(tez_ticketer.to_string()));
+    for fa2 in fa2_ticketers {
+        if fa2.as_ref() == tez_ticketer {
+            // Skip: this address is already the tez ticketer.
+            // Including it as FA2 would expose first-match lookup
+            // ordering as a security property.
+            continue;
+        }
+        entries.push(AssetEntry::fa2(fa2.as_ref().to_string()));
+    }
+    entries
+}
+
+/// Look up the L1 ticketer address that mints/burns tickets for a
+/// given asset_id. Used by the outbox dispatcher (E.4). Returns None
+/// if the asset is not in the registry — the caller (kernel) MUST
+/// treat this as a hard error (refuse to emit the outbox message,
+/// surface a kernel-result Error).
+pub fn ticketer_for_asset<'a>(
+    registry: &'a [AssetEntry],
+    asset_id: &F,
+) -> Option<&'a str> {
+    registry
+        .iter()
+        .find(|entry| &entry.asset_id == asset_id)
+        .map(|entry| entry.ticketer.as_str())
+}
+
+/// Look up the asset_id served by a given L1 ticketer address. Used
+/// by the deposit dispatcher: when a ticket transfer arrives, the
+/// kernel matches the sender ticketer to a registered asset (or
+/// rejects the deposit). Returns None when the ticketer is not in
+/// the registry.
+pub fn asset_for_ticketer<'a>(
+    registry: &'a [AssetEntry],
+    ticketer: &str,
+) -> Option<&'a F> {
+    registry
+        .iter()
+        .find(|entry| entry.ticketer == ticketer)
+        .map(|entry| &entry.asset_id)
+}
+/// Number of bits used in the cheap-detection tag attached to every
+/// note. A watcher's `detect(enc, dk_d)` performs a full ML-KEM-768
+/// decapsulation, hashes the resulting shared secret, takes
+/// `DETECT_K` bits, and constant-time-compares against the on-chain
+/// tag. ML-KEM has implicit rejection, so an invalid `ct_d` yields a
+/// deterministic pseudo-random secret rather than failing — meaning
+/// the detect tag is information-theoretically a `DETECT_K`-bit
+/// filter, not a MAC.
+///
+/// Security tradeoff:
+///   - False-positive rate per garbage note ≈ 2^-DETECT_K = 2^-10
+///     (~0.1%). A malicious operator feeding ~1024 garbage notes
+///     per scan can statistically guarantee one false positive,
+///     which forces the downstream view watcher into a full memo
+///     decryption attempt (one ML-KEM decap + one ChaCha20Poly1305
+///     verify). This is bounded paid noise, not a vulnerability.
+///   - False-negative rate = 0: a correctly-encrypted note's tag
+///     is recomputed identically and always matches.
+///   - Larger DETECT_K reduces FP rate exponentially but linearly
+///     widens the on-chain note-memo encoding. 10 bits is the
+///     deployment choice; bumping requires a wire-format change.
+///
+/// Operators should monitor for sustained elevated decap rates as a
+/// signal of feed-poisoning attempts; this constant is the
+/// expected baseline noise floor.
 pub const DETECT_K: usize = 10;
 pub const ML_KEM768_CIPHERTEXT_BYTES: usize = 1088;
 pub const NOTE_AEAD_NONCE_BYTES: usize = 12;
@@ -274,6 +568,8 @@ pub fn shield_sighash(
     cm_producer: &F,
     memo_ct_hash_recipient: &F,
     memo_ct_hash_producer: &F,
+    asset_recipient: &F,
+    asset_producer: &F,
 ) -> F {
     let mut type_tag = ZERO;
     type_tag[0] = 0x03;
@@ -282,6 +578,8 @@ pub fn shield_sighash(
     h = sighash_fold(&h, &u64_to_felt(v));
     h = sighash_fold(&h, &u64_to_felt(fee));
     h = sighash_fold(&h, &u64_to_felt(producer_fee));
+    h = sighash_fold(&h, asset_recipient);
+    h = sighash_fold(&h, asset_producer);
     h = sighash_fold(&h, cm_recipient);
     h = sighash_fold(&h, cm_producer);
     h = sighash_fold(&h, memo_ct_hash_recipient);
@@ -339,6 +637,27 @@ pub fn parse_public_balance_key(value: &str) -> Option<(&str, &str)> {
     Some((owner, label))
 }
 
+/// Validate and canonicalize an L1 withdrawal recipient address.
+///
+/// Accepts BOTH Implicit (tz1/tz2/tz3) and Originated (KT1) Tezos
+/// addresses, in their canonical b58check form. The kernel does not
+/// discriminate by address class — both are valid `to_` targets for
+/// the FA2 `%transfer` invocation that the bridge ticketer's `%burn`
+/// performs, and both are valid TRANSFER_TOKENS targets for the tez
+/// ticketer. End-to-end:
+///
+///   - **tez_bridge_ticketer**: `%burn` calls `TRANSFER_TOKENS` to
+///     send mutez to the recipient. Tezos accepts mutez transfers
+///     to any contract type (Implicit or Originated). ✓
+///   - **fa2_bridge_ticketer**: `%burn` calls the underlying FA2's
+///     `%transfer` with `to_ = recipient_address`. FA2 (TZIP-12)
+///     contracts accept transfers to any address type. ✓
+///
+/// So accepting tz1 here is not a soundness or liveness bug — the
+/// audit's behavior-clarifying note was about the kernel's lack of
+/// discrimination, not a downstream burn failure. Leading/trailing
+/// whitespace is trimmed for ergonomics; otherwise the b58check
+/// parse is the canonicalization.
 pub fn validate_l1_withdrawal_recipient(value: &str) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -364,14 +683,23 @@ pub fn owner_tag(auth_root: &F, auth_pub_seed: &F, nk_tag: &F) -> F {
     blake2s_parts_personalized(b"ownrSP__", &[auth_root, auth_pub_seed, nk_tag])
 }
 
-pub fn commit(d_j: &F, v: u64, rcm: &F, otag: &F) -> F {
-    let mut buf = [0u8; 128];
+pub fn commit(d_j: &F, v: u64, asset: &F, rcm: &F, otag: &F) -> F {
+    // Multiasset commitment encoding (160 bytes, mirrors the Cairo
+    // `hash5` layout in blake_hash.cairo):
+    //   [  0.. 32) d_j
+    //   [ 32.. 40) v as u64 little-endian
+    //   [ 40.. 64) zeros (padding for v's felt slot)
+    //   [ 64.. 96) asset tag (32 bytes)
+    //   [ 96..128) rcm
+    //   [128..160) owner_tag
+    // The asset tag is hashed alongside value/randomness, so observers
+    // cannot tell which asset a given commitment encodes.
+    let mut buf = [0u8; 160];
     buf[..32].copy_from_slice(d_j);
-    // Canonical commitment encoding stores v as a u64 in bytes [32..40).
-    // Bytes [40..64) are intentionally zero.
     buf[32..40].copy_from_slice(&v.to_le_bytes());
-    buf[64..96].copy_from_slice(rcm);
-    buf[96..128].copy_from_slice(otag);
+    buf[64..96].copy_from_slice(asset);
+    buf[96..128].copy_from_slice(rcm);
+    buf[128..160].copy_from_slice(otag);
     hash_commit_raw(&buf)
 }
 
@@ -411,9 +739,11 @@ pub fn transfer_sighash(
     cm_1: &F,
     cm_2: &F,
     cm_3: &F,
+    cm_4: &F,
     mh_1: &F,
     mh_2: &F,
     mh_3: &F,
+    mh_4: &F,
 ) -> F {
     // Circuit-type tag 0x01 for transfer
     let mut type_tag = ZERO;
@@ -427,9 +757,11 @@ pub fn transfer_sighash(
     sh = sighash_fold(&sh, cm_1);
     sh = sighash_fold(&sh, cm_2);
     sh = sighash_fold(&sh, cm_3);
+    sh = sighash_fold(&sh, cm_4);
     sh = sighash_fold(&sh, mh_1);
     sh = sighash_fold(&sh, mh_2);
     sh = sighash_fold(&sh, mh_3);
+    sh = sighash_fold(&sh, mh_4);
     sh
 }
 
@@ -439,10 +771,13 @@ pub fn unshield_sighash(
     root: &F,
     nullifiers: &[F],
     v_pub: u64,
+    asset_pub: &F,
     fee: u64,
     recipient: &F,
     cm_change: &F,
     mh_change: &F,
+    cm_change_2: &F,
+    mh_change_2: &F,
     cm_fee: &F,
     mh_fee: &F,
 ) -> F {
@@ -455,10 +790,13 @@ pub fn unshield_sighash(
         sh = sighash_fold(&sh, nf);
     }
     sh = sighash_fold(&sh, &u64_to_felt(v_pub));
+    sh = sighash_fold(&sh, asset_pub);
     sh = sighash_fold(&sh, &u64_to_felt(fee));
     sh = sighash_fold(&sh, recipient);
     sh = sighash_fold(&sh, cm_change);
     sh = sighash_fold(&sh, mh_change);
+    sh = sighash_fold(&sh, cm_change_2);
+    sh = sighash_fold(&sh, mh_change_2);
     sh = sighash_fold(&sh, cm_fee);
     sh = sighash_fold(&sh, mh_fee);
     sh
@@ -1071,10 +1409,29 @@ pub struct OutgoingRecoveryPlaintext {
 }
 
 impl OutgoingRecoveryPlaintext {
-    pub fn commitment(&self) -> F {
+    /// Recompute the commitment for this outgoing-recovery plaintext
+    /// against a candidate `asset_id`. The plaintext does NOT store
+    /// `asset_id` (a wire-format bump would invalidate every
+    /// pre-multiasset OutgoingRecoveryPlaintext on chain), so the
+    /// caller — typically the wallet — passes each registered asset
+    /// in turn and keeps the one that matches the on-chain `cm`. See
+    /// `commitment_against_tez` for the pre-multiasset shorthand that
+    /// most call sites in the tez-only era used.
+    pub fn commitment_for_asset(&self, asset_id: &F) -> F {
         let rcm = derive_rcm(&self.rseed);
         let owner = owner_tag(&self.auth_root, &self.auth_pub_seed, &self.nk_tag);
-        commit(&self.d_j, self.value, &rcm, &owner)
+        commit(&self.d_j, self.value, asset_id, &rcm, &owner)
+    }
+
+    /// Convenience: re-derive the commitment under the tez asset.
+    /// Use this only when the caller is sure the recovered note is
+    /// tez (e.g. tez-only deployments, tests). The multiasset
+    /// watcher path should iterate `commitment_for_asset` over the
+    /// candidate registry instead — without that, watch-only
+    /// wallets would silently lose visibility of every FA2 receipt
+    /// (the on-chain `cm` commits to the FA2 asset_id, not tez).
+    pub fn commitment(&self) -> F {
+        self.commitment_for_asset(&ASSET_TEZ)
     }
 
     pub fn encode(&self) -> [u8; OUTGOING_RECOVERY_PLAINTEXT_BYTES] {
@@ -1481,6 +1838,10 @@ pub struct Note {
     pub cm: F,
     pub index: usize,
     pub addr_index: u32, // which address j this note belongs to
+    /// Asset class this note carries. Defaults to ASSET_TEZ so pre-
+    /// multiasset wallet fixtures continue to parse.
+    #[serde(with = "hex_f", default)]
+    pub asset_id: F,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1681,16 +2042,28 @@ pub struct PaymentAddress {
 
 /// Shield request.
 ///
-/// `pubkey_hash` identifies the deposit-balance pool to drain, computed as
-/// `H(auth_domain, auth_root, auth_pub_seed, blind)` (type tag 0x04). The
-/// kernel debits `v + fee + producer_fee` from that pool. The proof's
+/// `(asset_id, pubkey_hash)` identifies the deposit-balance pool to drain,
+/// where `pubkey_hash = H(auth_domain, auth_root, auth_pub_seed, blind)`
+/// (type tag 0x04). The kernel debits the asset pool by `v + fee` (FA2) or
+/// `v + fee + producer_fee` (tez); for FA2 shields it ALSO debits
+/// `producer_fee` from the `(ASSET_TEZ, pubkey_hash)` pool at the same
+/// pubkey_hash, because the producer-fee output note is permanently tez
+/// (bug-#2 fix, commit aff523a). FA2 shields therefore require BOTH an
+/// FA2 pool AND a tez pool at the same `pubkey_hash`. The proof's
 /// in-circuit WOTS+ signature, verified under the recipient's auth tree,
 /// binds the entire request payload (pubkey_hash, v, fee, producer_fee,
-/// output commitments, memo hashes) so a delegated prover cannot redirect
-/// funds, change values, or swap recipients without the wallet's signing
-/// key.
+/// output commitments, memo hashes, asset_new, asset_producer) so a
+/// delegated prover cannot redirect funds, change values, swap recipients,
+/// or change the asset without the wallet's signing key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShieldReq {
+    /// L2 asset_id whose pool this shield is draining. The Cairo
+    /// circuit binds this into `cm_new`'s preimage; the kernel uses it
+    /// to look up the correct `(asset_id, pubkey_hash)` deposit pool.
+    /// Default = ASSET_TEZ for backward compatibility with serialized
+    /// pre-multiasset requests.
+    #[serde(with = "hex_f", default)]
+    pub asset_id: F,
     /// Identifies the deposit-balance pool this shield is draining.
     #[serde(with = "hex_f")]
     pub pubkey_hash: F,
@@ -1723,15 +2096,20 @@ pub struct TransferReq {
     #[serde(with = "hex_f_vec")]
     pub nullifiers: Vec<F>,
     pub fee: u64,
+    // Phase C: N→4 outputs.
+    //   cm_1 = recipient, cm_2 = change_1, cm_3 = change_2, cm_4 = producer fee.
     #[serde(with = "hex_f")]
     pub cm_1: F,
     #[serde(with = "hex_f")]
     pub cm_2: F,
     #[serde(with = "hex_f")]
     pub cm_3: F,
+    #[serde(with = "hex_f")]
+    pub cm_4: F,
     pub enc_1: EncryptedNote,
     pub enc_2: EncryptedNote,
     pub enc_3: EncryptedNote,
+    pub enc_4: EncryptedNote,
     pub proof: Proof,
 }
 
@@ -1740,6 +2118,7 @@ pub struct TransferResp {
     pub index_1: usize,
     pub index_2: usize,
     pub index_3: usize,
+    pub index_4: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1751,9 +2130,13 @@ pub struct UnshieldReq {
     pub v_pub: u64,
     pub fee: u64,
     pub recipient: String,
+    // Phase C: two change slots.
     #[serde(with = "hex_f")]
     pub cm_change: F,
     pub enc_change: Option<EncryptedNote>,
+    #[serde(with = "hex_f")]
+    pub cm_change_2: F,
+    pub enc_change_2: Option<EncryptedNote>,
     #[serde(with = "hex_f")]
     pub cm_fee: F,
     pub enc_fee: EncryptedNote,
@@ -1763,12 +2146,18 @@ pub struct UnshieldReq {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnshieldResp {
     pub change_index: Option<usize>,
+    pub change_index_2: Option<usize>,
     pub producer_index: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct PreparedUnshield {
+    /// L2 asset_id of the public exit, taken from the proof's
+    /// `asset_pub` public output. The kernel uses this to route the
+    /// outbox burn to the correct ticketer at L4.
+    asset_id: F,
     change_note: Option<(F, EncryptedNote)>,
+    change_note_2: Option<(F, EncryptedNote)>,
     producer_note: (F, EncryptedNote),
     nullifiers: Vec<F>,
     recipient: String,
@@ -1776,8 +2165,16 @@ pub struct PreparedUnshield {
 }
 
 impl PreparedUnshield {
+    pub fn asset_id(&self) -> &F {
+        &self.asset_id
+    }
+
     pub fn change_note(&self) -> Option<(&F, &EncryptedNote)> {
         self.change_note.as_ref().map(|(cm, enc)| (cm, enc))
+    }
+
+    pub fn change_note_2(&self) -> Option<(&F, &EncryptedNote)> {
+        self.change_note_2.as_ref().map(|(cm, enc)| (cm, enc))
     }
 
     pub fn producer_note(&self) -> (&F, &EncryptedNote) {
@@ -1799,6 +2196,11 @@ impl PreparedUnshield {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WithdrawalRecord {
+    /// L2 asset_id identifying which ticketer should burn this
+    /// withdrawal at the L1 outbox boundary. ASSET_TEZ for tez,
+    /// derive_asset_id(ticketer) for FA2 entries.
+    #[serde(with = "hex_f", default)]
+    pub asset_id: F,
     pub recipient: String,
     pub amount: u64,
 }
@@ -1873,11 +2275,16 @@ pub struct Ledger {
     pub root_history: VecDeque<F>,
     pub memos: Vec<(F, EncryptedNote)>,
     pub withdrawals: Vec<WithdrawalRecord>,
-    /// Per-pool deposit balance keyed by `deposit_pubkey_hash`. Each L1
-    /// bridge deposit credits the pool (creating it if absent); each shield
-    /// debits it. Multiple L1 deposits to the same `pubkey_hash` aggregate.
+    /// Per-pool deposit balance, indexed first by `asset_id` then by
+    /// `deposit_pubkey_hash`. Each L1 bridge deposit credits the inner
+    /// pool (creating it if absent); each shield debits it. Multiple
+    /// L1 deposits to the same `(asset, pubkey)` aggregate. Pools are
+    /// scoped by asset so an FA2 deposit cannot be drawn down by a tez
+    /// shield (and vice versa). Nested layout keeps JSON serialization
+    /// simple (string-keyed inner maps via serde_json's default
+    /// behaviour for `HashMap<F, _>` where F is a 32-byte array).
     #[serde(default)]
-    pub deposit_balances: HashMap<F, u64>,
+    pub deposit_balances: HashMap<F, HashMap<F, u64>>,
     /// Replay-protection set for shield commitments. Each successful
     /// shield records its `client_cm` here; a subsequent shield carrying
     /// the same `client_cm` is rejected. Without this, anyone could top
@@ -1908,22 +2315,38 @@ pub trait LedgerState {
     fn ensure_note_capacity(&self, additional: usize) -> Result<(), String>;
     fn append_note(&mut self, cm: F, enc: EncryptedNote) -> Result<usize, String>;
     fn snapshot_root(&mut self) -> Result<(), String>;
-    fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String>;
+    fn enqueue_withdrawal(
+        &mut self,
+        asset_id: &F,
+        recipient: &str,
+        amount: u64,
+    ) -> Result<usize, String>;
     fn note_private_tx_applied(&mut self);
-    /// Look up a deposit pool's current balance. `None` if the pool key has
-    /// never been credited (or has been fully drained — implementations may
-    /// either return Some(0) or None here; both have the same semantics for
-    /// downstream code).
-    fn deposit_balance(&self, pubkey_hash: &F) -> Result<Option<u64>, String>;
-    /// Credit `amount` to the pool keyed by `pubkey_hash`. Creates the pool
-    /// if absent. Used by `apply_deposit` on every L1 bridge deposit.
-    fn credit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String>;
-    /// Debit `amount` from the pool keyed by `pubkey_hash`. The caller
+    /// Look up a deposit pool's current balance for `(asset_id, pubkey_hash)`.
+    /// `None` if the pool has never been credited (or has been fully
+    /// drained — implementations may return Some(0) or None; both have
+    /// the same downstream semantics).
+    fn deposit_balance(&self, asset_id: &F, pubkey_hash: &F) -> Result<Option<u64>, String>;
+    /// Credit `amount` to the pool keyed by `(asset_id, pubkey_hash)`.
+    /// Creates the pool if absent. Used by `apply_deposit` on every L1
+    /// bridge deposit.
+    fn credit_deposit(
+        &mut self,
+        asset_id: &F,
+        pubkey_hash: &F,
+        amount: u64,
+    ) -> Result<(), String>;
+    /// Debit `amount` from `(asset_id, pubkey_hash)`. The caller
     /// (`commit_prepared_shield`) has already confirmed the pool has at
     /// least `amount`; implementations may panic / error if invariants are
     /// violated. When the balance reaches zero the entry should be removed
     /// to bound storage.
-    fn debit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String>;
+    fn debit_deposit(
+        &mut self,
+        asset_id: &F,
+        pubkey_hash: &F,
+        amount: u64,
+    ) -> Result<(), String>;
     /// True iff a shield with this `client_cm` has already been applied.
     /// Used by `prepare_shield` to reject replays of an old shield proof
     /// after a pool top-up; without this, the kernel would mint a
@@ -1988,9 +2411,25 @@ impl Ledger {
     }
 
     /// Apply a bridge deposit (recipient must be a `deposit:<hex>` string).
-    /// Credits the deposit pool keyed by the parsed pubkey_hash.
+    /// Credits the deposit pool keyed by `(asset_id, pubkey_hash)`. The
+    /// convenience entrypoint defaults to `ASSET_TEZ` for callers that
+    /// have not been updated; multi-asset callers should use
+    /// `Self::deposit_asset` instead.
     pub fn deposit(&mut self, recipient: &str, amount: u64) -> Result<(), String> {
-        apply_deposit(self, recipient, amount)
+        apply_deposit(self, &ASSET_TEZ, recipient, amount)
+    }
+
+    /// Like `deposit` but lets the caller specify which asset's pool to
+    /// credit. Both `deposit` and `deposit_asset` write to the same
+    /// underlying storage; choose `deposit` only when you statically
+    /// know the asset is tez.
+    pub fn deposit_asset(
+        &mut self,
+        asset_id: &F,
+        recipient: &str,
+        amount: u64,
+    ) -> Result<(), String> {
+        apply_deposit(self, asset_id, recipient, amount)
     }
 
     pub fn shield(&mut self, req: &ShieldReq) -> Result<ShieldResp, String> {
@@ -2056,9 +2495,15 @@ impl LedgerState for Ledger {
         Ok(())
     }
 
-    fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String> {
+    fn enqueue_withdrawal(
+        &mut self,
+        asset_id: &F,
+        recipient: &str,
+        amount: u64,
+    ) -> Result<usize, String> {
         let index = self.withdrawals.len();
         self.withdrawals.push(WithdrawalRecord {
+            asset_id: *asset_id,
             recipient: recipient.to_string(),
             amount,
         });
@@ -2067,31 +2512,51 @@ impl LedgerState for Ledger {
 
     fn note_private_tx_applied(&mut self) {}
 
-    fn deposit_balance(&self, pubkey_hash: &F) -> Result<Option<u64>, String> {
-        Ok(self.deposit_balances.get(pubkey_hash).copied())
+    fn deposit_balance(&self, asset_id: &F, pubkey_hash: &F) -> Result<Option<u64>, String> {
+        Ok(self
+            .deposit_balances
+            .get(asset_id)
+            .and_then(|inner| inner.get(pubkey_hash).copied()))
     }
 
-    fn credit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
-        let entry = self.deposit_balances.entry(*pubkey_hash).or_insert(0);
+    fn credit_deposit(
+        &mut self,
+        asset_id: &F,
+        pubkey_hash: &F,
+        amount: u64,
+    ) -> Result<(), String> {
+        let inner = self.deposit_balances.entry(*asset_id).or_default();
+        let entry = inner.entry(*pubkey_hash).or_insert(0);
         *entry = entry
             .checked_add(amount)
             .ok_or_else(|| "deposit balance overflow".to_string())?;
         Ok(())
     }
 
-    fn debit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
-        let balance = self
-            .deposit_balances
-            .get_mut(pubkey_hash)
-            .ok_or_else(|| {
-                format!(
-                    "deposit pool {} does not exist",
-                    hex::encode(pubkey_hash)
-                )
-            })?;
+    fn debit_deposit(
+        &mut self,
+        asset_id: &F,
+        pubkey_hash: &F,
+        amount: u64,
+    ) -> Result<(), String> {
+        let inner = self.deposit_balances.get_mut(asset_id).ok_or_else(|| {
+            format!(
+                "deposit pool ({}, {}) does not exist",
+                hex::encode(asset_id),
+                hex::encode(pubkey_hash),
+            )
+        })?;
+        let balance = inner.get_mut(pubkey_hash).ok_or_else(|| {
+            format!(
+                "deposit pool ({}, {}) does not exist",
+                hex::encode(asset_id),
+                hex::encode(pubkey_hash),
+            )
+        })?;
         if *balance < amount {
             return Err(format!(
-                "deposit pool {} balance {} too small to debit {}",
+                "deposit pool ({}, {}) balance {} too small to debit {}",
+                hex::encode(asset_id),
                 hex::encode(pubkey_hash),
                 *balance,
                 amount
@@ -2099,7 +2564,10 @@ impl LedgerState for Ledger {
         }
         *balance -= amount;
         if *balance == 0 {
-            self.deposit_balances.remove(pubkey_hash);
+            inner.remove(pubkey_hash);
+            if inner.is_empty() {
+                self.deposit_balances.remove(asset_id);
+            }
         }
         Ok(())
     }
@@ -2119,11 +2587,12 @@ impl LedgerState for Ledger {
 /// pool's balance. Multiple deposits to the same `pubkey_hash` aggregate.
 pub fn apply_deposit<S: LedgerState>(
     state: &mut S,
+    asset_id: &F,
     recipient: &str,
     amount: u64,
 ) -> Result<(), String> {
     let pubkey_hash = parse_deposit_recipient_pubkey_hash(recipient)?;
-    state.credit_deposit(&pubkey_hash, amount)
+    state.credit_deposit(asset_id, &pubkey_hash, amount)
 }
 
 /// All inputs needed to commit a shield. Built by `prepare_shield` from
@@ -2132,8 +2601,30 @@ pub fn apply_deposit<S: LedgerState>(
 /// without re-checking anything that was already validated.
 #[derive(Clone, Debug)]
 pub struct PreparedShield {
+    /// L2 asset_id whose pool will be debited for the recipient
+    /// note + kernel fee. `prepare_shield` validates that the pool
+    /// keyed by `(asset_id, pubkey_hash)` has at least `asset_debit`
+    /// available.
+    pub asset_id: F,
     pub pubkey_hash: F,
-    pub debit: u64,
+    /// Amount to debit from the `(asset_id, pubkey_hash)` pool —
+    /// always equal to `v + fee` (the recipient note + kernel fee).
+    pub asset_debit: u64,
+    /// Amount to debit from the `(ASSET_TEZ, pubkey_hash)` pool —
+    /// always equal to `producer_fee`. The producer-fee output note
+    /// is permanently tez (DAL slot publisher liquidity argument),
+    /// so any non-tez shield MUST also debit the user's tez pool
+    /// for `producer_fee`. Without this separate debit, an FA2
+    /// shield would mint `producer_fee` tez in the commitment tree
+    /// without any L1 tez backing — the producer (or anyone holding
+    /// the resulting tez note) could then drain real tez from the
+    /// tez ticketer.
+    ///
+    /// For tez-only shields (`asset_id == ASSET_TEZ`), the two
+    /// debits are summed into a single pool operation by
+    /// `commit_prepared_shield`. The split is logical, not
+    /// per-call.
+    pub producer_fee_tez_debit: u64,
     pub client_cm: F,
     pub client_enc: EncryptedNote,
     pub producer_cm: F,
@@ -2141,11 +2632,24 @@ pub struct PreparedShield {
 }
 
 impl PreparedShield {
+    pub fn asset_id(&self) -> &F {
+        &self.asset_id
+    }
     pub fn pubkey_hash(&self) -> &F {
         &self.pubkey_hash
     }
+    /// Total debit aggregated for the asset pool. For tez shields
+    /// this is `v + fee + producer_fee`; for FA2 shields it's
+    /// `v + fee` (the `producer_fee` portion comes out of the tez
+    /// pool via `producer_fee_tez_debit`).
     pub fn debit(&self) -> u64 {
-        self.debit
+        self.asset_debit
+    }
+    pub fn asset_debit(&self) -> u64 {
+        self.asset_debit
+    }
+    pub fn producer_fee_tez_debit(&self) -> u64 {
+        self.producer_fee_tez_debit
     }
     pub fn client_note(&self) -> (&F, &EncryptedNote) {
         (&self.client_cm, &self.client_enc)
@@ -2167,6 +2671,17 @@ pub fn prepare_shield<S: LedgerState>(
     }
     if req.producer_fee == 0 {
         return Err("producer fee must be greater than zero".into());
+    }
+    // Reject zero-value shields explicitly. A zero-value shield is
+    // not a vulnerability (the attacker still pays `fee +
+    // producer_fee` for the privilege), but it's noise: the resulting
+    // recipient note carries no real value, can't be spent
+    // meaningfully, and bloats the commitment tree + frontier. Most
+    // wallets enforce v > 0 client-side anyway; making the kernel
+    // refuse closes the gap so a buggy/adversarial client can't
+    // grief the durable store with paid zero-value notes.
+    if req.v == 0 {
+        return Err("shield requires non-zero v (zero-value shields are rejected)".into());
     }
     if req.client_cm == ZERO {
         return Err("shield requires non-zero client_cm".into());
@@ -2191,25 +2706,76 @@ pub fn prepare_shield<S: LedgerState>(
     let mh_recipient = memo_ct_hash(&req.client_enc);
     let mh_producer = memo_ct_hash(&req.producer_enc);
 
-    let debit = req
+    // Split the shield debit by asset:
+    //   - (req.asset_id, pubkey) pool pays for the recipient note +
+    //     kernel fee (v + fee).
+    //   - (ASSET_TEZ, pubkey) pool pays the producer fee, which is
+    //     PERMANENTLY a tez output regardless of the shielded asset
+    //     (DAL slot publisher liquidity argument). Without this
+    //     separate tez debit, an FA2 shield would mint
+    //     `producer_fee` tez into the commitment tree out of nothing
+    //     — backed only by other users' tez deposits when the
+    //     producer (or anyone holding the resulting note) later
+    //     unshields it. That would let an attacker who shields any
+    //     FA2 asset drain real tez from the tez ticketer.
+    //
+    // For tez shields (req.asset_id == ASSET_TEZ) the two debits
+    // touch the same pool; `commit_prepared_shield` collapses them
+    // into a single pool operation.
+    let asset_debit = req
         .v
         .checked_add(req.fee)
-        .and_then(|value| value.checked_add(req.producer_fee))
-        .ok_or_else(|| "shield debit overflow".to_string())?;
+        .ok_or_else(|| "shield debit overflow (v + fee)".to_string())?;
+    let producer_fee_tez_debit = req.producer_fee;
 
     let pool_balance = state
-        .deposit_balance(&req.pubkey_hash)?
+        .deposit_balance(&req.asset_id, &req.pubkey_hash)?
         .ok_or_else(|| {
             format!(
-                "no deposit pool for pubkey_hash {}; submit an L1 bridge deposit first",
-                hex::encode(&req.pubkey_hash)
+                "no deposit pool for (asset_id {}, pubkey_hash {}); submit an L1 bridge deposit first",
+                hex::encode(&req.asset_id),
+                hex::encode(&req.pubkey_hash),
             )
         })?;
-    if pool_balance < debit {
+    let asset_required = if req.asset_id == ASSET_TEZ {
+        // Same pool covers both debits.
+        asset_debit
+            .checked_add(producer_fee_tez_debit)
+            .ok_or_else(|| "shield debit overflow (v + fee + producer_fee)".to_string())?
+    } else {
+        asset_debit
+    };
+    if pool_balance < asset_required {
         return Err(format!(
-            "deposit pool balance ({}) too small for v + fee + producer_fee ({})",
-            pool_balance, debit
+            "deposit pool balance ({}) too small for v + fee{} ({})",
+            pool_balance,
+            if req.asset_id == ASSET_TEZ {
+                " + producer_fee"
+            } else {
+                ""
+            },
+            asset_required,
         ));
+    }
+
+    // For FA2 shields the user must also have a tez pool at the
+    // same pubkey_hash to cover producer_fee.
+    if req.asset_id != ASSET_TEZ {
+        let tez_pool_balance = state
+            .deposit_balance(&ASSET_TEZ, &req.pubkey_hash)?
+            .ok_or_else(|| {
+                format!(
+                    "no tez deposit pool at pubkey_hash {} — non-tez shields require a separate tez pool to fund producer_fee ({})",
+                    hex::encode(&req.pubkey_hash),
+                    producer_fee_tez_debit,
+                )
+            })?;
+        if tez_pool_balance < producer_fee_tez_debit {
+            return Err(format!(
+                "tez deposit pool balance ({}) too small for producer_fee ({}) — required because producer fees are permanently tez",
+                tez_pool_balance, producer_fee_tez_debit,
+            ));
+        }
     }
 
     if let Proof::Stark {
@@ -2217,10 +2783,14 @@ pub fn prepare_shield<S: LedgerState>(
         output_preimage,
     } = &req.proof
     {
-        let public_outputs = transition_public_outputs(output_preimage, 9)?;
-        if public_outputs.len() != 9 {
+        // Phase E.3: shield outputs now include `asset_new` at index
+        // 9 (the recipient note's asset) so the kernel can validate
+        // it against the registered bridge ticketers. Length is now
+        // 10 fields.
+        let public_outputs = transition_public_outputs(output_preimage, 10)?;
+        if public_outputs.len() != 10 {
             return Err(format!(
-                "shield public output length mismatch: {} != 9",
+                "shield public output length mismatch: {} != 10",
                 public_outputs.len()
             ));
         }
@@ -2251,13 +2821,24 @@ pub fn prepare_shield<S: LedgerState>(
         if public_outputs[8] != mh_producer {
             return Err("proof producer memo_ct_hash mismatch".into());
         }
+        // The proof's asset_new must match the shield request's
+        // asset_id. Without this bind, a malicious wallet could
+        // commit cm_new to one asset while claiming to draw a
+        // different asset's pool — minting an FA2 note "for free"
+        // by draining tez. The kernel's registry membership check
+        // is downstream of this consistency check.
+        if public_outputs[9] != req.asset_id {
+            return Err("proof asset_new does not match req.asset_id".into());
+        }
     }
 
     state.ensure_note_capacity(2)?;
 
     Ok(PreparedShield {
+        asset_id: req.asset_id,
         pubkey_hash: req.pubkey_hash,
-        debit,
+        asset_debit,
+        producer_fee_tez_debit,
         client_cm: req.client_cm,
         client_enc: req.client_enc.clone(),
         producer_cm: req.producer_cm,
@@ -2280,7 +2861,24 @@ pub fn commit_prepared_shield<S: LedgerState>(
     state: &mut S,
     prepared: PreparedShield,
 ) -> Result<ShieldResp, String> {
-    state.debit_deposit(&prepared.pubkey_hash, prepared.debit)?;
+    // For tez shields the asset and tez debits collapse onto the
+    // same pool, so we do a single combined call to keep the
+    // existing storage-write pattern (one entry touched). For FA2
+    // shields we MUST debit both pools — the (asset_id, pubkey)
+    // pool covers the recipient note + kernel fee, and the
+    // (ASSET_TEZ, pubkey) pool covers the producer-fee tez note.
+    // Without the second debit, FA2 shields would mint
+    // `producer_fee` tez in the commitment tree out of nothing.
+    if prepared.asset_id == ASSET_TEZ {
+        let combined = prepared
+            .asset_debit
+            .checked_add(prepared.producer_fee_tez_debit)
+            .ok_or_else(|| "shield combined debit overflow".to_string())?;
+        state.debit_deposit(&ASSET_TEZ, &prepared.pubkey_hash, combined)?;
+    } else {
+        state.debit_deposit(&prepared.asset_id, &prepared.pubkey_hash, prepared.asset_debit)?;
+        state.debit_deposit(&ASSET_TEZ, &prepared.pubkey_hash, prepared.producer_fee_tez_debit)?;
+    }
     state.mark_applied_shield(prepared.client_cm)?;
     let index = state.append_note(prepared.client_cm, prepared.client_enc)?;
     let producer_index = state.append_note(prepared.producer_cm, prepared.producer_enc)?;
@@ -2342,7 +2940,10 @@ pub fn apply_transfer<S: LedgerState>(
             proof_bytes: _,
             output_preimage,
         } => {
-            let expected_output_len = 2 + n + 7;
+            // Phase C: 4 cm's + 4 memos = +2 vs prior layout.
+            // Layout: auth_domain, root, nf_0..nf_{n-1}, fee,
+            //         cm_1, cm_2, cm_3, cm_4, memo_1, memo_2, memo_3, memo_4.
+            let expected_output_len = 2 + n + 9;
             let public_outputs = transition_public_outputs(output_preimage, expected_output_len)?;
             let tail = public_outputs;
 
@@ -2371,25 +2972,33 @@ pub fn apply_transfer<S: LedgerState>(
             if tail[cm1_pos + 2] != req.cm_3 {
                 return Err("proof cm_3 mismatch".into());
             }
+            if tail[cm1_pos + 3] != req.cm_4 {
+                return Err("proof cm_4 mismatch".into());
+            }
             let mh_1 = memo_ct_hash(&req.enc_1);
             let mh_2 = memo_ct_hash(&req.enc_2);
             let mh_3 = memo_ct_hash(&req.enc_3);
-            if tail[cm1_pos + 3] != mh_1 {
+            let mh_4 = memo_ct_hash(&req.enc_4);
+            if tail[cm1_pos + 4] != mh_1 {
                 return Err("proof memo_ct_hash_1 mismatch — encrypted note tampered".into());
             }
-            if tail[cm1_pos + 4] != mh_2 {
+            if tail[cm1_pos + 5] != mh_2 {
                 return Err("proof memo_ct_hash_2 mismatch — encrypted note tampered".into());
             }
-            if tail[cm1_pos + 5] != mh_3 {
+            if tail[cm1_pos + 6] != mh_3 {
                 return Err("proof memo_ct_hash_3 mismatch — encrypted note tampered".into());
+            }
+            if tail[cm1_pos + 7] != mh_4 {
+                return Err("proof memo_ct_hash_4 mismatch — encrypted note tampered".into());
             }
         }
     }
 
-    state.ensure_note_capacity(3)?;
+    state.ensure_note_capacity(4)?;
     let index_1 = state.append_note(req.cm_1, req.enc_1.clone())?;
     let index_2 = state.append_note(req.cm_2, req.enc_2.clone())?;
     let index_3 = state.append_note(req.cm_3, req.enc_3.clone())?;
+    let index_4 = state.append_note(req.cm_4, req.enc_4.clone())?;
     for nf in &req.nullifiers {
         state.insert_nullifier(*nf)?;
     }
@@ -2399,6 +3008,7 @@ pub fn apply_transfer<S: LedgerState>(
         index_1,
         index_2,
         index_3,
+        index_4,
     })
 }
 
@@ -2447,13 +3057,19 @@ pub fn prepare_unshield<S: LedgerState>(
         }
     }
 
+    let mut asset_id_from_proof = ASSET_TEZ;
     match &req.proof {
         Proof::TrustMeBro => {}
         Proof::Stark {
             proof_bytes: _,
             output_preimage,
         } => {
-            let expected_output_len = 2 + n + 7;
+            // Phase B + C unshield layout:
+            //   auth_domain, root, nf_0..nf_{n-1}, v_pub, asset_pub, fee,
+            //   recipient, cm_change_1, memo_change_1, cm_change_2,
+            //   memo_change_2, cm_fee, memo_fee.
+            // Length = 2 + n + 10.
+            let expected_output_len = 2 + n + 10;
             let public_outputs = transition_public_outputs(output_preimage, expected_output_len)?;
             let tail = public_outputs;
 
@@ -2471,43 +3087,74 @@ pub fn prepare_unshield<S: LedgerState>(
             if tail[2 + n] != u64_to_felt(req.v_pub) {
                 return Err("proof v_pub mismatch".into());
             }
-            if tail[3 + n] != u64_to_felt(req.fee) {
+            // asset_pub is now read directly from the proof rather than
+            // pinned to ASSET_TEZ here. The kernel's registry check
+            // (E.3) decides whether this asset is bridgeable; in the
+            // pure-tez in-memory ledger any registered asset value
+            // is accepted (the registry membership check is at the
+            // kernel boundary, not in core).
+            asset_id_from_proof = tail[3 + n];
+            if tail[4 + n] != u64_to_felt(req.fee) {
                 return Err("proof fee mismatch".into());
             }
-            if tail[4 + n] != hash(recipient.as_bytes()) {
+            if tail[5 + n] != hash(recipient.as_bytes()) {
                 return Err("proof recipient mismatch".into());
             }
-            if tail[5 + n] != req.cm_change {
+            if tail[6 + n] != req.cm_change {
                 return Err("proof cm_change mismatch".into());
             }
             if let Some(ref enc) = req.enc_change {
                 let mh = memo_ct_hash(enc);
-                if tail[6 + n] != mh {
+                if tail[7 + n] != mh {
                     return Err("proof memo_ct_hash_change mismatch".into());
                 }
-            } else if tail[6 + n] != ZERO {
+            } else if tail[7 + n] != ZERO {
                 return Err("proof memo_ct_hash_change should be 0 when no change".into());
             }
-            if tail[7 + n] != req.cm_fee {
+            if tail[8 + n] != req.cm_change_2 {
+                return Err("proof cm_change_2 mismatch".into());
+            }
+            if let Some(ref enc) = req.enc_change_2 {
+                let mh = memo_ct_hash(enc);
+                if tail[9 + n] != mh {
+                    return Err("proof memo_ct_hash_change_2 mismatch".into());
+                }
+            } else if tail[9 + n] != ZERO {
+                return Err("proof memo_ct_hash_change_2 should be 0 when no change_2".into());
+            }
+            if tail[10 + n] != req.cm_fee {
                 return Err("proof cm_fee mismatch".into());
             }
             let fee_mh = memo_ct_hash(&req.enc_fee);
-            if tail[8 + n] != fee_mh {
+            if tail[11 + n] != fee_mh {
                 return Err("proof memo_ct_hash_fee mismatch".into());
             }
         }
     }
 
-    let additional_notes = usize::from(req.cm_change != ZERO) + 1;
+    let additional_notes =
+        usize::from(req.cm_change != ZERO) + usize::from(req.cm_change_2 != ZERO) + 1;
     state.ensure_note_capacity(additional_notes)?;
 
     Ok(PreparedUnshield {
+        asset_id: asset_id_from_proof,
         change_note: if req.cm_change != ZERO {
             Some((
                 req.cm_change,
                 req.enc_change
                     .as_ref()
                     .ok_or("change cm without encrypted note")?
+                    .clone(),
+            ))
+        } else {
+            None
+        },
+        change_note_2: if req.cm_change_2 != ZERO {
+            Some((
+                req.cm_change_2,
+                req.enc_change_2
+                    .as_ref()
+                    .ok_or("change_2 cm without encrypted note")?
                     .clone(),
             ))
         } else {
@@ -2541,9 +3188,14 @@ pub fn commit_prepared_unshield<S: LedgerState>(
     state: &mut S,
     prepared: PreparedUnshield,
 ) -> Result<UnshieldResp, String> {
-    state.enqueue_withdrawal(&prepared.recipient, prepared.amount)?;
+    state.enqueue_withdrawal(&prepared.asset_id, &prepared.recipient, prepared.amount)?;
 
     let change_index = if let Some((cm, enc)) = prepared.change_note {
+        Some(state.append_note(cm, enc)?)
+    } else {
+        None
+    };
+    let change_index_2 = if let Some((cm, enc)) = prepared.change_note_2 {
         Some(state.append_note(cm, enc)?)
     } else {
         None
@@ -2557,6 +3209,7 @@ pub fn commit_prepared_unshield<S: LedgerState>(
     state.note_private_tx_applied();
     Ok(UnshieldResp {
         change_index,
+        change_index_2,
         producer_index,
     })
 }
@@ -2736,7 +3389,7 @@ mod tests {
             encrypt_note_deterministic(v, &rseed, memo, &ek_v, &ek_d, &[0x11; 32], &[0x22; 32]);
         let rcm = derive_rcm(&rseed);
         let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &addr.nk_tag);
-        let cm = commit(&addr.d_j, v, &rcm, &otag);
+        let cm = commit(&addr.d_j, v, &ASSET_TEZ, &rcm, &otag);
         (enc, cm)
     }
 
@@ -2776,6 +3429,42 @@ mod tests {
             None,
             "outgoing recovery is bound to the note commitment"
         );
+    }
+
+    /// Phase E.5 regression: `OutgoingRecoveryPlaintext::commitment_for_asset`
+    /// must recompute the commitment under the supplied asset_id so
+    /// the wallet's outgoing-watcher recovery path can iterate the
+    /// candidate registry and label each recovered note with the
+    /// correct asset. Before this fix the function hardcoded
+    /// ASSET_TEZ, making outgoing watchers blind to every FA2 send.
+    #[test]
+    fn test_outgoing_recovery_commitment_for_asset_distinguishes_tez_and_fa2() {
+        let (_account, addr, _, _, _) = sample_address_bundle(0x02, 0);
+        let rseed = u(778);
+        let plaintext = OutgoingRecoveryPlaintext {
+            role: OutgoingNoteRole::TransferRecipient,
+            value: 123,
+            rseed,
+            d_j: addr.d_j,
+            auth_root: addr.auth_root,
+            auth_pub_seed: addr.auth_pub_seed,
+            nk_tag: addr.nk_tag,
+        };
+
+        let fa2_asset = derive_asset_id("KT1FA2_recovery_test");
+        assert_ne!(fa2_asset, ASSET_TEZ);
+
+        let cm_tez = plaintext.commitment_for_asset(&ASSET_TEZ);
+        let cm_fa2 = plaintext.commitment_for_asset(&fa2_asset);
+
+        assert_ne!(
+            cm_tez, cm_fa2,
+            "commitment must depend on asset_id; tez and FA2 commitments cannot collide",
+        );
+        // The convenience `commitment()` shorthand returns the
+        // tez-side commitment (kept for backward compatibility with
+        // pre-multiasset call sites).
+        assert_eq!(plaintext.commitment(), cm_tez);
     }
 
     struct LimitedAppendLedgerState {
@@ -2839,22 +3528,37 @@ mod tests {
             self.inner.snapshot_root()
         }
 
-        fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String> {
-            self.inner.enqueue_withdrawal(recipient, amount)
+        fn enqueue_withdrawal(
+            &mut self,
+            asset_id: &F,
+            recipient: &str,
+            amount: u64,
+        ) -> Result<usize, String> {
+            self.inner.enqueue_withdrawal(asset_id, recipient, amount)
         }
 
         fn note_private_tx_applied(&mut self) {}
 
-        fn deposit_balance(&self, pubkey_hash: &F) -> Result<Option<u64>, String> {
-            self.inner.deposit_balance(pubkey_hash)
+        fn deposit_balance(&self, asset_id: &F, pubkey_hash: &F) -> Result<Option<u64>, String> {
+            self.inner.deposit_balance(asset_id, pubkey_hash)
         }
 
-        fn credit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
-            self.inner.credit_deposit(pubkey_hash, amount)
+        fn credit_deposit(
+            &mut self,
+            asset_id: &F,
+            pubkey_hash: &F,
+            amount: u64,
+        ) -> Result<(), String> {
+            self.inner.credit_deposit(asset_id, pubkey_hash, amount)
         }
 
-        fn debit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
-            self.inner.debit_deposit(pubkey_hash, amount)
+        fn debit_deposit(
+            &mut self,
+            asset_id: &F,
+            pubkey_hash: &F,
+            amount: u64,
+        ) -> Result<(), String> {
+            self.inner.debit_deposit(asset_id, pubkey_hash, amount)
         }
 
         fn has_applied_shield(&self, client_cm: &F) -> Result<bool, String> {
@@ -2909,22 +3613,37 @@ mod tests {
             self.inner.snapshot_root()
         }
 
-        fn enqueue_withdrawal(&mut self, _recipient: &str, _amount: u64) -> Result<usize, String> {
+        fn enqueue_withdrawal(
+            &mut self,
+            _asset_id: &F,
+            _recipient: &str,
+            _amount: u64,
+        ) -> Result<usize, String> {
             Err("withdrawal queue unavailable".into())
         }
 
         fn note_private_tx_applied(&mut self) {}
 
-        fn deposit_balance(&self, pubkey_hash: &F) -> Result<Option<u64>, String> {
-            self.inner.deposit_balance(pubkey_hash)
+        fn deposit_balance(&self, asset_id: &F, pubkey_hash: &F) -> Result<Option<u64>, String> {
+            self.inner.deposit_balance(asset_id, pubkey_hash)
         }
 
-        fn credit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
-            self.inner.credit_deposit(pubkey_hash, amount)
+        fn credit_deposit(
+            &mut self,
+            asset_id: &F,
+            pubkey_hash: &F,
+            amount: u64,
+        ) -> Result<(), String> {
+            self.inner.credit_deposit(asset_id, pubkey_hash, amount)
         }
 
-        fn debit_deposit(&mut self, pubkey_hash: &F, amount: u64) -> Result<(), String> {
-            self.inner.debit_deposit(pubkey_hash, amount)
+        fn debit_deposit(
+            &mut self,
+            asset_id: &F,
+            pubkey_hash: &F,
+            amount: u64,
+        ) -> Result<(), String> {
+            self.inner.debit_deposit(asset_id, pubkey_hash, amount)
         }
 
         fn has_applied_shield(&self, client_cm: &F) -> Result<bool, String> {
@@ -2982,6 +3701,7 @@ mod tests {
             .unwrap();
         let resp = ledger
             .shield(&ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash,
                 fee: MIN_TX_FEE,
                 v: amount,
@@ -3071,8 +3791,8 @@ mod tests {
             let rseed_1 = truncate_felt(rseed_1);
             let rseed_2 = truncate_felt(rseed_2);
             prop_assert_ne!(
-                commit(&d_j, v, &derive_rcm(&rseed_1), &otag),
-                commit(&d_j, v, &derive_rcm(&rseed_2), &otag)
+                commit(&d_j, v, &ASSET_TEZ, &derive_rcm(&rseed_1), &otag),
+                commit(&d_j, v, &ASSET_TEZ, &derive_rcm(&rseed_2), &otag)
             );
         }
 
@@ -3276,7 +3996,7 @@ mod tests {
 
         let rcm = derive_rcm(&decrypted_rseed);
         let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &addr.nk_tag);
-        let recomputed = commit(&addr.d_j, value, &rcm, &otag);
+        let recomputed = commit(&addr.d_j, value, &ASSET_TEZ, &rcm, &otag);
         assert_eq!(recomputed, cm);
     }
 
@@ -3289,7 +4009,7 @@ mod tests {
             "fixture should encode the canonical low-8-byte u64::MAX layout"
         );
         assert_eq!(
-            commit(&fixture.d_j, u64::MAX, &fixture.rcm, &fixture.owner_tag),
+            commit(&fixture.d_j, u64::MAX, &ASSET_TEZ, &fixture.rcm, &fixture.owner_tag),
             fixture.cm
         );
     }
@@ -3503,6 +4223,8 @@ mod tests {
             &cm_producer,
             &mh_recipient,
             &mh_producer,
+            &ASSET_TEZ,
+            &ASSET_TEZ
         );
 
         let perturbations: Vec<F> = vec![
@@ -3516,6 +4238,8 @@ mod tests {
                 &cm_producer,
                 &mh_recipient,
                 &mh_producer,
+                &ASSET_TEZ,
+                &ASSET_TEZ
             ),
             shield_sighash(
                 &auth_domain,
@@ -3527,6 +4251,8 @@ mod tests {
                 &cm_producer,
                 &mh_recipient,
                 &mh_producer,
+                &ASSET_TEZ,
+                &ASSET_TEZ
             ),
             shield_sighash(
                 &auth_domain,
@@ -3538,6 +4264,8 @@ mod tests {
                 &cm_producer,
                 &mh_recipient,
                 &mh_producer,
+                &ASSET_TEZ,
+                &ASSET_TEZ
             ),
             shield_sighash(
                 &auth_domain,
@@ -3549,6 +4277,8 @@ mod tests {
                 &cm_producer,
                 &mh_recipient,
                 &mh_producer,
+                &ASSET_TEZ,
+                &ASSET_TEZ
             ),
             shield_sighash(
                 &auth_domain,
@@ -3560,6 +4290,8 @@ mod tests {
                 &cm_producer,
                 &mh_recipient,
                 &mh_producer,
+                &ASSET_TEZ,
+                &ASSET_TEZ
             ),
             shield_sighash(
                 &auth_domain,
@@ -3571,6 +4303,8 @@ mod tests {
                 &cm_producer,
                 &mh_recipient,
                 &mh_producer,
+                &ASSET_TEZ,
+                &ASSET_TEZ
             ),
             shield_sighash(
                 &auth_domain,
@@ -3582,6 +4316,8 @@ mod tests {
                 &u(99),
                 &mh_recipient,
                 &mh_producer,
+                &ASSET_TEZ,
+                &ASSET_TEZ
             ),
             shield_sighash(
                 &auth_domain,
@@ -3593,6 +4329,8 @@ mod tests {
                 &cm_producer,
                 &u(99),
                 &mh_producer,
+                &ASSET_TEZ,
+                &ASSET_TEZ
             ),
             shield_sighash(
                 &auth_domain,
@@ -3604,6 +4342,8 @@ mod tests {
                 &cm_producer,
                 &mh_recipient,
                 &u(99),
+                &ASSET_TEZ,
+                &ASSET_TEZ
             ),
         ];
         for (idx, perturbed) in perturbations.iter().enumerate() {
@@ -3627,8 +4367,10 @@ mod tests {
                 &cm_producer,
                 &mh_recipient,
                 &mh_recipient,
+                &mh_recipient,
                 &mh_producer,
                 &mh_producer,
+                &mh_producer
             )
         );
     }
@@ -3716,11 +4458,14 @@ mod tests {
         // would push a pool past u64::MAX must error rather than wrap.
         let mut ledger = Ledger::new();
         let pubkey_hash = u(0xC0);
-        ledger.credit_deposit(&pubkey_hash, u64::MAX).unwrap();
-        let err = ledger.credit_deposit(&pubkey_hash, 1).unwrap_err();
+        ledger.credit_deposit(&ASSET_TEZ, &pubkey_hash, u64::MAX).unwrap();
+        let err = ledger.credit_deposit(&ASSET_TEZ, &pubkey_hash, 1).unwrap_err();
         assert!(err.contains("overflow"), "{}", err);
         assert_eq!(
-            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            ledger
+                .deposit_balances
+                .get(&ASSET_TEZ)
+                .and_then(|inner| inner.get(&pubkey_hash).copied()),
             Some(u64::MAX)
         );
     }
@@ -3731,17 +4476,23 @@ mod tests {
         // pool entry (only debits to exactly the remaining balance do).
         let mut ledger = Ledger::new();
         let pubkey_hash = u(0xD0);
-        ledger.credit_deposit(&pubkey_hash, 100).unwrap();
-        ledger.debit_deposit(&pubkey_hash, 0).unwrap();
+        ledger.credit_deposit(&ASSET_TEZ, &pubkey_hash, 100).unwrap();
+        ledger.debit_deposit(&ASSET_TEZ, &pubkey_hash, 0).unwrap();
         assert_eq!(
-            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            ledger
+                .deposit_balances
+                .get(&ASSET_TEZ)
+                .and_then(|inner| inner.get(&pubkey_hash).copied()),
             Some(100)
         );
         // Full drain removes the entry.
-        ledger.debit_deposit(&pubkey_hash, 100).unwrap();
-        assert!(!ledger.deposit_balances.contains_key(&pubkey_hash));
+        ledger.debit_deposit(&ASSET_TEZ, &pubkey_hash, 100).unwrap();
+        assert!(ledger
+            .deposit_balances
+            .get(&ASSET_TEZ)
+            .map_or(true, |inner| !inner.contains_key(&pubkey_hash)));
         // Debiting an absent pool errors.
-        let err = ledger.debit_deposit(&pubkey_hash, 1).unwrap_err();
+        let err = ledger.debit_deposit(&ASSET_TEZ, &pubkey_hash, 1).unwrap_err();
         assert!(err.contains("does not exist"), "{}", err);
     }
 
@@ -3769,9 +4520,11 @@ mod tests {
             &cm_1,
             &cm_2,
             &cm_3,
+            &cm_3,
             &mh_1,
             &mh_2,
             &mh_3,
+            &mh_3
         );
         assert_ne!(
             transfer,
@@ -3783,9 +4536,13 @@ mod tests {
                 &cm_1,
                 &cm_2,
                 &cm_3,
+                &cm_3,
                 &mh_1,
                 &mh_2,
                 &mh_3
+            ,
+                &mh_3
+            
             )
         );
         assert_ne!(
@@ -3798,9 +4555,13 @@ mod tests {
                 &cm_1,
                 &cm_2,
                 &cm_3,
+                &cm_3,
                 &mh_1,
                 &mh_2,
                 &mh_3
+            ,
+                &mh_3
+            
             )
         );
         assert_ne!(
@@ -3813,9 +4574,13 @@ mod tests {
                 &cm_1,
                 &cm_2,
                 &cm_3,
+                &cm_3,
                 &mh_1,
                 &mh_2,
                 &mh_3
+            ,
+                &mh_3
+            
             )
         );
         assert_ne!(
@@ -3828,9 +4593,13 @@ mod tests {
                 &cm_1,
                 &cm_2,
                 &cm_3,
+                &cm_3,
                 &mh_1,
                 &mh_2,
                 &mh_3
+            ,
+                &mh_3
+            
             )
         );
         assert_ne!(
@@ -3843,9 +4612,13 @@ mod tests {
                 &cm_1,
                 &cm_2,
                 &cm_3,
+                &cm_3,
                 &mh_1,
                 &mh_2,
                 &mh_3
+            ,
+                &mh_3
+            
             )
         );
         assert_ne!(
@@ -3858,9 +4631,13 @@ mod tests {
                 &u(50),
                 &cm_2,
                 &cm_3,
+                &cm_3,
                 &mh_1,
                 &mh_2,
                 &mh_3
+            ,
+                &mh_3
+            
             )
         );
         assert_ne!(
@@ -3873,9 +4650,13 @@ mod tests {
                 &cm_1,
                 &u(60),
                 &cm_3,
+                &cm_3,
                 &mh_1,
                 &mh_2,
                 &mh_3
+            ,
+                &mh_3
+            
             )
         );
         assert_ne!(
@@ -3888,9 +4669,13 @@ mod tests {
                 &cm_1,
                 &cm_2,
                 &u(61),
+                &u(61),
                 &mh_1,
                 &mh_2,
                 &mh_3
+            ,
+                &mh_3
+            
             )
         );
         assert_ne!(
@@ -3902,10 +4687,14 @@ mod tests {
                 fee,
                 &cm_1,
                 &cm_2,
+                &cm_3,
                 &cm_3,
                 &u(70),
                 &mh_2,
                 &mh_3
+            ,
+                &mh_3
+            
             )
         );
         assert_ne!(
@@ -3917,10 +4706,14 @@ mod tests {
                 fee,
                 &cm_1,
                 &cm_2,
+                &cm_3,
                 &cm_3,
                 &mh_1,
                 &u(80),
                 &mh_3
+            ,
+                &mh_3
+            
             )
         );
         assert_ne!(
@@ -3933,9 +4726,13 @@ mod tests {
                 &cm_1,
                 &cm_2,
                 &cm_3,
+                &cm_3,
                 &mh_1,
                 &mh_2,
                 &u(81)
+            ,
+                &u(81)
+            
             )
         );
 
@@ -3944,12 +4741,16 @@ mod tests {
             &root,
             &nullifiers,
             12,
+            &ASSET_TEZ,
             fee,
             &recipient,
             &cm_1,
             &cm_fee,
+            &ZERO,
+            &ZERO,
             &mh_1,
-            &mh_fee,
+            &mh_fee
+        
         );
         assert_ne!(
             unshield,
@@ -3958,12 +4759,18 @@ mod tests {
                 &root,
                 &nullifiers,
                 13,
+                &ASSET_TEZ,
                 fee,
                 &recipient,
                 &cm_1,
                 &cm_fee,
+                &ZERO,
+                &ZERO,
                 &mh_1,
                 &mh_fee
+            
+            
+            
             )
         );
         assert_ne!(
@@ -3973,12 +4780,18 @@ mod tests {
                 &root,
                 &nullifiers,
                 12,
+                &ASSET_TEZ,
                 fee,
                 &u(10),
                 &cm_1,
                 &cm_fee,
+                &ZERO,
+                &ZERO,
                 &mh_1,
                 &mh_fee
+            
+            
+            
             )
         );
         assert_ne!(
@@ -3988,12 +4801,18 @@ mod tests {
                 &u(20),
                 &nullifiers,
                 12,
+                &ASSET_TEZ,
                 fee,
                 &recipient,
                 &cm_1,
                 &cm_fee,
+                &ZERO,
+                &ZERO,
                 &mh_1,
                 &mh_fee
+            
+            
+            
             )
         );
         assert_ne!(
@@ -4003,12 +4822,18 @@ mod tests {
                 &root,
                 &[u(4), u(3)],
                 12,
+                &ASSET_TEZ,
                 fee,
                 &recipient,
                 &cm_1,
                 &cm_fee,
+                &ZERO,
+                &ZERO,
                 &mh_1,
                 &mh_fee
+            
+            
+            
             )
         );
         assert_ne!(
@@ -4018,12 +4843,18 @@ mod tests {
                 &root,
                 &nullifiers,
                 12,
+                &ASSET_TEZ,
                 fee + 1,
                 &recipient,
                 &cm_1,
                 &cm_fee,
+                &ZERO,
+                &ZERO,
                 &mh_1,
                 &mh_fee
+            
+            
+            
             )
         );
         assert_ne!(
@@ -4033,12 +4864,18 @@ mod tests {
                 &root,
                 &nullifiers,
                 12,
+                &ASSET_TEZ,
                 fee,
                 &recipient,
                 &u(11),
                 &cm_fee,
+                &ZERO,
+                &ZERO,
                 &mh_1,
                 &mh_fee
+            
+            
+            
             )
         );
         assert_ne!(
@@ -4048,12 +4885,18 @@ mod tests {
                 &root,
                 &nullifiers,
                 12,
+                &ASSET_TEZ,
                 fee,
                 &recipient,
                 &cm_1,
                 &u(14),
+                &ZERO,
+                &ZERO,
                 &mh_1,
                 &mh_fee
+            
+            
+            
             )
         );
         assert_ne!(
@@ -4063,12 +4906,18 @@ mod tests {
                 &root,
                 &nullifiers,
                 12,
+                &ASSET_TEZ,
                 fee,
                 &recipient,
                 &cm_1,
                 &cm_fee,
+                &ZERO,
+                &ZERO,
                 &u(12),
                 &mh_fee
+            
+            
+            
             )
         );
         assert_ne!(
@@ -4078,12 +4927,18 @@ mod tests {
                 &root,
                 &nullifiers,
                 12,
+                &ASSET_TEZ,
                 fee,
                 &recipient,
                 &cm_1,
                 &cm_fee,
+                &ZERO,
+                &ZERO,
                 &mh_1,
                 &u(15)
+            
+            
+            
             )
         );
     }
@@ -4113,6 +4968,7 @@ mod tests {
         let resp = apply_shield(
             &mut ledger,
             &ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash,
                 fee,
                 v,
@@ -4127,6 +4983,7 @@ mod tests {
                     producer_cm,
                     memo_hash,
                     producer_memo_hash,
+                    ASSET_TEZ,
                 ]),
                 client_cm: cm,
                 client_enc: enc,
@@ -4185,6 +5042,7 @@ mod tests {
             .unwrap();
 
         let req_a = ShieldReq {
+            asset_id: ASSET_TEZ,
             pubkey_hash,
             fee,
             v,
@@ -4199,6 +5057,7 @@ mod tests {
                 producer_cm_a,
                 mh_a,
                 producer_mh_a,
+                ASSET_TEZ,
             ]),
             client_cm: cm_a,
             client_enc: enc_a,
@@ -4208,6 +5067,7 @@ mod tests {
         ledger.shield(&req_a).expect("first shield");
 
         let req_b = ShieldReq {
+            asset_id: ASSET_TEZ,
             pubkey_hash,
             fee,
             v,
@@ -4222,6 +5082,7 @@ mod tests {
                 producer_cm_b,
                 mh_b,
                 producer_mh_b,
+                ASSET_TEZ,
             ]),
             client_cm: cm_b,
             client_enc: enc_b,
@@ -4263,6 +5124,7 @@ mod tests {
         let producer_memo_hash = memo_ct_hash(&producer_enc);
 
         let req = ShieldReq {
+            asset_id: ASSET_TEZ,
             pubkey_hash,
             fee,
             v,
@@ -4277,6 +5139,7 @@ mod tests {
                 producer_cm,
                 memo_hash,
                 producer_memo_hash,
+                ASSET_TEZ,
             ]),
             client_cm: cm,
             client_enc: enc,
@@ -4311,7 +5174,7 @@ mod tests {
         // Topup is still in the pool (rejected request must not have
         // partially debited).
         assert_eq!(
-            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            ledger.deposit_balances.get(&ASSET_TEZ).and_then(|inner| inner.get(&pubkey_hash).copied()),
             Some(debit)
         );
         // The applied-shield set has exactly the one cm.
@@ -4338,7 +5201,7 @@ mod tests {
         // Two L1 deposits aggregating to debit + slack.
         ledger.deposit(&recipient, debit / 2).unwrap();
         ledger.deposit(&recipient, debit - debit / 2 + 50).unwrap();
-        assert_eq!(ledger.deposit_balances.get(&pubkey_hash).copied(), Some(debit + 50));
+        assert_eq!(ledger.deposit_balances.get(&ASSET_TEZ).and_then(|inner| inner.get(&pubkey_hash).copied()), Some(debit + 50));
 
         let (enc, cm) = deterministic_note(&addr, v, u(31), Some(b"shield"));
         let (producer_enc, producer_cm) =
@@ -4349,6 +5212,7 @@ mod tests {
         apply_shield(
             &mut ledger,
             &ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash,
                 fee,
                 v,
@@ -4363,6 +5227,7 @@ mod tests {
                     producer_cm,
                     memo_hash,
                     producer_memo_hash,
+                    ASSET_TEZ,
                 ]),
                 client_cm: cm,
                 client_enc: enc,
@@ -4373,7 +5238,7 @@ mod tests {
         .unwrap();
 
         // 50 mutez left in the pool after the first shield.
-        assert_eq!(ledger.deposit_balances.get(&pubkey_hash).copied(), Some(50));
+        assert_eq!(ledger.deposit_balances.get(&ASSET_TEZ).and_then(|inner| inner.get(&pubkey_hash).copied()), Some(50));
     }
 
     #[test]
@@ -4397,6 +5262,7 @@ mod tests {
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash,
                 fee,
                 v,
@@ -4438,6 +5304,7 @@ mod tests {
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash,
                 fee,
                 v,
@@ -4454,10 +5321,227 @@ mod tests {
         assert!(err.contains("balance"), "err = {}", err);
         // Pool still has its underfunded balance (rejection left state untouched).
         assert_eq!(
-            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            ledger.deposit_balances.get(&ASSET_TEZ).and_then(|inner| inner.get(&pubkey_hash).copied()),
             Some(debit - 1)
         );
         assert!(ledger.memos.is_empty());
+    }
+
+    /// Phase E.5 (bug #2 regression): an FA2 shield request MUST be
+    /// rejected when the user has NO tez deposit pool at the same
+    /// pubkey_hash, even if their FA2 pool is fully funded for
+    /// (v + fee). The producer-fee output note is permanently tez,
+    /// so the kernel must debit `producer_fee` tez from the user's
+    /// tez pool. Without this check, an FA2 shield would mint
+    /// `producer_fee` tez in the commitment tree out of nothing —
+    /// drainable later via the tez ticketer's L1 backing, funded by
+    /// other users' real tez deposits.
+    #[test]
+    fn test_apply_shield_fa2_rejects_when_user_has_no_tez_pool() {
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x95, 0);
+        let mut ledger = Ledger::new();
+        let fee = MIN_TX_FEE;
+        let producer_fee = 7;
+        let v = 125u64;
+        let auth_domain = ledger.auth_domain;
+        let blind = felt_tag(b"fa2-no-tez-pool-test");
+        let pubkey_hash = test_pubkey_hash_for_address(&auth_domain, &addr, &blind);
+        let fa2_asset = derive_asset_id("KT1FA2Ticketer");
+        assert_ne!(fa2_asset, ASSET_TEZ);
+
+        let (enc, cm) = deterministic_note(&addr, v, u(33), Some(b"fa2-shield"));
+        let (producer_enc, producer_cm) =
+            deterministic_note(&addr, producer_fee, u(34), Some(b"dal"));
+
+        // Fully fund the FA2 pool for v + fee.
+        apply_deposit(
+            &mut ledger,
+            &fa2_asset,
+            &deposit_recipient_string(&pubkey_hash),
+            v + fee,
+        )
+        .unwrap();
+        // Crucially, do NOT credit any tez pool at this pubkey_hash.
+
+        let err = apply_shield(
+            &mut ledger,
+            &ShieldReq {
+                asset_id: fa2_asset,
+                pubkey_hash,
+                fee,
+                v,
+                producer_fee,
+                proof: Proof::TrustMeBro,
+                client_cm: cm,
+                client_enc: enc,
+                producer_cm,
+                producer_enc,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("no tez deposit pool") && err.contains("producer_fee"),
+            "err = {}",
+            err,
+        );
+        // FA2 pool untouched (rejection left state intact); no tez
+        // pool ever existed.
+        assert_eq!(
+            ledger.deposit_balance(&fa2_asset, &pubkey_hash).unwrap(),
+            Some(v + fee),
+            "FA2 pool must be untouched when the shield is rejected pre-commit",
+        );
+        assert_eq!(
+            ledger.deposit_balance(&ASSET_TEZ, &pubkey_hash).unwrap(),
+            None,
+            "no tez pool must exist after the rejected shield",
+        );
+        assert!(
+            ledger.memos.is_empty(),
+            "rejected shield must not append any notes",
+        );
+    }
+
+    /// Phase E.5 (bug #2 regression): an FA2 shield request MUST be
+    /// rejected when the user's tez pool exists but is too small to
+    /// cover `producer_fee`. Both pools must reach the rejection
+    /// without any mutation (FA2 pool full, tez pool underfunded but
+    /// non-zero).
+    #[test]
+    fn test_apply_shield_fa2_rejects_when_tez_pool_too_small_for_producer_fee() {
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x96, 0);
+        let mut ledger = Ledger::new();
+        let fee = MIN_TX_FEE;
+        let producer_fee = 10;
+        let v = 200u64;
+        let auth_domain = ledger.auth_domain;
+        let blind = felt_tag(b"fa2-tez-pool-too-small-test");
+        let pubkey_hash = test_pubkey_hash_for_address(&auth_domain, &addr, &blind);
+        let fa2_asset = derive_asset_id("KT1FA2Ticketer2");
+
+        let (enc, cm) = deterministic_note(&addr, v, u(35), Some(b"fa2-shield"));
+        let (producer_enc, producer_cm) =
+            deterministic_note(&addr, producer_fee, u(36), Some(b"dal"));
+
+        apply_deposit(
+            &mut ledger,
+            &fa2_asset,
+            &deposit_recipient_string(&pubkey_hash),
+            v + fee,
+        )
+        .unwrap();
+        // Underfund the tez pool by 1.
+        apply_deposit(
+            &mut ledger,
+            &ASSET_TEZ,
+            &deposit_recipient_string(&pubkey_hash),
+            producer_fee - 1,
+        )
+        .unwrap();
+
+        let err = apply_shield(
+            &mut ledger,
+            &ShieldReq {
+                asset_id: fa2_asset,
+                pubkey_hash,
+                fee,
+                v,
+                producer_fee,
+                proof: Proof::TrustMeBro,
+                client_cm: cm,
+                client_enc: enc,
+                producer_cm,
+                producer_enc,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("tez deposit pool") && err.contains("producer_fee"),
+            "err = {}",
+            err,
+        );
+        assert_eq!(
+            ledger.deposit_balance(&fa2_asset, &pubkey_hash).unwrap(),
+            Some(v + fee),
+            "FA2 pool must be untouched on rejection",
+        );
+        assert_eq!(
+            ledger.deposit_balance(&ASSET_TEZ, &pubkey_hash).unwrap(),
+            Some(producer_fee - 1),
+            "tez pool must keep its underfunded balance on rejection",
+        );
+        assert!(ledger.memos.is_empty());
+    }
+
+    /// Phase E.5 (bug #2 happy path): an FA2 shield succeeds when
+    /// BOTH the FA2 pool (v + fee) AND the tez pool (producer_fee)
+    /// are funded at the same pubkey_hash, debiting each pool
+    /// independently.
+    #[test]
+    fn test_apply_shield_fa2_debits_both_fa2_and_tez_pools_independently() {
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x97, 0);
+        let mut ledger = Ledger::new();
+        let fee = MIN_TX_FEE;
+        let producer_fee = 13;
+        let v = 250u64;
+        let auth_domain = ledger.auth_domain;
+        let blind = felt_tag(b"fa2-both-pools-funded-test");
+        let pubkey_hash = test_pubkey_hash_for_address(&auth_domain, &addr, &blind);
+        let fa2_asset = derive_asset_id("KT1FA2Ticketer3");
+
+        let (enc, cm) = deterministic_note(&addr, v, u(37), Some(b"fa2-shield"));
+        let (producer_enc, producer_cm) =
+            deterministic_note(&addr, producer_fee, u(38), Some(b"dal"));
+
+        // Fund FA2 with exactly v + fee and tez with exactly
+        // producer_fee. After the shield both pools must drain to
+        // zero.
+        apply_deposit(
+            &mut ledger,
+            &fa2_asset,
+            &deposit_recipient_string(&pubkey_hash),
+            v + fee,
+        )
+        .unwrap();
+        apply_deposit(
+            &mut ledger,
+            &ASSET_TEZ,
+            &deposit_recipient_string(&pubkey_hash),
+            producer_fee,
+        )
+        .unwrap();
+
+        apply_shield(
+            &mut ledger,
+            &ShieldReq {
+                asset_id: fa2_asset,
+                pubkey_hash,
+                fee,
+                v,
+                producer_fee,
+                proof: Proof::TrustMeBro,
+                client_cm: cm,
+                client_enc: enc,
+                producer_cm,
+                producer_enc,
+            },
+        )
+        .expect("FA2 shield with both pools funded must succeed");
+
+        // Fully drained pools are removed from the Ledger's
+        // HashMap, so balance lookups return None (not Some(0)).
+        assert_eq!(
+            ledger.deposit_balance(&fa2_asset, &pubkey_hash).unwrap(),
+            None,
+            "FA2 pool must be fully drained by (v + fee)",
+        );
+        assert_eq!(
+            ledger.deposit_balance(&ASSET_TEZ, &pubkey_hash).unwrap(),
+            None,
+            "tez pool must be fully drained by producer_fee",
+        );
     }
 
     #[test]
@@ -4482,6 +5566,7 @@ mod tests {
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash,
                 fee,
                 v,
@@ -4497,6 +5582,7 @@ mod tests {
                     producer_cm,
                     memo_ct_hash(&enc),
                     memo_ct_hash(&producer_enc),
+                    ASSET_TEZ,
                 ]),
                 client_cm: cm,
                 client_enc: enc,
@@ -4509,7 +5595,7 @@ mod tests {
         assert!(err.contains("public output length mismatch"), "err = {}", err);
         // Pool balance untouched.
         assert_eq!(
-            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            ledger.deposit_balances.get(&ASSET_TEZ).and_then(|inner| inner.get(&pubkey_hash).copied()),
             Some(debit)
         );
         assert!(ledger.memos.is_empty());
@@ -4542,6 +5628,7 @@ mod tests {
 
         let err = ledger
             .shield(&ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash,
                 fee,
                 v,
@@ -4556,6 +5643,7 @@ mod tests {
                     producer_cm,
                     memo_ct_hash(&enc),
                     memo_ct_hash(&producer_enc),
+                    ASSET_TEZ,
                 ]),
                 client_cm: cm,
                 client_enc: enc,
@@ -4567,7 +5655,7 @@ mod tests {
         assert!(err.contains("pubkey_hash mismatch"), "err = {}", err);
         // Pool balance untouched.
         assert_eq!(
-            ledger.deposit_balances.get(&pubkey_hash).copied(),
+            ledger.deposit_balances.get(&ASSET_TEZ).and_then(|inner| inner.get(&pubkey_hash).copied()),
             Some(debit)
         );
     }
@@ -4607,6 +5695,7 @@ mod tests {
         // Drain ledger A succeeds (TrustMeBro skips proof public-output check).
         ledger_a
             .shield(&ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash: pubkey_hash_a,
                 fee,
                 v,
@@ -4623,6 +5712,7 @@ mod tests {
         // deployment B because output[0] disagrees.
         let err = ledger_b
             .shield(&ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash: pubkey_hash_b,
                 fee,
                 v,
@@ -4637,6 +5727,7 @@ mod tests {
                     producer_cm,
                     memo_ct_hash(&enc),
                     memo_ct_hash(&producer_enc),
+                    ASSET_TEZ,
                 ]),
                 client_cm: cm,
                 client_enc: enc,
@@ -4648,7 +5739,7 @@ mod tests {
         assert!(err.contains("auth_domain mismatch"), "err = {}", err);
         // Ledger B's pool is intact.
         assert_eq!(
-            ledger_b.deposit_balances.get(&pubkey_hash_b).copied(),
+            ledger_b.deposit_balances.get(&ASSET_TEZ).and_then(|inner| inner.get(&pubkey_hash_b).copied()),
             Some(debit)
         );
     }
@@ -4661,7 +5752,10 @@ mod tests {
         let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
         let (enc_1, cm_1) = deterministic_note(&addr, 60_000, u(21), Some(b"out-1"));
         let (enc_2, cm_2) = deterministic_note(&addr, 70_000, u(22), Some(b"out-2"));
-        let (enc_3, cm_3) = deterministic_note(&addr, 20_000, u(23), Some(b"dal"));
+        // Phase C: cm_3 is the change_2 slot (zero-value here), cm_4 is the
+        // producer fee.
+        let (enc_3, cm_3) = deterministic_note(&addr, 0, u(23), None);
+        let (enc_4, cm_4) = deterministic_note(&addr, 20_000, u(24), Some(b"dal"));
 
         let resp = apply_transfer(
             &mut ledger,
@@ -4672,9 +5766,11 @@ mod tests {
                 cm_1,
                 cm_2,
                 cm_3,
+                cm_4,
                 enc_1: enc_1.clone(),
                 enc_2: enc_2.clone(),
                 enc_3: enc_3.clone(),
+                enc_4: enc_4.clone(),
                 proof: fake_stark(vec![
                     auth_domain,
                     root,
@@ -4683,9 +5779,11 @@ mod tests {
                     cm_1,
                     cm_2,
                     cm_3,
+                    cm_4,
                     memo_ct_hash(&enc_1),
                     memo_ct_hash(&enc_2),
                     memo_ct_hash(&enc_3),
+                    memo_ct_hash(&enc_4),
                 ]),
             },
         )
@@ -4694,8 +5792,9 @@ mod tests {
         assert_eq!(resp.index_1, 2);
         assert_eq!(resp.index_2, 3);
         assert_eq!(resp.index_3, 4);
+        assert_eq!(resp.index_4, 5);
         assert!(ledger.nullifiers.contains(&nf));
-        assert_eq!(ledger.memos.len(), 5);
+        assert_eq!(ledger.memos.len(), 6);
         assert!(ledger.valid_roots.contains(&ledger.tree.root()));
     }
 
@@ -4707,7 +5806,8 @@ mod tests {
         let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
         let (enc_1, cm_1) = deterministic_note(&addr, 60_000, u(24), Some(b"out-1"));
         let (enc_2, cm_2) = deterministic_note(&addr, 70_000, u(25), Some(b"out-2"));
-        let (enc_3, cm_3) = deterministic_note(&addr, 20_000, u(26), Some(b"dal"));
+        let (enc_3, cm_3) = deterministic_note(&addr, 0, u(26), None);
+        let (enc_4, cm_4) = deterministic_note(&addr, 20_000, u(27), Some(b"dal"));
 
         let public_outputs = vec![
             auth_domain,
@@ -4717,9 +5817,11 @@ mod tests {
             cm_1,
             cm_2,
             cm_3,
+            cm_4,
             memo_ct_hash(&enc_1),
             memo_ct_hash(&enc_2),
             memo_ct_hash(&enc_3),
+            memo_ct_hash(&enc_4),
         ];
         let resp = apply_transfer(
             &mut ledger,
@@ -4730,15 +5832,20 @@ mod tests {
                 cm_1,
                 cm_2,
                 cm_3,
+                cm_4,
                 enc_1,
                 enc_2,
                 enc_3,
+                enc_4,
                 proof: fake_stark(bootloader_wrapped_public_outputs(u(12345), public_outputs)),
             },
         )
         .unwrap();
 
-        assert_eq!((resp.index_1, resp.index_2, resp.index_3), (2, 3, 4));
+        assert_eq!(
+            (resp.index_1, resp.index_2, resp.index_3, resp.index_4),
+            (2, 3, 4, 5),
+        );
         assert!(ledger.nullifiers.contains(&nf));
     }
 
@@ -4766,9 +5873,11 @@ mod tests {
                 cm_1,
                 cm_2,
                 cm_3,
+                cm_4: ZERO,
                 enc_1,
                 enc_2,
-                enc_3,
+                enc_3: enc_3.clone(),
+                enc_4: enc_3.clone(),
                 proof: fake_stark(vec![
                     auth_domain,
                     root,
@@ -4777,6 +5886,8 @@ mod tests {
                     cm_1,
                     cm_2,
                     cm_3,
+                    ZERO,
+                    ZERO,
                     ZERO,
                     ZERO,
                     ZERO,
@@ -4800,7 +5911,8 @@ mod tests {
         let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
         let (enc_1, cm_1) = deterministic_note(&addr, 60_000, u(34), Some(b"out-1"));
         let (enc_2, cm_2) = deterministic_note(&addr, 70_000, u(35), Some(b"out-2"));
-        let (enc_3, cm_3) = deterministic_note(&addr, 20_000, u(36), Some(b"dal"));
+        let (enc_3, cm_3) = deterministic_note(&addr, 0, u(36), None);
+        let (enc_4, cm_4) = deterministic_note(&addr, 20_000, u(37), Some(b"dal"));
         let leaves_before = ledger.tree.leaves.clone();
         let memos_before = ledger.memos.len();
 
@@ -4813,9 +5925,11 @@ mod tests {
                 cm_1,
                 cm_2,
                 cm_3,
+                cm_4,
                 enc_1: enc_1.clone(),
                 enc_2: enc_2.clone(),
                 enc_3: enc_3.clone(),
+                enc_4: enc_4.clone(),
                 proof: fake_stark(vec![
                     ZERO,
                     auth_domain,
@@ -4825,9 +5939,11 @@ mod tests {
                     cm_1,
                     cm_2,
                     cm_3,
+                    cm_4,
                     memo_ct_hash(&enc_1),
                     memo_ct_hash(&enc_2),
                     memo_ct_hash(&enc_3),
+                    memo_ct_hash(&enc_4),
                 ]),
             },
         )
@@ -4858,6 +5974,8 @@ mod tests {
                 recipient: TEST_L1_RECIPIENT.into(),
                 cm_change,
                 enc_change: Some(enc_change.clone()),
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee,
                 enc_fee: enc_fee.clone(),
                 proof: fake_stark(vec![
@@ -4865,10 +5983,13 @@ mod tests {
                     root,
                     nf,
                     u(50),
+                    ASSET_TEZ, // asset_pub (Phase B)
                     u(MIN_TX_FEE),
                     hash(TEST_L1_RECIPIENT.as_bytes()),
                     cm_change,
                     memo_ct_hash(&enc_change),
+                    ZERO, // cm_change_2 (Phase C)
+                    ZERO, // mh_change_2
                     cm_fee,
                     memo_ct_hash(&enc_fee),
                 ]),
@@ -4881,6 +6002,7 @@ mod tests {
         assert_eq!(
             ledger.withdrawals,
             vec![WithdrawalRecord {
+                asset_id: ASSET_TEZ,
                 recipient: TEST_L1_RECIPIENT.into(),
                 amount: 50,
             }]
@@ -4904,10 +6026,13 @@ mod tests {
             root,
             nf,
             u(50),
+            ASSET_TEZ,
             u(MIN_TX_FEE),
             hash(TEST_L1_RECIPIENT.as_bytes()),
             cm_change,
             memo_ct_hash(&enc_change),
+            ZERO,
+            ZERO,
             cm_fee,
             memo_ct_hash(&enc_fee),
         ];
@@ -4921,6 +6046,8 @@ mod tests {
                 recipient: TEST_L1_RECIPIENT.into(),
                 cm_change,
                 enc_change: Some(enc_change),
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee,
                 enc_fee,
                 proof: fake_stark(bootloader_wrapped_public_outputs(u(12345), public_outputs)),
@@ -4933,6 +6060,7 @@ mod tests {
         assert_eq!(
             ledger.withdrawals,
             vec![WithdrawalRecord {
+                asset_id: ASSET_TEZ,
                 recipient: TEST_L1_RECIPIENT.into(),
                 amount: 50,
             }]
@@ -4961,6 +6089,8 @@ mod tests {
                 recipient: TEST_L1_RECIPIENT.into(),
                 cm_change,
                 enc_change: Some(enc_change.clone()),
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee,
                 enc_fee: enc_fee.clone(),
                 proof: fake_stark(vec![
@@ -4969,10 +6099,13 @@ mod tests {
                     root,
                     nf,
                     u(50),
+                    ASSET_TEZ,
                     u(MIN_TX_FEE),
                     hash(TEST_L1_RECIPIENT.as_bytes()),
                     cm_change,
                     memo_ct_hash(&enc_change),
+                    ZERO,
+                    ZERO,
                     cm_fee,
                     memo_ct_hash(&enc_fee),
                 ]),
@@ -5004,6 +6137,8 @@ mod tests {
                 recipient: TEST_L1_RECIPIENT.into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee,
                 enc_fee,
                 proof: Proof::TrustMeBro,
@@ -5016,6 +6151,7 @@ mod tests {
         assert_eq!(
             ledger.withdrawals,
             vec![WithdrawalRecord {
+                asset_id: ASSET_TEZ,
                 recipient: TEST_L1_RECIPIENT.into(),
                 amount: 1,
             }]
@@ -5043,6 +6179,8 @@ mod tests {
                 recipient: "bob".into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee,
                 enc_fee,
                 proof: Proof::TrustMeBro,
@@ -5076,6 +6214,8 @@ mod tests {
                 recipient: format!(" {} ", TEST_L1_RECIPIENT),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee,
                 enc_fee,
                 proof: Proof::TrustMeBro,
@@ -5088,6 +6228,7 @@ mod tests {
         assert_eq!(
             ledger.withdrawals,
             vec![WithdrawalRecord {
+                asset_id: ASSET_TEZ,
                 recipient: TEST_L1_RECIPIENT.into(),
                 amount: 1,
             }]
@@ -5112,6 +6253,7 @@ mod tests {
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash,
                 fee: MIN_TX_FEE - 1,
                 v: 125,
@@ -5158,6 +6300,7 @@ mod tests {
         let err = apply_shield(
             &mut state,
             &ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash,
                 fee: MIN_TX_FEE,
                 v: 125,
@@ -5196,6 +6339,7 @@ mod tests {
         let err = apply_shield(
             &mut state,
             &ShieldReq {
+                asset_id: ASSET_TEZ,
                 pubkey_hash,
                 fee: MIN_TX_FEE,
                 v: 125,
@@ -5238,7 +6382,9 @@ mod tests {
                 cm_3,
                 enc_1,
                 enc_2,
-                enc_3,
+                enc_3: enc_3.clone(),
+                cm_4: ZERO, // Phase C placeholder
+                enc_4: enc_3.clone(),
                 proof: Proof::TrustMeBro,
             },
         )
@@ -5274,7 +6420,9 @@ mod tests {
                 cm_3,
                 enc_1,
                 enc_2,
-                enc_3,
+                enc_3: enc_3.clone(),
+                cm_4: ZERO, // Phase C placeholder
+                enc_4: enc_3.clone(),
                 proof: Proof::TrustMeBro,
             },
         )
@@ -5312,7 +6460,9 @@ mod tests {
                 cm_3,
                 enc_1,
                 enc_2,
-                enc_3,
+                enc_3: enc_3.clone(),
+                cm_4: ZERO, // Phase C placeholder
+                enc_4: enc_3.clone(),
                 proof: Proof::TrustMeBro,
             },
         )
@@ -5343,6 +6493,8 @@ mod tests {
                 recipient: TEST_L1_RECIPIENT.into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee,
                 enc_fee,
                 proof: Proof::TrustMeBro,
@@ -5377,6 +6529,8 @@ mod tests {
                 recipient: TEST_L1_RECIPIENT.into(),
                 cm_change: ZERO,
                 enc_change: None,
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee,
                 enc_fee,
                 proof: Proof::TrustMeBro,
@@ -5415,6 +6569,8 @@ mod tests {
                 recipient: TEST_L1_RECIPIENT.into(),
                 cm_change,
                 enc_change: Some(enc_change),
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee,
                 enc_fee,
                 proof: Proof::TrustMeBro,
@@ -5453,6 +6609,8 @@ mod tests {
                 recipient: TEST_L1_RECIPIENT.into(),
                 cm_change,
                 enc_change: Some(enc_change),
+                cm_change_2: ZERO,
+                enc_change_2: None,
                 cm_fee,
                 enc_fee,
                 proof: Proof::TrustMeBro,
@@ -5512,5 +6670,894 @@ mod tests {
         assert!(ledger.valid_roots.contains(&u(103)));
         assert_eq!(ledger.root_history.len(), 3);
         assert_eq!(ledger.valid_roots.len(), 3);
+    }
+
+    // ─── Multiasset Phase B positive coverage ────────────────────────
+    //
+    // The Cairo unit tests fully exercise per-asset balance behaviour;
+    // these tests cover the Rust-side primitives (commitment hash,
+    // sighash binding, kernel asset_pub pin) so a regression that bypasses
+    // the asset field in any Rust sighash/commit helper is caught here
+    // independent of the Cairo verifier.
+
+    /// `commit` must include the asset in its preimage. Two commitments
+    /// with identical (d_j, value, rcm, otag) but different assets
+    /// must differ — otherwise an attacker could swap the asset tag of
+    /// a note without invalidating its commitment.
+    #[test]
+    fn test_commit_distinguishes_assets_in_preimage() {
+        let d_j = u(0x1234);
+        let v = 12345u64;
+        let rcm = u(0xAAAA);
+        let otag = u(0xBBBB);
+        let primary = u(0xCAFE);
+
+        let cm_tez = commit(&d_j, v, &ASSET_TEZ, &rcm, &otag);
+        let cm_primary = commit(&d_j, v, &primary, &rcm, &otag);
+
+        assert_ne!(
+            cm_tez, cm_primary,
+            "commit() must domain-separate by asset; otherwise an attacker can flip a note's asset class without changing its commitment"
+        );
+    }
+
+    /// `transfer_sighash` binds output assets indirectly through cm_i
+    /// (each cm = commit(d_j, v, asset, rcm, otag)). Swap one
+    /// output's asset and the cm — and therefore the sighash — must
+    /// change. Without this, a relayer could substitute a primary
+    /// output for a tez output post-signing.
+    #[test]
+    fn test_transfer_sighash_changes_when_output_asset_flips() {
+        let auth_domain = u(0xD000);
+        let root = u(0xD001);
+        let nf = u(0xD002);
+        let fee = MIN_TX_FEE;
+        let d_j = u(0xD100);
+        let v = 5_000u64;
+        let rcm = u(0xD101);
+        let otag = u(0xD102);
+        let mh = u(0xD200);
+        let primary = u(0xFA2);
+
+        let cm_tez = commit(&d_j, v, &ASSET_TEZ, &rcm, &otag);
+        let cm_primary = commit(&d_j, v, &primary, &rcm, &otag);
+
+        let sh_tez =
+            transfer_sighash(&auth_domain, &root, &[nf], fee, &cm_tez, &cm_tez, &cm_tez, &cm_tez,
+                             &mh, &mh, &mh, &mh);
+        let sh_primary = transfer_sighash(
+            &auth_domain, &root, &[nf], fee, &cm_primary, &cm_tez, &cm_tez, &cm_tez,
+            &mh, &mh, &mh, &mh,
+        );
+        assert_ne!(sh_tez, sh_primary, "sighash must change when an output's asset flips");
+    }
+
+    /// `unshield_sighash` takes `asset_pub` as an explicit argument
+    /// (the L1 exit asset). Changing it must change the sighash —
+    /// even though the v1 verifier pins it to ASSET_TEZ, the binding
+    /// has to be there in case the pin is relaxed in a future
+    /// version. Without this binding a relayer could change which
+    /// asset the L1 bridge releases.
+    #[test]
+    fn test_unshield_sighash_binds_asset_pub() {
+        let auth_domain = u(0xE000);
+        let root = u(0xE001);
+        let nf = u(0xE002);
+        let v_pub = 1000u64;
+        let fee = MIN_TX_FEE;
+        let recipient = hash(b"some-l1");
+        let cm_change = u(0xE100);
+        let mh_change = u(0xE101);
+        let cm_change_2 = ZERO;
+        let mh_change_2 = ZERO;
+        let cm_fee = u(0xE200);
+        let mh_fee = u(0xE201);
+
+        let primary = u(0xFA2);
+
+        let sh_tez = unshield_sighash(
+            &auth_domain, &root, &[nf], v_pub, &ASSET_TEZ, fee, &recipient,
+            &cm_change, &mh_change, &cm_change_2, &mh_change_2, &cm_fee, &mh_fee,
+        );
+        let sh_primary = unshield_sighash(
+            &auth_domain, &root, &[nf], v_pub, &primary, fee, &recipient,
+            &cm_change, &mh_change, &cm_change_2, &mh_change_2, &cm_fee, &mh_fee,
+        );
+        assert_ne!(sh_tez, sh_primary, "sighash must change when asset_pub flips");
+    }
+
+    /// `unshield_sighash` binds the change commitments. Since cm
+    /// itself includes the asset (see test_commit_distinguishes_assets),
+    /// flipping a change slot's asset (and therefore its cm) must
+    /// change the sighash. This is the indirect binding that lets us
+    /// route the primary asset through change_1 or change_2 without a
+    /// dedicated asset_change argument.
+    #[test]
+    fn test_unshield_sighash_binds_change_asset_via_commitment() {
+        let auth_domain = u(0xE300);
+        let root = u(0xE301);
+        let nf = u(0xE302);
+        let v_pub = 0u64;
+        let fee = MIN_TX_FEE;
+        let recipient = hash(b"other-l1");
+        let d_j_c = u(0xE400);
+        let v_c = 7u64;
+        let rcm_c = u(0xE401);
+        let otag_c = u(0xE402);
+        let mh_c = u(0xE403);
+        let cm_change_2 = ZERO;
+        let mh_change_2 = ZERO;
+        let cm_fee = u(0xE500);
+        let mh_fee = u(0xE501);
+        let primary = u(0xFA2);
+
+        let cm_change_tez = commit(&d_j_c, v_c, &ASSET_TEZ, &rcm_c, &otag_c);
+        let cm_change_primary = commit(&d_j_c, v_c, &primary, &rcm_c, &otag_c);
+
+        let sh_tez_change = unshield_sighash(
+            &auth_domain, &root, &[nf], v_pub, &ASSET_TEZ, fee, &recipient,
+            &cm_change_tez, &mh_c, &cm_change_2, &mh_change_2, &cm_fee, &mh_fee,
+        );
+        let sh_primary_change = unshield_sighash(
+            &auth_domain, &root, &[nf], v_pub, &ASSET_TEZ, fee, &recipient,
+            &cm_change_primary, &mh_c, &cm_change_2, &mh_change_2, &cm_fee, &mh_fee,
+        );
+        assert_ne!(
+            sh_tez_change, sh_primary_change,
+            "sighash must change when change_1's asset flips (via cm_change)"
+        );
+    }
+
+    /// Phase E.2 removes the core-side `asset_pub == ASSET_TEZ` pin: the
+    /// in-memory `Ledger` is asset-agnostic and merely records the
+    /// asset_id in its `WithdrawalRecord`. The bridge-registry check
+    /// (which IS the v1 "tez only" enforcement) moves to the rollup
+    /// kernel in Phase E.3. Until then, a non-tez asset_pub flows
+    /// through core, ending up stored on the withdrawal record where a
+    /// later FA2 outbox dispatch will look up its ticketer.
+    #[test]
+    fn test_apply_unshield_records_asset_pub_from_proof_outputs() {
+        let (mut ledger, addr, nk_spend, shield_resp) =
+            shielded_note_setup(0xC0, "alice", 180_000);
+        let root = ledger.tree.root();
+        let auth_domain = ledger.auth_domain;
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (enc_change, cm_change) = deterministic_note(&addr, 30, u(0xA1), Some(b"change"));
+        let (enc_fee, cm_fee) = deterministic_note(&addr, 29_970, u(0xA2), Some(b"dal"));
+        let primary = u(0xFA2);
+
+        apply_unshield(
+            &mut ledger,
+            &UnshieldReq {
+                root,
+                nullifiers: vec![nf],
+                v_pub: 50,
+                fee: MIN_TX_FEE,
+                recipient: TEST_L1_RECIPIENT.into(),
+                cm_change,
+                enc_change: Some(enc_change.clone()),
+                cm_change_2: ZERO,
+                enc_change_2: None,
+                cm_fee,
+                enc_fee: enc_fee.clone(),
+                proof: fake_stark(vec![
+                    auth_domain,
+                    root,
+                    nf,
+                    u(50),
+                    primary, // non-tez asset_pub — recorded, not rejected
+                    u(MIN_TX_FEE),
+                    hash(TEST_L1_RECIPIENT.as_bytes()),
+                    cm_change,
+                    memo_ct_hash(&enc_change),
+                    ZERO,
+                    ZERO,
+                    cm_fee,
+                    memo_ct_hash(&enc_fee),
+                ]),
+            },
+        )
+        .expect("core no longer pins asset_pub == ASSET_TEZ");
+
+        assert_eq!(
+            ledger.withdrawals.last().expect("withdrawal recorded").asset_id,
+            primary,
+            "withdrawal record should carry the asset_pub from the proof",
+        );
+    }
+
+    // ─── Phase E.5: registry routing helpers ───────────────────────
+
+    /// Two compose_asset_registry calls with the same tez ticketer
+    /// produce the same registry. Verifies the helper is pure.
+    #[test]
+    fn test_compose_asset_registry_deterministic() {
+        let a = compose_asset_registry_with("KT1Tez", &["KT1FA2A", "KT1FA2B"]);
+        let b = compose_asset_registry_with("KT1Tez", &["KT1FA2A", "KT1FA2B"]);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 3);
+        assert_eq!(a[0].asset_id, ASSET_TEZ);
+        assert_ne!(a[1].asset_id, ASSET_TEZ);
+        assert_ne!(a[2].asset_id, ASSET_TEZ);
+        assert_ne!(a[1].asset_id, a[2].asset_id);
+    }
+
+    /// ticketer_for_asset / asset_for_ticketer are inverse lookups
+    /// over a Vec<AssetEntry>. Tests both directions.
+    #[test]
+    fn test_registry_lookups_invert() {
+        let registry = compose_asset_registry_with("KT1Tez", &["KT1FA2X"]);
+        let fa2_id = registry[1].asset_id;
+        assert_eq!(ticketer_for_asset(&registry, &ASSET_TEZ), Some("KT1Tez"));
+        assert_eq!(ticketer_for_asset(&registry, &fa2_id), Some("KT1FA2X"));
+        assert_eq!(asset_for_ticketer(&registry, "KT1Tez"), Some(&ASSET_TEZ));
+        assert_eq!(asset_for_ticketer(&registry, "KT1FA2X"), Some(&fa2_id));
+        // Unknown assets / tickers return None.
+        let bogus = u(0xC0FFEE);
+        assert_eq!(ticketer_for_asset(&registry, &bogus), None);
+        assert_eq!(asset_for_ticketer(&registry, "KT1Unknown"), None);
+    }
+
+    /// FA2 deposits should land in their own pool, isolated from
+    /// the tez pool — a tez shield must not be able to drain FA2
+    /// liquidity and vice versa.
+    #[test]
+    fn test_fa2_deposit_isolated_from_tez_pool() {
+        let registry = compose_asset_registry_with("KT1Tez", &["KT1FA2"]);
+        let fa2_id = registry[1].asset_id;
+        let mut ledger = Ledger::new();
+        let alice = hash(b"alice-pubkey-hash");
+        let recipient = deposit_recipient_string(&alice);
+
+        // Credit alice's FA2 pool.
+        apply_deposit(&mut ledger, &fa2_id, &recipient, 1_000)
+            .expect("FA2 deposit");
+
+        // The tez pool for alice must remain zero.
+        assert_eq!(
+            ledger.deposit_balance(&ASSET_TEZ, &alice).unwrap(),
+            None,
+            "tez pool must be untouched by FA2 deposit"
+        );
+        assert_eq!(
+            ledger.deposit_balance(&fa2_id, &alice).unwrap(),
+            Some(1_000),
+            "FA2 pool must hold the deposit"
+        );
+
+        // A tez deposit to the same pubkey hash sits in its own bucket.
+        apply_deposit(&mut ledger, &ASSET_TEZ, &recipient, 7).expect("tez deposit");
+        assert_eq!(
+            ledger.deposit_balance(&ASSET_TEZ, &alice).unwrap(),
+            Some(7),
+        );
+        assert_eq!(
+            ledger.deposit_balance(&fa2_id, &alice).unwrap(),
+            Some(1_000),
+            "FA2 pool unaffected by tez deposit"
+        );
+    }
+
+    /// Outbox dispatch must pick the FA2 ticketer when asset_pub is
+    /// a registered FA2 asset_id, and the tez ticketer when asset_pub
+    /// is ASSET_TEZ. This is the contract that prepare_unshield_outbox
+    /// in the kernel relies on.
+    #[test]
+    fn test_outbox_dispatch_picks_correct_ticketer() {
+        let registry = compose_asset_registry_with("KT1Tez", &["KT1FA2A", "KT1FA2B"]);
+        let fa2_a = registry[1].asset_id;
+        let fa2_b = registry[2].asset_id;
+
+        assert_eq!(ticketer_for_asset(&registry, &ASSET_TEZ).unwrap(), "KT1Tez");
+        assert_eq!(ticketer_for_asset(&registry, &fa2_a).unwrap(), "KT1FA2A");
+        assert_eq!(ticketer_for_asset(&registry, &fa2_b).unwrap(), "KT1FA2B");
+    }
+
+    /// AssetEntry::tez is always asset_id = ASSET_TEZ regardless of the
+    /// ticketer string supplied. This preserves the property that every
+    /// pre-multiasset commitment (which hardcoded asset = ZERO for tez)
+    /// continues to match the registered tez bridge after the registry
+    /// is populated.
+    #[test]
+    fn test_asset_entry_tez_fixes_asset_id_to_zero() {
+        let entry = AssetEntry::tez("KT1Tezzz".into());
+        assert_eq!(entry.asset_id, ASSET_TEZ);
+        assert_eq!(entry.asset_id, ZERO);
+        assert_eq!(entry.ticketer, "KT1Tezzz");
+    }
+
+    /// AssetEntry::fa2 derives asset_id from the ticketer address —
+    /// different ticketer addresses produce different asset_ids
+    /// (one-ticketer-per-asset is structural, not registered).
+    #[test]
+    fn test_asset_entry_fa2_distinct_per_ticketer() {
+        let a = AssetEntry::fa2("KT1AAA".into());
+        let b = AssetEntry::fa2("KT1BBB".into());
+        assert_ne!(a.asset_id, b.asset_id, "two FA2 ticketers must have distinct asset_ids");
+        assert_ne!(a.asset_id, ASSET_TEZ, "FA2 asset_id must not collide with tez");
+        assert_eq!(a.asset_id, derive_asset_id("KT1AAA"));
+    }
+
+    /// `apply_transfer` does not constrain asset values directly; the
+    /// asset is bound only through the cm_i public outputs. Confirm
+    /// the kernel happily accepts a transfer whose recipient cm was
+    /// computed against a non-tez asset, as long as the proof outputs
+    /// match. The Cairo verifier (not the kernel) is the layer that
+    /// enforces per-asset balance.
+    #[test]
+    fn test_apply_transfer_accepts_non_tez_recipient_cm() {
+        let (mut ledger, addr, nk_spend, shield_resp) =
+            shielded_note_setup(0xC1, "alice", 250_000);
+        let root = ledger.tree.root();
+        let auth_domain = ledger.auth_domain;
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let primary = u(0xFA2);
+
+        // Build a recipient commitment that's tagged with the primary
+        // asset. Other slots stay tez-tagged (zero-value placeholders +
+        // producer fee).
+        let (enc_1, _cm_tez_placeholder) =
+            deterministic_note(&addr, 60_000, u(0xB1), Some(b"primary-out"));
+        let rcm_1 = derive_rcm(&u(0xB1));
+        let otag_1 = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &addr.nk_tag);
+        let cm_1 = commit(&addr.d_j, 60_000, &primary, &rcm_1, &otag_1);
+        let (enc_2, cm_2) = deterministic_note(&addr, 70_000, u(0xB2), Some(b"out-2"));
+        let (enc_3, cm_3) = deterministic_note(&addr, 0, u(0xB3), None);
+        let (enc_4, cm_4) = deterministic_note(&addr, 20_000, u(0xB4), Some(b"dal"));
+
+        let resp = apply_transfer(
+            &mut ledger,
+            &TransferReq {
+                root,
+                nullifiers: vec![nf],
+                fee: MIN_TX_FEE,
+                cm_1,
+                cm_2,
+                cm_3,
+                cm_4,
+                enc_1: enc_1.clone(),
+                enc_2: enc_2.clone(),
+                enc_3: enc_3.clone(),
+                enc_4: enc_4.clone(),
+                proof: fake_stark(vec![
+                    auth_domain,
+                    root,
+                    nf,
+                    u(MIN_TX_FEE),
+                    cm_1,
+                    cm_2,
+                    cm_3,
+                    cm_4,
+                    memo_ct_hash(&enc_1),
+                    memo_ct_hash(&enc_2),
+                    memo_ct_hash(&enc_3),
+                    memo_ct_hash(&enc_4),
+                ]),
+            },
+        )
+        .unwrap();
+
+        assert!(ledger.nullifiers.contains(&nf));
+        assert_eq!(resp.index_1, 2);
+    }
+
+    // ─── Multiasset proptests + adversarial edge cases ───────────
+    //
+    // proptest gives us coverage of the input space rather than
+    // hand-picked values. Each property below pins an invariant
+    // the kernel/wallet/circuit ALL rely on. If any of these were
+    // to fail, the security argument for the multi-asset bridge
+    // collapses.
+
+    /// A ticketer string for proptest purposes. Real Tezos KT1s are
+    /// base58check-encoded — we don't enforce that here because the
+    /// kernel's derive_asset_id treats the string as opaque bytes.
+    /// Using arbitrary printable-ascii strings lets us cover any
+    /// edge case the kernel could see if a future protocol upgrade
+    /// changed the address format.
+    fn arb_ticketer() -> impl Strategy<Value = String> {
+        // 1..64 printable-ASCII chars; the kernel's MAX_ACCOUNT_ID_BYTES
+        // is 1024, but anything beyond ~50 is hypothetical for Tezos
+        // addresses.
+        "[ -~]{1,64}".prop_filter("non-empty", |s| !s.is_empty())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// derive_asset_id is a pure deterministic function of the
+        /// ticketer string. Two calls with the same input MUST yield
+        /// the same asset_id; otherwise a kernel reload would change
+        /// which pool an existing shielded note belongs to.
+        #[test]
+        fn prop_derive_asset_id_is_deterministic(t in arb_ticketer()) {
+            let a = derive_asset_id(&t);
+            let b = derive_asset_id(&t);
+            prop_assert_eq!(a, b);
+        }
+
+        /// derive_asset_id is injective on the input space we care
+        /// about: distinct ticketer strings produce distinct
+        /// asset_ids. This is the structural-uniqueness guarantee
+        /// that makes "one ticketer per asset" actually mean one
+        /// asset per ticketer — collisions would let two L1 contracts
+        /// share an L2 asset_id, breaking the bridge's identity model.
+        ///
+        /// Strictly speaking this is a hash-collision-resistance
+        /// assumption on Blake2; proptest can't disprove a 256-bit
+        /// collision but it can catch a bug where derive_asset_id
+        /// accidentally drops part of its input (e.g. a slice off-by-
+        /// one before hashing).
+        #[test]
+        fn prop_derive_asset_id_is_collision_free(
+            t1 in arb_ticketer(),
+            t2 in arb_ticketer(),
+        ) {
+            prop_assume!(t1 != t2);
+            prop_assert_ne!(derive_asset_id(&t1), derive_asset_id(&t2));
+        }
+
+        /// derive_asset_id never returns ASSET_TEZ (= ZERO) for any
+        /// non-empty string. If it did, an FA2 ticketer could spoof
+        /// the tez pool. The "tzel:asset:" domain tag prepended
+        /// before hashing makes the preimage at least 12 bytes, so
+        /// the hash is overwhelmingly unlikely to be all-zero unless
+        /// derive_asset_id is implemented incorrectly.
+        ///
+        /// We can't *prove* this for the entire string space (256-bit
+        /// search is intractable), but proptest's random sampling
+        /// catches any structural bug that would make collisions
+        /// likely.
+        #[test]
+        fn prop_derive_asset_id_never_collides_with_tez(t in arb_ticketer()) {
+            prop_assert_ne!(derive_asset_id(&t), ASSET_TEZ);
+        }
+
+        /// AssetEntry::tez ALWAYS sets asset_id = ASSET_TEZ
+        /// regardless of the ticketer string. This is the property
+        /// that preserves backward-compatibility with every
+        /// pre-multiasset commitment in the system (each was built
+        /// with asset=ZERO=ASSET_TEZ). If the tez bridge's address
+        /// changed on a network reset, the *asset_id* stays the
+        /// same — only `ticketer_for_asset(registry, ASSET_TEZ)`
+        /// returns the new address.
+        #[test]
+        fn prop_asset_entry_tez_fixes_asset_id_at_zero(t in arb_ticketer()) {
+            let entry = AssetEntry::tez(t.clone());
+            prop_assert_eq!(entry.asset_id, ASSET_TEZ);
+            prop_assert_eq!(entry.ticketer, t);
+        }
+
+        /// AssetEntry::fa2 derives asset_id from the ticketer
+        /// directly via derive_asset_id. No surprise mutations.
+        #[test]
+        fn prop_asset_entry_fa2_matches_derive(t in arb_ticketer()) {
+            let entry = AssetEntry::fa2(t.clone());
+            prop_assert_eq!(entry.asset_id, derive_asset_id(&t));
+            prop_assert_eq!(entry.ticketer, t);
+        }
+
+        /// commit() is sensitive to the asset field: changing JUST
+        /// the asset between two otherwise-identical calls produces
+        /// distinct commitments. Without this, an attacker could
+        /// "convert" an asset by re-tagging the cm.
+        #[test]
+        fn prop_commit_is_asset_sensitive(
+            d_j_bytes in prop::array::uniform32(any::<u8>()),
+            v in any::<u64>(),
+            rcm_bytes in prop::array::uniform32(any::<u8>()),
+            otag_bytes in prop::array::uniform32(any::<u8>()),
+            asset_a_bytes in prop::array::uniform32(any::<u8>()),
+            asset_b_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let d_j = truncate_felt(d_j_bytes);
+            let rcm = truncate_felt(rcm_bytes);
+            let otag = truncate_felt(otag_bytes);
+            let asset_a = truncate_felt(asset_a_bytes);
+            let asset_b = truncate_felt(asset_b_bytes);
+            prop_assume!(asset_a != asset_b);
+            let cm_a = commit(&d_j, v, &asset_a, &rcm, &otag);
+            let cm_b = commit(&d_j, v, &asset_b, &rcm, &otag);
+            prop_assert_ne!(cm_a, cm_b);
+        }
+
+        /// commit() is deterministic: same args → same cm. This is
+        /// the property the wallet's recover_note_for_address relies
+        /// on when it iterates registered assets trying to recover
+        /// a note's asset_id.
+        #[test]
+        fn prop_commit_is_deterministic(
+            d_j_bytes in prop::array::uniform32(any::<u8>()),
+            v in any::<u64>(),
+            rcm_bytes in prop::array::uniform32(any::<u8>()),
+            otag_bytes in prop::array::uniform32(any::<u8>()),
+            asset_bytes in prop::array::uniform32(any::<u8>()),
+        ) {
+            let d_j = truncate_felt(d_j_bytes);
+            let rcm = truncate_felt(rcm_bytes);
+            let otag = truncate_felt(otag_bytes);
+            let asset = truncate_felt(asset_bytes);
+            let cm_1 = commit(&d_j, v, &asset, &rcm, &otag);
+            let cm_2 = commit(&d_j, v, &asset, &rcm, &otag);
+            prop_assert_eq!(cm_1, cm_2);
+        }
+
+        /// compose_asset_registry_with always produces:
+        ///   - tez entry at index 0 with asset_id = ASSET_TEZ
+        ///   - subsequent entries are the FA2 list with duplicates of
+        ///     the tez ticketer SKIPPED (defensive guard from
+        ///     compose_asset_registry_with — see X4 fix)
+        ///   - tez ticketer string preserved on entry 0
+        ///   - non-skipped FA2 entries appear in order with the
+        ///     correct derived asset_id
+        #[test]
+        fn prop_compose_asset_registry_shape(
+            tez in arb_ticketer(),
+            fa2 in prop::collection::vec(arb_ticketer(), 0..5),
+        ) {
+            let registry = compose_asset_registry_with(&tez, &fa2);
+
+            // Length = 1 (tez) + number of FA2 entries that are NOT
+            // equal to the tez ticketer (the X4 defense skips
+            // duplicates rather than letting first-match ordering
+            // mask the FA2 entry).
+            let expected_kept: Vec<&String> =
+                fa2.iter().filter(|f| f.as_str() != tez.as_str()).collect();
+            prop_assert_eq!(registry.len(), 1 + expected_kept.len());
+            prop_assert_eq!(registry[0].asset_id, ASSET_TEZ);
+            prop_assert_eq!(registry[0].ticketer.as_str(), tez.as_str());
+            for (i, fa2_addr) in expected_kept.iter().enumerate() {
+                prop_assert_eq!(registry[i + 1].ticketer.as_str(), fa2_addr.as_str());
+                prop_assert_eq!(registry[i + 1].asset_id, derive_asset_id(fa2_addr));
+            }
+        }
+
+        /// ticketer_for_asset and asset_for_ticketer are inverse
+        /// lookups: for any entry in the registry, looking up by
+        /// asset returns the ticketer, looking up by ticketer
+        /// returns the asset. Property holds across arbitrary FA2
+        /// lists.
+        #[test]
+        fn prop_registry_lookups_are_inverses(
+            tez in arb_ticketer(),
+            fa2 in prop::collection::vec(arb_ticketer(), 0..4),
+        ) {
+            // Skip cases with duplicate strings (would mean two
+            // entries share an asset_id; the linear scan returns
+            // the first match, which is the documented behavior
+            // but breaks invertibility for the duplicates).
+            let mut all = vec![tez.clone()];
+            all.extend_from_slice(&fa2);
+            let unique: std::collections::HashSet<&str> =
+                all.iter().map(|s| s.as_str()).collect();
+            prop_assume!(unique.len() == all.len());
+
+            let registry = compose_asset_registry_with(&tez, &fa2);
+            for entry in &registry {
+                let resolved_ticketer = ticketer_for_asset(&registry, &entry.asset_id);
+                let resolved_asset = asset_for_ticketer(&registry, &entry.ticketer);
+                prop_assert_eq!(resolved_ticketer, Some(entry.ticketer.as_str()));
+                prop_assert_eq!(resolved_asset, Some(&entry.asset_id));
+            }
+        }
+
+        /// Lookups MUST return None for inputs not in the registry.
+        /// This is the "fail-closed" property the kernel's deposit
+        /// dispatcher and outbox dispatcher both rely on.
+        #[test]
+        fn prop_registry_lookups_miss_unknown(
+            tez in arb_ticketer(),
+            fa2 in prop::collection::vec(arb_ticketer(), 0..3),
+            stranger in arb_ticketer(),
+        ) {
+            // Stranger must not collide with any registered ticketer.
+            let mut all = vec![tez.clone()];
+            all.extend_from_slice(&fa2);
+            prop_assume!(!all.iter().any(|s| s == &stranger));
+            let registry = compose_asset_registry_with(&tez, &fa2);
+            prop_assert_eq!(asset_for_ticketer(&registry, &stranger), None);
+
+            // For ticketer_for_asset we need an asset_id that's not
+            // any of the registered ones. derive_asset_id(stranger)
+            // is guaranteed distinct from each by the collision-
+            // freeness property, and != ASSET_TEZ by the never-tez
+            // property.
+            let stranger_asset = derive_asset_id(&stranger);
+            prop_assert_eq!(ticketer_for_asset(&registry, &stranger_asset), None);
+        }
+    }
+
+    // ─── Adversarial edge cases ────────────────────────────────────
+
+    /// Edge case: tez ticketer also appears in the FA2 list. The
+    /// composed registry has two entries for the same ticketer
+    /// Phase E.5 defense-in-depth: `compose_asset_registry_with`
+    /// silently SKIPS any FA2 ticketer that equals the tez ticketer
+    /// (rather than including it as a duplicate entry whose
+    /// `asset_id` would derive to a value distinct from ASSET_TEZ).
+    /// Earlier behaviour created a registry where the same ticketer
+    /// string appeared twice with DIFFERENT asset_ids and the
+    /// `find`-based lookups silently masked the FA2 entry behind
+    /// the tez entry — making first-match ordering a security
+    /// property. The new behaviour makes that misconfiguration
+    /// un-shootable.
+    #[test]
+    fn test_tez_ticketer_in_fa2_list_is_skipped_not_duplicated() {
+        let tez = "KT1Tez";
+        let registry = compose_asset_registry_with(tez, &[tez]);
+        assert_eq!(
+            registry.len(),
+            1,
+            "duplicate tez address in FA2 list must be skipped, leaving only the tez entry",
+        );
+        assert_eq!(registry[0].asset_id, ASSET_TEZ);
+        assert_eq!(registry[0].ticketer, tez);
+
+        // asset_for_ticketer resolves the tez address to ASSET_TEZ.
+        assert_eq!(asset_for_ticketer(&registry, tez), Some(&ASSET_TEZ));
+        // ticketer_for_asset for the would-be FA2-derived asset_id
+        // now returns None — the address is bound to tez only.
+        assert_eq!(ticketer_for_asset(&registry, &ASSET_TEZ), Some(tez));
+        assert_eq!(
+            ticketer_for_asset(&registry, &derive_asset_id(tez)),
+            None,
+            "skipped FA2 entry must not be reachable via its derived asset_id",
+        );
+    }
+
+    /// Edge case: duplicate FA2 ticketers in the list. The composed
+    /// registry has duplicate (asset_id, ticketer) pairs. Lookups
+    /// return the first match by linear scan.
+    #[test]
+    fn test_duplicate_fa2_ticketers_are_idempotent_under_lookup() {
+        let tez = "KT1Tez";
+        let fa2 = "KT1Dup";
+        let registry = compose_asset_registry_with(tez, &[fa2, fa2, fa2]);
+        assert_eq!(registry.len(), 4);
+        // All FA2 entries share the same asset_id (deterministic
+        // derivation).
+        let dup_id = derive_asset_id(fa2);
+        for i in 1..4 {
+            assert_eq!(registry[i].asset_id, dup_id);
+            assert_eq!(registry[i].ticketer, fa2);
+        }
+        // Lookups still work — just resolve to the first match.
+        assert_eq!(ticketer_for_asset(&registry, &dup_id), Some(fa2));
+        assert_eq!(asset_for_ticketer(&registry, fa2), Some(&dup_id));
+    }
+
+    /// Edge case: empty FA2 list = tez-only registry. Lookups for
+    /// any non-tez asset_id MUST return None.
+    #[test]
+    fn test_empty_fa2_list_yields_tez_only_registry() {
+        let registry = compose_asset_registry_with::<&str>("KT1Tez", &[]);
+        assert_eq!(registry.len(), 1);
+        let arbitrary_fa2_asset = derive_asset_id("KT1Foo");
+        assert_eq!(ticketer_for_asset(&registry, &arbitrary_fa2_asset), None);
+        assert_eq!(asset_for_ticketer(&registry, "KT1Foo"), None);
+    }
+
+    /// Edge case: a long ticketer string. The `derive_asset_id`
+    /// helper itself is length-agnostic — it just hashes bytes.
+    /// The kernel-wire decoder caps the ticketer field at
+    /// `MAX_ACCOUNT_ID_BYTES = 128` (real Tezos addresses are 36
+    /// bytes; the headroom is for hypothetical future formats),
+    /// but the pure `derive_asset_id` path can be exercised with
+    /// any length. We test at 1024 bytes to confirm there's no
+    /// internal cap inside `derive_asset_id` that would silently
+    /// truncate or fail for long inputs — even though such
+    /// strings would be refused at the wire boundary in practice.
+    #[test]
+    fn test_very_long_ticketer_string_works() {
+        let huge: String = std::iter::repeat('A').take(1024).collect();
+        let asset_id = derive_asset_id(&huge);
+        assert_ne!(asset_id, ASSET_TEZ);
+        let registry = compose_asset_registry_with("KT1Tez", &[huge.clone()]);
+        assert_eq!(registry.len(), 2);
+        assert_eq!(asset_for_ticketer(&registry, &huge), Some(&asset_id));
+    }
+
+    /// Phase E.5 regression: `validate_l1_ticketer_canonical` must
+    /// accept canonical KT1/tz addresses verbatim, REJECT
+    /// whitespace-padded variants, and REJECT garbage. The defensive
+    /// goal is that any caller routing untrusted input through this
+    /// validator before `derive_asset_id` cannot land on a
+    /// silently-divergent asset_id (e.g. a CLI paste with a trailing
+    /// newline would otherwise hash to a different value than the
+    /// kernel's canonical string).
+    #[test]
+    fn test_validate_l1_ticketer_canonical_accepts_kt1_addresses() {
+        // KT1 (Originated) — canonical form passes round-trip.
+        let kt1 = "KT1HbQepzV1nVGg8QVznG7z4RcHseD5kwqBn";
+        assert_eq!(
+            validate_l1_ticketer_canonical(kt1).unwrap(),
+            kt1,
+        );
+    }
+
+    #[test]
+    fn test_validate_l1_ticketer_canonical_rejects_implicit_address() {
+        // tz1/tz2/tz3 are Implicit — a Tezos protocol-level Transfer
+        // cannot have an Implicit sender, so an Implicit ticketer
+        // would produce an asset_id the kernel could never observe.
+        let tz1 = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
+        let err = validate_l1_ticketer_canonical(tz1).unwrap_err();
+        assert!(
+            err.contains("Implicit"),
+            "expected Implicit-rejection error, got: {}",
+            err,
+        );
+    }
+
+    #[test]
+    fn test_validate_l1_ticketer_canonical_normalizes_surrounding_whitespace() {
+        let kt1 = "KT1HbQepzV1nVGg8QVznG7z4RcHseD5kwqBn";
+        // Leading + trailing whitespace gets trimmed (matches the
+        // ergonomics of `validate_l1_withdrawal_recipient`).
+        assert_eq!(
+            validate_l1_ticketer_canonical(&format!("  {}  ", kt1)).unwrap(),
+            kt1,
+        );
+        assert_eq!(
+            validate_l1_ticketer_canonical(&format!("{}\n", kt1)).unwrap(),
+            kt1,
+        );
+    }
+
+    #[test]
+    fn test_validate_l1_ticketer_canonical_rejects_garbage() {
+        // Empty string.
+        assert!(validate_l1_ticketer_canonical("").is_err());
+        assert!(validate_l1_ticketer_canonical("   ").is_err());
+        // Random non-Tezos string.
+        assert!(validate_l1_ticketer_canonical("not-a-tezos-address").is_err());
+        // Truncated KT1.
+        assert!(validate_l1_ticketer_canonical("KT1Hb").is_err());
+        // Wrong checksum (last char flipped).
+        assert!(
+            validate_l1_ticketer_canonical("KT1HbQepzV1nVGg8QVznG7z4RcHseD5kwqBz").is_err(),
+        );
+    }
+
+    #[test]
+    fn test_validate_l1_ticketer_canonical_preserves_derive_asset_id_outputs() {
+        // The whole point of canonicalizing: untrusted-input ticketers
+        // go through `validate_l1_ticketer_canonical` first, then
+        // `derive_asset_id` on the canonical form. The resulting
+        // asset_id MUST equal what the kernel would compute on the
+        // canonical string from L1's `to_b58check()`.
+        let raw = "  KT1HbQepzV1nVGg8QVznG7z4RcHseD5kwqBn\n";
+        let canonical = validate_l1_ticketer_canonical(raw).unwrap();
+        let asset_id_after = derive_asset_id(&canonical);
+        let asset_id_direct = derive_asset_id("KT1HbQepzV1nVGg8QVznG7z4RcHseD5kwqBn");
+        assert_eq!(asset_id_after, asset_id_direct);
+
+        // The pre-validation asset_id (raw bytes with whitespace) is
+        // DIFFERENT — exactly the stranded-funds scenario the
+        // validator is designed to prevent.
+        let asset_id_naive = derive_asset_id(raw);
+        assert_ne!(
+            asset_id_naive, asset_id_direct,
+            "non-canonical input must hash differently — confirms why the validator is needed",
+        );
+    }
+
+    /// Edge case: a registry of size 1 (only tez). The compose
+    /// helper short-circuits the iteration over fa2; we verify the
+    /// result still has every invariant the kernel depends on.
+    #[test]
+    fn test_singleton_registry_invariants() {
+        let registry = compose_asset_registry_with::<&str>("KT1Tez", &[]);
+        assert_eq!(registry.len(), 1);
+        // Tez round-trip.
+        assert_eq!(ticketer_for_asset(&registry, &ASSET_TEZ), Some("KT1Tez"));
+        assert_eq!(asset_for_ticketer(&registry, "KT1Tez"), Some(&ASSET_TEZ));
+    }
+
+    /// Edge case: per-asset deposit pool isolation under ARBITRARY
+    /// asset values. The Ledger's deposit_balances HashMap is
+    /// keyed first by asset_id; bugs that conflate two asset_ids
+    /// (e.g. truncation, comparison by reference instead of value)
+    /// would manifest as a leak from one pool to another.
+    #[test]
+    fn test_deposit_pool_isolation_under_arbitrary_assets() {
+        let mut ledger = Ledger::new();
+        let pkh = hash(b"alice-pkh");
+        let recipient = deposit_recipient_string(&pkh);
+        // Credit several asset pools at the same pubkey_hash with
+        // distinct amounts. Each must be readable independently.
+        let assets: Vec<F> = (0..10).map(|i| hash(format!("asset-{}", i).as_bytes())).collect();
+        for (i, asset) in assets.iter().enumerate() {
+            apply_deposit(&mut ledger, asset, &recipient, (i as u64 + 1) * 100)
+                .expect("deposit succeeds");
+        }
+        for (i, asset) in assets.iter().enumerate() {
+            assert_eq!(
+                ledger.deposit_balance(asset, &pkh).unwrap(),
+                Some((i as u64 + 1) * 100),
+                "asset {} pool must report its own balance",
+                i,
+            );
+        }
+        // Tez pool stays empty (no tez deposits made).
+        assert_eq!(ledger.deposit_balance(&ASSET_TEZ, &pkh).unwrap(), None);
+    }
+
+    /// Edge case: drain an asset pool to zero, then redeposit, then
+    /// drain again. The HashMap entry is fully removed on first
+    /// drain; the second deposit must re-create it cleanly without
+    /// resurrecting stale state.
+    #[test]
+    fn test_pool_drain_then_redeposit_is_idempotent() {
+        let mut ledger = Ledger::new();
+        let asset = derive_asset_id("KT1Foo");
+        let pkh = hash(b"alice-pkh");
+        let recipient = deposit_recipient_string(&pkh);
+
+        apply_deposit(&mut ledger, &asset, &recipient, 100).unwrap();
+        ledger.debit_deposit(&asset, &pkh, 100).unwrap();
+        assert_eq!(ledger.deposit_balance(&asset, &pkh).unwrap(), None);
+
+        apply_deposit(&mut ledger, &asset, &recipient, 50).unwrap();
+        assert_eq!(ledger.deposit_balance(&asset, &pkh).unwrap(), Some(50));
+
+        ledger.debit_deposit(&asset, &pkh, 50).unwrap();
+        assert_eq!(ledger.deposit_balance(&asset, &pkh).unwrap(), None);
+    }
+
+    /// Edge case: debiting more than the pool holds must error
+    /// without modifying state. Tests both per-asset isolation
+    /// (the tez pool with the same pubkey_hash must NOT cover the
+    /// FA2 shortfall) and atomicity (a failed debit leaves the
+    /// pool's balance unchanged).
+    #[test]
+    fn test_debit_overshoot_errors_atomically_under_asset_isolation() {
+        let mut ledger = Ledger::new();
+        let fa2 = derive_asset_id("KT1Foo");
+        let pkh = hash(b"alice-pkh");
+        let recipient = deposit_recipient_string(&pkh);
+
+        apply_deposit(&mut ledger, &ASSET_TEZ, &recipient, 1_000_000).unwrap();
+        apply_deposit(&mut ledger, &fa2, &recipient, 50).unwrap();
+
+        let err = ledger.debit_deposit(&fa2, &pkh, 1000).expect_err("overshoot must fail");
+        assert!(err.contains("too small to debit"));
+
+        // FA2 pool unchanged.
+        assert_eq!(ledger.deposit_balance(&fa2, &pkh).unwrap(), Some(50));
+        // Tez pool definitely unchanged (the failure must NOT
+        // leak across assets — this is the asset-isolation
+        // invariant under failure).
+        assert_eq!(
+            ledger.deposit_balance(&ASSET_TEZ, &pkh).unwrap(),
+            Some(1_000_000),
+        );
+    }
+
+    /// Edge case: WithdrawalRecord encoding round-trips under
+    /// arbitrary asset_ids, including the all-zero (tez) case and
+    /// the all-ones edge case. The encoded format is:
+    ///   32B asset_id || 8B LE amount || 4B LE recipient_len || recipient
+    /// — proptest the round-trip exhaustively.
+    #[test]
+    fn test_withdrawal_record_format_pins() {
+        // Pre-multiasset format had no asset_id; the new layout
+        // adds 32 bytes at the front. Pin the exact size for a
+        // known recipient.
+        let record = WithdrawalRecord {
+            asset_id: ASSET_TEZ,
+            recipient: "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx".into(),
+            amount: 42,
+        };
+        // 32 (asset_id) + 8 (amount) + 4 (len) + 36 (recipient) = 80.
+        let encoded_len = 32 + 8 + 4 + record.recipient.len();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&record.asset_id);
+        bytes.extend_from_slice(&record.amount.to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(record.recipient.len()).unwrap().to_le_bytes(),
+        );
+        bytes.extend_from_slice(record.recipient.as_bytes());
+        assert_eq!(bytes.len(), encoded_len);
     }
 }

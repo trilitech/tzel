@@ -1,0 +1,119 @@
+name: rocq model
+
+# Drift-checks the Cairo↔Impl manifest and builds the Rocq theory under
+# coq/. The build job uses Rocq 9 via opam (same opam-via-setup-ocaml
+# pattern as the OCaml unit tests workflow) so the dependency surface
+# stays inside actions/* + opam packages, no third-party Docker
+# images.
+#
+# Triggers:
+# - any push to main affecting coq/** or cairo/src/**.cairo (Cairo
+#   edits drive drift detection)
+# - same-paths PRs
+# - the coq-model branch (so the model can iterate independently of
+#   main while it's under development)
+# - workflow_dispatch
+#
+# Extraction wires through ocaml/coq_driver/ — `make` builds the
+# theory and side-effects writing tzel_wots.{ml,mli} into coq/Impl/.
+# coq/Extracted/build.sh copies those into ocaml/coq_driver/ and runs
+# `dune build` against the OCaml workspace, so the realizations for
+# Hash3 and pack_adrs_chain in Impl/Extraction.v resolve to the real
+# Tzel.Hash.hash3 / Tzel.Wots.pack_adrs from the protocol port. The
+# smoke step asserts a known reference vector (the all-zero input
+# hashes to a fixed felt under the OCaml port; the extracted driver
+# must produce the same byte-for-byte). Cairo-side run_chain_step
+# runner + QCheck2 differential land next — see coq/STATUS.md.
+
+on:
+  push:
+    branches: [main, coq-model]
+    paths:
+      - "coq/**"
+      - "cairo/src/**.cairo"
+      - "ocaml/coq_driver/**"
+      - ".github/workflows/coq.yml"
+  pull_request:
+    paths:
+      - "coq/**"
+      - "cairo/src/**.cairo"
+      - "ocaml/coq_driver/**"
+      - ".github/workflows/coq.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocq-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Drift check (Cairo SHAs vs MANIFEST.toml)
+        run: ./coq/Drift/check.sh
+
+  build:
+    runs-on: ubuntu-latest
+    needs: drift
+    env:
+      LIBRARY_PATH: ${{ github.workspace }}/ocaml/vendor/mlkem-native/test/build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install OCaml system prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgmp-dev pkg-config
+
+      - name: Set up OCaml + opam
+        uses: ocaml/setup-ocaml@e32b06a3e831ff2fbc6f08cf35be2085e3918014  # v3
+        with:
+          ocaml-compiler: "5.2.0"
+
+      - name: Install OCaml dependencies (tzel library + Rocq prover)
+        # Same opam package list as the unit-tests workflow's ocaml
+        # job — tzel links against these and the extracted driver
+        # links tzel. rocq-prover provides Rocq 9 and the extraction
+        # plugin.
+        run: |
+          opam install -y dune alcotest cstruct ctypes ctypes-foreign hex \
+                          mirage-crypto yojson digestif rocq-prover
+
+      - name: Build ML-KEM native library
+        # tzel transitively links libmlkem768 via foreign stubs.
+        run: make -C ocaml/vendor/mlkem-native lib
+
+      - name: Build Rocq theory (compiles modules and extracts to OCaml)
+        working-directory: coq
+        run: |
+          opam exec -- rocq makefile -f _CoqProject -o Makefile
+          opam exec -- make -j2
+
+      - name: Build extracted-Rocq OCaml driver
+        run: opam exec -- ./coq/Extracted/build.sh
+
+      - name: Smoke run extracted driver (zero-input reference vector)
+        # With the real Tzel.Hash.hash3 / Tzel.Wots.pack_adrs
+        # realizations, hashing 96 zero bytes (x || pack_adrs(...) ||
+        # pub_seed where pack_adrs of all-zero indices is just the
+        # 8-byte little-endian TAG_XMSS_CHAIN followed by zeros) under
+        # BLAKE2s-251 produces this fixed felt. Computed once via the
+        # OCaml port; the extracted driver must match byte-for-byte.
+        run: |
+          out=$(./coq/Extracted/chain_step \
+            "0000000000000000000000000000000000000000000000000000000000000000" \
+            "0000000000000000000000000000000000000000000000000000000000000000" \
+            0 0 0)
+          echo "extracted xmss_chain_step output: $out"
+          expected="5ca134c7d8b26856b4dc9c748905318c23da49cac0fd56cc26c7885155466807"
+          if [[ "$out" != "$expected" ]]; then
+            echo "::error::expected $expected, got $out"
+            exit 1
+          fi

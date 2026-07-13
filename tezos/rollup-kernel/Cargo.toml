@@ -31,4 +31,11 @@ tzel-verifier = { path = "../../verifier", optional = true }
 getrandom = { version = "0.2.17", features = ["custom"] }
 
 [dev-dependencies]
-ml-kem = "=0.3.0-rc.2"
+ml-kem = "=0.3.2"
+proptest = "1"
+# Integration tests exercise the FA2 registry override path to test
+# per-asset deposit / shield / unshield routing against synthetic
+# ticketers without polluting the production registry. Importantly
+# this is only enabled in dev-dependencies, so the shipped kernel
+# binary still ignores tzel_core::test_fa2_bridges.
+tzel-core = { path = "../../core", features = ["test-fa2-bridges"] }

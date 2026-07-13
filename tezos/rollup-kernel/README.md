@@ -17,20 +17,28 @@ The kernel consumes Tezos Data Encoding inbox messages and records:
 
 Supported message kinds:
 - L1 internal `Transfer` carrying a bridge ticket (credits the
-  per-pool aggregated balance keyed by `pubkey_hash =
-  H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)` parsed from
-  the ticket's `deposit:<hex(pubkey_hash)>` recipient string;
-  multiple tickets to the same pool aggregate)
-- `shield` (debit the named pool by `v + fee + producer_fee` and
-  append the recipient note plus a DAL-producer fee note; the proof
-  verifies an in-circuit WOTS+ signature under the recipient's auth
-  tree, binding the entire shield request)
-- `transfer` (shielded transfer inside the rollup, creating recipient,
-  change, and DAL-producer fee notes while burning the protocol fee)
-- `unshield` (consume one or more shielded notes, append optional change
-  and a DAL-producer fee note, queue a withdrawal record, and emit an
-  L1 outbox withdrawal payload directly — there is no separate
-  transparent-balance step)
+  per-pool aggregated balance keyed by `(asset_id, pubkey_hash)` where
+  `pubkey_hash = H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)`
+  is parsed from the ticket's `deposit:<hex(pubkey_hash)>` recipient
+  string and `asset_id` is determined by the ticketer KT1 that emitted
+  the L1 ticket; multiple tickets from the same ticketer to the same
+  recipient aggregate)
+- `shield` (debit the asset pool by `v + fee` and, for FA2 shields,
+  ALSO debit the user's `(ASSET_TEZ, pubkey_hash)` pool by `producer_fee`;
+  for tez shields the same asset pool is debited the full
+  `v + fee + producer_fee`. Appends the recipient note plus a
+  DAL-producer fee note (always tez). The proof verifies an in-circuit
+  WOTS+ signature under the recipient's auth tree, binding the entire
+  shield request including `asset_new`.)
+- `transfer` (shielded transfer inside the rollup, creating up to 4
+  output notes — recipient, up to two change notes (one per asset under
+  the multiasset 2-accumulator design), and a DAL-producer fee note —
+  while burning the protocol fee)
+- `unshield` (consume one or more shielded notes, append up to two change
+  notes and a DAL-producer fee note, queue a withdrawal record for
+  `(asset_pub, v_pub, recipient)`, and emit an L1 outbox withdrawal
+  payload directly via `ticketer_for_asset(asset_pub)` — there is no
+  separate transparent-balance step)
 - `configure_verifier` / `configure_bridge` (signed administrative
   messages installing the verifier config and bridge ticketer)
 
@@ -41,9 +49,11 @@ The kernel does not keep the full ledger as one serialized blob. It stores:
 - the commitment-tree append frontier and current root
 - valid-root membership markers
 - nullifier membership markers
-- per-pool aggregated deposit balances keyed by `pubkey_hash`. A pool
-  whose balance reaches zero is removed (best-effort delete via empty
-  value).
+- per-pool aggregated deposit balances keyed by `(asset_id, pubkey_hash)`.
+  The same `pubkey_hash` may host distinct pools for tez and one or more
+  FA2 assets simultaneously (FA2 shields rely on the dual-pool layout to
+  fund the producer-fee tez note from the user's tez pool). A pool whose
+  balance reaches zero is removed (best-effort delete via empty value).
 - queued withdrawals under append-only per-index paths
 - the configured bridge ticketer (one-shot; reconfiguration is
   rejected once set)

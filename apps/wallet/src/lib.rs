@@ -510,6 +510,10 @@ struct PendingSpend {
 /// signs the request with one of the recipient's auth-tree WOTS+ keys.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingDeposit {
+    /// L2 asset_id this deposit was made under. Defaults to ASSET_TEZ
+    /// so wallet fixtures from before multi-asset land parse cleanly.
+    #[serde(with = "hex_f", default)]
+    asset_id: F,
     /// Deposit pool key. The L1 recipient string is
     /// `deposit:<hex(pubkey_hash)>`.
     #[serde(with = "hex_f")]
@@ -610,6 +614,14 @@ struct ViewedNoteRecord {
     value: u64,
     #[serde(default, with = "hex_bytes")]
     memo: Vec<u8>,
+    /// Asset class of the recovered note. Defaults to `ASSET_TEZ` so
+    /// records written by the pre-multiasset wallet deserialize
+    /// cleanly. The multiasset recovery path now iterates the
+    /// candidate registry and records whichever asset_id matched the
+    /// on-chain `cm` — without this field a view watcher would have
+    /// no way to label FA2 receipts.
+    #[serde(default = "default_asset_tez", with = "hex_f")]
+    asset_id: F,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -629,6 +641,14 @@ struct OutgoingNoteRecord {
     auth_pub_seed: F,
     #[serde(with = "hex_f")]
     nk_tag: F,
+    /// Asset class of the recovered note. See `ViewedNoteRecord` for
+    /// the rationale.
+    #[serde(default = "default_asset_tez", with = "hex_f")]
+    asset_id: F,
+}
+
+fn default_asset_tez() -> F {
+    ASSET_TEZ
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -765,9 +785,22 @@ impl WalletFile {
         let nk_tg = derive_nk_tag(&nk_sp);
         let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tg);
         let rcm = derive_rcm(&rseed);
-        if commit(&addr.d_j, v, &rcm, &otag) != cm {
-            return None;
+        // Multiasset: the encrypted note payload doesn't include the
+        // asset_id (that would force a wire-format bump and a Cairo
+        // change that re-bound mh to asset). Instead we re-derive cm
+        // against each registered asset and pick whichever matches.
+        // The cost is O(|registry|) hashes per candidate decrypt;
+        // for a single-digit registry this is negligible. The list
+        // tried is: ASSET_TEZ first (almost every note is tez), then
+        // each compile-time FA2 entry in declaration order.
+        let mut candidates: Vec<F> = Vec::with_capacity(1 + COMPILE_TIME_FA2_BRIDGES.len());
+        candidates.push(ASSET_TEZ);
+        for ticketer in COMPILE_TIME_FA2_BRIDGES {
+            candidates.push(derive_asset_id(ticketer));
         }
+        let asset_id = candidates
+            .into_iter()
+            .find(|asset| commit(&addr.d_j, v, asset, &rcm, &otag) == cm)?;
         Some(Note {
             nk_spend: nk_sp,
             nk_tag: nk_tg,
@@ -778,6 +811,7 @@ impl WalletFile {
             cm,
             index,
             addr_index: addr.index,
+            asset_id,
         })
     }
 
@@ -871,6 +905,47 @@ impl WalletFile {
             .sum()
     }
 
+    /// Per-asset breakdown of `balance()`. Keys are asset_ids
+    /// (ASSET_TEZ + each FA2 the wallet has ever received). Sorted
+    /// with ASSET_TEZ first, then by asset_id for stable display.
+    fn balance_by_asset(&self) -> Vec<(F, u128)> {
+        use std::collections::BTreeMap;
+        let mut acc: BTreeMap<[u8; 32], u128> = BTreeMap::new();
+        for n in &self.notes {
+            *acc.entry(n.asset_id).or_insert(0) += n.v as u128;
+        }
+        let mut out: Vec<(F, u128)> = acc.into_iter().collect();
+        // Tez first.
+        out.sort_by(|a, b| match (a.0 == ASSET_TEZ, b.0 == ASSET_TEZ) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.cmp(&b.0),
+        });
+        out
+    }
+
+    /// Per-asset breakdown of `available_balance()` (excludes notes
+    /// whose nullifier sits in a pending spend).
+    fn available_balance_by_asset(&self) -> Vec<(F, u128)> {
+        use std::collections::BTreeMap;
+        let pending = self.pending_nullifier_set();
+        let mut acc: BTreeMap<[u8; 32], u128> = BTreeMap::new();
+        for n in self
+            .notes
+            .iter()
+            .filter(|n| !pending.contains(&note_nullifier(n)))
+        {
+            *acc.entry(n.asset_id).or_insert(0) += n.v as u128;
+        }
+        let mut out: Vec<(F, u128)> = acc.into_iter().collect();
+        out.sort_by(|a, b| match (a.0 == ASSET_TEZ, b.0 == ASSET_TEZ) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.cmp(&b.0),
+        });
+        out
+    }
+
     fn register_pending_spend(
         &mut self,
         nullifiers: Vec<F>,
@@ -900,17 +975,25 @@ impl WalletFile {
         }
     }
 
-    /// Select notes to cover at least `amount`. Returns indices into self.notes.
-    fn select_notes(&self, amount: u64) -> Result<Vec<usize>, String> {
+    /// Select notes of `asset_id` to cover at least `amount`. Returns
+    /// indices into self.notes. Largest-first packing. Only notes
+    /// whose nullifier is not in a pending spend are considered.
+    fn select_notes_of_asset(
+        &self,
+        asset_id: &F,
+        amount: u64,
+    ) -> Result<Vec<usize>, String> {
         let pending = self.pending_nullifier_set();
         let mut indexed: Vec<(usize, u64)> = self
             .notes
             .iter()
             .enumerate()
-            .filter(|(_, note)| !pending.contains(&note_nullifier(note)))
+            .filter(|(_, note)| {
+                &note.asset_id == asset_id && !pending.contains(&note_nullifier(note))
+            })
             .map(|(i, n)| (i, n.v))
             .collect();
-        indexed.sort_by(|a, b| b.1.cmp(&a.1)); // largest first
+        indexed.sort_by(|a, b| b.1.cmp(&a.1));
         let mut sum = 0u128;
         let mut selected = vec![];
         for (i, v) in indexed {
@@ -920,12 +1003,34 @@ impl WalletFile {
                 return Ok(selected);
             }
         }
+        let available: u128 = self
+            .notes
+            .iter()
+            .filter(|n| &n.asset_id == asset_id && !pending.contains(&note_nullifier(n)))
+            .map(|n| n.v as u128)
+            .sum();
+        let pending_amt: u128 = self
+            .notes
+            .iter()
+            .filter(|n| &n.asset_id == asset_id && pending.contains(&note_nullifier(n)))
+            .map(|n| n.v as u128)
+            .sum();
+        let label = if asset_id == &ASSET_TEZ {
+            "tez".to_string()
+        } else {
+            hex::encode(asset_id)
+        };
         Err(format!(
-            "insufficient funds: have {} available ({} pending) need {}",
-            self.available_balance(),
-            self.pending_outgoing_balance(),
-            amount
+            "insufficient {} funds: have {} available ({} pending) need {}",
+            label, available, pending_amt, amount
         ))
+    }
+
+    /// Tez-only convenience for callers that haven't been generalised
+    /// to multi-asset yet. New code should call `select_notes_of_asset`
+    /// directly with an explicit asset_id.
+    fn select_notes(&self, amount: u64) -> Result<Vec<usize>, String> {
+        self.select_notes_of_asset(&ASSET_TEZ, amount)
     }
 }
 
@@ -1056,11 +1161,28 @@ fn detect_record_for_note(
     None
 }
 
+/// Candidate-asset list for watcher-mode commitment matching. Order
+/// is ASSET_TEZ first (the overwhelmingly common case), then each
+/// compile-time FA2 entry. Mirrors `recover_note_for_address` so the
+/// view/outgoing watch paths recover FA2 notes the same way the full
+/// wallet does. Without this, a watch wallet would silently lose
+/// visibility of every FA2 receipt because the on-chain `cm`
+/// commits to the FA2 asset_id, not tez.
+fn watcher_asset_candidates() -> Vec<F> {
+    let mut candidates: Vec<F> = Vec::with_capacity(1 + COMPILE_TIME_FA2_BRIDGES.len());
+    candidates.push(ASSET_TEZ);
+    for ticketer in COMPILE_TIME_FA2_BRIDGES {
+        candidates.push(derive_asset_id(ticketer));
+    }
+    candidates
+}
+
 fn view_record_for_note(
     incoming_seed: &F,
     addresses: &[WatchAddressRecord],
     nm: &NoteMemo,
 ) -> Option<ViewedNoteRecord> {
+    let candidates = watcher_asset_candidates();
     for addr in addresses {
         let (_, dk_v, _, dk_d) = derive_kem_keys(incoming_seed, addr.index);
         if !detect(&nm.enc, &dk_d) {
@@ -1071,15 +1193,22 @@ fn view_record_for_note(
         };
         let rcm = derive_rcm(&rseed);
         let owner = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &addr.nk_tag);
-        if commit(&addr.d_j, value, &rcm, &owner) != nm.cm {
+        // Try each candidate asset; the first one whose commitment
+        // matches the on-chain `cm` is the asset this note carries.
+        let Some(asset_id) = candidates
+            .iter()
+            .copied()
+            .find(|asset| commit(&addr.d_j, value, asset, &rcm, &owner) == nm.cm)
+        else {
             continue;
-        }
+        };
         return Some(ViewedNoteRecord {
             index: nm.index,
             addr_index: addr.index,
             cm: nm.cm,
             value,
             memo: trim_decrypted_memo(memo),
+            asset_id,
         });
     }
     None
@@ -1087,9 +1216,13 @@ fn view_record_for_note(
 
 fn outgoing_record_for_note(outgoing_seed: &F, nm: &NoteMemo) -> Option<OutgoingNoteRecord> {
     let recovery = decrypt_outgoing_recovery(outgoing_seed, &nm.cm, &nm.enc.outgoing_ct)?;
-    if recovery.commitment() != nm.cm {
-        return None;
-    }
+    // OutgoingRecoveryPlaintext does NOT carry asset_id (changing its
+    // wire format would break every pre-multiasset outgoing-recovery
+    // ciphertext on chain), so iterate candidates and pick the asset
+    // whose commitment recomputes to the on-chain `cm`.
+    let asset_id = watcher_asset_candidates()
+        .into_iter()
+        .find(|asset| recovery.commitment_for_asset(asset) == nm.cm)?;
     Some(OutgoingNoteRecord {
         index: nm.index,
         role: recovery.role.as_str().into(),
@@ -1100,6 +1233,7 @@ fn outgoing_record_for_note(outgoing_seed: &F, nm: &NoteMemo) -> Option<Outgoing
         auth_root: recovery.auth_root,
         auth_pub_seed: recovery.auth_pub_seed,
         nk_tag: recovery.nk_tag,
+        asset_id,
     })
 }
 
@@ -1414,6 +1548,24 @@ fn create_private_temp_file(
 fn enforce_wallet_xmss_floor(path: &str, wallet: &WalletFile) -> Result<(), String> {
     let floor_path = wallet_xmss_floor_path(path);
     let Ok(data) = std::fs::read_to_string(&floor_path) else {
+        // Missing floor sidecar: best-effort silent pass to keep
+        // legitimate backup-restore UX working (a user restoring a
+        // wallet from cold storage genuinely has no floor file).
+        // BUT: surface a stderr warning so an operator restoring a
+        // hot wallet realizes the rollback alarm is now disabled
+        // until a fresh signing op rewrites the sidecar. Without
+        // this hint, the silent-pass would otherwise mask a stale-
+        // backup restore performed against a hot-wallet host.
+        if wallet.addr_counter > 0 {
+            eprintln!(
+                "tzel-wallet: warning — no XMSS floor sidecar at `{}`. The \
+                 stale-backup rollback alarm is disabled for this load. If \
+                 you did not just restore from a fresh seed, regenerate the \
+                 floor by running any state-mutating command (e.g. \
+                 `tzel-wallet receive`).",
+                floor_path.display(),
+            );
+        }
         return Ok(());
     };
     let floor: WalletXmssFloor =
@@ -1527,7 +1679,9 @@ fn post_json<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
         let body = resp.into_body().read_to_string().unwrap_or_default();
         return Err(format!("HTTP {}: {}", status, body));
     }
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
@@ -1558,16 +1712,30 @@ fn post_json_with_bearer<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
         let body = resp.into_body().read_to_string().unwrap_or_default();
         return Err(format!("HTTP {}: {}", status, body));
     }
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
+
+/// Maximum bytes the wallet will read from any HTTP JSON response.
+/// Bounds memory usage when fetching from an untrusted operator /
+/// rollup node — without this cap, a malicious endpoint could return
+/// a multi-GB body and OOM the wallet (especially the `tzel-detect`
+/// daemon, which polls in a background loop). 64 MiB is well above
+/// the largest legitimate feed page (which is bounded by the kernel's
+/// `MAX_DAL_PAYLOAD_BYTES`) but small enough to prevent runaway
+/// allocation.
+const HTTP_JSON_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 fn get_json<Resp: for<'de> Deserialize<'de>>(url: &str) -> Result<Resp, String> {
     let resp = ureq::get(url)
         .call()
         .map_err(|e| format!("HTTP error: {}", e))?;
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
@@ -1581,7 +1749,9 @@ fn get_json_with_bearer<Resp: for<'de> Deserialize<'de>>(
         req = req.header("Authorization", &format!("Bearer {}", token));
     }
     let resp = req.call().map_err(|e| format!("HTTP error: {}", e))?;
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
@@ -2220,17 +2390,20 @@ impl<'a> RollupRpc<'a> {
     /// (`_at_head` vs `_at_block`) is deliberate so that re-introducing the
     /// consistency bug (PR #24 audit, 2026-05) is loud at code review.
     ///
-    /// `None` (absent from the map) means the pool has never been credited
-    /// (or has been fully drained — implementations may garbage-collect).
+    /// The map is keyed by `(asset_id, pubkey_hash)` because the same
+    /// pubkey_hash may have separate FA2 + tez balances; the caller must
+    /// decide which it wants. `None` (absent from the map) means the pool
+    /// has never been credited (or has been fully drained — kernel
+    /// garbage-collects empty entries).
     fn load_pool_balances_at_head(
         &self,
         pending: &[PendingDeposit],
-    ) -> Result<std::collections::HashMap<F, u64>, String> {
+    ) -> Result<std::collections::HashMap<(F, F), u64>, String> {
         let head = self.head_hash()?;
         self.load_pool_balances_at_block(&head, pending)
     }
 
-    /// Pinned-block variant of `load_pool_balances`. Use this from
+    /// Pinned-block variant of `load_pool_balances_at_head`. Use this from
     /// `cmd_rollup_sync` where the same `head_hash` is reused across the
     /// note slice, the nullifier set, and the pool balances — re-resolving
     /// `head` between the three reads would let a concurrent slow-lane
@@ -2241,15 +2414,19 @@ impl<'a> RollupRpc<'a> {
         &self,
         block_ref: &str,
         pending: &[PendingDeposit],
-    ) -> Result<std::collections::HashMap<F, u64>, String> {
-        let mut map: std::collections::HashMap<F, u64> = std::collections::HashMap::new();
-        let mut seen: std::collections::HashSet<F> = std::collections::HashSet::new();
+    ) -> Result<std::collections::HashMap<(F, F), u64>, String> {
+        let mut map: std::collections::HashMap<(F, F), u64> =
+            std::collections::HashMap::new();
+        let mut seen: std::collections::HashSet<(F, F)> = std::collections::HashSet::new();
         for p in pending {
-            if !seen.insert(p.pubkey_hash) {
+            let key = (p.asset_id, p.pubkey_hash);
+            if !seen.insert(key) {
                 continue;
             }
-            if let Some(balance) = self.try_read_deposit_balance(block_ref, &p.pubkey_hash)? {
-                map.insert(p.pubkey_hash, balance);
+            if let Some(balance) =
+                self.try_read_deposit_balance(block_ref, &p.asset_id, &p.pubkey_hash)?
+            {
+                map.insert(key, balance);
             }
         }
         Ok(map)
@@ -2261,9 +2438,15 @@ impl<'a> RollupRpc<'a> {
     fn try_read_deposit_balance(
         &self,
         block_ref: &str,
+        asset_id: &F,
         pubkey_hash: &F,
     ) -> Result<Option<u64>, String> {
-        let key = format!("{}{}", DURABLE_DEPOSIT_BALANCE_PREFIX, hex::encode(pubkey_hash));
+        let key = format!(
+            "{}{}/{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(asset_id),
+            hex::encode(pubkey_hash),
+        );
         match self.read_durable_length_at_block(block_ref, &key)? {
             None => Ok(None),
             Some(0) => Ok(None),
@@ -3372,6 +3555,7 @@ fn outgoing_recovery_plaintext(
 fn build_output_note_inner(
     address: &PaymentAddress,
     value: u64,
+    asset_id: &F,
     memo: Option<&[u8]>,
     outgoing: Option<(&F, OutgoingNoteRole)>,
 ) -> Result<PreparedOutputNote, String> {
@@ -3386,7 +3570,7 @@ fn build_output_note_inner(
     )
     .map_err(|_| "invalid ek_d")?;
     let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
-    let cm = commit(&address.d_j, value, &rcm, &otag);
+    let cm = commit(&address.d_j, value, asset_id, &rcm, &otag);
     let mut enc = encrypt_note(value, &rseed, memo, &ek_v, &ek_d);
     if let Some((outgoing_seed, role)) = outgoing {
         let recovery = outgoing_recovery_plaintext(address, role, value, rseed);
@@ -3403,7 +3587,21 @@ fn build_output_note_with_outgoing(
     outgoing_seed: &F,
     role: OutgoingNoteRole,
 ) -> Result<PreparedOutputNote, String> {
-    build_output_note_inner(address, value, memo, Some((outgoing_seed, role)))
+    // Backwards-compatible v1 wrapper: tez asset. Multi-asset callers
+    // (shield, eventually transfer/unshield) use
+    // `build_output_note_with_outgoing_asset`.
+    build_output_note_inner(address, value, &ASSET_TEZ, memo, Some((outgoing_seed, role)))
+}
+
+fn build_output_note_with_outgoing_asset(
+    address: &PaymentAddress,
+    value: u64,
+    asset_id: &F,
+    memo: Option<&[u8]>,
+    outgoing_seed: &F,
+    role: OutgoingNoteRole,
+) -> Result<PreparedOutputNote, String> {
+    build_output_note_inner(address, value, asset_id, memo, Some((outgoing_seed, role)))
 }
 
 fn extract_operation_hash(output: &str) -> Option<String> {
@@ -3456,6 +3654,7 @@ fn host_stark_proof_to_kernel(proof: &Proof) -> Result<KernelStarkProof, String>
 
 fn shield_req_to_kernel(req: &ShieldReq) -> Result<KernelShieldReq, String> {
     Ok(KernelShieldReq {
+        asset_id: req.asset_id,
         pubkey_hash: req.pubkey_hash,
         fee: req.fee,
         producer_fee: req.producer_fee,
@@ -3476,9 +3675,11 @@ fn transfer_req_to_kernel(req: &TransferReq) -> Result<KernelTransferReq, String
         cm_1: req.cm_1,
         cm_2: req.cm_2,
         cm_3: req.cm_3,
+        cm_4: req.cm_4,
         enc_1: req.enc_1.clone(),
         enc_2: req.enc_2.clone(),
         enc_3: req.enc_3.clone(),
+        enc_4: req.enc_4.clone(),
         proof: host_stark_proof_to_kernel(&req.proof)?,
     })
 }
@@ -3492,6 +3693,8 @@ fn unshield_req_to_kernel(req: &UnshieldReq) -> Result<KernelUnshieldReq, String
         recipient: req.recipient.clone(),
         cm_change: req.cm_change,
         enc_change: req.enc_change.clone(),
+        cm_change_2: req.cm_change_2,
+        enc_change_2: req.enc_change_2.clone(),
         cm_fee: req.cm_fee,
         enc_fee: req.enc_fee.clone(),
         proof: host_stark_proof_to_kernel(&req.proof)?,
@@ -4038,7 +4241,10 @@ enum UserCmd {
     /// `deposit:<hex(pubkey_hash)>` for `amount` mutez. Recipient,
     /// fee, and memo are decided later at shield time, not here.
     Deposit {
-        /// L1 mutez to credit to the pool.
+        /// L1 token amount to credit to the pool. For tez this is
+        /// mutez (1 tez = 1_000_000 mutez). For FA2 this is the
+        /// number of FA2 token units, in the FA2 contract's native
+        /// unit.
         #[arg(long)]
         amount: u64,
         /// Emit the Michelson parameters for the bridge deposit call instead of
@@ -4053,6 +4259,18 @@ enum UserCmd {
         /// should always combine `--json --prepare-only`.
         #[arg(long)]
         prepare_only: bool,
+        /// Asset to deposit. Defaults to tez. Pass a hex asset_id
+        /// (or "tez"/"0") for non-tez. For FA2, the wallet looks up
+        /// the asset's ticketer in `compose_asset_registry`, emits
+        /// Michelson params for that ticketer's %mint(amount,
+        /// receiver, rollup) entrypoint, and saves the PendingDeposit
+        /// with `asset_id` set so the recovery scan and balance
+        /// poll target the FA2 pool. The caller must have already
+        /// approved the ticketer to pull `amount` of token_id via
+        /// the FA2 contract's %update_operators entrypoint (E.5
+        /// fa2_bridge_ticketer.tz flow).
+        #[arg(long)]
+        asset: Option<String>,
     },
     /// Reconstruct `PendingDeposit` entries from the seed alone after a
     /// wallet-file loss. For each candidate `(address_index,
@@ -4089,6 +4307,11 @@ enum UserCmd {
         /// `amount + required_tx_fee + producer_fee`.
         #[arg(long)]
         amount: Option<u64>,
+        /// Asset to shield. Defaults to tez (asset_id = 0). Pass a hex
+        /// asset_id (e.g. derived from an L1 FA2 ticketer address via
+        /// `tzel_core::derive_asset_id`) to drain an FA2 pool instead.
+        #[arg(long)]
+        asset: Option<String>,
     },
     /// Send shielded funds to another payment address.
     Send {
@@ -4100,6 +4323,13 @@ enum UserCmd {
         fee: Option<u64>,
         #[arg(long)]
         memo: Option<String>,
+        /// Asset the recipient receives. Defaults to tez. Pass a hex
+        /// asset_id (or "tez"/"0") to send a non-tez asset. The
+        /// wallet picks notes of this asset for the recipient amount;
+        /// tez notes are still used to cover fee + producer fee
+        /// (which must stay tez).
+        #[arg(long)]
+        asset: Option<String>,
     },
     /// Unshield private notes directly to an L1 tz/KT1 recipient.
     Unshield {
@@ -4110,6 +4340,13 @@ enum UserCmd {
         /// Override the default L1 recipient. Defaults to the source alias address.
         #[arg(long)]
         recipient: Option<String>,
+        /// Asset to exit. Defaults to tez. Pass a hex asset_id (or
+        /// "tez"/"0") to exit a non-tez asset; the wallet picks FA2
+        /// notes covering `amount` plus tez notes covering fee +
+        /// producer fee. The L1 outbox dispatches the burn to the
+        /// asset's registered ticketer.
+        #[arg(long)]
+        asset: Option<String>,
     },
     /// Query a submission previously accepted by the configured operator.
     Status {
@@ -4247,6 +4484,45 @@ pub fn tzel_detect_entry() {
 
 async fn run_detect_service(cli: DetectServiceCli) -> Result<(), String> {
     validate_detection_service_wallet(&cli.wallet)?;
+
+    // Log the watch-mode at startup. The `tzel-detect` binary
+    // intentionally supports all three watch modes (Detect / View /
+    // Outgoing — see `apply_watch_feed`), but the binary name only
+    // telegraphs the most-restricted mode. Operators reading a daemon
+    // log expecting "tzel-detect" to mean "only detect_root loaded"
+    // could be surprised when full memo decryption runs because the
+    // wallet file is actually in View mode. Surface the mode
+    // explicitly at startup so the deployed key class is visible.
+    match load_watch_wallet(&cli.wallet) {
+        Ok(WatchWalletFile::Detect { .. }) => {
+            eprintln!(
+                "tzel-detect: watch wallet `{}` loaded in DETECT mode \
+                 (cheap match-detection only; memo contents stay encrypted)",
+                cli.wallet,
+            );
+        }
+        Ok(WatchWalletFile::View { .. }) => {
+            eprintln!(
+                "tzel-detect: watch wallet `{}` loaded in VIEW mode \
+                 (memo decryption runs on this host; treat key material as confidential)",
+                cli.wallet,
+            );
+        }
+        Ok(WatchWalletFile::Outgoing { .. }) => {
+            eprintln!(
+                "tzel-detect: watch wallet `{}` loaded in OUTGOING mode \
+                 (sender-side recovery of own outgoing notes runs on this host)",
+                cli.wallet,
+            );
+        }
+        Err(_) => {
+            // validate_detection_service_wallet already passed, so a
+            // load error here would be transient (race with the
+            // watcher being rewritten). Skip the log line — the
+            // background tick loop will retry.
+        }
+    }
+
     let state = DetectServiceState {
         wallet: cli.wallet.clone(),
         sync_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -4260,7 +4536,17 @@ async fn run_detect_service(cli: DetectServiceCli) -> Result<(), String> {
         loop {
             ticker.tick().await;
             let _guard = background_state.sync_lock.lock().await;
-            let _ = run_detection_service_once(&background_state.wallet);
+            // Log errors instead of swallowing them. Earlier
+            // drafts used `let _ = ...`; a network blip or
+            // misconfiguration would leave the daemon polling
+            // silently forever, with no signal to the operator
+            // that scans were actually failing. eprintln is the
+            // simplest available sink (the daemon doesn't pull
+            // in a structured-log crate); operators can capture
+            // stderr via systemd / docker logs.
+            if let Err(err) = run_detection_service_once(&background_state.wallet) {
+                eprintln!("tzel-detect: background scan failed: {}", err);
+            }
         }
     });
 
@@ -4392,9 +4678,14 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Deposit {
             amount,
             prepare_only,
+            asset,
         } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_bridge_deposit(&cli.wallet, &profile, amount, prepare_only)
+            let asset_id = match asset {
+                None => ASSET_TEZ,
+                Some(ref hex) => parse_asset_id_hex(hex)?,
+            };
+            cmd_bridge_deposit(&cli.wallet, &profile, amount, asset_id, prepare_only)
         }
         UserCmd::RecoverDeposits {
             max_address_index,
@@ -4411,31 +4702,47 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Shield {
             pubkey_hash,
             amount,
+            asset,
         } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_shield_rollup(&cli.wallet, &profile, &pubkey_hash, amount, &pc)
+            let asset_id = match asset {
+                None => ASSET_TEZ,
+                Some(ref hex) => parse_asset_id_hex(hex)?,
+            };
+            cmd_shield_rollup(&cli.wallet, &profile, &pubkey_hash, amount, asset_id, &pc)
         }
         UserCmd::Send {
             to,
             amount,
             fee,
             memo,
+            asset,
         } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_transfer_rollup(&cli.wallet, &profile, &to, amount, fee, memo, &pc)
+            let asset_id = match asset {
+                None => ASSET_TEZ,
+                Some(ref hex) => parse_asset_id_hex(hex)?,
+            };
+            cmd_transfer_rollup(&cli.wallet, &profile, &to, amount, fee, memo, asset_id, &pc)
         }
         UserCmd::Unshield {
             amount,
             fee,
             recipient,
+            asset,
         } => {
             let profile = load_required_network_profile(&cli.wallet)?;
+            let asset_id = match asset {
+                None => ASSET_TEZ,
+                Some(ref hex) => parse_asset_id_hex(hex)?,
+            };
             cmd_unshield_rollup(
                 &cli.wallet,
                 &profile,
                 amount,
                 fee,
                 recipient.as_deref(),
+                asset_id,
                 &pc,
             )
         }
@@ -4639,6 +4946,37 @@ fn parse_pubkey_hash_hex(value: &str) -> Result<F, String> {
 
 fn pubkey_hash_hex(pubkey_hash: &F) -> String {
     hex::encode(pubkey_hash)
+}
+
+/// Parse a CLI-supplied asset_id. Accepts the canonical lowercase
+/// 64-char hex with optional `0x` prefix, OR the literal "tez" /
+/// "0" / "" as syntactic sugar for ASSET_TEZ. The asset_id is just a
+/// felt252 (32 bytes), so the parsing rules mirror `parse_pubkey_hash_hex`
+/// with a couple of friendly shorthands at the front.
+fn parse_asset_id_hex(value: &str) -> Result<F, String> {
+    let stripped = value.trim();
+    if stripped.is_empty() || stripped.eq_ignore_ascii_case("tez") || stripped == "0" {
+        return Ok(ASSET_TEZ);
+    }
+    let body = stripped
+        .strip_prefix("0x")
+        .or_else(|| stripped.strip_prefix("0X"))
+        .unwrap_or(stripped);
+    if body.len() > 64 {
+        return Err(format!(
+            "asset_id must be at most 64 hex chars; got {}",
+            body.len()
+        ));
+    }
+    let padded = format!("{:0>64}", body);
+    if padded.chars().any(|c| !matches!(c, '0'..='9' | 'a'..='f' | 'A'..='F')) {
+        return Err("asset_id must be hex (0-9, a-f) only".into());
+    }
+    let bytes =
+        hex::decode(&padded).map_err(|e| format!("invalid asset_id hex: {}", e))?;
+    let mut out = ZERO;
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 /// Call the reprover to generate a ZK proof.
@@ -4975,7 +5313,9 @@ fn http_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Val
         let body = resp.into_body().read_to_string().unwrap_or_default();
         return Err(format!("HTTP {}: {}", status, body));
     }
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
@@ -4995,7 +5335,9 @@ fn http_get_json(url: &str) -> Result<serde_json::Value, String> {
         let body = resp.into_body().read_to_string().unwrap_or_default();
         return Err(format!("HTTP {}: {}", status, body));
     }
-    resp.into_body()
+    let mut body = resp.into_body();
+    body.with_config()
+        .limit(HTTP_JSON_MAX_BYTES)
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
 }
@@ -5436,17 +5778,43 @@ pub fn validate_detection_service_wallet(path: &str) -> Result<(), String> {
 }
 
 /// Fetch each tracked deposit pool's current balance from the demo
-/// HTTP ledger. Returns a sparse map; pools with no recorded balance
-/// (never credited or fully drained) are absent.
+/// HTTP ledger. Returns a sparse map keyed by `(asset_id, pubkey_hash)`;
+/// pools with no recorded balance are absent. The demo HTTP ledger's
+/// /deposits/balance endpoint is tez-only by construction (it backs a
+/// single-asset toy), so non-tez pending entries silently report
+/// absent. Production callers route through `load_pool_balances` on
+/// the real rollup-node HTTP path instead.
 fn fetch_pool_balances_http(
     ledger: &str,
     pending: &[PendingDeposit],
-) -> Result<std::collections::HashMap<F, u64>, String> {
-    let mut map: std::collections::HashMap<F, u64> = std::collections::HashMap::new();
-    let mut seen: std::collections::HashSet<F> = std::collections::HashSet::new();
+) -> Result<std::collections::HashMap<(F, F), u64>, String> {
+    let mut map: std::collections::HashMap<(F, F), u64> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<(F, F)> = std::collections::HashSet::new();
     for p in pending {
-        if !seen.insert(p.pubkey_hash) {
+        let key = (p.asset_id, p.pubkey_hash);
+        if !seen.insert(key) {
             continue;
+        }
+        if p.asset_id != ASSET_TEZ {
+            // The demo HTTP ledger's /deposits/balance endpoint is
+            // tez-only by construction. Earlier drafts silently
+            // skipped non-tez entries, but that left an FA2
+            // PendingDeposit absent from the returned map. The
+            // downstream prune predicate then reads `absent → 0 →
+            // drained_on_chain = true`, so any FA2 PendingDeposit
+            // whose recipient cm had been observed in the feed got
+            // silently pruned while still funded on-chain. Refuse
+            // explicitly so the caller routes through the real
+            // rollup-node RPC (`load_pool_balances`) instead.
+            return Err(format!(
+                "cmd_scan / fetch_pool_balances_http is tez-only (the demo HTTP \
+                 ledger doesn't expose FA2 pool balances) but wallet has a \
+                 non-tez PendingDeposit (asset_id {}, pubkey_hash {}). Use \
+                 `tzel-wallet rollup-sync` instead, which routes through the \
+                 rollup-node's asset-aware RPC.",
+                hex::encode(p.asset_id),
+                hex::encode(p.pubkey_hash),
+            ));
         }
         let url = format!(
             "{}/deposits/balance?pubkey_hash={}",
@@ -5460,7 +5828,7 @@ fn fetch_pool_balances_http(
         // Treat 404 / missing keys as "no pool yet"; surface other errors.
         match get_json::<BalanceBody>(&url) {
             Ok(body) => {
-                map.insert(p.pubkey_hash, body.balance);
+                map.insert(key, body.balance);
             }
             Err(e) if e.contains("404") => {}
             Err(e) => return Err(e),
@@ -5486,8 +5854,18 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
     );
     if !summary.pool_balances.is_empty() {
         println!("Deposit pools:");
-        for (pubkey_hash, balance) in &summary.pool_balances {
-            println!("  pool {} = {} mutez", pubkey_hash_hex(pubkey_hash), balance);
+        for ((asset_id, pubkey_hash), balance) in &summary.pool_balances {
+            let label = if *asset_id == ASSET_TEZ {
+                "tez".to_string()
+            } else {
+                hex::encode(asset_id)
+            };
+            println!(
+                "  pool [{}] {} = {}",
+                label,
+                pubkey_hash_hex(pubkey_hash),
+                balance
+            );
         }
     }
     Ok(())
@@ -5497,8 +5875,9 @@ struct ScanSummary {
     found: usize,
     spent: usize,
     confirmed_pending: usize,
-    /// Snapshot of each known pool's current kernel-side balance.
-    pool_balances: std::collections::HashMap<F, u64>,
+    /// Snapshot of each known pool's current kernel-side balance,
+    /// keyed by `(asset_id, pubkey_hash)`.
+    pool_balances: std::collections::HashMap<(F, F), u64>,
     /// Number of `PendingDeposit` entries pruned because their
     /// `shielded_cm` was observed as a tree leaf this round.
     pruned_drained_pools: usize,
@@ -5508,7 +5887,7 @@ fn apply_scan_feed(
     w: &mut WalletFile,
     feed: &NotesFeedResp,
     nullifiers: impl IntoIterator<Item = F>,
-    pool_balances: &std::collections::HashMap<F, u64>,
+    pool_balances: &std::collections::HashMap<(F, F), u64>,
 ) -> ScanSummary {
     let mut found = 0usize;
     let mut known_notes: std::collections::HashSet<(usize, F)> =
@@ -5575,7 +5954,8 @@ fn apply_scan_feed(
     // metadata it needs.
     let before_pools = w.pending_deposits.len();
     w.pending_deposits.retain(|p| {
-        let drained_on_chain = pool_balances.get(&p.pubkey_hash).copied().unwrap_or(0) == 0;
+        let drained_on_chain =
+            pool_balances.get(&(p.asset_id, p.pubkey_hash)).copied().unwrap_or(0) == 0;
         let cm_observed = p
             .shielded_cm
             .as_ref()
@@ -5665,7 +6045,7 @@ fn apply_scan_feed_finalize(
     w: &mut WalletFile,
     seen_cms: &[F],
     nullifiers: impl IntoIterator<Item = F>,
-    pool_balances: &std::collections::HashMap<F, u64>,
+    pool_balances: &std::collections::HashMap<(F, F), u64>,
 ) -> ScanSummary {
     let mut known_cms: std::collections::HashSet<F> =
         w.notes.iter().map(|n| n.cm).collect();
@@ -5681,7 +6061,8 @@ fn apply_scan_feed_finalize(
 
     let before_pools = w.pending_deposits.len();
     w.pending_deposits.retain(|p| {
-        let drained_on_chain = pool_balances.get(&p.pubkey_hash).copied().unwrap_or(0) == 0;
+        let drained_on_chain =
+            pool_balances.get(&(p.asset_id, p.pubkey_hash)).copied().unwrap_or(0) == 0;
         let cm_observed = p
             .shielded_cm
             .as_ref()
@@ -5966,7 +6347,7 @@ mod tests {
         let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tg);
         let rseed = random_felt();
         let rcm = derive_rcm(&rseed);
-        let cm = commit(&addr.d_j, note_value, &rcm, &otag);
+        let cm = commit(&addr.d_j, note_value, &ASSET_TEZ, &rcm, &otag);
         w.notes.push(Note {
             nk_spend: nk_sp,
             nk_tag: nk_tg,
@@ -5977,6 +6358,7 @@ mod tests {
             cm,
             index: 0,
             addr_index: 0,
+            asset_id: ASSET_TEZ,
         });
         (w, cm)
     }
@@ -5988,13 +6370,28 @@ mod tests {
         rseed: F,
         memo: Option<&[u8]>,
     ) -> NoteMemo {
+        note_memo_for_wallet_address_with_asset(w, j, value, rseed, memo, &ASSET_TEZ)
+    }
+
+    /// Construct a NoteMemo whose commitment is computed against an
+    /// arbitrary `asset_id`. Used by the FA2 watcher-recovery
+    /// regression tests to prove that view/outgoing watchers
+    /// correctly handle non-tez notes.
+    pub(super) fn note_memo_for_wallet_address_with_asset(
+        w: &WalletFile,
+        j: u32,
+        value: u64,
+        rseed: F,
+        memo: Option<&[u8]>,
+        asset_id: &F,
+    ) -> NoteMemo {
         let acc = w.account();
         let addr = &w.addresses[j as usize];
         let nk_sp = derive_nk_spend(&acc.nk, &addr.d_j);
         let nk_tg = derive_nk_tag(&nk_sp);
         let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tg);
         let rcm = derive_rcm(&rseed);
-        let cm = commit(&addr.d_j, value, &rcm, &otag);
+        let cm = commit(&addr.d_j, value, asset_id, &rcm, &otag);
         let (ek_v, _, ek_d, _) = w.kem_keys(j);
         let enc = encrypt_note(value, &rseed, memo, &ek_v, &ek_d);
         NoteMemo { index: 0, cm, enc }
@@ -6007,7 +6404,7 @@ mod tests {
         let nk_tag = derive_nk_tag(&nk_spend);
         let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tag);
         let rcm = derive_rcm(&rseed);
-        let cm = commit(&addr.d_j, value, &rcm, &otag);
+        let cm = commit(&addr.d_j, value, &ASSET_TEZ, &rcm, &otag);
         Note {
             nk_spend,
             nk_tag,
@@ -6018,6 +6415,7 @@ mod tests {
             cm,
             index,
             addr_index: j,
+            asset_id: ASSET_TEZ,
         }
     }
 
@@ -6044,6 +6442,7 @@ mod tests {
                 cm: u64_to_felt(i as u64 + 1),
                 index: i,
                 addr_index: 0,
+                asset_id: ASSET_TEZ,
             }).collect();
 
             let selected = w.select_notes(amount).expect("selection should succeed");
@@ -6057,6 +6456,214 @@ mod tests {
 
             prop_assert!(selected_sum >= amount as u128);
         }
+
+        /// select_notes_of_asset returns ONLY notes of the
+        /// requested asset. Even with a mixed-asset note bag, the
+        /// picker must never include a wrong-asset note in the
+        /// selection — that would break the per-asset balance the
+        /// circuit enforces.
+        #[test]
+        fn prop_select_notes_of_asset_filters_by_asset(
+            tez_values in prop::collection::vec(1u64..10_000, 0..6),
+            fa2_values in prop::collection::vec(1u64..10_000, 1..6),
+        ) {
+            // Build a mixed note bag. fa2_values is non-empty so
+            // we always have a primary-asset selection to make.
+            let mut w = test_wallet(0);
+            let primary_asset = hash(b"prop-fa2-asset");
+            let mut idx = 0usize;
+            for v in &tez_values {
+                w.notes.push(Note {
+                    nk_spend: ZERO,
+                    nk_tag: ZERO,
+                    auth_root: ZERO,
+                    d_j: ZERO,
+                    v: *v,
+                    rseed: u64_to_felt(idx as u64),
+                    cm: u64_to_felt(0xCC00 + idx as u64),
+                    index: idx,
+                    addr_index: 0,
+                    asset_id: ASSET_TEZ,
+                });
+                idx += 1;
+            }
+            for v in &fa2_values {
+                w.notes.push(Note {
+                    nk_spend: ZERO,
+                    nk_tag: ZERO,
+                    auth_root: ZERO,
+                    d_j: ZERO,
+                    v: *v,
+                    rseed: u64_to_felt(idx as u64),
+                    cm: u64_to_felt(0xCC00 + idx as u64),
+                    index: idx,
+                    addr_index: 0,
+                    asset_id: primary_asset,
+                });
+                idx += 1;
+            }
+
+            let fa2_total: u64 = fa2_values.iter().sum();
+            let amount = fa2_total.min(1 + fa2_total / 2);
+            let selected = w
+                .select_notes_of_asset(&primary_asset, amount)
+                .expect("selection should succeed");
+
+            // Every selected note must carry the primary asset.
+            for i in &selected {
+                prop_assert_eq!(
+                    w.notes[*i].asset_id,
+                    primary_asset,
+                    "selection MUST be filtered to the requested asset",
+                );
+            }
+            // Selected sum must cover the amount.
+            let sum: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
+            prop_assert!(sum >= amount as u128);
+        }
+
+        /// balance_by_asset partitions the wallet's notes exactly:
+        /// the sum of per-asset totals equals the unpartitioned
+        /// balance. This is the "no notes silently disappear into
+        /// the wrong asset" invariant.
+        #[test]
+        fn prop_balance_by_asset_sums_to_total(
+            notes in prop::collection::vec(
+                (any::<u64>(), prop::array::uniform32(any::<u8>())),
+                0..20,
+            ),
+        ) {
+            let mut w = test_wallet(0);
+            for (i, (v, asset_bytes)) in notes.iter().enumerate() {
+                w.notes.push(Note {
+                    nk_spend: ZERO,
+                    nk_tag: ZERO,
+                    auth_root: ZERO,
+                    d_j: ZERO,
+                    v: *v,
+                    rseed: u64_to_felt(i as u64),
+                    cm: u64_to_felt(0xDD00 + i as u64),
+                    index: i,
+                    addr_index: 0,
+                    asset_id: *asset_bytes,
+                });
+            }
+
+            let by_asset_sum: u128 = w.balance_by_asset().iter().map(|(_, b)| *b).sum();
+            prop_assert_eq!(by_asset_sum, w.balance());
+        }
+
+        /// balance_by_asset always reports tez (ASSET_TEZ) first
+        /// when present. The wallet's display code relies on this
+        /// ordering for the human-readable "Private balance: <n>"
+        /// summary line.
+        #[test]
+        fn prop_balance_by_asset_orders_tez_first(
+            asset_seed in any::<u32>(),
+            n_tez in 0u32..5,
+            n_fa2 in 0u32..5,
+        ) {
+            prop_assume!(n_tez > 0 || n_fa2 > 0);
+            let mut w = test_wallet(0);
+            let primary = hash(format!("asset-{}", asset_seed).as_bytes());
+            prop_assume!(primary != ASSET_TEZ);
+            let mut idx = 0usize;
+            for _ in 0..n_tez {
+                w.notes.push(Note {
+                    nk_spend: ZERO, nk_tag: ZERO, auth_root: ZERO, d_j: ZERO,
+                    v: 100, rseed: u64_to_felt(idx as u64), cm: u64_to_felt(0xEE00 + idx as u64),
+                    index: idx, addr_index: 0, asset_id: ASSET_TEZ,
+                });
+                idx += 1;
+            }
+            for _ in 0..n_fa2 {
+                w.notes.push(Note {
+                    nk_spend: ZERO, nk_tag: ZERO, auth_root: ZERO, d_j: ZERO,
+                    v: 200, rseed: u64_to_felt(idx as u64), cm: u64_to_felt(0xEE00 + idx as u64),
+                    index: idx, addr_index: 0, asset_id: primary,
+                });
+                idx += 1;
+            }
+
+            let by_asset = w.balance_by_asset();
+            if n_tez > 0 {
+                prop_assert_eq!(by_asset[0].0, ASSET_TEZ);
+            } else if n_fa2 > 0 {
+                // No tez notes → tez doesn't appear at all.
+                prop_assert!(by_asset.iter().all(|(a, _)| *a != ASSET_TEZ));
+            }
+        }
+    }
+
+    /// select_notes_of_asset must error cleanly when the wallet
+    /// has no notes of the requested asset, regardless of how
+    /// much tez it holds. This is the cross-asset-isolation
+    /// invariant under failure.
+    #[test]
+    fn test_select_notes_of_asset_returns_error_for_unknown_asset() {
+        let mut w = test_wallet(0);
+        w.notes.push(Note {
+            nk_spend: ZERO, nk_tag: ZERO, auth_root: ZERO, d_j: ZERO,
+            v: 1_000_000, rseed: ZERO, cm: u64_to_felt(0xFFFF),
+            index: 0, addr_index: 0, asset_id: ASSET_TEZ,
+        });
+        let unknown_asset = hash(b"never-deposited");
+        let err = w
+            .select_notes_of_asset(&unknown_asset, 100)
+            .expect_err("must fail when no notes of asset exist");
+        assert!(err.contains("insufficient"));
+        // Tez balance is untouched.
+        assert_eq!(w.balance(), 1_000_000);
+        assert_eq!(w.available_balance(), 1_000_000);
+    }
+
+    /// A wallet with one note of an FA2 asset and zero tez can
+    /// answer balance queries correctly for both assets — the
+    /// nested-map structure of deposit_balances must report 0 for
+    /// the missing inner key, not panic.
+    #[test]
+    fn test_balance_queries_handle_missing_inner_asset_correctly() {
+        let mut w = test_wallet(0);
+        let primary = hash(b"single-fa2");
+        w.notes.push(Note {
+            nk_spend: ZERO, nk_tag: ZERO, auth_root: ZERO, d_j: ZERO,
+            v: 42, rseed: ZERO, cm: u64_to_felt(0xAAAA),
+            index: 0, addr_index: 0, asset_id: primary,
+        });
+        assert_eq!(w.balance(), 42);
+        let breakdown = w.balance_by_asset();
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0].0, primary);
+        assert_eq!(breakdown[0].1, 42);
+    }
+
+    /// Mixed tez + FA2 wallet: balance_by_asset preserves both
+    /// totals exactly, with tez first.
+    #[test]
+    fn test_mixed_wallet_balance_breakdown() {
+        let mut w = test_wallet(0);
+        let primary = hash(b"fa2-asset");
+        w.notes.push(Note {
+            nk_spend: ZERO, nk_tag: ZERO, auth_root: ZERO, d_j: ZERO,
+            v: 100, rseed: ZERO, cm: u64_to_felt(1),
+            index: 0, addr_index: 0, asset_id: ASSET_TEZ,
+        });
+        w.notes.push(Note {
+            nk_spend: ZERO, nk_tag: ZERO, auth_root: ZERO, d_j: ZERO,
+            v: 200, rseed: ZERO, cm: u64_to_felt(2),
+            index: 1, addr_index: 0, asset_id: ASSET_TEZ,
+        });
+        w.notes.push(Note {
+            nk_spend: ZERO, nk_tag: ZERO, auth_root: ZERO, d_j: ZERO,
+            v: 500, rseed: ZERO, cm: u64_to_felt(3),
+            index: 2, addr_index: 0, asset_id: primary,
+        });
+        let breakdown = w.balance_by_asset();
+        assert_eq!(breakdown.len(), 2);
+        assert_eq!(breakdown[0].0, ASSET_TEZ);
+        assert_eq!(breakdown[0].1, 300);
+        assert_eq!(breakdown[1].0, primary);
+        assert_eq!(breakdown[1].1, 500);
     }
 
     #[test]
@@ -6207,6 +6814,59 @@ mod tests {
         assert!(view_record_for_note(&incoming_seed, &addresses, &nm).is_none());
     }
 
+    /// Phase E.5 regression for the view-watcher FA2-blindness bug.
+    /// Before the fix, `view_record_for_note` hardcoded ASSET_TEZ
+    /// when recomputing the commitment, so a view watcher silently
+    /// dropped every FA2 receipt — the on-chain `cm` commits to the
+    /// FA2 asset_id, not tez, so the comparison always failed. The
+    /// fix iterates the candidate registry (tez + COMPILE_TIME_FA2_BRIDGES)
+    /// and labels the recovered record with whichever asset matched.
+    #[test]
+    fn test_view_material_recovers_fa2_note_under_compile_time_bridge() {
+        let Some(ticketer) = COMPILE_TIME_FA2_BRIDGES.first() else {
+            // No FA2 bridge registered at compile time — the
+            // candidate registry has only tez. This branch documents
+            // that the test asserts a property that only matters when
+            // FA2 bridges exist.
+            return;
+        };
+        let fa2_asset = derive_asset_id(ticketer);
+        assert_ne!(
+            fa2_asset, ASSET_TEZ,
+            "compile-time FA2 ticketer must hash to a non-tez asset_id",
+        );
+
+        let w = test_wallet(1);
+        let material = WatchKeyMaterial::from_view_wallet(&w);
+        let WatchKeyMaterial::View {
+            incoming_seed,
+            addresses,
+            ..
+        } = material
+        else {
+            panic!("expected view material");
+        };
+
+        let nm = note_memo_for_wallet_address_with_asset(
+            &w,
+            0,
+            123,
+            felt_tag(b"watch-view-fa2"),
+            Some(b"fa2-memo"),
+            &fa2_asset,
+        );
+        let recovered = view_record_for_note(&incoming_seed, &addresses, &nm)
+            .expect("view material must recover FA2 wallet notes");
+        assert_eq!(recovered.addr_index, 0);
+        assert_eq!(recovered.cm, nm.cm);
+        assert_eq!(recovered.value, 123);
+        assert_eq!(recovered.memo, b"fa2-memo");
+        assert_eq!(
+            recovered.asset_id, fa2_asset,
+            "recovered record must be labelled with the FA2 asset_id, not tez",
+        );
+    }
+
     #[test]
     fn test_outgoing_export_and_watch_recover_sent_output() {
         let w = test_wallet(1);
@@ -6249,6 +6909,53 @@ mod tests {
         assert!(
             outgoing_record_for_note(&other.account().incoming_seed, &nm).is_none(),
             "wrong key material must not recover outgoing note"
+        );
+    }
+
+    /// Phase E.5 regression for the outgoing-watcher FA2-blindness
+    /// bug. Before the fix, `OutgoingRecoveryPlaintext::commitment`
+    /// hardcoded ASSET_TEZ, so an outgoing watcher (the sender's
+    /// view of their own sent notes) silently dropped every FA2
+    /// note they sent. The fix iterates the candidate registry and
+    /// returns the asset that matches the on-chain `cm`. The
+    /// OutgoingRecoveryPlaintext wire format is unchanged — we
+    /// could not bump it without invalidating every existing
+    /// outgoing-recovery ciphertext on chain.
+    #[test]
+    fn test_outgoing_material_recovers_fa2_note_under_compile_time_bridge() {
+        let Some(ticketer) = COMPILE_TIME_FA2_BRIDGES.first() else {
+            return;
+        };
+        let fa2_asset = derive_asset_id(ticketer);
+        assert_ne!(fa2_asset, ASSET_TEZ);
+
+        let w = test_wallet(1);
+        let outgoing_seed = w.account().outgoing_seed;
+        let (ek_v, _, ek_d, _) = w.kem_keys(0);
+        let address = w.addresses[0].payment_address(&ek_v, &ek_d);
+        let note = build_output_note_with_outgoing_asset(
+            &address,
+            91,
+            &fa2_asset,
+            Some(b"fa2-outgoing"),
+            &outgoing_seed,
+            OutgoingNoteRole::TransferRecipient,
+        )
+        .expect("FA2 output note should build");
+        let nm = NoteMemo {
+            index: 11,
+            cm: note.cm,
+            enc: note.enc,
+        };
+
+        let recovered = outgoing_record_for_note(&outgoing_seed, &nm)
+            .expect("outgoing material must recover FA2 sender note");
+        assert_eq!(recovered.index, 11);
+        assert_eq!(recovered.cm, nm.cm);
+        assert_eq!(recovered.value, 91);
+        assert_eq!(
+            recovered.asset_id, fa2_asset,
+            "recovered outgoing record must be labelled with the FA2 asset_id, not tez",
         );
     }
 
@@ -6387,6 +7094,7 @@ mod tests {
                         cm,
                         value: *value as u64,
                         memo: vec![idx as u8],
+                        asset_id: ASSET_TEZ,
                     }
                 })
                 .collect();
@@ -6774,7 +7482,7 @@ mod tests {
         let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tg);
         let rseed = random_felt();
         let rcm = derive_rcm(&rseed);
-        let cm = commit(&addr.d_j, 77, &rcm, &otag);
+        let cm = commit(&addr.d_j, 77, &ASSET_TEZ, &rcm, &otag);
         let (ek_v, _, ek_d, _) = w.kem_keys(0);
         let enc = encrypt_note(77, &rseed, Some(b"new"), &ek_v, &ek_d);
         let nm = NoteMemo { index: 5, cm, enc };
@@ -6818,7 +7526,7 @@ mod tests {
         let other_owner_tag = owner_tag(&other_auth_root, &other_auth_pub_seed, &other_nk_tag);
         let mut rseed = ZERO;
         rseed[0] = 0x22;
-        let cm = commit(&d_j, 88, &derive_rcm(&rseed), &other_owner_tag);
+        let cm = commit(&d_j, 88, &ASSET_TEZ, &derive_rcm(&rseed), &other_owner_tag);
         let nm = NoteMemo {
             index: 3,
             cm,
@@ -7294,6 +8002,7 @@ mod tests {
                 cm: felt_tag(b"note-0"),
                 index: 0,
                 addr_index: 0,
+                asset_id: ASSET_TEZ,
             },
             Note {
                 nk_spend: ZERO,
@@ -7305,11 +8014,15 @@ mod tests {
                 cm: felt_tag(b"note-1"),
                 index: 1,
                 addr_index: 0,
+                asset_id: ASSET_TEZ,
             },
         ];
 
         let err = w.select_notes(40).expect_err("overspend should fail");
-        assert!(err.contains("insufficient funds"));
+        // Phase E.7 generalised select_notes_of_asset → error string
+        // now includes the asset label ("tez") between "insufficient"
+        // and "funds".
+        assert!(err.contains("insufficient") && err.contains("funds"));
     }
 
     #[test]
@@ -7326,6 +8039,7 @@ mod tests {
                 cm: felt_tag(b"small-note"),
                 index: 0,
                 addr_index: 0,
+                asset_id: ASSET_TEZ,
             },
             Note {
                 nk_spend: ZERO,
@@ -7337,6 +8051,7 @@ mod tests {
                 cm: felt_tag(b"large-note"),
                 index: 1,
                 addr_index: 0,
+                asset_id: ASSET_TEZ,
             },
         ];
 
@@ -7365,7 +8080,7 @@ mod tests {
         let err = w
             .select_notes(30)
             .expect_err("pending note must not count toward spendable balance");
-        assert!(err.contains("insufficient funds"));
+        assert!(err.contains("insufficient") && err.contains("funds"));
         assert_eq!(w.available_balance(), 25);
         assert_eq!(w.pending_outgoing_balance(), 40);
     }
@@ -7463,6 +8178,7 @@ mod tests {
         let recipient_cm = felt_tag(b"scan-feed-prune-cm");
 
         w.pending_deposits.push(PendingDeposit {
+            asset_id: ASSET_TEZ,
             pubkey_hash,
             blind,
             address_index: 0,
@@ -7474,7 +8190,7 @@ mod tests {
 
         // First sync: kernel reports zero balance for the pool but
         // the recipient note is NOT yet in the feed → keep the entry.
-        let pool_balances_drained: std::collections::HashMap<F, u64> =
+        let pool_balances_drained: std::collections::HashMap<(F, F), u64> =
             std::collections::HashMap::new();
         let summary = apply_scan_feed(
             &mut w,
@@ -7517,6 +8233,203 @@ mod tests {
         assert!(w.pending_deposits.is_empty());
     }
 
+    /// Phase E.5 regression for W3: the PendingDeposit selector
+    /// must filter by `(asset_id, pubkey_hash)`, not just
+    /// `pubkey_hash`. After `cmd_recover_deposits`, the same
+    /// pubkey_hash can correspond to two PendingDeposits (one tez,
+    /// one FA2 — see the bug #2 fix which requires both pools at the
+    /// same key). Without the asset filter the selector silently
+    /// returns the first match, which is asset-correct today only
+    /// because the returned fields are asset-independent — a future
+    /// field that becomes asset-dependent would silently regress.
+    #[test]
+    fn test_select_pending_deposit_by_asset_and_pubkey_hash_distinguishes_assets() {
+        let mut w = test_wallet(1);
+        let pubkey_hash = felt_tag(b"select-pending-pkh");
+        let blind = felt_tag(b"select-pending-blind");
+        let auth_domain = felt_tag(b"select-pending-domain");
+        let fa2_asset = derive_asset_id("KT1SelectPendingFA2");
+        assert_ne!(fa2_asset, ASSET_TEZ);
+
+        // Push a tez pool first, then an FA2 pool at the same
+        // pubkey_hash. Without asset filtering the selector would
+        // always return the tez entry.
+        w.pending_deposits.push(PendingDeposit {
+            asset_id: ASSET_TEZ,
+            pubkey_hash,
+            blind,
+            address_index: 0,
+            auth_domain,
+            amount: 100,
+            operation_hash: Some("opTez".into()),
+            shielded_cm: None,
+        });
+        w.pending_deposits.push(PendingDeposit {
+            asset_id: fa2_asset,
+            pubkey_hash,
+            blind,
+            address_index: 0,
+            auth_domain,
+            amount: 200,
+            operation_hash: Some("opFA2".into()),
+            shielded_cm: None,
+        });
+
+        let tez_match =
+            select_pending_deposit_by_asset_and_pubkey_hash(&w, &ASSET_TEZ, &pubkey_hash)
+                .expect("tez pool must be found");
+        assert_eq!(tez_match.asset_id, ASSET_TEZ);
+        assert_eq!(tez_match.amount, 100);
+
+        let fa2_match =
+            select_pending_deposit_by_asset_and_pubkey_hash(&w, &fa2_asset, &pubkey_hash)
+                .expect("FA2 pool must be found");
+        assert_eq!(fa2_match.asset_id, fa2_asset);
+        assert_eq!(fa2_match.amount, 200);
+
+        // A third asset for the same pubkey_hash that the wallet
+        // doesn't track must produce a clear error, not silently
+        // resolve to one of the others.
+        let third_asset = derive_asset_id("KT1SelectPendingThird");
+        let err = select_pending_deposit_by_asset_and_pubkey_hash(&w, &third_asset, &pubkey_hash)
+            .unwrap_err();
+        assert!(
+            err.contains("is not tracked"),
+            "error message must indicate the pool isn't tracked: {}",
+            err,
+        );
+    }
+
+    /// Phase E.5 regression for W4: stamping `shielded_cm` after a
+    /// successful shield must only touch PendingDeposits whose
+    /// `(asset_id, pubkey_hash)` matches the shield request. Without
+    /// the asset filter, an FA2 shield would also stamp the tez
+    /// PendingDeposit at the same pubkey_hash (used as the
+    /// producer-fee tez pool — see bug #2 fix), and `apply_scan_feed`
+    /// would later prune the still-funded tez record on observing
+    /// the FA2 shield's cm in the feed.
+    #[test]
+    fn test_shielded_cm_stamping_isolates_assets_at_same_pubkey_hash() {
+        // Reproduce the bug-prone state: tez + FA2 PendingDeposits at
+        // the same pubkey_hash. Then apply the shield's stamping
+        // filter manually and assert only the FA2 record gets
+        // stamped.
+        let pubkey_hash = felt_tag(b"stamp-isolation-pkh");
+        let fa2_asset = derive_asset_id("KT1StampIsolationFA2");
+        let mut deposits = vec![
+            PendingDeposit {
+                asset_id: ASSET_TEZ,
+                pubkey_hash,
+                blind: felt_tag(b"stamp-tez-blind"),
+                address_index: 0,
+                auth_domain: felt_tag(b"stamp-domain"),
+                amount: 50,
+                operation_hash: None,
+                shielded_cm: None,
+            },
+            PendingDeposit {
+                asset_id: fa2_asset,
+                pubkey_hash,
+                blind: felt_tag(b"stamp-fa2-blind"),
+                address_index: 0,
+                auth_domain: felt_tag(b"stamp-domain"),
+                amount: 100,
+                operation_hash: None,
+                shielded_cm: None,
+            },
+        ];
+
+        // This is the exact filter expression cmd_shield_rollup uses
+        // after submitting an FA2 shield to the operator.
+        let asset_id = fa2_asset;
+        let cm = felt_tag(b"stamp-shield-cm");
+        for p in deposits
+            .iter_mut()
+            .filter(|p| p.asset_id == asset_id && p.pubkey_hash == pubkey_hash)
+        {
+            p.shielded_cm = Some(cm);
+        }
+
+        assert_eq!(
+            deposits[0].shielded_cm, None,
+            "tez PendingDeposit at same pubkey_hash must NOT be stamped by an FA2 shield",
+        );
+        assert_eq!(
+            deposits[1].shielded_cm,
+            Some(cm),
+            "FA2 PendingDeposit must be stamped with the shield's cm",
+        );
+    }
+
+    /// Phase E.5 regression for the demo HTTP `cmd_scan` FA2 prune
+    /// hazard. `fetch_pool_balances_http` previously skipped non-tez
+    /// PendingDeposits silently — absent from the returned map. The
+    /// downstream prune predicate then reads `absent → 0 →
+    /// drained_on_chain = true`, so an FA2 PendingDeposit whose
+    /// recipient cm had been observed would be silently pruned
+    /// despite being still funded on-chain. Production
+    /// `cmd_rollup_sync` is unaffected (asset-aware RPC); the fix
+    /// makes the demo path refuse to run when any non-tez entry is
+    /// present rather than silently mis-prune.
+    #[test]
+    fn test_fetch_pool_balances_http_refuses_non_tez_pending_deposit() {
+        let pubkey_hash = felt_tag(b"fetch-pool-fa2-pkh");
+        let fa2_asset = derive_asset_id("KT1FetchPoolFA2");
+        let pending = vec![PendingDeposit {
+            asset_id: fa2_asset,
+            pubkey_hash,
+            blind: felt_tag(b"fetch-pool-fa2-blind"),
+            address_index: 0,
+            auth_domain: felt_tag(b"fetch-pool-fa2-domain"),
+            amount: 100,
+            operation_hash: None,
+            shielded_cm: None,
+        }];
+
+        // Use an unreachable ledger URL — the function must fail at
+        // the asset-check BEFORE any HTTP call.
+        let err = fetch_pool_balances_http(
+            "http://invalid.example.tzel-test:0",
+            &pending,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("tez-only") && err.contains("rollup-sync"),
+            "expected the asset-mismatch error pointing at rollup-sync; got: {}",
+            err,
+        );
+    }
+
+    /// Mirror positive case: a tez-only PendingDeposit list passes
+    /// the asset check (and will fail later at the HTTP layer because
+    /// the URL is unreachable, but it must not fail at the
+    /// asset-check step).
+    #[test]
+    fn test_fetch_pool_balances_http_accepts_tez_only() {
+        let pending = vec![PendingDeposit {
+            asset_id: ASSET_TEZ,
+            pubkey_hash: felt_tag(b"fetch-pool-tez-pkh"),
+            blind: felt_tag(b"fetch-pool-tez-blind"),
+            address_index: 0,
+            auth_domain: felt_tag(b"fetch-pool-tez-domain"),
+            amount: 100,
+            operation_hash: None,
+            shielded_cm: None,
+        }];
+
+        let err = fetch_pool_balances_http(
+            "http://invalid.example.tzel-test:0",
+            &pending,
+        )
+        .unwrap_err();
+        // Must surface an HTTP failure, NOT the asset-check error.
+        assert!(
+            !err.contains("tez-only"),
+            "tez-only pending must not trigger the asset-check error; got: {}",
+            err,
+        );
+    }
+
     #[test]
     fn test_apply_scan_feed_keeps_funded_pool_even_when_cm_observed() {
         // Defensive: a pool with a positive kernel-side balance is
@@ -7528,6 +8441,7 @@ mod tests {
         let pubkey_hash = felt_tag(b"scan-feed-keep-pkh");
         let cm = felt_tag(b"scan-feed-keep-cm");
         w.pending_deposits.push(PendingDeposit {
+            asset_id: ASSET_TEZ,
             pubkey_hash,
             blind: felt_tag(b"scan-feed-keep-blind"),
             address_index: 0,
@@ -7537,7 +8451,7 @@ mod tests {
             shielded_cm: Some(cm),
         });
         let mut pool_balances = std::collections::HashMap::new();
-        pool_balances.insert(pubkey_hash, 42u64);
+        pool_balances.insert((ASSET_TEZ, pubkey_hash), 42u64);
         let alien_nm = NoteMemo {
             index: 0,
             cm,
@@ -7585,6 +8499,7 @@ mod tests {
         // First shield: set shielded_cm to cm1.
         let cm1 = felt_tag(b"multi-stage-cm-1");
         w.pending_deposits.push(PendingDeposit {
+            asset_id: ASSET_TEZ,
             pubkey_hash,
             blind: felt_tag(b"multi-stage-blind"),
             address_index: 0,
@@ -7596,7 +8511,7 @@ mod tests {
 
         // Sync 1: cm1 in feed, pool balance > 0 → keep.
         let mut pool_balances = std::collections::HashMap::new();
-        pool_balances.insert(pubkey_hash, 80_000u64);
+        pool_balances.insert((ASSET_TEZ, pubkey_hash), 80_000u64);
         let nm1 = NoteMemo {
             index: 0,
             cm: cm1,
@@ -7635,7 +8550,7 @@ mod tests {
 
         // Sync 2: cm2 in feed (cm1 is in past sync's notes only),
         // pool balance == 0 → must prune.
-        let pool_balances_drained: std::collections::HashMap<F, u64> =
+        let pool_balances_drained: std::collections::HashMap<(F, F), u64> =
             std::collections::HashMap::new();
         let nm2 = NoteMemo {
             index: 1,
@@ -7680,6 +8595,7 @@ mod tests {
         let new_nm = note_memo_for_wallet_address(&w, 0, 100_000, recipient_rseed, None);
         let cm = new_nm.cm;
         w.pending_deposits.push(PendingDeposit {
+            asset_id: ASSET_TEZ,
             pubkey_hash,
             blind: felt_tag(b"two-syncs-blind"),
             address_index: 0,
@@ -7692,7 +8608,7 @@ mod tests {
         // Sync 1: cm in feed, pool still funded (residual or stale
         // read) → don't prune; cm gets absorbed into w.notes.
         let mut pool_balances_funded = std::collections::HashMap::new();
-        pool_balances_funded.insert(pubkey_hash, 50u64);
+        pool_balances_funded.insert((ASSET_TEZ, pubkey_hash), 50u64);
         let summary = apply_scan_feed(
             &mut w,
             &NotesFeedResp {
@@ -7709,7 +8625,7 @@ mod tests {
         // Sync 2: empty feed, pool drained. Without cumulative cm
         // tracking the entry would stay pinned. With it, w.notes
         // still contains cm → prune.
-        let pool_balances_drained: std::collections::HashMap<F, u64> =
+        let pool_balances_drained: std::collections::HashMap<(F, F), u64> =
             std::collections::HashMap::new();
         let summary = apply_scan_feed(
             &mut w,
@@ -7853,6 +8769,7 @@ mod tests {
             commit(
                 &recipient.d_j,
                 recipient_value,
+                &ASSET_TEZ,
                 &derive_rcm(&recipient_rseed),
                 &recipient_otag
             ),
@@ -7873,15 +8790,34 @@ mod tests {
             commit(
                 &change_addr.d_j,
                 change_value,
+                &ASSET_TEZ,
                 &derive_rcm(&change_rseed),
                 &change_otag
             ),
             req.cm_2
         );
 
-        assert!(detect(&req.enc_3, &dk_d0));
+        // Phase C: req.cm_3 / req.enc_3 are now the zero-value change_2
+        // placeholder (owned by the change address); the producer fee
+        // moved to cm_4 / enc_4.
+        assert!(detect(&req.enc_3, &dk_d1));
+        let (change_2_value, change_2_rseed, _change_2_memo) =
+            decrypt_memo(&req.enc_3, &dk_v1).expect("change_2 note should decrypt");
+        assert_eq!(change_2_value, 0);
+        assert_eq!(
+            commit(
+                &change_addr.d_j,
+                change_2_value,
+                &ASSET_TEZ,
+                &derive_rcm(&change_2_rseed),
+                &change_otag
+            ),
+            req.cm_3
+        );
+
+        assert!(detect(&req.enc_4, &dk_d0));
         let (producer_value, producer_rseed, producer_memo) =
-            decrypt_memo(&req.enc_3, &dk_v0).expect("producer note should decrypt");
+            decrypt_memo(&req.enc_4, &dk_v0).expect("producer note should decrypt");
         assert_eq!(producer_value, 1);
         assert_eq!(&producer_memo[..3], b"dal");
         let producer_otag = owner_tag(
@@ -7893,10 +8829,11 @@ mod tests {
             commit(
                 &producer_address.d_j,
                 producer_value,
+                &ASSET_TEZ,
                 &derive_rcm(&producer_rseed),
                 &producer_otag
             ),
-            req.cm_3
+            req.cm_4
         );
 
         finalize_successful_spend(wallet_path_str, &mut loaded, &prepared.selected)
@@ -7978,6 +8915,7 @@ mod tests {
             commit(
                 &change_addr.d_j,
                 change_value,
+                &ASSET_TEZ,
                 &derive_rcm(&change_rseed),
                 &change_otag
             ),
@@ -7998,6 +8936,7 @@ mod tests {
             commit(
                 &producer_address.d_j,
                 producer_value,
+                &ASSET_TEZ,
                 &derive_rcm(&producer_rseed),
                 &producer_otag
             ),
@@ -8134,18 +9073,60 @@ mod tests {
 fn cmd_balance(path: &str) -> Result<(), String> {
     let w = load_wallet(path)?;
     let pending = w.pending_nullifier_set();
-    println!("Private balance: {}", w.balance());
+
+    // Per-asset breakdown. Tez first, then any FA2 assets in the
+    // wallet's note set. The single-line "Private balance: <n>"
+    // summary is kept for backward-compat with consumers (scripts,
+    // downstream wallets) that grep for it — it remains the tez
+    // total when the wallet only holds tez.
+    let totals = w.balance_by_asset();
+    let available = w.available_balance_by_asset();
+    let avail_map: std::collections::HashMap<F, u128> = available.iter().cloned().collect();
+
+    let tez_total = totals
+        .iter()
+        .find(|(asset, _)| *asset == ASSET_TEZ)
+        .map(|(_, v)| *v)
+        .unwrap_or(0);
+    let tez_available = avail_map.get(&ASSET_TEZ).copied().unwrap_or(0);
+
+    println!("Private balance: {}", tez_total);
     if !w.pending_spends.is_empty() {
-        println!("Private available: {}", w.available_balance());
+        println!("Private available: {}", tez_available);
         println!("Pending outgoing: {}", w.pending_outgoing_balance());
         println!("Pending operations: {}", w.pending_spends.len());
     }
+
+    let has_fa2 = totals.iter().any(|(asset, _)| *asset != ASSET_TEZ);
+    if has_fa2 {
+        println!("Per-asset balance:");
+        for (asset, total) in &totals {
+            let avail = avail_map.get(asset).copied().unwrap_or(0);
+            let label = if *asset == ASSET_TEZ {
+                "tez".to_string()
+            } else {
+                hex::encode(asset)
+            };
+            if !w.pending_spends.is_empty() && avail != *total {
+                println!("  {}: {} (available: {})", label, total, avail);
+            } else {
+                println!("  {}: {}", label, total);
+            }
+        }
+    }
+
     println!("Notes: {}", w.notes.len());
     for (i, n) in w.notes.iter().enumerate() {
+        let asset_tag = if n.asset_id == ASSET_TEZ {
+            "tez".to_string()
+        } else {
+            format!("asset {}", short(&n.asset_id))
+        };
         println!(
-            "  [{}] v={} cm={} index={}{}",
+            "  [{}] v={} {} cm={} index={}{}",
             i,
             n.v,
+            asset_tag,
             short(&n.cm),
             n.index,
             if pending.contains(&note_nullifier(n)) {
@@ -8198,14 +9179,14 @@ fn cmd_user_balance(path: &str) -> Result<(), String> {
 /// observed in the tree).
 fn print_deposit_pool_summary(
     w: &WalletFile,
-    balances: &std::collections::HashMap<F, u64>,
+    balances: &std::collections::HashMap<(F, F), u64>,
 ) {
     let funded_count = balances.len();
     let total_funded: u64 = balances.values().sum();
     let mut drained_pending_scan = 0usize;
     let mut awaiting_credit = 0usize;
     for p in &w.pending_deposits {
-        if balances.contains_key(&p.pubkey_hash) {
+        if balances.contains_key(&(p.asset_id, p.pubkey_hash)) {
             continue;
         }
         if p.shielded_cm.is_some() {
@@ -8588,7 +9569,7 @@ fn cmd_rollup_sync(
     let mut pools_awaiting_credit = 0usize;
     let mut pools_drained_pending_scan = 0usize;
     for p in &w.pending_deposits {
-        if summary.pool_balances.contains_key(&p.pubkey_hash) {
+        if summary.pool_balances.contains_key(&(p.asset_id, p.pubkey_hash)) {
             continue;
         }
         if p.shielded_cm.is_some() {
@@ -8642,18 +9623,29 @@ fn cmd_rollup_sync_watch(
     }
 }
 
-fn select_pending_deposit_by_pubkey_hash<'a>(
+/// Pick a `PendingDeposit` matching both `asset_id` AND `pubkey_hash`.
+/// After `cmd_recover_deposits` can produce multiple PendingDeposits
+/// with the same pubkey_hash (one per asset the user deposited into
+/// the same auth tree); without filtering by asset_id the wallet
+/// would silently pick the first one — fine today because the
+/// returned fields (blind, address_index, auth_domain) are asset-
+/// independent, but a future field that becomes asset-dependent
+/// would silently regress. Filtering by `(asset_id, pubkey_hash)`
+/// closes that door and improves error diagnostics.
+fn select_pending_deposit_by_asset_and_pubkey_hash<'a>(
     wallet: &'a WalletFile,
+    asset_id: &F,
     pubkey_hash: &F,
 ) -> Result<&'a PendingDeposit, String> {
     wallet
         .pending_deposits
         .iter()
-        .find(|p| &p.pubkey_hash == pubkey_hash)
+        .find(|p| &p.asset_id == asset_id && &p.pubkey_hash == pubkey_hash)
         .ok_or_else(|| {
             format!(
-                "deposit pool {} is not tracked by this wallet",
-                hex::encode(pubkey_hash)
+                "deposit pool (asset_id {}, pubkey_hash {}) is not tracked by this wallet",
+                hex::encode(asset_id),
+                hex::encode(pubkey_hash),
             )
         })
 }
@@ -8677,6 +9669,36 @@ fn deposit_mint_michelson_params(
         "args": [
             { "bytes": hex::encode(recipient.as_bytes()) },
             { "string": rollup_address },
+        ],
+    })
+}
+
+/// Michelson parameters for the FA2 ticketer's `%mint` entrypoint.
+/// Shape matches `tezos/fa2_bridge_ticketer.tz`:
+///   pair (nat %amount) (pair (bytes %receiver) (address %rollup))
+///
+/// Caller MUST have already authorised this ticketer to pull
+/// `amount` of the FA2 contract's configured `token_id` via
+/// %update_operators on the FA2 contract. The ticketer's %mint
+/// dispatches FA2 %transfer to pull tokens from SENDER into
+/// SELF_ADDRESS before minting the L2 ticket to the rollup.
+fn deposit_mint_fa2_michelson_params(
+    amount: u64,
+    pubkey_hash: &F,
+    rollup_address: &str,
+) -> serde_json::Value {
+    let recipient = deposit_recipient_string(pubkey_hash);
+    serde_json::json!({
+        "prim": "Pair",
+        "args": [
+            { "int": amount.to_string() },
+            {
+                "prim": "Pair",
+                "args": [
+                    { "bytes": hex::encode(recipient.as_bytes()) },
+                    { "string": rollup_address },
+                ],
+            },
         ],
     })
 }
@@ -8711,11 +9733,49 @@ fn cmd_bridge_deposit(
     path: &str,
     profile: &WalletNetworkProfile,
     amount: u64,
+    asset_id: F,
     prepare_only: bool,
 ) -> Result<(), String> {
+    // FA2 deposits cannot be submitted through octez-client's
+    // transfer-mutez flow — FA2 tokens move via the FA2 contract's
+    // own %transfer entrypoint, which the user must pre-authorise
+    // and which only the L1 signer (Temple / Beacon / Ledger) can
+    // sign. Refuse anything but `prepare-only` for non-tez deposits
+    // and emit the ticketer's mint params for the signer to use.
+    let is_tez = asset_id == ASSET_TEZ;
+    if !is_tez && !prepare_only {
+        return Err(
+            "FA2 deposits require --prepare-only: the L1 signer must \
+             call %update_operators on the FA2 contract and then sign \
+             the FA2 ticketer's %mint(amount, receiver, rollup) \
+             entrypoint. The wallet emits the Michelson params; the \
+             signer drives the L1 ops."
+                .into(),
+        );
+    }
     let rollup = RollupRpc::new(profile);
     let head_hash = rollup.head_hash()?;
     let auth_domain = rollup.read_felt_at_block(&head_hash, DURABLE_AUTH_DOMAIN)?;
+
+    // For FA2 we resolve the ticketer from the asset_id via the
+    // kernel's compose_asset_registry. The tez ticketer comes from
+    // the wallet profile. Either way `bridge_contract` holds the
+    // KT1 we'll target with the mint call.
+    let bridge_contract: String = if is_tez {
+        profile.bridge_ticketer.clone()
+    } else {
+        let registry = compose_asset_registry(&profile.bridge_ticketer);
+        ticketer_for_asset(&registry, &asset_id)
+            .ok_or_else(|| {
+                format!(
+                    "asset_id {} is not in the kernel-binary FA2 bridge \
+                     registry — the kernel won't accept its tickets even \
+                     if the L1 signer submits them",
+                    hex::encode(asset_id),
+                )
+            })?
+            .to_string()
+    };
 
     let mut wallet = load_wallet(path)?;
     let master_sk = wallet.master_sk;
@@ -8763,6 +9823,7 @@ fn cmd_bridge_deposit(
     // successful L1 deposit (which would strand the pool, since only the
     // wallet that knows the blind can recompute pubkey_hash and shield).
     let pending = PendingDeposit {
+        asset_id,
         pubkey_hash,
         blind,
         address_index,
@@ -8785,26 +9846,49 @@ fn cmd_bridge_deposit(
         // is `deposit_recipient_string(pubkey_hash)` ⇒ `deposit:<hex>`, which
         // is exactly what the bridge ticketer's `mint` entrypoint expects.
         let pubkey_hash_hex_str = pubkey_hash_hex(&pubkey_hash);
-        let params = deposit_mint_michelson_params(&pubkey_hash, &profile.rollup_address);
+        // For FA2 we emit `pair (nat amount) (pair (bytes receiver)
+        // (address rollup))`; the FA2 ticketer's mint pulls
+        // `amount` of token_id from SENDER (the L1 signer) via the
+        // FA2 %transfer entrypoint. For tez we keep the existing
+        // shape `pair (bytes receiver) (address rollup)` and the L1
+        // signer carries the amount in implicit AMOUNT (mutez sent
+        // with the call).
+        let params = if is_tez {
+            deposit_mint_michelson_params(&pubkey_hash, &profile.rollup_address)
+        } else {
+            deposit_mint_fa2_michelson_params(amount, &pubkey_hash, &profile.rollup_address)
+        };
+        let asset_label = if is_tez { "tez (mutez)" } else { "FA2" };
+        let asset_id_hex = hex::encode(asset_id);
         user_out!(
             json: {
-                "bridge_contract" => &profile.bridge_ticketer,
+                "bridge_contract" => &bridge_contract,
                 "entrypoint" => "mint",
                 "params" => params.clone(),
                 "pubkey_hash" => &pubkey_hash_hex_str,
+                "asset_id" => &asset_id_hex,
                 "amount" => amount,
                 "pending_saved" => true,
             },
-            human: "Prepared bridge deposit of {} mutez for pool {} (not submitted)",
-            amount, pubkey_hash_hex_str
+            human: "Prepared bridge deposit of {} {} for pool {} (not submitted)",
+            amount, asset_label, pubkey_hash_hex_str
         );
         if !json_mode() {
-            println!("bridge_contract: {}", profile.bridge_ticketer);
+            println!("bridge_contract: {}", bridge_contract);
             println!("entrypoint:      mint");
             println!(
                 "params:          {}",
                 serde_json::to_string(&params).unwrap_or_default()
             );
+            if !is_tez {
+                println!(
+                    "FA2 deposit prerequisite: caller must first \
+                     %update_operators on the FA2 contract authorising \
+                     bridge_contract to pull {} units of its configured \
+                     token_id.",
+                    amount,
+                );
+            }
             println!(
                 "Caller must sign + broadcast the operation (e.g. via Temple) \
                  and then notify the daemon via POST /api/deposit/submitted."
@@ -8814,10 +9898,19 @@ fn cmd_bridge_deposit(
     }
 
     let submission = rollup.deposit_to_bridge(&pubkey_hash, amount)?;
+    // Match the PendingDeposit by (asset_id, pubkey_hash). Today the
+    // freshly-pushed entry above is the only one with this
+    // pubkey_hash (deposit_nonce makes pubkey_hash uniquely derived
+    // per L1 mint), so `pubkey_hash` alone would still resolve to
+    // the right entry — but every other PendingDeposit lookup in
+    // this file is keyed by (asset_id, pubkey_hash), and a future
+    // refactor that allowed pubkey_hash reuse across assets would
+    // silently regress this site otherwise. Pair-keying restores
+    // parity.
     if let Some(p) = wallet
         .pending_deposits
         .iter_mut()
-        .find(|p| p.pubkey_hash == pubkey_hash)
+        .find(|p| p.asset_id == asset_id && p.pubkey_hash == pubkey_hash)
     {
         p.operation_hash = submission.operation_hash.clone();
     }
@@ -8894,11 +9987,23 @@ fn cmd_recover_deposits(
     wallet.materialize_addresses()?;
     save_wallet(path, &wallet)?;
 
-    let known_pubkey_hashes: std::collections::HashSet<F> = wallet
+    let known_pools: std::collections::HashSet<(F, F)> = wallet
         .pending_deposits
         .iter()
-        .map(|p| p.pubkey_hash)
+        .map(|p| (p.asset_id, p.pubkey_hash))
         .collect();
+
+    // Recovery scans every registered asset's pool keyed by every
+    // candidate pubkey_hash. ASSET_TEZ is always first; any FA2
+    // entries from COMPILE_TIME_FA2_BRIDGES follow. The (i, j) grid
+    // is the same as before — derive_deposit_blind doesn't depend on
+    // asset_id — but each candidate pubkey_hash is now probed against
+    // every registered asset, not just tez.
+    let mut scan_assets: Vec<F> = Vec::with_capacity(1 + COMPILE_TIME_FA2_BRIDGES.len());
+    scan_assets.push(ASSET_TEZ);
+    for ticketer in COMPILE_TIME_FA2_BRIDGES {
+        scan_assets.push(derive_asset_id(ticketer));
+    }
 
     let mut recovered = 0usize;
     let mut max_nonce_seen: Option<u64> = None;
@@ -8919,35 +10024,45 @@ fn cmd_recover_deposits(
                 &addr.auth_pub_seed,
                 &blind,
             );
-            if known_pubkey_hashes.contains(&pubkey_hash) {
-                continue;
+            for asset_id in &scan_assets {
+                if known_pools.contains(&(*asset_id, pubkey_hash)) {
+                    continue;
+                }
+                let balance =
+                    rollup.try_read_deposit_balance(&head_hash, asset_id, &pubkey_hash)?;
+                let Some(amount) = balance else { continue };
+                if amount == 0 {
+                    continue;
+                }
+                let asset_label = if *asset_id == ASSET_TEZ {
+                    "tez".to_string()
+                } else {
+                    short(asset_id)
+                };
+                eprintln!(
+                    "  recovered: address_index={} deposit_nonce={} asset={} balance={} pubkey_hash={}",
+                    i,
+                    j,
+                    asset_label,
+                    amount,
+                    pubkey_hash_hex(&pubkey_hash),
+                );
+                wallet.pending_deposits.push(PendingDeposit {
+                    asset_id: *asset_id,
+                    pubkey_hash,
+                    blind,
+                    address_index: i,
+                    auth_domain,
+                    amount,
+                    operation_hash: None,
+                    shielded_cm: None,
+                });
+                max_nonce_seen = Some(match max_nonce_seen {
+                    Some(prev) => prev.max(j),
+                    None => j,
+                });
+                recovered += 1;
             }
-            let balance = rollup.try_read_deposit_balance(&head_hash, &pubkey_hash)?;
-            let Some(amount) = balance else { continue };
-            if amount == 0 {
-                continue;
-            }
-            eprintln!(
-                "  recovered: address_index={} deposit_nonce={} balance={} pubkey_hash={}",
-                i,
-                j,
-                amount,
-                pubkey_hash_hex(&pubkey_hash),
-            );
-            wallet.pending_deposits.push(PendingDeposit {
-                pubkey_hash,
-                blind,
-                address_index: i,
-                auth_domain,
-                amount,
-                operation_hash: None,
-                shielded_cm: None,
-            });
-            max_nonce_seen = Some(match max_nonce_seen {
-                Some(prev) => prev.max(j),
-                None => j,
-            });
-            recovered += 1;
         }
     }
 
@@ -9141,7 +10256,17 @@ fn cmd_transfer(
         &outgoing_seed,
         OutgoingNoteRole::TransferChange,
     )?;
+    // Phase C: cm_3 = zero-value tez change_2 placeholder (wallet keeps
+    // the slot for future non-tez transfers that need tez change paid
+    // alongside a primary asset change).
     let note_3 = build_output_note_with_outgoing(
+        &change_address,
+        0,
+        None,
+        &outgoing_seed,
+        OutgoingNoteRole::TransferChange,
+    )?;
+    let note_4 = build_output_note_with_outgoing(
         &producer_address,
         dal_fee,
         Some(b"dal"),
@@ -9153,12 +10278,8 @@ fn cmd_transfer(
         let auth_domain = cfg.auth_domain;
 
         // Build witness for run_transfer with WOTS+ w=4 inside the STARK.
-        // Layout:
-        // [N, auth_domain, root, per-input(nf,nk_spend,auth_root,auth_idx,d_j,v,rseed,cm_path_idx)×N,
-        //  cm_siblings(N×DEPTH), auth_siblings(N×AUTH_DEPTH),
-        //  wots_sig(N×133), wots_pk(N×133),
-        //  (digits computed by circuit from sighash — not in args)
-        //  output1(7), output2(7)]
+        // Phase B/C layout adds per-input asset tags and a 4th output
+        // block (change_2 placeholder) + primary_non_tez_asset.
         let n = selected.len();
         let mut args: Vec<String> = vec![];
         let mut cm_paths: Vec<Vec<F>> = vec![];
@@ -9181,9 +10302,11 @@ fn cmd_transfer(
             &note_1.cm,
             &note_2.cm,
             &note_3.cm,
+            &note_4.cm,
             &note_1.mh,
             &note_2.mh,
             &note_3.mh,
+            &note_4.mh
         );
 
         let mut wots_key_indices: Vec<u32> = vec![];
@@ -9219,14 +10342,26 @@ fn cmd_transfer(
             wots_key_indices.push(key_idx);
         }
 
-        let total_fields = 4 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 24;
+        // Phase C: per-input asset + 4 outputs × (8 fields + asset)
+        // + primary_non_tez_asset. For pure-tez transfers (the v1 use
+        // case) all asset tags are ASSET_TEZ and primary_non_tez_asset
+        // is irrelevant (the constraint is vacuously satisfied).
+        let total_fields = 4
+            + 9 * n
+            + n * DEPTH
+            + n * AUTH_DEPTH
+            + n * WOTS_CHAINS
+            + n          // per-input asset tags
+            + 9 * 4      // 4 output blocks (cm + d_j + v + rseed + auth_root +
+                          //  auth_pub_seed + nk_tag + mh + asset)
+            + 1;         // primary_non_tez_asset
         args.push(felt_u64_to_hex(total_fields as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
         args.push(felt_to_hex(&root));
         args.push(felt_u64_to_hex(fee));
 
-        // Per-input scalar fields (8 per input)
+        // Per-input scalar fields (9 per input)
         for (idx, &si) in selected.iter().enumerate() {
             let note = &w.notes[si];
             let nf = nullifier(&note.nk_spend, &note.cm, note.index as u64);
@@ -9257,7 +10392,12 @@ fn cmd_transfer(
             }
         }
 
-        // Output 1
+        // Phase B: per-input asset tags (pure-tez transfer).
+        for _ in 0..n {
+            args.push(felt_to_hex(&ASSET_TEZ));
+        }
+
+        // Output 1: recipient
         args.push(felt_to_hex(&note_1.cm));
         args.push(felt_to_hex(&recipient.d_j));
         args.push(felt_u64_to_hex(amount));
@@ -9266,8 +10406,9 @@ fn cmd_transfer(
         args.push(felt_to_hex(&recipient.auth_pub_seed));
         args.push(felt_to_hex(&recipient.nk_tag));
         args.push(felt_to_hex(&note_1.mh));
+        args.push(felt_to_hex(&ASSET_TEZ));
 
-        // Output 2
+        // Output 2: change_1
         args.push(felt_to_hex(&note_2.cm));
         args.push(felt_to_hex(&change_state.d_j));
         args.push(felt_u64_to_hex(change));
@@ -9276,16 +10417,32 @@ fn cmd_transfer(
         args.push(felt_to_hex(&change_state.auth_pub_seed));
         args.push(felt_to_hex(&change_state.nk_tag));
         args.push(felt_to_hex(&note_2.mh));
+        args.push(felt_to_hex(&ASSET_TEZ));
 
-        // Output 3
+        // Output 3: change_2 (zero-value tez placeholder).
         args.push(felt_to_hex(&note_3.cm));
+        args.push(felt_to_hex(&change_state.d_j));
+        args.push(felt_u64_to_hex(0));
+        args.push(felt_to_hex(&note_3.rseed));
+        args.push(felt_to_hex(&change_state.auth_root));
+        args.push(felt_to_hex(&change_state.auth_pub_seed));
+        args.push(felt_to_hex(&change_state.nk_tag));
+        args.push(felt_to_hex(&note_3.mh));
+        args.push(felt_to_hex(&ASSET_TEZ));
+
+        // Output 4: producer fee
+        args.push(felt_to_hex(&note_4.cm));
         args.push(felt_to_hex(&producer_address.d_j));
         args.push(felt_u64_to_hex(dal_fee));
-        args.push(felt_to_hex(&note_3.rseed));
+        args.push(felt_to_hex(&note_4.rseed));
         args.push(felt_to_hex(&producer_address.auth_root));
         args.push(felt_to_hex(&producer_address.auth_pub_seed));
         args.push(felt_to_hex(&producer_address.nk_tag));
-        args.push(felt_to_hex(&note_3.mh));
+        args.push(felt_to_hex(&note_4.mh));
+        args.push(felt_to_hex(&ASSET_TEZ));
+
+        // primary_non_tez_asset (unused in pure-tez transfers)
+        args.push(felt_to_hex(&ASSET_TEZ));
 
         // Persist consumed WOTS+ leaf reservations before handing witness material
         // to the prover. If proving fails, the keys stay burned instead of being
@@ -9306,9 +10463,11 @@ fn cmd_transfer(
         cm_1: note_1.cm,
         cm_2: note_2.cm,
         cm_3: note_3.cm,
+        cm_4: note_4.cm,
         enc_1: note_1.enc,
         enc_2: note_2.enc,
         enc_3: note_3.enc,
+        enc_4: note_4.enc,
         proof,
     };
     let resp: TransferResp = post_json(&format!("{}/transfer", ledger), &req)?;
@@ -9316,8 +10475,15 @@ fn cmd_transfer(
     finalize_successful_spend(path, &mut w, &selected)?;
 
     println!(
-        "Transferred {} to recipient, fee={}, dal fee={}, change={} (idx={},{},{})",
-        amount, fee, dal_fee, change, resp.index_1, resp.index_2, resp.index_3
+        "Transferred {} to recipient, fee={}, dal fee={}, change={} (idx={},{},{},{})",
+        amount,
+        fee,
+        dal_fee,
+        change,
+        resp.index_1,
+        resp.index_2,
+        resp.index_3,
+        resp.index_4,
     );
     println!("Run 'scan' to pick up change note.");
     Ok(())
@@ -9447,12 +10613,16 @@ fn cmd_unshield(
             &root,
             &nfs_for_sh,
             amount,
+            &ASSET_TEZ,
             fee,
             &recipient_f,
             &cm_change,
             &mh_change_f,
+            &ZERO,
+            &ZERO,
             &producer_note.cm,
-            &producer_note.mh,
+            &producer_note.mh
+        
         );
 
         let mut wots_key_indices: Vec<u32> = vec![];
@@ -9486,7 +10656,12 @@ fn cmd_unshield(
             wots_key_indices.push(key_idx);
         }
 
-        let total = 6 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 15;
+        // Phase B+C unshield layout:
+        //   N input asset tags + change_1 block (8+1) + change_2 block
+        //   (8+1) + fee block (7+1) + asset_pub + primary_non_tez_asset
+        //   = N + 9 + 9 + 8 + 1 + 1 = N + 28 (was 15 pre-Phase-B).
+        let total =
+            6 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + n + 28;
         args.push(felt_u64_to_hex(total as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
@@ -9525,6 +10700,12 @@ fn cmd_unshield(
             }
         }
 
+        // Phase B: per-input asset tags.
+        for _ in 0..n {
+            args.push(felt_to_hex(&ASSET_TEZ));
+        }
+
+        // Change_1 block + asset_change.
         args.push(felt_u64_to_hex(has_change_val));
         if let Some(cd) = &change_data {
             args.push(felt_to_hex(&cd.d_j));
@@ -9539,6 +10720,13 @@ fn cmd_unshield(
                 args.push("0x0".to_string());
             }
         }
+        args.push(felt_to_hex(&ASSET_TEZ));
+
+        // Change_2 block (all zero — no second change in v1 wallet) +
+        // asset_change_2 (zero satisfies the in-set check since ASSET_TEZ = 0).
+        for _ in 0..9 {
+            args.push("0x0".to_string());
+        }
 
         args.push(felt_to_hex(&producer_address.d_j));
         args.push(felt_u64_to_hex(dal_fee));
@@ -9547,6 +10735,10 @@ fn cmd_unshield(
         args.push(felt_to_hex(&producer_address.auth_pub_seed));
         args.push(felt_to_hex(&producer_address.nk_tag));
         args.push(felt_to_hex(&producer_note.mh));
+        args.push(felt_to_hex(&ASSET_TEZ));
+
+        args.push(felt_to_hex(&ASSET_TEZ));
+        args.push(felt_to_hex(&ASSET_TEZ));
 
         // Persist consumed WOTS+ leaf reservations before handing witness material
         // to the prover. If proving fails, the keys stay burned instead of being
@@ -9567,6 +10759,8 @@ fn cmd_unshield(
         recipient: recipient.clone(),
         cm_change,
         enc_change,
+        cm_change_2: ZERO,
+        enc_change_2: None,
         cm_fee: producer_note.cm,
         enc_fee: producer_note.enc,
         proof,
@@ -9597,6 +10791,7 @@ fn cmd_shield_rollup(
     profile: &WalletNetworkProfile,
     pubkey_hash_arg: &str,
     amount_arg: Option<u64>,
+    asset_id: F,
     pc: &ProveConfig,
 ) -> Result<(), String> {
     // Upstream patch ④: phase event — entered the shield path, deposit
@@ -9618,49 +10813,94 @@ fn cmd_shield_rollup(
     let producer_address = profile.dal_fee_address.clone();
 
     // Pool must currently hold at least the fixed fees; otherwise even a
-    // zero-value shield can't settle.
+    // zero-value shield can't settle. E.6: the pool is now keyed by
+    // (asset_id, pubkey_hash) — the user's --asset selects which
+    // pool to drain.
+    //
+    // Phase E.5 (bug #2): the producer-fee output note is permanently
+    // tez (DAL slot publisher liquidity argument), so when the user
+    // shields a non-tez asset the kernel debits `producer_fee` from a
+    // SEPARATE (ASSET_TEZ, pubkey_hash) pool. We mirror that split
+    // here: the asset pool funds (v + tx_fee); the user's tez pool
+    // (if shielding FA2) funds producer_fee. Without this client-side
+    // split, the wallet would either misreport "insufficient
+    // balance" (when the asset pool lacks the extra producer_fee
+    // worth of an unrelated unit) or build a request the kernel
+    // would reject for an empty/underfunded tez pool.
+    let is_tez_shield = asset_id == ASSET_TEZ;
     let pool_balance = rollup
-        .try_read_deposit_balance(&head_hash, &pubkey_hash)?
+        .try_read_deposit_balance(&head_hash, &asset_id, &pubkey_hash)?
         .ok_or_else(|| {
             format!(
-                "deposit pool {} not found or already drained",
-                pubkey_hash_hex(&pubkey_hash)
+                "deposit pool (asset_id {}, {}) not found or already drained",
+                hex::encode(&asset_id),
+                pubkey_hash_hex(&pubkey_hash),
             )
         })?;
-    let min_fees = fee
-        .checked_add(producer_fee)
-        .ok_or_else(|| "fee + producer_fee overflow".to_string())?;
-    if pool_balance < min_fees {
+    let asset_min_fees = if is_tez_shield {
+        // Same pool covers tx_fee + producer_fee.
+        fee.checked_add(producer_fee)
+            .ok_or_else(|| "fee + producer_fee overflow".to_string())?
+    } else {
+        fee
+    };
+    if pool_balance < asset_min_fees {
         return Err(format!(
-            "deposit pool {} balance {} < required fees {} (tx_fee {} + producer_fee {})",
+            "deposit pool {} balance {} < required asset-side fees {} ({})",
             pubkey_hash_hex(&pubkey_hash),
             pool_balance,
-            min_fees,
-            fee,
-            producer_fee,
+            asset_min_fees,
+            if is_tez_shield {
+                format!("tx_fee {} + producer_fee {}", fee, producer_fee)
+            } else {
+                format!("tx_fee {}", fee)
+            },
         ));
+    }
+    // For FA2 shields, also verify the user's tez pool can cover
+    // producer_fee. This mirrors the kernel-side check in
+    // prepare_shield / prepare_durable_shield_commit so the wallet
+    // catches the failure early instead of submitting a doomed
+    // request.
+    if !is_tez_shield {
+        let tez_pool_balance = rollup
+            .try_read_deposit_balance(&head_hash, &ASSET_TEZ, &pubkey_hash)?
+            .ok_or_else(|| {
+                format!(
+                    "FA2 shield requires a tez deposit pool at {} to fund producer_fee ({}); none found",
+                    pubkey_hash_hex(&pubkey_hash),
+                    producer_fee,
+                )
+            })?;
+        if tez_pool_balance < producer_fee {
+            return Err(format!(
+                "FA2 shield: tez deposit pool {} balance {} < producer_fee {} (producer-fee notes are permanently tez)",
+                pubkey_hash_hex(&pubkey_hash),
+                tez_pool_balance,
+                producer_fee,
+            ));
+        }
     }
     let amount = match amount_arg {
         Some(a) => a,
-        None => pool_balance - min_fees,
+        None => pool_balance - asset_min_fees,
     };
     let total_drain = amount
-        .checked_add(min_fees)
+        .checked_add(asset_min_fees)
         .ok_or_else(|| "shield total draw overflow".to_string())?;
     if pool_balance < total_drain {
         return Err(format!(
-            "deposit pool {} balance {} < requested draw {} (amount {} + tx_fee {} + producer_fee {})",
+            "deposit pool {} balance {} < requested draw {} (amount {} + asset-side fees {})",
             pubkey_hash_hex(&pubkey_hash),
             pool_balance,
             total_drain,
             amount,
-            fee,
-            producer_fee,
+            asset_min_fees,
         ));
     }
 
     let mut w = load_wallet(path)?;
-    let pending_match = select_pending_deposit_by_pubkey_hash(&w, &pubkey_hash)?;
+    let pending_match = select_pending_deposit_by_asset_and_pubkey_hash(&w, &asset_id, &pubkey_hash)?;
     let blind = pending_match.blind;
     let address_index = pending_match.address_index;
     let stored_auth_domain = pending_match.auth_domain;
@@ -9687,13 +10927,16 @@ fn cmd_shield_rollup(
     let recipient = recipient_state.payment_address(&ek_v_recipient, &ek_d_recipient);
 
     let outgoing_seed = w.account().outgoing_seed;
-    let note_recipient = build_output_note_with_outgoing(
+    let note_recipient = build_output_note_with_outgoing_asset(
         &recipient,
         amount,
+        &asset_id,
         None,
         &outgoing_seed,
         OutgoingNoteRole::ShieldOutput,
     )?;
+    // Producer-fee note is permanently tez (liquidity argument; see
+    // whitepaper §"Multiasset" fee rationale).
     let note_producer = build_output_note_with_outgoing(
         &producer_address,
         producer_fee,
@@ -9702,6 +10945,9 @@ fn cmd_shield_rollup(
         OutgoingNoteRole::ProducerFee,
     )?;
 
+    // Phase E.6: asset_new = asset_id (user-supplied; ASSET_TEZ by
+    // default). asset_producer stays tez permanently (producer-fee
+    // liquidity argument).
     let sighash = shield_sighash(
         &auth_domain,
         &pubkey_hash,
@@ -9712,6 +10958,8 @@ fn cmd_shield_rollup(
         &note_producer.cm,
         &note_recipient.mh,
         &note_producer.mh,
+        &asset_id,
+        &ASSET_TEZ,
     );
 
     let ask_j = derive_ask(&w.account().ask_base, address_index);
@@ -9737,7 +10985,8 @@ fn cmd_shield_rollup(
     let (sig, _pk, _digits) = wots_sign(&ask_j, key_idx, &sighash);
 
     let proof = {
-        let total_fields: usize = 16 + WOTS_CHAINS + AUTH_DEPTH + 5;
+        // Phase B: +2 fields for asset_new + asset_producer.
+        let total_fields: usize = 16 + WOTS_CHAINS + AUTH_DEPTH + 5 + 2;
         let mut args: Vec<String> = Vec::with_capacity(1 + total_fields);
         args.push(felt_u64_to_hex(total_fields as u64));
 
@@ -9775,6 +11024,13 @@ fn cmd_shield_rollup(
         args.push(felt_to_hex(&producer_address.d_j));
         args.push(felt_to_hex(&note_producer.rseed));
 
+        // Phase E.6: asset_new (caller-selected) + asset_producer
+        // (permanent tez). The kernel re-checks asset_new against
+        // its registry; the circuit's commit recompute pins cm_new
+        // to (d_j, v, asset_new).
+        args.push(felt_to_hex(&asset_id));
+        args.push(felt_to_hex(&ASSET_TEZ));
+
         let args_bytes = serde_json::to_string(&args).map(|s| s.len() as u64).unwrap_or(0);
         phase_event!("witness_built", { "args_count": args.len() as u64, "args_bytes": args_bytes });
         persist_wallet_and_make_proof(path, &w, pc, "run_shield", &args)?
@@ -9782,6 +11038,7 @@ fn cmd_shield_rollup(
 
     save_wallet(path, &w)?;
     let req = ShieldReq {
+        asset_id,
         pubkey_hash,
         fee,
         v: amount,
@@ -9804,18 +11061,27 @@ fn cmd_shield_rollup(
     });
     let submission = rollup.submit_kernel_message(&kernel_msg)?;
     emit_operator_done_event(&submission);
-    // Mark every local PendingDeposit for this pool as consumed by
-    // *this* shield's recipient cm — overwriting any previous cm
-    // recorded against the same pool. Multi-stage drains are
-    // legitimate (the core ledger explicitly supports two distinct
-    // shields draining one pool), so the latest cm is the one sync
-    // most likely sees in the next feed; older cms are still tracked
-    // cumulatively in `w.notes`, so the prune predicate in
-    // `apply_scan_feed` accepts an observation of any prior cm too.
+    // Mark every local PendingDeposit FOR THIS ASSET AND POOL as
+    // consumed by *this* shield's recipient cm — overwriting any
+    // previous cm recorded against the same (asset_id, pubkey_hash).
+    // Multi-stage drains are legitimate (the core ledger explicitly
+    // supports two distinct shields draining one pool), so the latest
+    // cm is the one sync most likely sees in the next feed; older cms
+    // are still tracked cumulatively in `w.notes`, so the prune
+    // predicate in `apply_scan_feed` accepts an observation of any
+    // prior cm too.
+    //
+    // Filtering by asset_id is load-bearing under multi-asset: an
+    // FA2 shield and a tez shield can both target the same
+    // pubkey_hash (the producer-fee tez pool sits at the same key as
+    // the FA2 pool, see bug #2 fix). Stamping the tez PendingDeposit
+    // with the FA2 shield's cm would falsely mark the tez pool as
+    // drained and cause the prune predicate to evict a still-funded
+    // tez record.
     for p in w
         .pending_deposits
         .iter_mut()
-        .filter(|p| p.pubkey_hash == pubkey_hash)
+        .filter(|p| p.asset_id == asset_id && p.pubkey_hash == pubkey_hash)
     {
         p.shielded_cm = Some(note_recipient.cm);
     }
@@ -9840,6 +11106,7 @@ fn cmd_transfer_rollup(
     amount: u64,
     fee: Option<u64>,
     memo: Option<String>,
+    recipient_asset_id: F,
     pc: &ProveConfig,
 ) -> Result<(), String> {
     // Upstream patch ④: phase event — entered the transfer path.
@@ -9859,22 +11126,64 @@ fn cmd_transfer_rollup(
     let outgoing_seed = w.account().outgoing_seed;
     let recipient = load_address(to_path)?;
     let producer_address = &profile.dal_fee_address;
-    let total_spend = amount
-        .checked_add(fee)
-        .and_then(|value| value.checked_add(profile.dal_fee))
+
+    // Multi-asset note selection.
+    //   - When sending tez, we pick tez notes covering amount + fee
+    //     + producer_fee (single asset class). change_1 takes the
+    //     leftover tez, change_2 is a zero-value tez placeholder.
+    //   - When sending an FA2 asset, we pick FA2 notes covering the
+    //     recipient amount AND tez notes covering fee + producer_fee.
+    //     change_1 carries the FA2 refund, change_2 carries the tez
+    //     refund (producer-fee tez stays pinned via the circuit).
+    //     The combined input count must still be <= MAX_INPUTS (7).
+    let is_tez = recipient_asset_id == ASSET_TEZ;
+    let mut selected: Vec<usize>;
+    let change_primary: u64; // FA2 (or tez) refund routed to change_1
+    let change_tez: u64;     // tez refund routed to change_2
+    let tez_fees = fee
+        .checked_add(profile.dal_fee)
         .ok_or_else(|| "transfer total spend overflow".to_string())?;
-    let selected = w.select_notes(total_spend)?;
-    let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128 - fee as u128 - profile.dal_fee as u128) as u64;
+    if is_tez {
+        let total = amount
+            .checked_add(tez_fees)
+            .ok_or_else(|| "transfer total spend overflow".to_string())?;
+        selected = w.select_notes_of_asset(&ASSET_TEZ, total)?;
+        let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
+        change_primary = (sum_in - amount as u128 - tez_fees as u128) as u64;
+        change_tez = 0;
+    } else {
+        // FA2 notes for the recipient amount.
+        let fa2_idx = w.select_notes_of_asset(&recipient_asset_id, amount)?;
+        let fa2_sum: u128 = fa2_idx.iter().map(|&i| w.notes[i].v as u128).sum();
+        // Tez notes for the fees.
+        let tez_idx = w.select_notes_of_asset(&ASSET_TEZ, tez_fees)?;
+        let tez_sum: u128 = tez_idx.iter().map(|&i| w.notes[i].v as u128).sum();
+        if fa2_idx.len() + tez_idx.len() > 7 {
+            return Err(format!(
+                "multi-asset transfer needs {} inputs ({} fa2 + {} tez) but the circuit caps inputs at 7 — consolidate notes first",
+                fa2_idx.len() + tez_idx.len(),
+                fa2_idx.len(),
+                tez_idx.len(),
+            ));
+        }
+        selected = Vec::with_capacity(fa2_idx.len() + tez_idx.len());
+        selected.extend(fa2_idx);
+        selected.extend(tez_idx);
+        change_primary = (fa2_sum - amount as u128) as u64;
+        change_tez = (tez_sum - tez_fees as u128) as u64;
+    }
+    let _sum_in_for_diag: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
 
     let nullifiers: Vec<F> = selected
         .iter()
         .map(|&i| note_nullifier(&w.notes[i]))
         .collect();
 
-    let note_1 = build_output_note_with_outgoing(
+    // Recipient gets `amount` of `recipient_asset_id`.
+    let note_1 = build_output_note_with_outgoing_asset(
         &recipient,
         amount,
+        &recipient_asset_id,
         memo.as_deref().map(str::as_bytes),
         &outgoing_seed,
         OutgoingNoteRole::TransferRecipient,
@@ -9883,14 +11192,28 @@ fn cmd_transfer_rollup(
     let (change_state, _change_addr) = w.next_address()?;
     let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
     let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
-    let note_2 = build_output_note_with_outgoing(
+    // change_1 carries the primary refund — same asset as the
+    // recipient (FA2 refund for FA2 transfers, tez refund for tez
+    // transfers).
+    let note_2 = build_output_note_with_outgoing_asset(
         &change_address,
-        change,
+        change_primary,
+        &recipient_asset_id,
         None,
         &outgoing_seed,
         OutgoingNoteRole::TransferChange,
     )?;
+    // change_2 carries the tez refund (only non-zero for FA2 transfers
+    // that also spent tez to pay fees; tez transfers leave this as
+    // a zero-value placeholder).
     let note_3 = build_output_note_with_outgoing(
+        &change_address,
+        change_tez,
+        None,
+        &outgoing_seed,
+        OutgoingNoteRole::TransferChange,
+    )?;
+    let note_4 = build_output_note_with_outgoing(
         producer_address,
         profile.dal_fee,
         Some(b"dal"),
@@ -9915,9 +11238,11 @@ fn cmd_transfer_rollup(
             &note_1.cm,
             &note_2.cm,
             &note_3.cm,
+            &note_4.cm,
             &note_1.mh,
             &note_2.mh,
             &note_3.mh,
+            &note_4.mh
         );
 
         let mut wots_key_indices: Vec<u32> = vec![];
@@ -9951,7 +11276,14 @@ fn cmd_transfer_rollup(
             wots_key_indices.push(key_idx);
         }
 
-        let total_fields = 4 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 24;
+        let total_fields = 4
+            + 9 * n
+            + n * DEPTH
+            + n * AUTH_DEPTH
+            + n * WOTS_CHAINS
+            + n
+            + 9 * 4
+            + 1;
         args.push(felt_u64_to_hex(total_fields as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
@@ -9987,6 +11319,12 @@ fn cmd_transfer_rollup(
             }
         }
 
+        // Multiasset: per-input asset tag from each selected note.
+        for &si in &selected {
+            args.push(felt_to_hex(&w.notes[si].asset_id));
+        }
+
+        // Output 1: recipient — asset = recipient_asset_id
         args.push(felt_to_hex(&note_1.cm));
         args.push(felt_to_hex(&recipient.d_j));
         args.push(felt_u64_to_hex(amount));
@@ -9995,24 +11333,48 @@ fn cmd_transfer_rollup(
         args.push(felt_to_hex(&recipient.auth_pub_seed));
         args.push(felt_to_hex(&recipient.nk_tag));
         args.push(felt_to_hex(&note_1.mh));
+        args.push(felt_to_hex(&recipient_asset_id));
 
+        // Output 2: change_1 — same asset as recipient (primary refund)
         args.push(felt_to_hex(&note_2.cm));
         args.push(felt_to_hex(&change_state.d_j));
-        args.push(felt_u64_to_hex(change));
+        args.push(felt_u64_to_hex(change_primary));
         args.push(felt_to_hex(&note_2.rseed));
         args.push(felt_to_hex(&change_state.auth_root));
         args.push(felt_to_hex(&change_state.auth_pub_seed));
         args.push(felt_to_hex(&change_state.nk_tag));
         args.push(felt_to_hex(&note_2.mh));
+        args.push(felt_to_hex(&recipient_asset_id));
 
+        // Output 3: change_2 — always tez (carries the tez refund for
+        // FA2 transfers, or zero-value placeholder for tez transfers)
         args.push(felt_to_hex(&note_3.cm));
+        args.push(felt_to_hex(&change_state.d_j));
+        args.push(felt_u64_to_hex(change_tez));
+        args.push(felt_to_hex(&note_3.rseed));
+        args.push(felt_to_hex(&change_state.auth_root));
+        args.push(felt_to_hex(&change_state.auth_pub_seed));
+        args.push(felt_to_hex(&change_state.nk_tag));
+        args.push(felt_to_hex(&note_3.mh));
+        args.push(felt_to_hex(&ASSET_TEZ));
+
+        // Output 4: producer fee — permanently tez
+        args.push(felt_to_hex(&note_4.cm));
         args.push(felt_to_hex(&producer_address.d_j));
         args.push(felt_u64_to_hex(profile.dal_fee));
-        args.push(felt_to_hex(&note_3.rseed));
+        args.push(felt_to_hex(&note_4.rseed));
         args.push(felt_to_hex(&producer_address.auth_root));
         args.push(felt_to_hex(&producer_address.auth_pub_seed));
         args.push(felt_to_hex(&producer_address.nk_tag));
-        args.push(felt_to_hex(&note_3.mh));
+        args.push(felt_to_hex(&note_4.mh));
+        args.push(felt_to_hex(&ASSET_TEZ));
+
+        // primary_non_tez_asset — the asset_id the 2-accumulator
+        // constraint accepts alongside tez. For tez-only transfers
+        // this can be anything (constraint trivially satisfied), so
+        // we pass ASSET_TEZ for determinism. For FA2 transfers this
+        // is the recipient's asset.
+        args.push(felt_to_hex(&recipient_asset_id));
 
         let args_bytes = serde_json::to_string(&args).map(|s| s.len() as u64).unwrap_or(0);
         phase_event!("witness_built", { "args_count": args.len() as u64, "args_bytes": args_bytes });
@@ -10027,9 +11389,11 @@ fn cmd_transfer_rollup(
         cm_1: note_1.cm,
         cm_2: note_2.cm,
         cm_3: note_3.cm,
+        cm_4: note_4.cm,
         enc_1: note_1.enc,
         enc_2: note_2.enc,
         enc_3: note_3.enc,
+        enc_4: note_4.enc,
         proof,
     };
     let kernel_req = transfer_req_to_kernel(&req)?;
@@ -10057,20 +11421,28 @@ fn cmd_transfer_rollup(
     // Upstream patch ①.
     let cm_1_hex = hex::encode(&note_1.cm);
     let cm_2_hex = hex::encode(&note_2.cm);
-    let cm_3_hex = hex::encode(&note_3.cm);
+    // producer_cm reports note_4 (the producer-fee note), not note_3
+    // (the change_2 tez-refund note).
+    let cm_4_hex = hex::encode(&note_4.cm);
+    // `change` historically reported the tez refund. With multi-
+    // asset transfers we have two refunds (primary and tez); preserve
+    // the existing JSON key by reporting the primary-asset refund
+    // there (matches the tez case exactly when sending tez) and add
+    // a parallel tez-refund field for FA2 transfers.
     user_out!(
         json: {
             "amount" => amount,
             "fee" => fee,
             "dal_fee" => profile.dal_fee,
-            "change" => change,
+            "change" => change_primary,
+            "change_tez" => change_tez,
             "nullifiers" => nullifiers_hex,
             "recipient_cm" => &cm_1_hex,
             "change_cm" => &cm_2_hex,
-            "producer_cm" => &cm_3_hex,
+            "producer_cm" => &cm_4_hex,
         },
         human: "Submitted transfer of {} with fee {} + dal fee {} and change {}",
-        amount, fee, profile.dal_fee, change
+        amount, fee, profile.dal_fee, change_primary
     );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
@@ -10083,6 +11455,7 @@ fn cmd_unshield_rollup(
     amount: u64,
     fee: Option<u64>,
     recipient: Option<&str>,
+    exit_asset_id: F,
     pc: &ProveConfig,
 ) -> Result<(), String> {
     // Upstream patch ④: phase event — entered the unshield path.
@@ -10104,26 +11477,86 @@ fn cmd_unshield_rollup(
     let mut w = load_wallet(path)?;
     let outgoing_seed = w.account().outgoing_seed;
     let producer_address = &profile.dal_fee_address;
-    let total_spend = amount
-        .checked_add(fee)
-        .and_then(|value| value.checked_add(profile.dal_fee))
+    let is_tez_exit = exit_asset_id == ASSET_TEZ;
+    let tez_fees = fee
+        .checked_add(profile.dal_fee)
         .ok_or_else(|| "unshield total spend overflow".to_string())?;
-    let selected = w.select_notes(total_spend)?;
-    let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
-    let change = (sum_in - amount as u128 - fee as u128 - profile.dal_fee as u128) as u64;
+    // Multi-asset note selection. Tez exits draw from a single pool
+    // (amount + fee + producer_fee from tez). FA2 exits draw from
+    // two pools: FA2 notes for the exit amount and tez notes for
+    // fees (the producer fee stays pinned to tez).
+    let mut selected: Vec<usize>;
+    let change_primary: u64; // exit-asset refund routed to change_1
+    let change_tez: u64;     // tez refund routed to change_2 (FA2 exits)
+    if is_tez_exit {
+        let total = amount
+            .checked_add(tez_fees)
+            .ok_or_else(|| "unshield total spend overflow".to_string())?;
+        selected = w.select_notes_of_asset(&ASSET_TEZ, total)?;
+        let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
+        change_primary = (sum_in - amount as u128 - tez_fees as u128) as u64;
+        change_tez = 0;
+    } else {
+        let fa2_idx = w.select_notes_of_asset(&exit_asset_id, amount)?;
+        let fa2_sum: u128 = fa2_idx.iter().map(|&i| w.notes[i].v as u128).sum();
+        let tez_idx = w.select_notes_of_asset(&ASSET_TEZ, tez_fees)?;
+        let tez_sum: u128 = tez_idx.iter().map(|&i| w.notes[i].v as u128).sum();
+        if fa2_idx.len() + tez_idx.len() > 7 {
+            return Err(format!(
+                "multi-asset unshield needs {} inputs ({} fa2 + {} tez) but the circuit caps inputs at 7 — consolidate notes first",
+                fa2_idx.len() + tez_idx.len(),
+                fa2_idx.len(),
+                tez_idx.len(),
+            ));
+        }
+        selected = Vec::with_capacity(fa2_idx.len() + tez_idx.len());
+        selected.extend(fa2_idx);
+        selected.extend(tez_idx);
+        change_primary = (fa2_sum - amount as u128) as u64;
+        change_tez = (tez_sum - tez_fees as u128) as u64;
+    }
 
     let nullifiers: Vec<F> = selected
         .iter()
         .map(|&i| note_nullifier(&w.notes[i]))
         .collect();
 
-    let (cm_change, enc_change, change_data) = if change > 0 {
+    // change_1 carries the exit-asset refund (FA2 refund for FA2
+    // exits, or the leftover tez for tez exits).
+    let (cm_change, enc_change, change_data) = if change_primary > 0 {
+        let (change_state, _change_addr) = w.next_address()?;
+        let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
+        let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
+        let note = build_output_note_with_outgoing_asset(
+            &change_address,
+            change_primary,
+            &exit_asset_id,
+            None,
+            &outgoing_seed,
+            OutgoingNoteRole::UnshieldChange,
+        )?;
+        let cd = ChangeData {
+            d_j: change_state.d_j,
+            rseed: note.rseed,
+            auth_root: change_state.auth_root,
+            auth_pub_seed: change_state.auth_pub_seed,
+            nk_tag: change_state.nk_tag,
+            mh: note.mh,
+        };
+        (note.cm, Some(note.enc), Some(cd))
+    } else {
+        (ZERO, None, None)
+    };
+
+    // change_2 carries the tez refund for FA2 exits (always tez).
+    // For tez exits the slot is a zero-value placeholder.
+    let (cm_change_2, enc_change_2, change_data_2) = if change_tez > 0 {
         let (change_state, _change_addr) = w.next_address()?;
         let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
         let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
         let note = build_output_note_with_outgoing(
             &change_address,
-            change,
+            change_tez,
             None,
             &outgoing_seed,
             OutgoingNoteRole::UnshieldChange,
@@ -10157,18 +11590,23 @@ fn cmd_unshield_rollup(
         let mut wots_sigs: Vec<Vec<F>> = vec![];
         let mut auth_pub_seeds: Vec<F> = vec![];
 
-        let has_change_val: u64 = if change > 0 { 1 } else { 0 };
+        let has_change_val: u64 = if change_primary > 0 { 1 } else { 0 };
+        let has_change_2_val: u64 = if change_tez > 0 { 1 } else { 0 };
         let recipient_f = hash(recipient.as_bytes());
         let mh_change_f = change_data.as_ref().map(|cd| cd.mh).unwrap_or(ZERO);
+        let mh_change_2_f = change_data_2.as_ref().map(|cd| cd.mh).unwrap_or(ZERO);
         let sighash = unshield_sighash(
             &auth_domain,
             &root,
             &nullifiers,
             amount,
+            &exit_asset_id,
             fee,
             &recipient_f,
             &cm_change,
             &mh_change_f,
+            &cm_change_2,
+            &mh_change_2_f,
             &producer_note.cm,
             &producer_note.mh,
         );
@@ -10203,7 +11641,10 @@ fn cmd_unshield_rollup(
             wots_key_indices.push(key_idx);
         }
 
-        let total = 6 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 15;
+        // Phase B+C: N input asset + change_1 block (9) + change_2 block
+        // (9) + fee block (8) + asset_pub + primary_non_tez_asset = N+28.
+        let total =
+            6 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + n + 28;
         args.push(felt_u64_to_hex(total as u64));
         args.push(felt_u64_to_hex(n as u64));
         args.push(felt_to_hex(&auth_domain));
@@ -10241,10 +11682,16 @@ fn cmd_unshield_rollup(
             }
         }
 
+        // Multiasset: per-input asset tag from each selected note.
+        for &si in &selected {
+            args.push(felt_to_hex(&w.notes[si].asset_id));
+        }
+
+        // change_1: primary refund (same asset as exit_asset_id).
         args.push(felt_u64_to_hex(has_change_val));
         if let Some(cd) = &change_data {
             args.push(felt_to_hex(&cd.d_j));
-            args.push(felt_u64_to_hex(change));
+            args.push(felt_u64_to_hex(change_primary));
             args.push(felt_to_hex(&cd.rseed));
             args.push(felt_to_hex(&cd.auth_root));
             args.push(felt_to_hex(&cd.auth_pub_seed));
@@ -10255,6 +11702,24 @@ fn cmd_unshield_rollup(
                 args.push("0x0".to_string());
             }
         }
+        args.push(felt_to_hex(&exit_asset_id));
+
+        // change_2: tez refund (only non-zero for FA2 exits).
+        args.push(felt_u64_to_hex(has_change_2_val));
+        if let Some(cd) = &change_data_2 {
+            args.push(felt_to_hex(&cd.d_j));
+            args.push(felt_u64_to_hex(change_tez));
+            args.push(felt_to_hex(&cd.rseed));
+            args.push(felt_to_hex(&cd.auth_root));
+            args.push(felt_to_hex(&cd.auth_pub_seed));
+            args.push(felt_to_hex(&cd.nk_tag));
+            args.push(felt_to_hex(&cd.mh));
+        } else {
+            for _ in 0..7 {
+                args.push("0x0".to_string());
+            }
+        }
+        args.push(felt_to_hex(&ASSET_TEZ));
 
         args.push(felt_to_hex(&producer_address.d_j));
         args.push(felt_u64_to_hex(profile.dal_fee));
@@ -10263,6 +11728,14 @@ fn cmd_unshield_rollup(
         args.push(felt_to_hex(&producer_address.auth_pub_seed));
         args.push(felt_to_hex(&producer_address.nk_tag));
         args.push(felt_to_hex(&producer_note.mh));
+        args.push(felt_to_hex(&ASSET_TEZ));
+
+        // asset_pub (L1 exit asset) + primary_non_tez_asset (the
+        // 2-accumulator witness). Both are the user's chosen exit
+        // asset; for tez exits this collapses both accumulators
+        // into the tez lane.
+        args.push(felt_to_hex(&exit_asset_id));
+        args.push(felt_to_hex(&exit_asset_id));
 
         let args_bytes = serde_json::to_string(&args).map(|s| s.len() as u64).unwrap_or(0);
         phase_event!("witness_built", { "args_count": args.len() as u64, "args_bytes": args_bytes });
@@ -10278,6 +11751,8 @@ fn cmd_unshield_rollup(
         recipient: recipient.clone(),
         cm_change,
         enc_change,
+        cm_change_2,
+        enc_change_2,
         cm_fee: producer_note.cm,
         enc_fee: producer_note.enc,
         proof,
@@ -10307,8 +11782,13 @@ fn cmd_unshield_rollup(
     // Upstream patch ①: emit a structured envelope while preserving the new
     // L1-recipient outbox/cementation wording introduced by the streamline-
     // unshield-withdrawals rewrite.
-    let change_cm_hex = if change > 0 {
+    let change_cm_hex = if change_primary > 0 {
         Some(hex::encode(&cm_change))
+    } else {
+        None
+    };
+    let change_2_cm_hex = if change_tez > 0 {
+        Some(hex::encode(&cm_change_2))
     } else {
         None
     };
@@ -10318,10 +11798,15 @@ fn cmd_unshield_rollup(
             "amount" => amount,
             "fee" => fee,
             "dal_fee" => profile.dal_fee,
-            "change" => change,
+            // "change" historically meant the single refund (tez).
+            // Keep that key as the primary-asset refund (exit-asset);
+            // expose the tez refund separately for FA2 exits.
+            "change" => change_primary,
+            "change_tez" => change_tez,
             "recipient" => recipient,
             "nullifiers" => nullifiers_hex,
             "change_cm" => change_cm_hex,
+            "change_2_cm" => change_2_cm_hex,
             "producer_cm" => hex::encode(&producer_note.cm),
             "outbox_note" => outbox_note,
         },
@@ -10402,7 +11887,15 @@ fn prepare_transfer_skip_proof(
         &outgoing_seed,
         OutgoingNoteRole::TransferChange,
     )?;
+    // Phase C: cm_3 = zero-value tez change_2 placeholder.
     let note_3 = build_output_note_with_outgoing(
+        &change_address,
+        0,
+        None,
+        &outgoing_seed,
+        OutgoingNoteRole::TransferChange,
+    )?;
+    let note_4 = build_output_note_with_outgoing(
         producer_address,
         dal_fee,
         Some(b"dal"),
@@ -10420,9 +11913,11 @@ fn prepare_transfer_skip_proof(
             cm_1: note_1.cm,
             cm_2: note_2.cm,
             cm_3: note_3.cm,
+            cm_4: note_4.cm,
             enc_1: note_1.enc,
             enc_2: note_2.enc,
             enc_3: note_3.enc,
+            enc_4: note_4.enc,
             proof: Proof::TrustMeBro,
         },
     })
@@ -10495,6 +11990,8 @@ fn prepare_unshield_skip_proof(
             recipient: recipient.into(),
             cm_change,
             enc_change,
+            cm_change_2: ZERO,
+            enc_change_2: None,
             cm_fee: producer_note.cm,
             enc_fee: producer_note.enc,
             proof: Proof::TrustMeBro,
@@ -10653,7 +12150,7 @@ mod network_profile_tests {
         let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tag);
         let rseed = felt_tag(b"canonical-unshield");
         let rcm = derive_rcm(&rseed);
-        let cm = commit(&addr.d_j, note_value, &rcm, &otag);
+        let cm = commit(&addr.d_j, note_value, &ASSET_TEZ, &rcm, &otag);
         wallet.notes.push(Note {
             nk_spend,
             nk_tag,
@@ -10664,6 +12161,7 @@ mod network_profile_tests {
             cm,
             index: 0,
             addr_index: 0,
+            asset_id: ASSET_TEZ,
         });
         save_wallet(wallet_path_str, &wallet).expect("save wallet");
 
@@ -10849,6 +12347,7 @@ mod network_profile_tests {
             amount,
             None,
             Some(recipient),
+            ASSET_TEZ,
             &pc,
         )
         .expect("explicit L1 unshield recipient should not require octez source lookup");
@@ -11772,14 +13271,18 @@ mod network_profile_tests {
         );
         let funded_balance: u64 = 314_159;
 
+        // E.6: pool key is now `<prefix><asset_hex>/<pubkey_hex>`.
+        // This test exercises the tez pool only.
         let funded_length_route = format!(
-            "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}{}",
+            "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}{}/{}",
             DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
             hex::encode(target_pubkey_hash),
         );
         let funded_value_route = format!(
-            "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}{}",
+            "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}{}/{}",
             DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
             hex::encode(target_pubkey_hash),
         );
 
@@ -11852,6 +13355,7 @@ mod network_profile_tests {
             &blind,
         );
         wallet.pending_deposits.push(PendingDeposit {
+            asset_id: ASSET_TEZ,
             pubkey_hash: pkh,
             blind,
             address_index: 0,
@@ -11863,13 +13367,15 @@ mod network_profile_tests {
         save_wallet(wallet_path_str, &wallet).expect("save wallet");
 
         let funded_length_route = format!(
-            "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}{}",
+            "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}{}/{}",
             DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
             hex::encode(pkh),
         );
         let funded_value_route = format!(
-            "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}{}",
+            "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}{}/{}",
             DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
             hex::encode(pkh),
         );
         let base_url = super::tests::spawn_mock_http_server(HashMap::from([
@@ -11970,6 +13476,41 @@ mod network_profile_tests {
         // 64 chars but with an embedded non-hex glyph.
         let bad = format!("{}g", &hex[..63]);
         assert!(parse_pubkey_hash_hex(&bad).is_err());
+    }
+
+    /// Phase E.6: parse_asset_id_hex accepts the canonical 64-char
+    /// hex form (with or without the 0x prefix), short hex forms
+    /// (left-padded with zeros), and the literal "tez"/"0"/empty
+    /// shorthands for ASSET_TEZ.
+    #[test]
+    fn parse_asset_id_hex_accepts_canonical_and_shorthand_forms() {
+        // Shorthands for tez.
+        assert_eq!(parse_asset_id_hex("").unwrap(), ASSET_TEZ);
+        assert_eq!(parse_asset_id_hex("tez").unwrap(), ASSET_TEZ);
+        assert_eq!(parse_asset_id_hex("TEZ").unwrap(), ASSET_TEZ);
+        assert_eq!(parse_asset_id_hex("0").unwrap(), ASSET_TEZ);
+
+        // Round-trip a full 64-char hex.
+        let mut sample = ZERO;
+        for (i, b) in sample.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let hex = hex::encode(sample);
+        assert_eq!(parse_asset_id_hex(&hex).unwrap(), sample);
+        assert_eq!(parse_asset_id_hex(&format!("0x{}", hex)).unwrap(), sample);
+        assert_eq!(parse_asset_id_hex(&format!("0X{}", hex)).unwrap(), sample);
+
+        // Short forms left-pad with zeros.
+        let derived = parse_asset_id_hex("dead").unwrap();
+        assert_eq!(derived[30], 0xde);
+        assert_eq!(derived[31], 0xad);
+        for byte in &derived[..30] {
+            assert_eq!(*byte, 0);
+        }
+
+        // Reject oversize and non-hex inputs.
+        assert!(parse_asset_id_hex(&"0".repeat(65)).is_err());
+        assert!(parse_asset_id_hex("xx").is_err());
     }
 
     /// Phase-event wire format is consumed by the daemon's runner.rs
@@ -12101,7 +13642,7 @@ mod network_profile_tests {
             // existing helper used in adjacent tests for the same job.
             let rseed = random_felt();
             let rcm = derive_rcm(&rseed);
-            let cm = commit(&addr.d_j, value, &rcm, &otag);
+            let cm = commit(&addr.d_j, value, &ASSET_TEZ, &rcm, &otag);
             w.notes.push(Note {
                 nk_spend: nk_sp,
                 nk_tag: nk_tg,
@@ -12112,6 +13653,7 @@ mod network_profile_tests {
                 cm,
                 index: w.notes.len(),
                 addr_index,
+                asset_id: ASSET_TEZ,
             });
         };
         push_note(&mut w, &acc, 0, 100);
@@ -12202,23 +13744,62 @@ mod network_profile_tests {
         );
     }
 
+    /// FA2 mint Michelson params: `pair (nat amount) (pair (bytes
+    /// receiver) (address rollup))`. Pinned exactly because the L1
+    /// signer (Temple/Beacon/Ledger) needs to see this shape and
+    /// any drift would silently send the L1 ticket with bad
+    /// parameters.
+    #[test]
+    fn deposit_mint_fa2_michelson_params_match_expected_shape() {
+        let pubkey_hash: F = std::array::from_fn(|i| (i as u8) + 1);
+        let rollup_address = "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP";
+        let amount = 1_000_000u64;
+        let params = deposit_mint_fa2_michelson_params(amount, &pubkey_hash, rollup_address);
+
+        // Outer pair.
+        assert_eq!(params["prim"], "Pair");
+        let outer = params["args"].as_array().unwrap();
+        assert_eq!(outer.len(), 2);
+
+        // First: nat amount, as Michelson int literal (string-encoded
+        // — the JSON encoding of Micheline preserves natural numbers
+        // as decimal strings to keep big integers safe).
+        assert_eq!(outer[0]["int"], amount.to_string());
+        assert!(outer[0].get("bytes").is_none());
+
+        // Second: nested pair (bytes receiver, address rollup).
+        assert_eq!(outer[1]["prim"], "Pair");
+        let inner = outer[1]["args"].as_array().unwrap();
+        assert_eq!(inner.len(), 2);
+
+        let recipient_ascii = format!("deposit:{}", hex::encode(&pubkey_hash));
+        assert_eq!(
+            inner[0]["bytes"].as_str().unwrap(),
+            hex::encode(recipient_ascii.as_bytes()),
+        );
+        assert_eq!(inner[1]["string"], rollup_address);
+    }
+
     /// Pool-model port of the legacy
     /// `rollup_rpc_load_balances_preserves_raw_json_deposit_balance_key`.
     /// The kernel's deposit-pool balance loader translates each
     /// `PendingDeposit.pubkey_hash` into the durable-storage key
-    /// `/tzel/v1/state/deposits/balance/<hex(pubkey_hash)>` and decodes
-    /// the LE-u64 value at that key. Spawn a mock rollup-node that serves
-    /// exactly that key/value pair, push a PendingDeposit with the
-    /// matching pubkey_hash, and assert the loader returns the expected
-    /// balance keyed on pubkey_hash.
+    /// `/tzel/v1/state/deposits/balance/<hex(asset_id)>/<hex(pubkey_hash)>`
+    /// and decodes the LE-u64 value at that key. Spawn a mock rollup-
+    /// node that serves exactly that key/value pair, push a
+    /// PendingDeposit with the matching pubkey_hash, and assert the
+    /// loader returns the expected balance keyed on pubkey_hash.
+    /// E.6 pool lookups are now scoped by asset_id; this test
+    /// exercises the tez pool.
     #[test]
     fn rollup_rpc_load_pool_balances_preserves_pubkey_hash_key() {
         let pubkey_hash: F = felt_tag(b"pool-balance-test-pkh");
         let amount: u64 = 4_321u64;
         let balance_key = format!(
-            "{}{}",
+            "{}{}/{}",
             DURABLE_DEPOSIT_BALANCE_PREFIX,
-            hex::encode(pubkey_hash)
+            hex::encode(ASSET_TEZ),
+            hex::encode(pubkey_hash),
         );
 
         let base_url = super::tests::spawn_mock_http_server(HashMap::from([
@@ -12243,6 +13824,7 @@ mod network_profile_tests {
         ]));
         let profile = super::tests::rollup_profile_for_url(&base_url);
         let pending = vec![PendingDeposit {
+            asset_id: ASSET_TEZ,
             pubkey_hash,
             blind: felt_tag(b"pool-balance-test-blind"),
             address_index: 0,
@@ -12256,7 +13838,7 @@ mod network_profile_tests {
             .load_pool_balances_at_head(&pending)
             .expect("load_pool_balances_at_head should succeed");
 
-        assert_eq!(balances.get(&pubkey_hash), Some(&amount));
+        assert_eq!(balances.get(&(ASSET_TEZ, pubkey_hash)), Some(&amount));
         assert_eq!(balances.len(), 1);
     }
 
@@ -13252,7 +14834,12 @@ mod network_profile_tests {
         use std::collections::HashMap;
         let pkh: F = felt_tag(b"pool-pinned-test");
         let pkh_hex = hex::encode(pkh);
-        let key = format!("{}{}", DURABLE_DEPOSIT_BALANCE_PREFIX, pkh_hex);
+        let key = format!(
+            "{}{}/{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
+            pkh_hex
+        );
 
         let block_old = "BLpinnedold";
         let block_new = "BLpinnednew";
@@ -13302,6 +14889,7 @@ mod network_profile_tests {
         let profile = super::tests::rollup_profile_for_url(&base_url);
         let rpc = RollupRpc::new(&profile);
         let pending = vec![PendingDeposit {
+            asset_id: ASSET_TEZ,
             pubkey_hash: pkh,
             blind: felt_tag(b"pool-pinned-blind"),
             address_index: 0,
@@ -13314,7 +14902,7 @@ mod network_profile_tests {
         let pinned = rpc
             .load_pool_balances_at_block(block_old, &pending)
             .expect("load_pool_balances_at_block must succeed");
-        let pinned_value = pinned.get(&pkh).copied();
+        let pinned_value = pinned.get(&(ASSET_TEZ, pkh)).copied();
         assert_eq!(
             pinned_value,
             Some(value_old),
@@ -13482,6 +15070,7 @@ mod network_profile_tests {
         wallet.scanned = 0;
         let pkh = felt_tag(b"finalize-pin-pool-pkh");
         wallet.pending_deposits.push(PendingDeposit {
+            asset_id: ASSET_TEZ,
             pubkey_hash: pkh,
             blind: felt_tag(b"finalize-pin-blind"),
             address_index: 0,
@@ -13510,7 +15099,12 @@ mod network_profile_tests {
 
         let pkh_hex = hex::encode(pkh);
         let pool_key =
-            format!("{}{}", DURABLE_DEPOSIT_BALANCE_PREFIX, pkh_hex);
+            format!(
+            "{}{}/{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
+            pkh_hex
+        );
         let value_old: u64 = 1_000_000;
         let tree_size: u64 = 1;
 
@@ -13699,6 +15293,7 @@ mod network_profile_tests {
         let mut wallet = super::tests::test_wallet(1);
         let pkh = felt_tag(b"finalize-pin-pool-pkh-fixture");
         wallet.pending_deposits.push(PendingDeposit {
+            asset_id: ASSET_TEZ,
             pubkey_hash: pkh,
             blind: felt_tag(b"finalize-pin-blind-fixture"),
             address_index: 0,
@@ -13710,7 +15305,12 @@ mod network_profile_tests {
 
         let pkh_hex = hex::encode(pkh);
         let pool_key =
-            format!("{}{}", DURABLE_DEPOSIT_BALANCE_PREFIX, pkh_hex);
+            format!(
+            "{}{}/{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
+            pkh_hex
+        );
         let value_old: u64 = 1_000_000;
 
         let mut routes: HashMap<String, (u16, String)> = HashMap::new();
@@ -13806,7 +15406,7 @@ mod network_profile_tests {
             .load_pool_balances_at_head(&wallet.pending_deposits)
             .expect("regression helper succeeds");
         assert_eq!(
-            drained_pool.get(&pkh).copied().unwrap_or(0),
+            drained_pool.get(&(ASSET_TEZ, pkh)).copied().unwrap_or(0),
             0,
             "regression read at block_new must see drained pool"
         );

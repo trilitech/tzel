@@ -1,8 +1,14 @@
 /// Parameterized shield executable — takes witness data as input.
 ///
-/// Public outputs (in order):
+/// Public outputs (10 felts, in order):
 ///   [auth_domain, pubkey_hash, v_note, fee, producer_fee,
-///    cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash]
+///    cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash,
+///    asset_new]
+///
+/// (Multiasset: `asset_new` is the 10th public output. `asset_producer`
+///  is folded into the sighash but is asserted in-circuit to equal
+///  ASSET_TEZ, so it doesn't appear as a public output — only its
+///  commitment-preimage binding does.)
 ///
 /// Argument layout (flattened felt252 array):
 ///   [auth_domain, pubkey_hash, v_note, fee, producer_fee,
@@ -12,7 +18,8 @@
 ///    wots_sig[0]..wots_sig[WOTS_CHAINS-1],
 ///    auth_siblings[0]..auth_siblings[AUTH_DEPTH-1],
 ///    producer_auth_root, producer_auth_pub_seed, producer_nk_tag,
-///    producer_d_j, producer_rseed]
+///    producer_d_j, producer_rseed,
+///    asset_new, asset_producer]    (multiasset Phase B)
 ///
 /// The shield circuit verifies an in-circuit WOTS+ signature under the
 /// recipient's auth tree, binding the entire request payload. The wallet
@@ -28,7 +35,8 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let wots_chains: u32 = xmss_common::WOTS_CHAINS;
     let auth_depth: u32 = merkle::AUTH_DEPTH;
     let producer_witness: u32 = 5;
-    let expected_len = fixed_prefix + wots_chains + auth_depth + producer_witness;
+    let asset_fields: u32 = 2; // multiasset Phase B: asset_new, asset_producer
+    let expected_len = fixed_prefix + wots_chains + auth_depth + producer_witness + asset_fields;
     assert(args.len() == expected_len, 'shield: bad arg len');
 
     let auth_domain = *args.at(0);
@@ -60,6 +68,9 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let producer_d_j = *args.at(prod_start + 3);
     let producer_rseed = *args.at(prod_start + 4);
 
+    let asset_new = *args.at(prod_start + 5);
+    let asset_producer = *args.at(prod_start + 6);
+
     shield::verify(
         auth_domain,
         pubkey_hash,
@@ -84,5 +95,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         producer_nk_tag,
         producer_d_j,
         producer_rseed,
+        asset_new,
+        asset_producer,
     )
 }
