@@ -14,7 +14,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tezos_data_encoding_05::enc::BinWriter as _;
 use tezos_smart_rollup_encoding::{inbox::ExternalMessageFrame, smart_rollup::SmartRollupAddress};
 #[cfg(any(test, debug_assertions))]
@@ -804,8 +804,23 @@ fn process_submission(
                 return Ok(stored.submission);
             }
             Err(err) => {
-                stored.submission.status = RollupSubmissionStatus::Failed;
                 stored.submission.transport = RollupSubmissionTransport::DirectInbox;
+                // Idempotency: octez-client prints the op hash the moment the op
+                // is injected, before it waits for confirmation. If a hash is
+                // present the op reached the node and the error is a
+                // post-injection confirmation timeout / RPC blip — record it as
+                // SubmittedToL1 rather than Failed, because re-injecting would
+                // duplicate it. Inclusion is not verified here; a dropped op is
+                // caught by the caller's settlement timeout.
+                if let Some(op_hash) = extract_operation_hash(&err) {
+                    stored.submission.status = RollupSubmissionStatus::SubmittedToL1;
+                    stored.submission.operation_hash = Some(op_hash);
+                    stored.submission.detail =
+                        Some(format!("injected; confirmation unverified: {}", err));
+                    persist_submission(config, &stored)?;
+                    return Ok(stored.submission);
+                }
+                stored.submission.status = RollupSubmissionStatus::Failed;
                 stored.submission.detail = Some(err.clone());
                 persist_submission(config, &stored)?;
                 return Err(err);
@@ -974,7 +989,26 @@ fn maybe_advance_submission(
     // before we return and release advance_lock, otherwise the next injection
     // from this key reuses the same counter and L1 rejects it ("mempool already
     // contains a conflicting operation"), failing the shield spuriously.
-    let output = inject_direct_message(config, &targeted_bytes, true)?;
+    let output = match inject_direct_message(config, &targeted_bytes, true) {
+        Ok(output) => output,
+        Err(err) => {
+            // Idempotency (see process_submission): if octez-client already
+            // printed the op hash the pointer op reached the node, so record it
+            // and stop here — returning Err would leave status Attested and make
+            // the reconciler inject a duplicate pointer next tick.
+            if let Some(op_hash) = extract_operation_hash(&err) {
+                stored.submission.status = RollupSubmissionStatus::SubmittedToL1;
+                stored.submission.operation_hash = Some(op_hash);
+                stored.submission.detail = Some(format!(
+                    "All DAL chunks attested; pointer injected, confirmation unverified\n{}\n{}",
+                    status_lines.join("\n"),
+                    err
+                ));
+                return Ok(stored);
+            }
+            return Err(err);
+        }
+    };
     stored.submission.status = RollupSubmissionStatus::SubmittedToL1;
     stored.submission.operation_hash = extract_operation_hash(&output);
     stored.submission.detail = Some(format!(
@@ -1284,7 +1318,7 @@ fn publish_dal_commitment(
         .arg("with")
         .arg("proof")
         .arg(proof);
-    run_command_collect_output(command, &config.octez_client_bin)
+    run_command_collect_output(command, &config.octez_client_bin, OCTEZ_CLIENT_TIMEOUT)
 }
 
 fn fetch_block_level(endpoint: &str, block_hash: &str) -> Result<i32, String> {
@@ -1422,7 +1456,7 @@ fn inject_direct_message(
         .arg("from")
         .arg(&config.source_alias);
 
-    let result = run_command_collect_output(command, &config.octez_client_bin);
+    let result = run_command_collect_output(command, &config.octez_client_bin, OCTEZ_CLIENT_TIMEOUT);
     let _ = std::fs::remove_file(&payload_file);
     result
 }
@@ -1441,24 +1475,106 @@ fn encode_targeted_rollup_message(rollup_address: &str, payload: &[u8]) -> Resul
     Ok(output)
 }
 
+// Ceiling on a single octez-client invocation. `-w 1` waits for the op to be
+// baked (~1-2 blocks); this bounds the wait so a stuck/never-confirmed op can't
+// hang forever while advance_lock is held and wedge the whole operator.
+// ponytail: fixed ceiling, generous vs the ~8-16s happy path; make it a config
+// flag if operators ever need to tune per-network block times.
+const OCTEZ_CLIENT_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn temp_output_path(kind: &str) -> Result<PathBuf, String> {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "tzel-operator-{}-{}-{}.log",
+        std::process::id(),
+        kind,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("system clock error: {}", e))?
+            .as_nanos()
+    ));
+    Ok(path)
+}
+
 fn run_command_collect_output(
     mut command: std::process::Command,
     program_name: &str,
+    timeout: Duration,
 ) -> Result<String, String> {
-    let output = command
-        .output()
+    // Capture stdout/stderr to temp files rather than pipes: a `-w 1` inject can
+    // block for many blocks, and reading a full pipe buffer via .output() could
+    // deadlock. Files also let us recover partial output after a timeout-kill —
+    // octez-client prints the injected op hash *before* it waits for
+    // confirmation, and callers use that hash for idempotency on a timeout.
+    let stdout_path = temp_output_path("out")?;
+    let stderr_path = temp_output_path("err")?;
+    let stdout_file = std::fs::File::create(&stdout_path)
+        .map_err(|e| format!("create stdout capture for {}: {}", program_name, e))?;
+    let stderr_file = std::fs::File::create(&stderr_path)
+        .map_err(|e| format!("create stderr capture for {}: {}", program_name, e))?;
+    command.stdout(stdout_file).stderr(stderr_file);
+
+    let mut child = command
+        .spawn()
         .map_err(|e| format!("failed to start {}: {}", program_name, e))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return Err(format!("failed to wait for {}: {}", program_name, e));
+            }
+        }
+    };
+
+    let stdout = std::fs::read_to_string(&stdout_path)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let stderr = std::fs::read_to_string(&stderr_path)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let _ = std::fs::remove_file(&stdout_path);
+    let _ = std::fs::remove_file(&stderr_path);
     let combined = match (stdout.is_empty(), stderr.is_empty()) {
         (true, true) => String::new(),
         (false, true) => stdout,
         (true, false) => stderr,
         (false, false) => format!("{}\n{}", stdout, stderr),
     };
-    if !output.status.success() {
+
+    if timed_out {
+        // Keep any partial output in the error: octez-client emits the op hash
+        // before waiting, so callers can still detect that the op was injected.
         return Err(if combined.is_empty() {
-            format!("{} exited with status {}", program_name, output.status)
+            format!("{} timed out after {}s", program_name, timeout.as_secs())
+        } else {
+            format!(
+                "{} timed out after {}s\n{}",
+                program_name,
+                timeout.as_secs(),
+                combined
+            )
+        });
+    }
+    let status = status.expect("status is set whenever the command did not time out");
+    if !status.success() {
+        return Err(if combined.is_empty() {
+            format!("{} exited with status {}", program_name, status)
         } else {
             combined
         });
@@ -2338,6 +2454,104 @@ mod tests {
         assert!(
             log.contains("-w\n1\n"),
             "pointer inject must wait for inclusion (-w 1); args were:\n{log}"
+        );
+    }
+
+    #[test]
+    fn pointer_inject_error_with_op_hash_is_recorded_not_retried() {
+        // octez-client prints the op hash the instant it injects, then errors
+        // during the confirmation wait (timeout / RPC blip). Because the op
+        // reached the node, the submission must land as SubmittedToL1 with that
+        // hash — NOT propagate an error (which would make the reconciler inject
+        // a duplicate pointer op next tick).
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooPointerHash123456789ABCDEFG'\nexit 1\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/levels/101/slots/3/status".into(),
+                (200, "{\"kind\":\"attested\",\"attestation_lag\":8}".into()),
+            ),
+            (
+                "/levels/102/slots/4/status".into(),
+                (200, "{\"kind\":\"attested\",\"attestation_lag\":8}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let submission = RollupSubmission {
+            id: "sub-1".into(),
+            kind: RollupSubmissionKind::Shield,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            status: RollupSubmissionStatus::CommitmentIncluded,
+            transport: RollupSubmissionTransport::Dal,
+            operation_hash: Some("ooCommitmentHash123456789ABCDEFG".into()),
+            dal_chunks: vec![
+                RollupDalChunk {
+                    slot_index: 3,
+                    published_level: 101,
+                    payload_len: 128,
+                    commitment: "commitment-1".into(),
+                    operation_hash: Some("ooChunkOne123456789ABCDEFG".into()),
+                },
+                RollupDalChunk {
+                    slot_index: 4,
+                    published_level: 102,
+                    payload_len: 64,
+                    commitment: "commitment-2".into(),
+                    operation_hash: Some("ooChunkTwo123456789ABCDEFG".into()),
+                },
+            ],
+            commitment: Some("commitment-1".into()),
+            published_level: Some(101),
+            slot_index: Some(3),
+            payload_hash: Some(hex::encode([0x44; 32])),
+            payload_len: 192,
+            detail: None,
+        };
+
+        let advanced =
+            maybe_advance_submission(&config, stored_submission(submission, None, &[])).unwrap();
+        assert_eq!(
+            advanced.submission.status,
+            RollupSubmissionStatus::SubmittedToL1,
+            "an injected-but-unconfirmed pointer must be recorded, not left to re-inject"
+        );
+        assert_eq!(
+            advanced.submission.operation_hash.as_deref(),
+            Some("ooPointerHash123456789ABCDEFG")
+        );
+        assert!(advanced
+            .submission
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("confirmation unverified"));
+    }
+
+    #[test]
+    fn run_command_times_out_and_keeps_partial_output() {
+        // A command that emits an op hash and then blocks past the deadline must
+        // be killed and surface a timeout error that still carries the hash, so
+        // callers can apply the injected-but-unconfirmed idempotency path.
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(
+            "echo 'Operation hash is ooTimeoutHash123456789ABCDEFG'; sleep 30",
+        );
+        let started = Instant::now();
+        let err = run_command_collect_output(command, "octez-client", Duration::from_millis(500))
+            .expect_err("command that outlives the timeout must error");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timeout should fire well before the command's own sleep"
+        );
+        assert!(err.contains("timed out"), "expected a timeout error, got: {err}");
+        assert_eq!(
+            extract_operation_hash(&err).as_deref(),
+            Some("ooTimeoutHash123456789ABCDEFG"),
+            "partial output (the op hash) must survive a timeout kill"
         );
     }
 
