@@ -790,7 +790,11 @@ fn process_submission(
     };
 
     if targeted_bytes.len() <= config.direct_max_message_bytes {
-        match inject_direct_message(config, &targeted_bytes, false) {
+        // Wait for inclusion (-w 1): the op must be baked before we return and
+        // release advance_lock, otherwise the next injection from this key reuses
+        // the same counter and L1 rejects it ("mempool already contains a
+        // conflicting operation") — the shield then fails spuriously.
+        match inject_direct_message(config, &targeted_bytes, true) {
             Ok(output) => {
                 stored.submission.status = RollupSubmissionStatus::SubmittedToL1;
                 stored.submission.transport = RollupSubmissionTransport::DirectInbox;
@@ -966,10 +970,11 @@ fn maybe_advance_submission(
     let pointer_payload = encode_kernel_inbox_message(&KernelInboxMessage::DalPointer(pointer))?;
     let targeted_bytes =
         encode_targeted_rollup_message(&stored.submission.rollup_address, &pointer_payload)?;
-    // The operator only needs successful injection here; callers can wait for
-    // inclusion by tracking the returned operation hash and baking/progressing
-    // the chain as needed.
-    let output = inject_direct_message(config, &targeted_bytes, false)?;
+    // Wait for inclusion (-w 1), not fire-and-forget: the op must be baked
+    // before we return and release advance_lock, otherwise the next injection
+    // from this key reuses the same counter and L1 rejects it ("mempool already
+    // contains a conflicting operation"), failing the shield spuriously.
+    let output = inject_direct_message(config, &targeted_bytes, true)?;
     stored.submission.status = RollupSubmissionStatus::SubmittedToL1;
     stored.submission.operation_hash = extract_operation_hash(&output);
     stored.submission.detail = Some(format!(
@@ -2325,6 +2330,15 @@ mod tests {
         assert!(log.contains("smart"));
         assert!(log.contains("rollup"));
         assert!(log.contains("message"));
+        // Must wait for inclusion (-w 1), not fire-and-forget (-w none): the op
+        // has to be baked before advance_lock releases, else the next injection
+        // reuses the counter and L1 rejects it as a mempool conflict. The
+        // args are one-per-line, so this pins the exact `-w 1` sequence and a
+        // revert to `-w none` fails it.
+        assert!(
+            log.contains("-w\n1\n"),
+            "pointer inject must wait for inclusion (-w 1); args were:\n{log}"
+        );
     }
 
     #[test]
