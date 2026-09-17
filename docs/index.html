@@ -40,6 +40,7 @@
     html { scroll-behavior: smooth; }
 
     body {
+      padding-top: var(--mb-h); /* clear the fixed migration banner */
       font-family: var(--font);
       background:
         radial-gradient(circle at top left, rgba(13, 97, 255, 0.18), transparent 32%),
@@ -108,7 +109,7 @@
 
     nav {
       position: fixed;
-      top: 0;
+      top: var(--mb-h); /* sit just below the migration banner */
       left: 0;
       right: 0;
       z-index: 100;
@@ -657,9 +658,34 @@
       .btn { width: 100%; }
       .cta-inner { padding: 28px 22px; }
     }
+
+    /* Migration notice — Ushuaianet → Shadownet (remove after cutover). */
+    :root { --mb-h: 44px; }
+    .migration-banner {
+      position: fixed; inset: 0 0 auto 0; z-index: 101;
+      display: flex; align-items: center; justify-content: center; gap: 10px;
+      min-height: var(--mb-h); padding: 8px 20px; box-sizing: border-box;
+      text-align: center; font-family: var(--font); font-size: 0.9rem;
+      line-height: 1.4; color: #fff;
+      background: linear-gradient(135deg, #0d61ff 0%, #14b8ac 100%);
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
+    }
+    .migration-banner strong { color: #fff; font-weight: 700; }
+    .migration-banner .mb-dot {
+      width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+      background: #fff; box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.25);
+    }
+    @media (max-width: 640px) {
+      :root { --mb-h: 60px; }
+      .migration-banner { font-size: 0.82rem; padding: 8px 14px; }
+    }
   </style>
 </head>
 <body>
+  <div class="migration-banner" role="status">
+    <span class="mb-dot" aria-hidden="true"></span>
+    <span><strong>Heads up:</strong> TzEL migrates from Ushuaianet to <strong>Shadownet</strong> on <strong>Sept&nbsp;21, 2026</strong> &mdash; testnet balances won&rsquo;t carry over.</span>
+  </div>
   <div class="page-shell">
     <nav>
       <div class="nav-inner">
