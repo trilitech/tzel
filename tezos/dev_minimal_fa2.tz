@@ -1,0 +1,116 @@
+# dev_minimal_fa2.tz — single-token balance-tracking FA2-ish
+# contract used for shadownet round-trip testing of
+# fa2_bridge_ticketer.tz. Two specific shortcuts make this tractable
+# to hand-write in Michelson:
+#
+# 1. Single-token: ignores the FA2 transfer's token_id field
+#    entirely; storage is just `big_map address nat`.
+# 2. Single-transfer: handles ONLY the first (outer, inner) tuple
+#    in the transfer list. The bridge ticketer always emits a
+#    1-of-1 list, so this is sufficient for the test. Real FA2
+#    deployments would iterate over arbitrary lengths.
+# 3. No operator authorisation: any caller can transfer from any
+#    address. Production FA2 contracts gate this with
+#    %update_operators; the bridge ticketer assumes the caller
+#    has pre-authorised it.
+#
+# Entrypoints:
+#   %transfer — standard FA2 transfer-list shape, processes the
+#       first (from, txs) pair where txs has exactly one element.
+#   %mint — credits a balance. Used by the test harness to seed
+#       initial holdings.
+
+parameter (or (list %transfer (pair (address %from_) (list %txs (pair (address %to_) (pair (nat %token_id) (nat %amount)))))) (pair %mint (address %to_) (nat %amount))) ;
+storage (big_map address nat) ;
+code
+  { UNPAIR ;
+    IF_LEFT
+      { # === transfer ===
+        # stack: outer_list, storage
+        IF_CONS
+          { # head = (from, txs), tail = rest; stack: head, tail, storage
+            DIP { DROP } ;
+            # stack: head, storage
+            UNPAIR ;
+            # stack: from, txs, storage
+            SWAP ;
+            # stack: txs, from, storage
+            IF_CONS
+              { # tx = (to, (token_id, amount)), rest_txs
+                # stack: tx, rest_txs, from, storage
+                DIP { DROP } ;
+                # stack: tx, from, storage
+                UNPAIR ;
+                # stack: to, (token_id, amount), from, storage
+                SWAP ;
+                CDR ;
+                # stack: amount, to, from, storage
+
+                # === Balance update ===
+                # Move storage to the top to work with it.
+                DIG 3 ;
+                # stack: storage, amount, to, from
+
+                # Debit: storage[from] := storage[from] - amount.
+                DUP ;
+                DUP 5 ;
+                GET ;
+                IF_NONE { PUSH nat 0 } {} ;
+                # stack: bal_from, storage, amount, to, from
+                DUP 3 ;
+                SWAP ;
+                SUB ;
+                # stack: bal_from - amount : int, storage, amount, to, from
+                ISNAT ;
+                IF_NONE { PUSH string "fa2: insufficient balance" ; FAILWITH } {} ;
+                # stack: new_bal_from, storage, amount, to, from
+                SOME ;
+                DIG 4 ;
+                # stack: from, Some new_bal_from, storage, amount, to
+                UPDATE ;
+                # stack: storage', amount, to
+
+                # Credit: storage'[to] := storage'[to] + amount.
+                DUP ;
+                DUP 4 ;
+                GET ;
+                IF_NONE { PUSH nat 0 } {} ;
+                # stack: bal_to, storage', amount, to
+                DUP 3 ;
+                ADD ;
+                # stack: new_bal_to, storage', amount, to
+                SOME ;
+                DUP 4 ;
+                # stack: to, Some new_bal_to, storage', amount, to
+                UPDATE ;
+                # stack: storage'', amount, to
+
+                DIP { DROP ; DROP } ;
+                # stack: storage''
+                NIL operation ;
+                PAIR }
+              { # inner txs empty
+                PUSH string "fa2: empty inner txs" ;
+                FAILWITH } }
+          { # outer list empty — no-op (returns storage unchanged)
+            NIL operation ;
+            PAIR } }
+      { # === mint === stack: (to, amount), storage
+        UNPAIR ;
+        # stack: to, amount, storage
+        DUP 3 ;
+        DUP 2 ;
+        # stack: to, storage, to, amount, storage
+        GET ;
+        IF_NONE { PUSH nat 0 } {} ;
+        # stack: bal, to, amount, storage
+        DIG 2 ;
+        ADD ;
+        # stack: new_bal, to, storage
+        SOME ;
+        SWAP ;
+        # stack: to, Some new_bal, storage
+        UPDATE ;
+        # stack: storage'
+        NIL operation ;
+        PAIR } }

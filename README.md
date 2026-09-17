@@ -16,16 +16,17 @@ Privacy on blockchains today relies on elliptic curve cryptography that quantum 
 - **Fuzzy message detection.** ML-KEM-based detection keys let a lightweight indexer flag likely-incoming transactions without being able to read them.
 - **Diversified addresses.** Generate unlimited unlinkable addresses from a single master key.
 - **1 KB encrypted memos.** End-to-end encrypted with ML-KEM-768 + ChaCha20-Poly1305.
-- **Flexible N->3 transfers.** Spend up to 7 notes in a single proof and produce recipient, change, and DAL-producer fee notes without dummy notes.
+- **Flexible N->4 transfers.** Spend up to 7 notes in a single proof and produce a recipient, up to two change notes (one per asset under the multiasset 2-accumulator design), and a DAL-producer fee note without dummy notes.
+- **Multiasset.** Tez and FA2 tokens are both bridgeable; each FA2 ticketer KT1 deterministically maps to an L2 `asset_id = H("tzel:asset:" || ticketer_kt1)`. The on-chain commitment hides which asset a note carries, so rare-asset transactions blend with the common-asset crowd. See [docs/multiasset_deployment.md](./docs/multiasset_deployment.md).
 
 ### How it works
 
 A UTXO-based private transaction system where:
-- **Deposits** credit an aggregated rollup pool keyed by `pubkey_hash = H(auth_domain, auth_root, auth_pub_seed, blind)`. Multiple L1 tickets to `deposit:<hex(pubkey_hash)>` add to the same balance. `shield` debits the pool by `v + fee + producer_fee` and mints recipient + producer-fee notes; the proof's in-circuit WOTS+ signature, verified under the recipient's auth tree, binds the entire request payload so a delegated prover cannot redirect funds.
-- **Transfers** spend 1-7 private notes and create recipient, change, and DAL-producer fee notes
-- **Withdrawals** (unshield) destroy private notes, emit an L1 outbox transfer to a tz/KT1 recipient, and create a DAL-producer fee note plus optional change
+- **Deposits** credit an aggregated rollup pool keyed by `(asset_id, pubkey_hash)` where `pubkey_hash = H(auth_domain, auth_root, auth_pub_seed, blind)` and `asset_id` is determined by the L1 ticketer that emitted the deposit (tez or any registered FA2). Multiple L1 tickets from the same ticketer to `deposit:<hex(pubkey_hash)>` add to the same balance. `shield` debits the asset pool by `v + fee` (or `v + fee + producer_fee` for tez shields) and mints recipient + producer-fee notes (the producer fee is always tez; for FA2 shields the kernel separately debits `producer_fee` from the user's tez pool at the same `pubkey_hash`). The proof's in-circuit WOTS+ signature, verified under the recipient's auth tree, binds the entire request payload — including the chosen asset — so a delegated prover cannot redirect funds.
+- **Transfers** spend 1-7 private notes and create a recipient, up to two change notes, and a DAL-producer fee note (always tez)
+- **Withdrawals** (unshield) destroy private notes, emit an L1 outbox transfer through the bridge ticketer registered for the unshielded asset (`tz1/tz2/tz3` or `KT1` recipient), and create a DAL-producer fee note plus optional change notes
 - **Every shield / transfer / unshield burns at least 100000 mutez (0.1 tez)**, with a simple per-level stepped fee under congestion in the current rollup deployment
-- **Every shield / transfer / unshield also creates a separate private DAL-producer fee note**
+- **Every shield / transfer / unshield also creates a separate private DAL-producer fee note** (permanently tez, regardless of the transaction's primary asset)
 - Every spend is proven with a **zero-knowledge STARK** that verifies the **WOTS+ signature inside the circuit** — the proof itself proves spend authorization
 
 ## Quick start

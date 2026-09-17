@@ -1,31 +1,50 @@
-/// Shield circuit (post deposit-pool / pubkey_hash redesign).
+/// Shield circuit (post deposit-pool / pubkey_hash redesign + multiasset).
 ///
-/// # Public outputs
+/// # Public outputs (10 felts)
 ///   [auth_domain, pubkey_hash, v_note, fee, producer_fee,
-///    cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash]
+///    cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash,
+///    asset_new]
+///
+/// `asset_new` is the recipient note's L2 asset_id (ASSET_TEZ or
+/// `derive_asset_id(ticketer_kt1)` for an FA2). The producer-fee
+/// note's asset is implicit (always ASSET_TEZ, asserted in-circuit by
+/// the producer-commitment recomputation below).
 ///
 /// # Spend authorization
 ///   In-circuit XMSS-style WOTS+ signature verification under the
 ///   recipient's auth tree, mirroring the transfer / unshield circuits.
 ///   The signature signs the shield sighash:
 ///     fold(0x03, auth_domain, pubkey_hash, v_note, fee, producer_fee,
-///          cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)
+///          cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash,
+///          asset_new, asset_producer)
 ///   so a delegated prover holding the witness still cannot redirect funds,
-///   change values, or swap recipients without the wallet's signing key.
+///   change values, swap recipients, or change the asset without the
+///   wallet's signing key. `asset_producer` is folded directly into the
+///   sighash even though it's pinned to ASSET_TEZ in-circuit, to keep the
+///   sighash structure identical to a hypothetical future variant that
+///   relaxes that pin.
 ///
 /// # Constraints
 ///   owner_tag = H_owner(auth_root, auth_pub_seed, nk_tag)
-///   cm_new   = H_commit(d_j, v_note, H(rseed), owner_tag)
+///   cm_new   = H_commit(d_j, v_note, asset_new, H(rseed), owner_tag)
 ///   producer_owner_tag = H_owner(producer_auth_root, producer_auth_pub_seed,
 ///                                producer_nk_tag)
-///   cm_producer = H_commit(producer_d_j, producer_fee, H(producer_rseed),
-///                          producer_owner_tag)
+///   cm_producer = H_commit(producer_d_j, producer_fee, ASSET_TEZ,
+///                          H(producer_rseed), producer_owner_tag)
 ///   producer_fee > 0
+///   asset_producer == ASSET_TEZ   (DAL liquidity argument; see whitepaper §Multiasset)
 ///   pubkey_hash = fold(0x04, auth_domain, auth_root, auth_pub_seed, blind)
 ///   WOTS+(sighash, auth_root, auth_pub_seed, auth_idx, wots_sig, auth_siblings)
+///
+///   Note: `asset_new` is NOT asserted to equal ASSET_TEZ — Phase E.3
+///   lifted that pin. The kernel re-checks `asset_new` against its
+///   registered-asset list. An attempt to shield against an
+///   unregistered asset reaches the circuit and produces a valid
+///   proof, but the kernel rejects the resulting Shield request.
 
 use tzel::blake_hash as hash;
 use tzel::{merkle, xmss_common};
+use tzel::ASSET_TEZ;
 
 pub fn verify(
     auth_domain: felt252,
@@ -58,21 +77,41 @@ pub fn verify(
     producer_nk_tag: felt252,
     producer_d_j: felt252,
     producer_rseed: felt252,
+    // Multiasset (Phase B). asset_new is the recipient note's asset
+    // (pinned to ASSET_TEZ in v1 — the only deployed bridge);
+    // asset_producer is the producer-fee note's asset (always
+    // ASSET_TEZ regardless of bridges, by the liquidity argument).
+    // Both are public side-bound via the sighash because the
+    // L1 ticket reveals the asset anyway.
+    asset_new: felt252,
+    asset_producer: felt252,
 ) -> Array<felt252> {
     assert(wots_sig_flat.len() == xmss_common::WOTS_CHAINS, 'shield: wots sig len');
     assert(auth_siblings_flat.len() == merkle::AUTH_DEPTH, 'shield: auth sib len');
 
+    // Phase E.3: asset_new is exposed in the public outputs (last
+    // entry) so the kernel can validate it against the registered
+    // bridge ticketers. The circuit no longer pins asset_new ==
+    // ASSET_TEZ; that check lives at the kernel boundary.
+    //
+    // Permanent constraint: DAL slot publisher fee must be tez.
+    assert(asset_producer == ASSET_TEZ, 'shield: producer must be tez');
+
     // Recipient commitment.
     let otag = hash::owner_tag(auth_root, auth_pub_seed, nk_tag);
     let rcm = hash::derive_rcm(rseed);
-    assert(hash::commit(d_j, v_note, rcm, otag) == cm_new, 'shield: bad commitment');
+    assert(
+        hash::commit(d_j, v_note, asset_new, rcm, otag) == cm_new,
+        'shield: bad commitment',
+    );
 
     // Producer-fee commitment.
     let producer_otag =
         hash::owner_tag(producer_auth_root, producer_auth_pub_seed, producer_nk_tag);
     let producer_rcm = hash::derive_rcm(producer_rseed);
     assert(
-        hash::commit(producer_d_j, producer_fee, producer_rcm, producer_otag) == cm_producer,
+        hash::commit(producer_d_j, producer_fee, asset_producer, producer_rcm, producer_otag)
+            == cm_producer,
         'shield: bad producer cm',
     );
     assert(producer_fee > 0_u64, 'shield: producer fee zero');
@@ -85,13 +124,17 @@ pub fn verify(
     assert(pkh == pubkey_hash, 'shield: bad pubkey_hash');
 
     // sighash = fold(0x03, auth_domain, pubkey_hash, v_note, fee,
-    //                producer_fee, cm_new, cm_producer, memo_ct_hash,
-    //                producer_memo_ct_hash).
+    //                producer_fee, asset_new, asset_producer, cm_new,
+    //                cm_producer, memo_ct_hash, producer_memo_ct_hash).
+    // The asset fields are included because they are public at the
+    // L1 bridge boundary.
     let mut sighash = hash::sighash_fold(0x03, auth_domain);
     sighash = hash::sighash_fold(sighash, pubkey_hash);
     sighash = hash::sighash_fold(sighash, v_note.into());
     sighash = hash::sighash_fold(sighash, fee.into());
     sighash = hash::sighash_fold(sighash, producer_fee.into());
+    sighash = hash::sighash_fold(sighash, asset_new);
+    sighash = hash::sighash_fold(sighash, asset_producer);
     sighash = hash::sighash_fold(sighash, cm_new);
     sighash = hash::sighash_fold(sighash, cm_producer);
     sighash = hash::sighash_fold(sighash, memo_ct_hash);
@@ -123,12 +166,18 @@ pub fn verify(
         cm_producer,
         memo_ct_hash,
         producer_memo_ct_hash,
+        // Phase E.3: expose the recipient note's asset so the kernel
+        // can route the shield to the right (asset_id, pubkey_hash)
+        // deposit pool. asset_producer stays implicit since it's
+        // pinned to ASSET_TEZ above.
+        asset_new,
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use tzel::{blake_hash as hash, merkle, xmss_common};
+    use tzel::ASSET_TEZ;
     use super::verify;
 
     const TAG_XMSS_TREE_TEST: felt252 = 0x72742D73736D78;
@@ -158,6 +207,9 @@ mod tests {
         producer_nk_tag: felt252,
         producer_d_j: felt252,
         producer_rseed: felt252,
+        // Multiasset Phase B
+        asset_new: felt252,
+        asset_producer: felt252,
     }
 
     fn copy_and_mutate(values: Span<felt252>, target: u32) -> Array<felt252> {
@@ -219,7 +271,7 @@ mod tests {
     ) -> felt252 {
         let rcm = hash::derive_rcm(rseed);
         let otag = hash::owner_tag(auth_root, auth_pub_seed, nk_tag);
-        hash::commit(d_j, v, rcm, otag)
+        hash::commit(d_j, v, ASSET_TEZ, rcm, otag)
     }
 
     fn deposit_pubkey_hash(
@@ -242,12 +294,16 @@ mod tests {
         cm_producer: felt252,
         memo_ct_hash: felt252,
         producer_memo_ct_hash: felt252,
+        asset_new: felt252,
+        asset_producer: felt252,
     ) -> felt252 {
         let mut sighash = hash::sighash_fold(0x03, auth_domain);
         sighash = hash::sighash_fold(sighash, pubkey_hash);
         sighash = hash::sighash_fold(sighash, v_note.into());
         sighash = hash::sighash_fold(sighash, fee.into());
         sighash = hash::sighash_fold(sighash, producer_fee.into());
+        sighash = hash::sighash_fold(sighash, asset_new);
+        sighash = hash::sighash_fold(sighash, asset_producer);
         sighash = hash::sighash_fold(sighash, cm_new);
         sighash = hash::sighash_fold(sighash, cm_producer);
         sighash = hash::sighash_fold(sighash, memo_ct_hash);
@@ -350,6 +406,8 @@ mod tests {
             cm_producer,
             memo_ct_hash,
             producer_memo_ct_hash,
+            ASSET_TEZ,
+            ASSET_TEZ,
         );
         let wots_sig = sign_shield(sighash, auth_pub_seed, auth_idx, 0xC100);
 
@@ -377,6 +435,8 @@ mod tests {
             producer_nk_tag,
             producer_d_j,
             producer_rseed,
+            asset_new: ASSET_TEZ,
+            asset_producer: ASSET_TEZ,
         }
     }
 
@@ -409,6 +469,8 @@ mod tests {
             f.producer_nk_tag,
             f.producer_d_j,
             f.producer_rseed,
+            f.asset_new,
+            f.asset_producer,
         )
     }
 
@@ -416,7 +478,8 @@ mod tests {
     fn test_shield_accepts_valid_statement() {
         let fixture = build_fixture();
         let outputs = run_verify(@fixture);
-        assert(outputs.len() == 9, 'shield outputs len');
+        // Phase E.3: +1 trailing slot for asset_new.
+        assert(outputs.len() == 10, 'shield outputs len');
         assert(*outputs.at(0) == fixture.auth_domain, 'shield out domain');
         assert(*outputs.at(1) == fixture.pubkey_hash, 'shield out pkh');
         assert(*outputs.at(2) == fixture.v_note.into(), 'shield out v');
@@ -426,6 +489,7 @@ mod tests {
         assert(*outputs.at(6) == fixture.cm_producer, 'shield out cm prod');
         assert(*outputs.at(7) == fixture.memo_ct_hash, 'shield out mh');
         assert(*outputs.at(8) == fixture.producer_memo_ct_hash, 'shield out prod mh');
+        assert(*outputs.at(9) == fixture.asset_new, 'shield out asset new');
     }
 
     #[test]
@@ -553,6 +617,8 @@ mod tests {
                     fixture.cm_producer,
                     fixture.memo_ct_hash,
                     fixture.producer_memo_ct_hash,
+                    fixture.asset_new,
+                    fixture.asset_producer,
                 ),
                 fixture.auth_pub_seed,
                 fixture.auth_idx,
@@ -611,6 +677,37 @@ mod tests {
         // Same: producer_fee feeds into cm_producer.
         let mut fixture = build_fixture();
         fixture.producer_fee += 1;
+        run_verify(@fixture);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Multiasset Phase B mutation tests
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Phase E.3: the Cairo `asset_new == ASSET_TEZ` pin was lifted —
+    /// the kernel now enforces "asset_new ∈ registered" at apply time
+    /// against the kernel-binary registry. The circuit only checks
+    /// that `cm_new = commit(d_j, v, asset_new, …)` is consistent with
+    /// whatever asset_new the prover claims, and that the WOTS sig
+    /// covers it via the sighash. Mutating just `asset_new` after the
+    /// fact still breaks the commitment recompute (fixture.cm_new was
+    /// built against asset = ASSET_TEZ) — the 'shield: bad commitment'
+    /// assertion fires before sighash recovery.
+    #[test]
+    #[should_panic(expected: ('shield: bad commitment',))]
+    fn test_shield_rejects_asset_new_mutation_via_commitment_binding() {
+        let mut fixture = build_fixture();
+        fixture.asset_new = 0xFEEDFACE;
+        run_verify(@fixture);
+    }
+
+    /// asset_producer must be ASSET_TEZ — permanent constraint
+    /// (liquidity argument for DAL inclusion).
+    #[test]
+    #[should_panic(expected: ('shield: producer must be tez',))]
+    fn test_shield_rejects_non_tez_producer_asset() {
+        let mut fixture = build_fixture();
+        fixture.asset_producer = 0xBADBEEF;
         run_verify(@fixture);
     }
 
@@ -676,6 +773,8 @@ mod tests {
             fixture.producer_nk_tag,
             fixture.producer_d_j,
             fixture.producer_rseed,
+            fixture.asset_new,
+            fixture.asset_producer,
         );
     }
 
@@ -713,6 +812,8 @@ mod tests {
             fixture.producer_nk_tag,
             fixture.producer_d_j,
             fixture.producer_rseed,
+            fixture.asset_new,
+            fixture.asset_producer,
         );
     }
 }

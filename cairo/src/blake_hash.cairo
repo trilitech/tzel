@@ -20,8 +20,8 @@
 /// # Note structure
 ///
 ///   owner_tag_j = H_owner(auth_root_j, pub_seed_j, nk_tag_j)
-///   cm = H_commit(d_j, v, rcm, owner_tag_j)  — commitment
-///   nf = H_nf(nk_spend_j, cm, pos)           — nullifier (position-dependent)
+///   cm = H_commit(d_j, v, asset_id, rcm, owner_tag_j)  — commitment (5-ary as of multiasset)
+///   nf = H_nf(nk_spend_j, cm, pos)                     — nullifier (position-dependent)
 ///
 /// # Domain separation
 ///
@@ -219,16 +219,30 @@ pub fn hash2(a: felt252, b: felt252) -> felt252 {
     hash2_with_iv(blake2s_iv_merkle(), a, b)
 }
 
-/// H_commit(a, b, c, d) — 128-byte commitment hash.
-fn hash4(a: felt252, b: felt252, c: felt252, d: felt252) -> felt252 {
+/// H_commit(a, b, c, d, e) — 160-byte commitment hash.
+///
+/// Layout:
+///   block 1 (64 B): a || b
+///   block 2 (64 B): c || d
+///   block 3 (32 B): e || 0
+///   finalized at 160 bytes.
+///
+/// Used for the multiasset note commitment, where the second slot is
+/// the asset tag (see `commit` below).
+fn hash5(
+    a: felt252, b: felt252, c: felt252, d: felt252, e: felt252,
+) -> felt252 {
     let (a0, a1, a2, a3, a4, a5, a6, a7) = felt_to_u32x8(a);
     let (b0, b1, b2, b3, b4, b5, b6, b7) = felt_to_u32x8(b);
     let (c0, c1, c2, c3, c4, c5, c6, c7) = felt_to_u32x8(c);
     let (d0, d1, d2, d3, d4, d5, d6, d7) = felt_to_u32x8(d);
+    let (e0, e1, e2, e3, e4, e5, e6, e7) = felt_to_u32x8(e);
     let block1 = BoxTrait::new([a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7]);
-    let state = blake2s_compress(blake2s_iv_commit(), 64, block1);
+    let state1 = blake2s_compress(blake2s_iv_commit(), 64, block1);
     let block2 = BoxTrait::new([c0, c1, c2, c3, c4, c5, c6, c7, d0, d1, d2, d3, d4, d5, d6, d7]);
-    let result = blake2s_finalize(state, 128, block2);
+    let state2 = blake2s_compress(state1, 128, block2);
+    let block3 = BoxTrait::new([e0, e1, e2, e3, e4, e5, e6, e7, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let result = blake2s_finalize(state2, 160, block3);
     let [h0, h1, h2, h3, h4, h5, h6, h7] = result.unbox();
     u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
 }
@@ -280,15 +294,26 @@ pub fn owner_tag(auth_root: felt252, auth_pub_seed: felt252, nk_tag: felt252) ->
     u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
 }
 
-/// Note commitment: cm = H_commit(d_j, v, rcm, owner_tag_j).
+/// Note commitment: cm = H_commit(d_j, v, asset, rcm, owner_tag_j).
 ///
-/// Binds to the diversified address, value, randomness, and the owner tag
-/// (which fuses auth_root and nk_tag). This ensures:
-///   - The prover can't substitute a different auth_root (breaks Merkle proof)
+/// Binds to the diversified address, value, asset tag, randomness, and the
+/// owner tag (which fuses auth_root and nk_tag). The asset tag is preimaged
+/// inside the hash so it does not appear publicly — observers cannot tell
+/// which asset a given commitment encodes (the multiasset hiding property).
+///
+/// The binding ensures:
+///   - The prover can't substitute a different auth_root (breaks Merkle proof).
 ///   - The prover can't use a different nk (changes nk_tag → changes
-///     owner_tag → changes cm → breaks Merkle proof)
-pub fn commit(d_j: felt252, v: u64, rcm: felt252, owner_tag: felt252) -> felt252 {
-    hash4(d_j, v.into(), rcm, owner_tag)
+///     owner_tag → changes cm → breaks Merkle proof).
+///   - The prover can't substitute the asset tag (changes cm → breaks
+///     Merkle proof or per-asset balance accounting).
+///
+/// Asset convention: `asset = 0` (ASSET_TEZ) denotes tez; any other felt is
+/// a future bridge-defined tag.
+pub fn commit(
+    d_j: felt252, v: u64, asset: felt252, rcm: felt252, owner_tag: felt252,
+) -> felt252 {
+    hash5(d_j, v.into(), asset, rcm, owner_tag)
 }
 
 /// Nullifier: nf = H_nf(nk_spend_j, cm, pos).

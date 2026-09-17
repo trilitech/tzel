@@ -1,0 +1,431 @@
+# fa2_bridge_ticketer.tz
+#
+# One ticketer per FA2 (contract, token_id) pair. The L2 asset_id is
+# derived structurally as hash("tzel:asset:" || ticketer_address) so
+# the L1 contract identity uniquely determines the L2 asset.
+#
+# Storage is set at origination and immutable thereafter:
+#   - fa2_contract: the L1 FA2 contract that holds the underlying token
+#   - token_id:     the specific token_id served by this ticketer
+#
+# L2 ticket content is canonical: every mint emits content `(0, None)`
+# regardless of the FA2 token_id this ticketer wraps, and burn accepts
+# only `(0, None)` content. The L2 asset_id derives from the
+# ticketer's KT1 address, which has the (fa2_contract, token_id) pair
+# in immutable storage, so the L2 layer doesn't need to repeat the
+# FA2 token_id inside the ticket. This is what makes the bridge work
+# for FA2 contracts whose token_id is non-zero — earlier drafts
+# stuffed the stored token_id into the L2 ticket content, but the
+# rollup kernel enforces `ticket.content.token_id == 0` on every
+# deposit (and on every burn outbox message it emits), so any
+# token_id != 0 was structurally unbridgeable.
+#
+# %mint flow (L1 -> L2 deposit):
+#   1. Off-chain: caller calls fa2_contract's %update_operators to
+#      authorise this ticketer to pull `token_id` tokens from them.
+#   2. Caller invokes %mint(amount, receiver, rollup).
+#   3. Contract calls fa2_contract %transfer to pull `amount` of
+#      `token_id` from SENDER into SELF_ADDRESS.
+#   4. Contract mints an L2 ticket of `amount` with canonical
+#      content `(0, None)` and TRANSFER_TOKENS it to the rollup,
+#      paired with `receiver` (which must be a
+#      `deposit:<hex pubkey_hash>` L2 string per the kernel's
+#      parse_bridge_deposit).
+#
+# %burn flow (L2 -> L1 exit):
+#   1. Rollup kernel emits an outbox burn message to this ticketer,
+#      with parameter (receiver, ticket) where the ticket has the
+#      ticketer's own address as the creator and canonical content
+#      `(0, None)`.
+#   2. Contract verifies the ticket's creator == SELF_ADDRESS,
+#      content's token_id == 0, and content's metadata is None.
+#   3. Contract calls fa2_contract %transfer to send `amount` of
+#      the stored `token_id` from SELF_ADDRESS to the receiver's L1
+#      address.
+
+parameter
+  (or
+    (pair %mint
+      (nat     %amount)
+      (pair
+        (bytes   %receiver)
+        (address %rollup)))
+    (pair %burn
+      (contract %receiver unit)
+      (ticket   %ticket   (pair nat (option bytes))))) ;
+
+storage
+  (pair
+    (address %fa2_contract)
+    (nat     %token_id)) ;
+
+code
+  { # ENTRY
+    # stack: input:pair(parameter, storage)
+
+    # ----- Reject tez attached to either entrypoint. The FA2 bridge
+    # ----- moves FA2 tokens, not tez — any attached mutez would
+    # ----- accumulate in this contract's balance with no recovery
+    # ----- path (there is no admin or withdrawal entrypoint, by
+    # ----- design). FAILWITH instead of accepting and locking funds.
+    AMOUNT ;
+    # stack: tx_amount:mutez  input
+
+    PUSH mutez 0 ;
+    # stack: 0:mutez  tx_amount  input
+
+    COMPARE ;
+    # stack: cmp:int  input
+
+    EQ ;
+    # stack: ok:bool  input
+
+    IF {} { PUSH string "fa2_bridge: must not attach tez" ; FAILWITH } ;
+    # stack: input
+
+    UNPAIR ;
+    # stack: parameter:or(mint, burn)  storage:(address fa2_contract, nat token_id)
+
+    IF_LEFT
+      {
+        # =====================================================
+        # MINT BRANCH
+        # =====================================================
+        # stack: mint:(nat amount, (bytes receiver, address rollup))  storage:(address fa2_contract, nat token_id)
+
+        UNPAIR ;
+        # stack: amount:nat  recv_rollup:(bytes receiver, address rollup)  storage:(address fa2_contract, nat token_id)
+
+        DIP { UNPAIR } ;
+        # stack: amount:nat  receiver:bytes  rollup:address  storage:(address fa2_contract, nat token_id)
+
+        # ----- Pull fa2_contract and token_id out of storage. We
+        # ----- copy storage (DUP 4) and UNPAIR the copy so the
+        # ----- original at the bottom remains intact for the
+        # ----- final PAIR.
+        DUP 4 ;
+        # stack: storage':(address fa2_contract, nat token_id)  amount:nat  receiver:bytes  rollup:address  storage
+
+        UNPAIR ;
+        # stack: fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        # ----- Build the FA2 %transfer parameter:
+        # -----   [ (SENDER, [ (SELF_ADDRESS, (token_id, amount)) ]) ]
+        # ----- We need fresh copies of token_id and amount because
+        # ----- both are also consumed later (token_id for the L2
+        # ----- ticket content, amount for the L2 ticket amount).
+
+        DUP 2 ;
+        # stack: token_id':nat  fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        DUP 4 ;
+        # stack: amount':nat  token_id':nat  fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        SWAP ;
+        # stack: token_id':nat  amount':nat  fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        PAIR ;
+        # stack: (token_id, amount):pair(nat,nat)  fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        SELF_ADDRESS ;
+        # stack: self:address  (token_id, amount):pair(nat,nat)  fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        PAIR ;
+        # stack: tx_inner:(address to_, (nat token_id, nat amount))  fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        NIL (pair address (pair nat nat)) ;
+        # stack: empty_txs:list  tx_inner:(address, (nat, nat))  fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        SWAP ;
+        CONS ;
+        # stack: txs:list (pair address (pair nat nat))  fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        SENDER ;
+        # stack: sender:address  txs:list  fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        PAIR ;
+        # stack: from_txs:(address from_, list txs)  fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        NIL (pair address (list (pair address (pair nat nat)))) ;
+        SWAP ;
+        CONS ;
+        # stack: fa2_arg:list(pair(address,list(...)))  fa2_contract:address  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        # ----- Resolve the FA2 %transfer contract reference.
+        SWAP ;
+        # stack: fa2_contract:address  fa2_arg:list  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        CONTRACT %transfer
+          (list (pair (address %from_)
+                      (list (pair (address %to_)
+                                  (pair (nat %token_id) (nat %amount)))))) ;
+        # stack: fa2_ref_opt:option(contract)  fa2_arg:list  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        IF_NONE
+          { PUSH string "fa2_bridge: mint: FA2 %transfer entrypoint not found at fa2_contract" ; FAILWITH }
+          {} ;
+        # stack: fa2_ref:contract  fa2_arg:list  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        # ----- TRANSFER_TOKENS expects (param, mutez, contract). Our
+        # ----- stack has (fa2_ref, fa2_arg, ...) so we SWAP and
+        # ----- DIP-push 0 mutez beneath the arg.
+        SWAP ;
+        # stack: fa2_arg:list  fa2_ref:contract  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        DIP { PUSH mutez 0 } ;
+        # stack: fa2_arg:list  0_mutez:mutez  fa2_ref:contract  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        TRANSFER_TOKENS ;
+        # stack: fa2_op:operation  token_id:nat  amount:nat  receiver:bytes  rollup:address  storage
+
+        # ----- Build the canonical L2 ticket content `(0, None)`.
+        # ----- The FA2 token_id from storage is NOT carried in the
+        # ----- L2 ticket — the L2 asset_id derives structurally
+        # ----- from this contract's KT1 address (which has the
+        # ----- (fa2_contract, token_id) pair in immutable storage),
+        # ----- so the L2 layer doesn't need to repeat the FA2
+        # ----- token_id. This matches the kernel's
+        # ----- `parse_bridge_deposit` check that rejects any L2
+        # ----- ticket whose content.token_id != 0, and lets the
+        # ----- bridge serve FA2 contracts with any token_id (not
+        # ----- just 0).
+        DIP { DROP } ;
+        # stack: fa2_op:operation  amount:nat  receiver:bytes  rollup:address  storage
+
+        PUSH nat 0 ;
+        # stack: 0:nat  fa2_op:operation  amount:nat  receiver:bytes  rollup:address  storage
+
+        NONE bytes ;
+        # stack: meta:option(bytes)=None  0:nat  fa2_op:operation  amount:nat  receiver:bytes  rollup:address  storage
+
+        SWAP ;
+        PAIR ;
+        # stack: content:(nat 0, option bytes None)  fa2_op:operation  amount:nat  receiver:bytes  rollup:address  storage
+
+        DIG 2 ;
+        # stack: amount:nat  content:(nat, option bytes)  fa2_op:operation  receiver:bytes  rollup:address  storage
+
+        SWAP ;
+        # stack: content:(nat, option bytes)  amount:nat  fa2_op:operation  receiver:bytes  rollup:address  storage
+
+        TICKET ;
+        # stack: ticket_opt:option(ticket (pair nat (option bytes)))  fa2_op:operation  receiver:bytes  rollup:address  storage
+
+        IF_NONE
+          { PUSH string "fa2_bridge: zero-amount mint" ; FAILWITH }
+          {} ;
+        # stack: ticket:ticket(pair nat (option bytes))  fa2_op:operation  receiver:bytes  rollup:address  storage
+
+        # ----- Pair the ticket with `receiver` and forward to the
+        # ----- rollup. The rollup's expected entrypoint signature is
+        # ----- (bytes %receiver, ticket (pair nat (option bytes))),
+        # ----- matching the tez bridge ticketer's mint payload.
+        DIG 2 ;
+        # stack: receiver:bytes  ticket  fa2_op:operation  rollup:address  storage
+
+        # PAIR pops top (receiver) and second (ticket) and builds
+        # pair(top, second) = (receiver, ticket), matching the
+        # rollup's (bytes, ticket) deposit-payload schema. Earlier
+        # drafts had an extra SWAP here that produced (ticket,
+        # receiver) — a type mismatch the octez-client typecheck
+        # caught the moment it was given access.
+        PAIR ;
+        # stack: deposit:(bytes receiver, ticket)  fa2_op:operation  rollup:address  storage
+
+        DIG 2 ;
+        # stack: rollup:address  deposit:(bytes, ticket)  fa2_op:operation  storage
+
+        CONTRACT (pair bytes (ticket (pair nat (option bytes)))) ;
+        # stack: rollup_ref_opt:option(contract)  deposit:(bytes, ticket)  fa2_op:operation  storage
+
+        IF_NONE
+          { PUSH string "fa2_bridge: invalid rollup contract" ; FAILWITH }
+          {} ;
+        # stack: rollup_ref:contract  deposit:(bytes, ticket)  fa2_op:operation  storage
+
+        SWAP ;
+        # stack: deposit:(bytes, ticket)  rollup_ref:contract  fa2_op:operation  storage
+
+        DIP { PUSH mutez 0 } ;
+        # stack: deposit:(bytes, ticket)  0_mutez:mutez  rollup_ref:contract  fa2_op:operation  storage
+
+        TRANSFER_TOKENS ;
+        # stack: rollup_op:operation  fa2_op:operation  storage
+
+        # ----- Assemble the operation list. FA2 transfer must run
+        # ----- before the rollup deposit op (otherwise the rollup
+        # ----- sees a ticket the contract hasn't yet backed with
+        # ----- real tokens). Tezos executes operations in list
+        # ----- order, so we CONS fa2_op last (puts it on top).
+        NIL operation ;
+        # stack: empty_ops:list  rollup_op:operation  fa2_op:operation  storage
+
+        SWAP ;
+        CONS ;
+        # stack: [rollup_op]:list  fa2_op:operation  storage
+
+        SWAP ;
+        CONS ;
+        # stack: [fa2_op, rollup_op]:list operation  storage
+
+        PAIR ;
+        # stack: (ops, storage)
+      }
+      {
+        # =====================================================
+        # BURN BRANCH
+        # =====================================================
+        # stack: burn:(contract receiver unit, ticket(pair nat (option bytes)))  storage
+
+        UNPAIR ;
+        # stack: receiver:contract(unit)  ticket:ticket  storage
+
+        SWAP ;
+        # stack: ticket  receiver:contract  storage
+
+        READ_TICKET ;
+        # READ_TICKET / 't ticket : S => pair address (pair 't nat) : 't ticket : S
+        # stack: read:(address ticketer, ((nat token_id, option bytes), nat amount))  ticket  receiver  storage
+
+        UNPAIR 3 ;
+        # stack: ticketer:address  content:(nat token_id, option bytes)  amount:nat  ticket  receiver  storage
+
+        # ----- Verify ticketer == SELF_ADDRESS. Using the explicit
+        # ----- COMPARE / EQ / IF triple rather than ASSERT_CMPEQ —
+        # ----- the macro form is not accepted by some Michelson
+        # ----- assemblers, and the tez bridge ticketer in this repo
+        # ----- already uses the explicit form (so we stay
+        # ----- syntactically homogeneous with the deployed contract).
+        SELF_ADDRESS ;
+        # stack: self:address  ticketer:address  content  amount  ticket  receiver  storage
+
+        COMPARE ;
+        # stack: cmp:int(ticketer - self)  content  amount  ticket  receiver  storage
+
+        EQ ;
+        # stack: ok:bool  content  amount  ticket  receiver  storage
+
+        IF {} { PUSH string "fa2_bridge: unexpected ticket creator" ; FAILWITH } ;
+        # stack: content:(nat token_id, option bytes)  amount:nat  ticket  receiver  storage
+
+        # ----- Verify ticket content's metadata is None.
+        DUP ;
+        # stack: content'  content  amount  ticket  receiver  storage
+
+        CDR ;
+        # stack: meta:option(bytes)  content  amount  ticket  receiver  storage
+
+        IF_NONE
+          {}
+          { PUSH string "fa2_bridge: ticket metadata must be None" ; FAILWITH } ;
+        # stack: content:(nat token_id, option bytes)  amount:nat  ticket  receiver  storage
+
+        # ----- Verify ticket content's token_id is 0. The L2 ticket
+        # ----- content is canonical `(0, None)` (see header). The
+        # ----- FA2 token_id binding is provided by this contract's
+        # ----- immutable storage and the asset_id derived from its
+        # ----- KT1, not by the ticket content. The creator check
+        # ----- above already pins the ticket to this ticketer's
+        # ----- KT1, so the token_id == 0 check is a defense-in-
+        # ----- depth guard against the kernel emitting any other
+        # ----- content shape in a future protocol version.
+        CAR ;
+        # stack: ticket_token_id:nat  amount:nat  ticket  receiver  storage
+
+        PUSH nat 0 ;
+        # stack: 0:nat  ticket_token_id:nat  amount:nat  ticket  receiver  storage
+
+        COMPARE ;
+        # stack: cmp:int  amount:nat  ticket  receiver  storage
+
+        EQ ;
+        # stack: ok:bool  amount:nat  ticket  receiver  storage
+
+        IF {} { PUSH string "fa2_bridge: ticket token_id must be 0" ; FAILWITH } ;
+        # stack: amount:nat  ticket  receiver  storage
+
+        # ----- Discard the consumed ticket — we've validated every
+        # ----- field we care about (creator, token_id, metadata)
+        # ----- and only need `amount` to size the FA2 transfer.
+        DIP { DROP } ;
+        # stack: amount:nat  receiver:contract(unit)  storage
+
+        # ----- Build the FA2 %transfer payload:
+        # -----   [ (SELF_ADDRESS, [(receiver_addr, (token_id, amount))]) ]
+        SWAP ;
+        # stack: receiver:contract(unit)  amount:nat  storage
+
+        ADDRESS ;
+        # stack: recv_addr:address  amount:nat  storage
+
+        DUP 3 ;
+        CDR ;
+        # stack: token_id:nat  recv_addr:address  amount:nat  storage
+
+        DIG 2 ;
+        # stack: amount:nat  token_id:nat  recv_addr:address  storage
+
+        SWAP ;
+        # stack: token_id:nat  amount:nat  recv_addr:address  storage
+
+        PAIR ;
+        # stack: (token_id, amount):pair(nat,nat)  recv_addr:address  storage
+
+        SWAP ;
+        PAIR ;
+        # stack: tx_inner:(address to_, (nat token_id, nat amount))  storage
+
+        NIL (pair address (pair nat nat)) ;
+        SWAP ;
+        CONS ;
+        # stack: txs:list  storage
+
+        SELF_ADDRESS ;
+        # stack: self:address  txs:list  storage
+
+        # PAIR top-then-second: pair(self, txs) = (from_, txs). The
+        # earlier SWAP at this site was a typo — caught by the
+        # typechecker.
+        PAIR ;
+        # stack: from_txs:(address from_, list txs)  storage
+
+        NIL (pair address (list (pair address (pair nat nat)))) ;
+        SWAP ;
+        CONS ;
+        # stack: fa2_arg:list  storage
+
+        DUP 2 ;
+        # stack: storage'  fa2_arg:list  storage
+
+        CAR ;
+        # stack: fa2_contract:address  fa2_arg:list  storage
+
+        CONTRACT %transfer
+          (list (pair (address %from_)
+                      (list (pair (address %to_)
+                                  (pair (nat %token_id) (nat %amount)))))) ;
+        # stack: fa2_ref_opt:option(contract)  fa2_arg:list  storage
+
+        IF_NONE
+          { PUSH string "fa2_bridge: burn: FA2 %transfer entrypoint not found at fa2_contract" ; FAILWITH }
+          {} ;
+        # stack: fa2_ref:contract  fa2_arg:list  storage
+
+        SWAP ;
+        # stack: fa2_arg:list  fa2_ref:contract  storage
+
+        DIP { PUSH mutez 0 } ;
+        # stack: fa2_arg:list  0_mutez:mutez  fa2_ref:contract  storage
+
+        TRANSFER_TOKENS ;
+        # stack: fa2_op:operation  storage
+
+        NIL operation ;
+        SWAP ;
+        CONS ;
+        # stack: [fa2_op]:list operation  storage
+
+        PAIR ;
+        # stack: (ops, storage)
+      }
+  }

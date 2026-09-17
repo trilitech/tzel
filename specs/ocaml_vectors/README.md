@@ -40,7 +40,7 @@ implementations must produce byte-identical outputs.
 | XMSS/WOTS+ keygen     | ask_j, auth_pub_seed, key_idx        | per-key seed, leaf         |
 | XMSS/WOTS+ sign/verify| ask_j, auth_pub_seed, key_idx, sighash | signature values         |
 | Merkle tree           | leaf list                            | root                       |
-| note commitment       | d_j, v, rseed, auth_root, auth_pub_seed, nk_tag | rcm, owner_tag, cm |
+| note commitment       | d_j, v, asset_id, rseed, auth_root, auth_pub_seed, nk_tag | rcm, owner_tag, cm |
 | nullifier             | nk_spend, cm, pos                    | nf                         |
 | sighash               | public outputs                       | sighash felt               |
 | account_id            | string                               | felt                       |

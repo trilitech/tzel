@@ -1,0 +1,5 @@
+(include_subdirs no)
+
+(test
+ (name test_extraction_diff)
+ (libraries tzel qcheck-core qcheck-alcotest alcotest))

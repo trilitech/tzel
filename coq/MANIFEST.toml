@@ -1,0 +1,77 @@
+# coq/MANIFEST.toml
+#
+# Drift-detection manifest mapping each modeled Cairo source file to
+# its [Impl] mirror(s) and pinning the Cairo file's SHA-256. CI runs
+# coq/Drift/check.sh which re-hashes each cairo path and fails if the
+# value diverges from the SHA pinned here.
+#
+# Bumping a SHA is the explicit signal "the Cairo source changed; the
+# [Impl] mirror has been re-read and updated to match." The hash check
+# is a speed bump that forces re-review, not a security guarantee — its
+# job is to make silent drift impossible. Cosmetic Cairo edits will
+# trigger false alarms; that's the intended cost.
+#
+# Only the [Impl] layer mirrors specific Cairo files. The [Spec] layer
+# is whitepaper-derived (not Cairo-derived) and intentionally has no
+# Cairo correspondence to drift against.
+#
+# `cairo/src/lib.cairo` and the `cairo/src/run_*.cairo` thin executable
+# wrappers are intentionally not modeled — lib.cairo only re-exports
+# modules, and the run_* wrappers just unpack args and call into the
+# verifier modules we already mirror.
+
+[[mirror]]
+cairo  = "cairo/src/blake_hash.cairo"
+coq    = ["coq/Impl/Hashes.v"]
+# Multiasset branch (Phase B+E): the 5-ary `H_commit(d_j, v, asset,
+# rcm, owner_tag)` and related domain-tag updates landed here.
+# Impl/Hashes.v re-reviewed — declares Hash3/Hash4/Hash2_merkle as
+# extraction-time parameters realized against `tzel-core` (no Coq-
+# level binding to the new `asset` slot needed; the Spec/Hashes.v
+# H_commit signature already accommodates a variable-arity fold).
+sha256 = "7dc803ef00006ab61e934c4a04629802567d8e0b3f7c6936468870445c10b8a6"
+
+[[mirror]]
+cairo  = "cairo/src/merkle.cairo"
+coq    = ["coq/Impl/Merkle.v"]
+sha256 = "0ca7884ed2495d8473c000382e6b26928a848b39026a81a4472faeccad88452c"
+
+[[mirror]]
+cairo  = "cairo/src/xmss_common.cairo"
+coq    = ["coq/Impl/Wots.v", "coq/Impl/Xmss.v"]
+sha256 = "6cb74358b1a9fb30610a780835d1624af7e11b1a1cffba279a4affe72148fc1b"
+
+[[mirror]]
+cairo  = "cairo/src/transfer.cairo"
+coq    = ["coq/Impl/Transfer.v"]
+# Multiasset branch (Phase B+E): transfer.cairo now enforces a
+# per-input/per-output `asset_i ∈ {ASSET_TEZ, primary_non_tez_asset}`
+# constraint with 2-accumulator balance closure. Impl/Transfer.v is
+# still a stub per its docstring ("implementation-side refinement
+# pending"); the Spec/Transfer.v Phi predicate already models the
+# multiasset balance and producer-tez pin. Bumping the SHA to
+# acknowledge re-review of the Cairo against the Spec; no Impl
+# semantic change is possible until the Impl module ships.
+sha256 = "3ad9ce48ecd614578e0687999060539b47daff08ffd2a4ce1f50d822caacbfa6"
+
+[[mirror]]
+cairo  = "cairo/src/shield.cairo"
+coq    = ["coq/Impl/Shield.v"]
+# Multiasset branch (Phase E.3): shield.cairo now folds `asset_new`
+# and `asset_producer` into the sighash and asserts
+# `asset_producer == ASSET_TEZ`. Spec/Shield.v has the matching
+# binding; Impl/Shield.v remains a stub.
+sha256 = "460fc3cf03b38307db29be82839d7fc58af33f51ff7529a82a96880c03e4d7e7"
+
+[[mirror]]
+cairo  = "cairo/src/unshield.cairo"
+coq    = ["coq/Impl/Unshield.v"]
+# Multiasset branch (Phase E.5, commit 2003bf5): CRITICAL fix —
+# `v_pub` lane-routing is now asset-aware. The previous unconditional
+# `tez_out += v_pub.into()` was unsound when `asset_pub` was a non-
+# tez asset (Cairo would accept a tez-only input set spending
+# `v_pub` of an FA2, minting unbacked L1 tokens). Spec/Unshield.v's
+# Phi has the asset_pub-bound per-asset balance; Impl/Unshield.v is
+# still a stub. SHA bumped to acknowledge re-review against the
+# post-fix Cairo.
+sha256 = "905f7b084620887d2316bfcf8e9c62ff3ac12e6827d5e0b93ee014e3623565e1"

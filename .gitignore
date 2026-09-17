@@ -2,6 +2,10 @@ target/
 .codex
 .codex/
 ocaml/_build/
+# Extracted Rocq sources copied into the dune driver dir by
+# coq/Extracted/build.sh; the canonical copy lives in coq/Impl/.
+ocaml/coq_driver/tzel_wots.ml
+ocaml/coq_driver/tzel_wots.mli
 ocaml/vendor/mlkem-native/_build/
 ocaml/vendor/mlkem-native/test/build/config.mk
 ocaml/vendor/mlkem-native/test/build/libmlkem.a
@@ -15,6 +19,8 @@ bob.json
 mutants.out*/
 aws_creds
 .env
+.gh_token
+gh_token
 third_party/patched-git/
 
 # Generated LaTeX artifacts

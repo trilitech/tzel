@@ -9,7 +9,17 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const CANONICAL_WIRE_VERSION: u16 = 3;
+/// Wire-format version reported in every canonical-wire fixture.
+///
+/// v4 (multiasset, Phase E): `H_commit` is now 5-ary —
+/// `commit(d_j, value, asset_id, rcm, owner_tag)` — and hashes 160
+/// bytes instead of the 128 used by v3. The cm values in
+/// `canonical_wire_v1.json` and `commitment_u64_max_v1.json` reflect
+/// the v4 formula. Any cross-implementation consumer pinned to v3
+/// will compute a different cm than this fixture for the same
+/// inputs; bumping the version makes the wire change explicit
+/// rather than silent.
+pub const CANONICAL_WIRE_VERSION: u16 = 4;
 pub const FELT252_BYTES: usize = 32;
 pub const ML_KEM768_ENCAPSULATION_KEY_BYTES: usize = 1184;
 
@@ -333,6 +343,7 @@ fn sample_data() -> (PaymentAddress, EncryptedNote, F, NoteMemo, F, F, u64) {
     let cm = crate::commit(
         &address.d_j,
         v,
+        &crate::ASSET_TEZ,
         &crate::derive_rcm(&rseed),
         &crate::owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag),
     );

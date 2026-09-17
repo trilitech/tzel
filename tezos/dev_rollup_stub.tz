@@ -1,0 +1,57 @@
+# dev_rollup_stub.tz — minimal KT1 that stands in for a Tezos smart
+# rollup during shadownet round-trip testing of
+# fa2_bridge_ticketer.tz. Accepts the bridge's deposit payload,
+# stashes the ticket, and exposes %forward_burn to replay it back
+# into the bridge ticketer's %burn entrypoint — closing the
+# round-trip from L1 to L2 to L1.
+#
+# A real rollup queues many tickets in its outbox; we hold only the
+# most recent.
+#
+# Entrypoints:
+#   %deposit(receiver, ticket) — receives an L2 deposit. The ticket
+#       is stashed in storage as `Some (receiver, ticket)`,
+#       overwriting any earlier deposit.
+#
+#   %forward_burn(burn_target, recipient) — pulls the stashed
+#       ticket out of storage and sends it via burn_target.%burn
+#       with `recipient` as the unit-typed receiver contract.
+#       Mirrors what a real rollup's outbox would emit.
+
+parameter (or (pair %default (bytes %receiver) (ticket %ticket (pair nat (option bytes)))) (pair %forward_burn (contract %burn_target (pair (contract unit) (ticket (pair nat (option bytes))))) (contract %recipient unit))) ;
+storage (option (pair bytes (ticket (pair nat (option bytes))))) ;
+code
+  { UNPAIR ;
+    # stack: parameter, storage
+    IF_LEFT
+      { # === deposit ===
+        # stack: (receiver, ticket), storage
+        DIP { DROP } ;
+        SOME ;
+        NIL operation ;
+        PAIR }
+      { # === forward_burn ===
+        # stack: (burn_target, recipient), storage
+        UNPAIR ;
+        # stack: burn_target, recipient, storage
+        DIG 2 ;
+        # stack: storage, burn_target, recipient
+        IF_NONE { PUSH string "rollup_stub: no deposit to forward" ; FAILWITH } {} ;
+        # stack: (receiver, ticket), burn_target, recipient
+        CDR ;
+        # stack: ticket, burn_target, recipient
+        DIG 2 ;
+        # stack: recipient, ticket, burn_target
+        PAIR ;
+        # stack: (recipient, ticket), burn_target
+        DIP { PUSH mutez 0 } ;
+        # stack: (recipient, ticket), 0_mutez, burn_target
+        TRANSFER_TOKENS ;
+        # stack: burn_op
+        NIL operation ;
+        SWAP ;
+        CONS ;
+        # stack: [burn_op]
+        NONE (pair bytes (ticket (pair nat (option bytes)))) ;
+        SWAP ;
+        PAIR } }

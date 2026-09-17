@@ -11,12 +11,16 @@
 ///   Then per input (N times): TREE_DEPTH cm siblings
 ///   Then per input (N times): AUTH_DEPTH auth siblings
 ///   Then per input (N times): WOTS_CHAINS sig values
-///   Then output 1: cm_1, d_j_1, v_1, rseed_1, auth_root_1, auth_pub_seed_1, nk_tag_1,
-///   memo_ct_hash_1
-///   Then output 2: cm_2, d_j_2, v_2, rseed_2, auth_root_2, auth_pub_seed_2, nk_tag_2,
-///   memo_ct_hash_2
-///   Then output 3: cm_3, d_j_3, v_3, rseed_3, auth_root_3, auth_pub_seed_3, nk_tag_3,
-///   memo_ct_hash_3
+///   Then per input (N times): asset_i (multiasset Phase B)
+///   Then output 1 (recipient): cm_1, d_j_1, v_1, rseed_1, auth_root_1,
+///        auth_pub_seed_1, nk_tag_1, memo_ct_hash_1, asset_1
+///   Then output 2 (change_1): cm_2, d_j_2, v_2, rseed_2, auth_root_2,
+///        auth_pub_seed_2, nk_tag_2, memo_ct_hash_2, asset_2
+///   Then output 3 (change_2): cm_3, d_j_3, v_3, rseed_3, auth_root_3,
+///        auth_pub_seed_3, nk_tag_3, memo_ct_hash_3, asset_3
+///   Then output 4 (producer fee): cm_4, d_j_4, v_4, rseed_4, auth_root_4,
+///        auth_pub_seed_4, nk_tag_4, memo_ct_hash_4, asset_4
+///   Then: primary_non_tez_asset (multiasset Phase B 2-accumulator witness)
 
 use tzel::merkle;
 use tzel::{transfer, xmss_common};
@@ -91,6 +95,15 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         i += 1;
     }
 
+    // Multiasset Phase B: per-input asset tags.
+    let mut input_asset_list: Array<felt252> = array![];
+    let mut i: u32 = 0;
+    while i < n {
+        input_asset_list.append(*args.at(pos));
+        pos += 1;
+        i += 1;
+    }
+
     let cm_1 = *args.at(pos);
     pos += 1;
     let d_j_1 = *args.at(pos);
@@ -106,6 +119,8 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let nk_tag_1 = *args.at(pos);
     pos += 1;
     let mh_1 = *args.at(pos);
+    pos += 1;
+    let asset_1 = *args.at(pos);
     pos += 1;
 
     let cm_2 = *args.at(pos);
@@ -124,6 +139,8 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     pos += 1;
     let mh_2 = *args.at(pos);
     pos += 1;
+    let asset_2 = *args.at(pos);
+    pos += 1;
 
     let cm_3 = *args.at(pos);
     pos += 1;
@@ -141,6 +158,30 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     pos += 1;
     let mh_3 = *args.at(pos);
     pos += 1;
+    let asset_3 = *args.at(pos);
+    pos += 1;
+
+    let cm_4 = *args.at(pos);
+    pos += 1;
+    let d_j_4 = *args.at(pos);
+    pos += 1;
+    let v_4: u64 = (*args.at(pos)).try_into().unwrap();
+    pos += 1;
+    let rseed_4 = *args.at(pos);
+    pos += 1;
+    let auth_root_4 = *args.at(pos);
+    pos += 1;
+    let auth_pub_seed_4 = *args.at(pos);
+    pos += 1;
+    let nk_tag_4 = *args.at(pos);
+    pos += 1;
+    let mh_4 = *args.at(pos);
+    pos += 1;
+    let asset_4 = *args.at(pos);
+    pos += 1;
+
+    let primary_non_tez_asset = *args.at(pos);
+    pos += 1;
 
     assert(pos == args.len(), 'unexpected trailing args');
 
@@ -152,6 +193,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         cm_1,
         cm_2,
         cm_3,
+        cm_4,
         nk_spend_list.span(),
         auth_root_list.span(),
         auth_pub_seed_list.span(),
@@ -163,6 +205,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         auth_sibs.span(),
         path_idx_list.span(),
         wots_sig.span(),
+        input_asset_list.span(),
         d_j_1,
         v_1,
         rseed_1,
@@ -170,6 +213,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         auth_pub_seed_1,
         nk_tag_1,
         mh_1,
+        asset_1,
         d_j_2,
         v_2,
         rseed_2,
@@ -177,6 +221,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         auth_pub_seed_2,
         nk_tag_2,
         mh_2,
+        asset_2,
         d_j_3,
         v_3,
         rseed_3,
@@ -184,5 +229,15 @@ fn main(args: Array<felt252>) -> Array<felt252> {
         auth_pub_seed_3,
         nk_tag_3,
         mh_3,
+        asset_3,
+        d_j_4,
+        v_4,
+        rseed_4,
+        auth_root_4,
+        auth_pub_seed_4,
+        nk_tag_4,
+        mh_4,
+        asset_4,
+        primary_non_tez_asset,
     )
 }
