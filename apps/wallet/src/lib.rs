@@ -4031,6 +4031,11 @@ enum UserCmd {
     Balance,
     /// Check whether the wallet profile, operator, and rollup node are usable.
     Check,
+    /// Confirm the wallet's network profile points at the rollup the live
+    /// rollup node actually serves. A one-shot cross-check (no wallet-state
+    /// reads) the daemon/entrypoint can run at startup to surface a
+    /// profile/rollup mismatch up front instead of only mid-deposit.
+    CheckNetwork,
     /// Deposit tez on L1 into a fresh self-owned pool. The wallet
     /// allocates a new auth-tree address, derives a deterministic blind,
     /// computes `pubkey_hash = H(0x04, auth_domain, auth_root,
@@ -4314,6 +4319,7 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         | UserCmd::Balance
         | UserCmd::Addresses
         | UserCmd::Check
+        | UserCmd::CheckNetwork
         | UserCmd::Status { .. }
         | UserCmd::ExportDetect { .. }
         | UserCmd::ExportView { .. }
@@ -4350,6 +4356,7 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Sync { .. } => "sync",
         UserCmd::Balance => "balance",
         UserCmd::Check => "check",
+        UserCmd::CheckNetwork => "check-network",
         UserCmd::Deposit { .. } => "deposit",
         UserCmd::RecoverDeposits { .. } => "recover-deposits",
         UserCmd::Shield { .. } => "shield",
@@ -4388,6 +4395,10 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Check => {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_wallet_check(&cli.wallet, &profile)
+        }
+        UserCmd::CheckNetwork => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            cmd_check_network(&profile)
         }
         UserCmd::Deposit {
             amount,
@@ -8238,6 +8249,25 @@ fn print_deposit_pool_summary(
     }
 }
 
+/// Standalone preflight: confirm the wallet's network profile points at the
+/// rollup the live rollup node actually serves. Reuses the same
+/// `ensure_rollup_address_matches` cross-check the deposit/shield flows run,
+/// so the daemon/entrypoint can surface a profile/rollup mismatch at startup
+/// instead of only mid-deposit. No wallet-state reads — just the one RPC.
+fn cmd_check_network(profile: &WalletNetworkProfile) -> Result<(), String> {
+    let rollup = RollupRpc::new(profile);
+    rollup.ensure_rollup_address_matches()?;
+    user_out!(
+        json: {
+            "network" => &profile.network,
+            "rollup_address" => &profile.rollup_address,
+        },
+        human: "OK: wallet profile '{}' matches rollup node at {}",
+        profile.network, profile.rollup_address
+    );
+    Ok(())
+}
+
 fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), String> {
     let wallet = load_wallet(path)?;
     let rollup = RollupRpc::new(profile);
@@ -11723,6 +11753,47 @@ mod network_profile_tests {
 
         let err = cmd_wallet_check(wallet_path_str, &profile)
             .expect_err("wallet check must reject a wrong-rollup mock node");
+        assert!(
+            err.contains("rollup-node served address")
+                && err.contains("does not match wallet profile.rollup_address"),
+            "expected rollup-address mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cmd_check_network_ok_when_rollup_node_serves_the_profile_rollup() {
+        // The standalone `check-network` preflight only cross-checks the
+        // served rollup address against the profile — no wallet-state reads.
+        // When the node serves the rollup the profile pins, it succeeds so
+        // the daemon/entrypoint can gate startup on it.
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([(
+            "/global/smart_rollup_address".into(),
+            // Matches `rollup_profile_for_url`'s pinned `rollup_address`.
+            (200, "\"sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP\"".into()),
+        )]));
+
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        assert_eq!(profile.rollup_address, "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP");
+
+        cmd_check_network(&profile).expect("check-network must accept a matching rollup node");
+    }
+
+    #[test]
+    fn cmd_check_network_fails_when_rollup_node_serves_a_different_rollup() {
+        // Mirror of the deposit-path guard: a node serving a different
+        // rollup than the profile pins must be rejected with the same clear
+        // mismatch error, so a wrong `rollup_node_url` is caught at startup.
+        let other_address = "sr1Ghp7iJC91k5tukgzMQTfUbY2t8ssVaHJk";
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([(
+            "/global/smart_rollup_address".into(),
+            (200, format!("\"{}\"", other_address)),
+        )]));
+
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        assert_ne!(profile.rollup_address, other_address);
+
+        let err = cmd_check_network(&profile)
+            .expect_err("check-network must reject a wrong-rollup mock node");
         assert!(
             err.contains("rollup-node served address")
                 && err.contains("does not match wallet profile.rollup_address"),
