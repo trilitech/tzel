@@ -380,7 +380,8 @@ let apply_shield ledger ~(pub : Transaction.shield_public)
     end
   end
 
-let apply_transfer ledger (pub : Transaction.transfer_public)
+let apply_transfer ledger ?(memo_ct_hash_change_2 = Felt.zero)
+    (pub : Transaction.transfer_public)
     ~memo_ct_hash_1 ~memo_ct_hash_2 ~memo_ct_hash_3 =
   if not (Felt.equal pub.auth_domain ledger.auth_domain) then
     Error "auth_domain mismatch"
@@ -390,6 +391,8 @@ let apply_transfer ledger (pub : Transaction.transfer_public)
     Error "memo_ct_hash_1 mismatch"
   else if not (Felt.equal memo_ct_hash_2 pub.memo_ct_hash_2) then
     Error "memo_ct_hash_2 mismatch"
+  else if not (Felt.equal memo_ct_hash_change_2 pub.memo_ct_hash_3) then
+    Error "memo_ct_hash_change_2 mismatch"
   (* Multiasset slot layout: slot 1 = recipient, 2 = change_1,
      3 = change_2 (the second-asset change, unused by single-asset
      transfers), 4 = producer-fee. The caller's [memo_ct_hash_3] is the

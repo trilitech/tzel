@@ -120,7 +120,9 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     memo_ct_hash_3 = felt_of_hex (json_string (json_field "memo_ct_hash_3" transfer));
     memo_ct_hash_4 = felt_of_hex (json_string (json_field "memo_ct_hash_4" transfer));
   } in
-  begin match Tzel.Ledger.apply_transfer ledger transfer_pub
+  begin match Tzel.Ledger.apply_transfer ledger
+                ~memo_ct_hash_change_2:transfer_pub.memo_ct_hash_3
+                transfer_pub
                 ~memo_ct_hash_1:transfer_pub.memo_ct_hash_1
                 ~memo_ct_hash_2:transfer_pub.memo_ct_hash_2
                 (* caller's slot-3 memo is the producer (record slot 4) *)

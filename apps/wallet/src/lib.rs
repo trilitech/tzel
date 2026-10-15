@@ -881,11 +881,11 @@ impl WalletFile {
     }
 
     fn tez_balance(&self) -> u128 {
-        self.notes
-            .iter()
-            .filter(|n| n.asset_id == ASSET_TEZ)
-            .map(|n| n.v as u128)
-            .sum()
+        self.balance_by_asset()
+            .into_iter()
+            .find(|(asset, _)| *asset == ASSET_TEZ)
+            .map(|(_, v)| v)
+            .unwrap_or(0)
     }
 
     fn pending_nullifier_set(&self) -> std::collections::HashSet<F> {
@@ -905,12 +905,11 @@ impl WalletFile {
     }
 
     fn tez_available_balance(&self) -> u128 {
-        let pending = self.pending_nullifier_set();
-        self.notes
-            .iter()
-            .filter(|note| note.asset_id == ASSET_TEZ && !pending.contains(&note_nullifier(note)))
-            .map(|note| note.v as u128)
-            .sum()
+        self.available_balance_by_asset()
+            .into_iter()
+            .find(|(asset, _)| *asset == ASSET_TEZ)
+            .map(|(_, v)| v)
+            .unwrap_or(0)
     }
 
     fn pending_outgoing_balance(&self) -> u128 {
@@ -923,12 +922,8 @@ impl WalletFile {
     }
 
     fn tez_pending_outgoing_balance(&self) -> u128 {
-        let pending = self.pending_nullifier_set();
-        self.notes
-            .iter()
-            .filter(|note| note.asset_id == ASSET_TEZ && pending.contains(&note_nullifier(note)))
-            .map(|note| note.v as u128)
-            .sum()
+        self.tez_balance()
+            .saturating_sub(self.tez_available_balance())
     }
 
     /// Per-asset breakdown of `balance()`. Keys are asset_ids
@@ -3755,8 +3750,8 @@ struct Cli {
     #[arg(long, default_value = "reprove")]
     reprove_bin: String,
 
-    /// Path to directory containing compiled .executable.json files
-    #[arg(long, default_value = "cairo/target/dev")]
+    /// Deprecated no-op (retained for CLI backwards compatibility; leanVM embeds its guest ELF).
+    #[arg(long, default_value = ".", hide = true)]
     executables_dir: String,
 
     #[command(subcommand)]
@@ -3947,8 +3942,8 @@ struct UserCli {
     #[arg(long, default_value = "reprove")]
     reprove_bin: String,
 
-    /// Path to directory containing compiled .executable.json files.
-    #[arg(long, default_value = "cairo/target/dev")]
+    /// Deprecated no-op (retained for CLI backwards compatibility; leanVM embeds its guest ELF).
+    #[arg(long, default_value = ".", hide = true)]
     executables_dir: String,
 
     /// Emit user-facing output as structured JSON on stdout instead of

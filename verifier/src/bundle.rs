@@ -13,6 +13,9 @@ pub struct ProofBundle {
 /// Magic prefix inside the zstd-compressed payload identifying a `leanVM` STARK proof.
 pub const LEANVM_PROOF_MAGIC: &[u8; 4] = b"LVM1";
 
+/// Maximum allowed decompressed STARK proof size (2 MiB; valid `leanVM` proofs are ~260 KiB).
+pub const MAX_DECOMPRESSED_PROOF_BYTES: usize = 2 * 1024 * 1024;
+
 fn leanvm_program() -> &'static leanvm::Program {
     static PROGRAM: std::sync::OnceLock<leanvm::Program> = std::sync::OnceLock::new();
     PROGRAM.get_or_init(|| {
@@ -62,9 +65,20 @@ impl ProofBundle {
     }
 
     pub fn verify(&self) -> Result<()> {
-        let compressed = self.proof_bytes();
-        let proof_bytes =
-            zstd::decode_all(&compressed[..]).map_err(|e| anyhow!("zstd decompress: {e}"))?;
+        use std::io::Read;
+        let mut decoder = zstd::stream::read::Decoder::new(&self.proof_bytes[..])
+            .map_err(|e| anyhow!("zstd decoder init: {e}"))?;
+        let mut proof_bytes = Vec::new();
+        decoder
+            .take((MAX_DECOMPRESSED_PROOF_BYTES + 1) as u64)
+            .read_to_end(&mut proof_bytes)
+            .map_err(|e| anyhow!("zstd decompress: {e}"))?;
+        if proof_bytes.len() > MAX_DECOMPRESSED_PROOF_BYTES {
+            return Err(anyhow!(
+                "zstd decompressed proof exceeds maximum size ({} bytes)",
+                MAX_DECOMPRESSED_PROOF_BYTES
+            ));
+        }
         let raw_leanvm_proof = proof_bytes
             .strip_prefix(LEANVM_PROOF_MAGIC)
             .ok_or_else(|| anyhow!("circuit verification FAILED: missing LVM1 proof header"))?;

@@ -15,7 +15,7 @@ class OctezRollupSandboxDalSmokeTest(unittest.TestCase):
               "shield_program_hash": "bb",
               "transfer_program_hash": "cc",
               "unshield_program_hash": "dd",
-              "shield_pool_recipient": "pool:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+              "shield_pool_recipient": "deposit:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
               "shield_amount": 400000,
               "shield_total_debit": 500001,
               "shield_tree_size_after": 2
@@ -48,7 +48,7 @@ class OctezRollupSandboxDalSmokeTest(unittest.TestCase):
                 "bb",
                 "cc",
                 "dd",
-                "pool:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "deposit:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "400000",
                 "500001",
                 "2",

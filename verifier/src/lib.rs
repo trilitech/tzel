@@ -157,25 +157,9 @@ pub fn leanvm_program_hashes() -> ProgramHashes {
 pub fn compute_executable_program_hash(
     executable_path: &std::path::Path,
 ) -> Result<tzel_core::F, String> {
-    let candidate = executable_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .or_else(|| executable_path.to_str());
-    match candidate {
-        Some("shield" | "tzel_run_shield.executable.json" | "run_shield.executable.json") => {
-            Ok(tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_SHIELD))
-        }
-        Some(
-            "transfer" | "tzel_run_transfer.executable.json" | "run_transfer.executable.json",
-        ) => Ok(tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_TRANSFER)),
-        Some(
-            "unshield" | "tzel_run_unshield.executable.json" | "run_unshield.executable.json",
-        ) => Ok(tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_UNSHIELD)),
-        _ => Err(format!(
-            "unknown TzEL circuit executable name: {}",
-            executable_path.display()
-        )),
-    }
+    let kind = CircuitKind::from_executable_path(executable_path)?;
+    let hashes = leanvm_program_hashes();
+    Ok(*kind.expected_program_hash(&hashes))
 }
 
 #[cfg(test)]
@@ -448,19 +432,7 @@ mod tests {
             .expect("leanVM ZK proof succeeds");
         assert_eq!(proven.output, run.expected);
 
-        let mut pub_outputs = Vec::with_capacity(11 + inputs.len());
-        pub_outputs.push(hdr.auth_domain);
-        pub_outputs.push(hdr.root);
-        for inp in &inputs {
-            pub_outputs.push(inp.nf);
-        }
-        pub_outputs.push(tzel_host::u64_to_felt(hdr.fee));
-        for out in &hdr.outputs {
-            pub_outputs.push(out.cm);
-        }
-        for out in &hdr.outputs {
-            pub_outputs.push(out.memo_ct_hash);
-        }
+        let pub_outputs = tzel_host::transfer_public_outputs(&hdr, &inputs);
         let preimage_felts = tzel_host::wrap_bootloader_output_preimage(
             tzel_host::PROGRAM_HASH_TRANSFER,
             &pub_outputs,
@@ -511,5 +483,22 @@ mod tests {
         }
         let err = verifier.validate(&tampered, CircuitKind::Transfer).unwrap_err();
         assert!(err.contains("circuit verification FAILED"), "{err}");
+    }
+
+    #[test]
+    fn test_proof_bundle_rejects_oversized_zstd_payload() {
+        let oversized = vec![0u8; bundle::MAX_DECOMPRESSED_PROOF_BYTES + 1024];
+        let compressed = zstd::encode_all(&oversized[..], 3).expect("zstd compress");
+        // Tiny compressed payload (~hundreds of bytes) that expands past MAX_DECOMPRESSED_PROOF_BYTES.
+        assert!(compressed.len() < 4096);
+        let bundle = ProofBundle {
+            proof_bytes: compressed,
+            output_preimage: vec![],
+        };
+        let err = bundle.verify().unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds maximum size"),
+            "expected size limit error, got: {err}"
+        );
     }
 }

@@ -40,6 +40,51 @@ pub fn wrap_bootloader_output_preimage(program_hash: Felt, public_outputs: &[Fel
     out
 }
 
+/// Assemble the flat public output sequence for a `Transfer` transaction:
+/// `[auth_domain, root, nf_1..nf_n, fee, cm_1..cm_4, memo_ct_hash_1..memo_ct_hash_4]`.
+pub fn transfer_public_outputs(hdr: &TransferHeader, inputs: &[InputNoteWitness]) -> Vec<Felt> {
+    let mut pub_outputs = Vec::with_capacity(11 + inputs.len());
+    pub_outputs.push(hdr.auth_domain);
+    pub_outputs.push(hdr.root);
+    for inp in inputs {
+        pub_outputs.push(inp.nf);
+    }
+    pub_outputs.push(u64_to_felt(hdr.fee));
+    for out in &hdr.outputs {
+        pub_outputs.push(out.cm);
+    }
+    for out in &hdr.outputs {
+        pub_outputs.push(out.memo_ct_hash);
+    }
+    pub_outputs
+}
+
+/// Assemble the flat public output sequence for an `Unshield` transaction:
+/// `[auth_domain, root, nf_1..nf_n, v_pub, asset_pub, fee, recipient, cm_change, memo_ct_hash_change, cm_change_2, memo_ct_hash_change_2, cm_fee, memo_ct_hash_fee]`.
+pub fn unshield_public_outputs(
+    hdr: &UnshieldHeader,
+    inputs: &[InputNoteWitness],
+    (c1, c2, cf): (Felt, Felt, Felt),
+) -> Vec<Felt> {
+    let mut pub_outputs = Vec::with_capacity(12 + inputs.len());
+    pub_outputs.push(hdr.auth_domain);
+    pub_outputs.push(hdr.root);
+    for inp in inputs {
+        pub_outputs.push(inp.nf);
+    }
+    pub_outputs.push(u64_to_felt(hdr.v_pub));
+    pub_outputs.push(hdr.asset_pub);
+    pub_outputs.push(u64_to_felt(hdr.fee));
+    pub_outputs.push(hdr.recipient);
+    pub_outputs.push(c1);
+    pub_outputs.push(hdr.change_1.memo_ct_hash);
+    pub_outputs.push(c2);
+    pub_outputs.push(hdr.change_2.memo_ct_hash);
+    pub_outputs.push(cf);
+    pub_outputs.push(hdr.fee_note.memo_ct_hash);
+    pub_outputs
+}
+
 /// Validate the 4-element bootloader header and compute the `leanVM` `PublicValues` digest
 /// for a full `output_preimage` slice (`[1, 3 + k, program_hash, k, public_outputs...]`).
 pub fn validate_and_digest_preimage(output_preimage: &[Felt]) -> Result<[u64; 4], String> {
@@ -453,19 +498,7 @@ pub fn build_exact_transfer(
         advice.extend(unsafe { as_words_unchecked(inp) });
     }
 
-    let mut pub_outputs = Vec::with_capacity(11 + inputs.len());
-    pub_outputs.push(hdr.auth_domain);
-    pub_outputs.push(hdr.root);
-    for inp in &inputs {
-        pub_outputs.push(inp.nf);
-    }
-    pub_outputs.push(u64_to_felt(hdr.fee));
-    for out in &hdr.outputs {
-        pub_outputs.push(out.cm);
-    }
-    for out in &hdr.outputs {
-        pub_outputs.push(out.memo_ct_hash);
-    }
+    let pub_outputs = transfer_public_outputs(&hdr, &inputs);
     let preimage = wrap_bootloader_output_preimage(PROGRAM_HASH_TRANSFER, &pub_outputs);
 
     (
@@ -681,7 +714,7 @@ pub fn build_exact_unshield(
         fee_note,
     };
 
-    let (c1, c2, cf) = hdr.verify(&inputs).expect("valid exact unshield");
+    let cms = hdr.verify(&inputs).expect("valid exact unshield");
 
     let mut advice = vec![OpTag::ExactUnshield as u64];
     advice.extend(unsafe { as_words_unchecked(&hdr) });
@@ -689,22 +722,7 @@ pub fn build_exact_unshield(
         advice.extend(unsafe { as_words_unchecked(inp) });
     }
 
-    let mut pub_outputs = Vec::with_capacity(12 + inputs.len());
-    pub_outputs.push(hdr.auth_domain);
-    pub_outputs.push(hdr.root);
-    for inp in &inputs {
-        pub_outputs.push(inp.nf);
-    }
-    pub_outputs.push(u64_to_felt(hdr.v_pub));
-    pub_outputs.push(hdr.asset_pub);
-    pub_outputs.push(u64_to_felt(hdr.fee));
-    pub_outputs.push(hdr.recipient);
-    pub_outputs.push(c1);
-    pub_outputs.push(hdr.change_1.memo_ct_hash);
-    pub_outputs.push(c2);
-    pub_outputs.push(hdr.change_2.memo_ct_hash);
-    pub_outputs.push(cf);
-    pub_outputs.push(hdr.fee_note.memo_ct_hash);
+    let pub_outputs = unshield_public_outputs(&hdr, &inputs, cms);
     let preimage = wrap_bootloader_output_preimage(PROGRAM_HASH_UNSHIELD, &pub_outputs);
 
     (
@@ -1034,19 +1052,7 @@ pub fn parse_cairo_transfer_args(args: &[String]) -> Result<(Vec<Felt>, Run), St
         advice.extend(unsafe { as_words_unchecked(inp) });
     }
 
-    let mut pub_outputs = Vec::with_capacity(11 + n_inputs);
-    pub_outputs.push(hdr.auth_domain);
-    pub_outputs.push(hdr.root);
-    for inp in &inputs {
-        pub_outputs.push(inp.nf);
-    }
-    pub_outputs.push(u64_to_felt(hdr.fee));
-    for out in &hdr.outputs {
-        pub_outputs.push(out.cm);
-    }
-    for out in &hdr.outputs {
-        pub_outputs.push(out.memo_ct_hash);
-    }
+    let pub_outputs = transfer_public_outputs(&hdr, &inputs);
     let preimage = wrap_bootloader_output_preimage(PROGRAM_HASH_TRANSFER, &pub_outputs);
     let expected = public_digest_for_preimage(&preimage);
     Ok((preimage, Run { advice, expected }))
@@ -1244,7 +1250,7 @@ pub fn parse_cairo_unshield_args(args: &[String]) -> Result<(Vec<Felt>, Run), St
         fee_note,
     };
 
-    let (c1, c2, cf) = hdr
+    let cms = hdr
         .verify(&inputs)
         .map_err(|e| format!("unshield witness verification failed: {e}"))?;
 
@@ -1254,22 +1260,7 @@ pub fn parse_cairo_unshield_args(args: &[String]) -> Result<(Vec<Felt>, Run), St
         advice.extend(unsafe { as_words_unchecked(inp) });
     }
 
-    let mut pub_outputs = Vec::with_capacity(12 + n_inputs);
-    pub_outputs.push(hdr.auth_domain);
-    pub_outputs.push(hdr.root);
-    for inp in &inputs {
-        pub_outputs.push(inp.nf);
-    }
-    pub_outputs.push(u64_to_felt(hdr.v_pub));
-    pub_outputs.push(hdr.asset_pub);
-    pub_outputs.push(u64_to_felt(hdr.fee));
-    pub_outputs.push(hdr.recipient);
-    pub_outputs.push(c1);
-    pub_outputs.push(hdr.change_1.memo_ct_hash);
-    pub_outputs.push(c2);
-    pub_outputs.push(hdr.change_2.memo_ct_hash);
-    pub_outputs.push(cf);
-    pub_outputs.push(hdr.fee_note.memo_ct_hash);
+    let pub_outputs = unshield_public_outputs(&hdr, &inputs, cms);
     let preimage = wrap_bootloader_output_preimage(PROGRAM_HASH_UNSHIELD, &pub_outputs);
     let expected = public_digest_for_preimage(&preimage);
     Ok((preimage, Run { advice, expected }))
@@ -1346,19 +1337,7 @@ mod tests {
     #[test]
     fn bootloader_header_program_hash_is_cryptographically_bound_to_digest() {
         let (hdr, inputs, run) = build_exact_transfer(2, true);
-        let mut pub_outputs = Vec::with_capacity(11 + inputs.len());
-        pub_outputs.push(hdr.auth_domain);
-        pub_outputs.push(hdr.root);
-        for inp in &inputs {
-            pub_outputs.push(inp.nf);
-        }
-        pub_outputs.push(u64_to_felt(hdr.fee));
-        for out in &hdr.outputs {
-            pub_outputs.push(out.cm);
-        }
-        for out in &hdr.outputs {
-            pub_outputs.push(out.memo_ct_hash);
-        }
+        let pub_outputs = transfer_public_outputs(&hdr, &inputs);
         let valid_preimage = wrap_bootloader_output_preimage(PROGRAM_HASH_TRANSFER, &pub_outputs);
         assert_eq!(
             validate_and_digest_preimage(&valid_preimage).unwrap(),
@@ -1407,6 +1386,83 @@ mod tests {
         unshield_args[1] = "0x1".to_string();
         let err = parse_cairo_unshield_args(&unshield_args).unwrap_err();
         assert!(err.contains("unshield declared length mismatch"), "{err}");
+    }
+
+    #[test]
+    fn zk_table_heights_are_independent_of_private_witness_values() {
+        let program = Program::from_elf(ELF).expect("valid tzel.elf");
+
+        // Shield: tez vs FA2 asset routing
+        let (_, shield_tez) = build_exact_shield(ASSET_TEZ);
+        let (_, shield_fa2) = build_exact_shield(FA2_ASSET_FELT);
+        let m_shield_tez = program.measure(&shield_tez.advice).unwrap();
+        let m_shield_fa2 = program.measure(&shield_fa2.advice).unwrap();
+        assert_eq!(
+            m_shield_tez.counts, m_shield_fa2.counts,
+            "Shield table counts must not leak private witness values"
+        );
+        assert_eq!(m_shield_tez.proven_rows, m_shield_fa2.proven_rows);
+
+        // Transfer (fixed public shape n_inputs = 2): single-asset tez vs mixed FA2+tez
+        // (exercises both branches of the 2-accumulator asset router and different output values/assets).
+        let (_, _, xfer_tez) = build_exact_transfer(2, false);
+        let (_, _, xfer_mixed) = build_exact_transfer(2, true);
+        let m_xfer_tez = program.measure(&xfer_tez.advice).unwrap();
+        let m_xfer_mixed = program.measure(&xfer_mixed.advice).unwrap();
+        assert_eq!(
+            m_xfer_tez.counts, m_xfer_mixed.counts,
+            "Transfer table counts for fixed n_inputs must not leak private witness values/asset routing"
+        );
+        assert_eq!(m_xfer_tez.proven_rows, m_xfer_mixed.proven_rows);
+    }
+
+    #[test]
+    fn elf_digest_is_pinned_to_program_hash_version_tags() {
+        // Guard against rebuilding `tzel.elf` without bumping `PROGRAM_HASH_{SHIELD,TRANSFER,UNSHIELD}`.
+        let mut pv = PublicValues::new();
+        pv.commit(&u64_to_felt(ELF.len() as u64));
+        for chunk in ELF.chunks(32) {
+            let mut b = [0u8; 32];
+            b[..chunk.len()].copy_from_slice(chunk);
+            pv.commit(&felt_from_bytes_le(&b));
+        }
+        assert_eq!(
+            PROGRAM_HASH_SHIELD,
+            [
+                0x545A_454C_5F53_4844,
+                0x4C45_414E_564D_5F31,
+                0x0000_0000_0000_0001,
+                0x0100_0000_0000_0000,
+            ]
+        );
+        assert_eq!(
+            PROGRAM_HASH_TRANSFER,
+            [
+                0x545A_454C_5F58_4652,
+                0x4C45_414E_564D_5F31,
+                0x0000_0000_0000_0002,
+                0x0100_0000_0000_0000,
+            ]
+        );
+        assert_eq!(
+            PROGRAM_HASH_UNSHIELD,
+            [
+                0x545A_454C_5F55_4E53,
+                0x4C45_414E_564D_5F31,
+                0x0000_0000_0000_0003,
+                0x0100_0000_0000_0000,
+            ]
+        );
+        assert_eq!(
+            pv.digest(),
+            [
+                17266481233476179038,
+                10115622727630409731,
+                11212739744090798557,
+                7296736276791755098
+            ],
+            "tzel.elf changed! If this guest change is intentional, bump PROGRAM_HASH_{{SHIELD,TRANSFER,UNSHIELD}} version tags and update this pinned ELF digest."
+        );
     }
 
     #[test]

@@ -529,7 +529,8 @@ mod tests {
         assert_eq!(scenario.transfer.fee, MIN_TX_FEE);
         tree.append(scenario.transfer.cm_1);
         tree.append(scenario.transfer.cm_2);
-        // slot 3 (change_2) is empty; producer-fee is slot 4
+        // slot 3 (change_2) is empty (ZERO), appended by the rollup kernel; producer-fee is slot 4
+        tree.append(scenario.transfer.cm_3);
         tree.append(scenario.transfer.cm_4);
         assert_eq!(scenario.unshield.root, tree.root());
         assert_eq!(
@@ -595,7 +596,7 @@ mod tests {
                 amount: 99_999,
             }]
         );
-        assert_eq!(reparsed.expected.tree_size, 6);
+        assert_eq!(reparsed.expected.tree_size, 7);
         assert_eq!(reparsed.expected.nullifier_count, 2);
 
         // The FA2 flow round-trips through JSON with its non-tez asset_id.

@@ -12,7 +12,6 @@ source "$ENV_FILE"
 
 TZEL_WALLET_BIN="${TZEL_WALLET_BIN:-/usr/local/bin/tzel-wallet}"
 TZEL_REPROVE_BIN="${TZEL_REPROVE_BIN:-/usr/local/bin/reprove}"
-TZEL_EXECUTABLES_DIR="${TZEL_EXECUTABLES_DIR:-/opt/tzel/executables}"
 TZEL_SMOKE_WORKDIR="${TZEL_SMOKE_WORKDIR:-$(mktemp -d /tmp/tzel-shadownet-smoke.XXXXXX)}"
 TZEL_SMOKE_DEPOSIT_AMOUNT="${TZEL_SMOKE_DEPOSIT_AMOUNT:-300000}"
 TZEL_SMOKE_SEND_AMOUNT="${TZEL_SMOKE_SEND_AMOUNT:-50000}"
@@ -83,7 +82,6 @@ wallet_prove_cmd() {
   "${TZEL_WALLET_BIN}" \
     --wallet "${wallet}" \
     --reprove-bin "${TZEL_REPROVE_BIN}" \
-    --executables-dir "${TZEL_EXECUTABLES_DIR}" \
     "$@"
 }
 

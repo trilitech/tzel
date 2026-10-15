@@ -790,10 +790,6 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn executables_dir() -> PathBuf {
-    workspace_root()
-}
-
 fn base_wallet_fixture_path() -> PathBuf {
     workspace_root().join("apps/wallet/testdata/base_wallet_bds.json")
 }

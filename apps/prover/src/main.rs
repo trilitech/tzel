@@ -62,25 +62,7 @@ fn get_peak_memory_kb() -> Option<u64> {
 }
 
 fn infer_circuit_kind(executable: &Path) -> Result<CircuitKind> {
-    let candidate = executable
-        .file_name()
-        .and_then(|s| s.to_str())
-        .or_else(|| executable.to_str());
-    match candidate {
-        Some("shield" | "tzel_run_shield.executable.json" | "run_shield.executable.json") => {
-            Ok(CircuitKind::Shield)
-        }
-        Some(
-            "transfer" | "tzel_run_transfer.executable.json" | "run_transfer.executable.json",
-        ) => Ok(CircuitKind::Transfer),
-        Some(
-            "unshield" | "tzel_run_unshield.executable.json" | "run_unshield.executable.json",
-        ) => Ok(CircuitKind::Unshield),
-        _ => Err(anyhow!(
-            "cannot infer TzEL circuit kind from executable path '{}'",
-            executable.display()
-        )),
-    }
+    CircuitKind::from_executable_path(executable).map_err(|e| anyhow!("{e}"))
 }
 
 fn build_leanvm_run(
@@ -113,19 +95,7 @@ fn build_leanvm_run(
             }
             CircuitKind::Transfer => {
                 let (hdr, inputs, run) = tzel_host::build_exact_transfer(1, false);
-                let mut pub_outputs = Vec::with_capacity(11 + inputs.len());
-                pub_outputs.push(hdr.auth_domain);
-                pub_outputs.push(hdr.root);
-                for inp in &inputs {
-                    pub_outputs.push(inp.nf);
-                }
-                pub_outputs.push(tzel_host::u64_to_felt(hdr.fee));
-                for out in &hdr.outputs {
-                    pub_outputs.push(out.cm);
-                }
-                for out in &hdr.outputs {
-                    pub_outputs.push(out.memo_ct_hash);
-                }
+                let pub_outputs = tzel_host::transfer_public_outputs(&hdr, &inputs);
                 let pre = tzel_host::wrap_bootloader_output_preimage(
                     tzel_host::PROGRAM_HASH_TRANSFER,
                     &pub_outputs,
@@ -134,23 +104,8 @@ fn build_leanvm_run(
             }
             CircuitKind::Unshield => {
                 let (hdr, inputs, run) = tzel_host::build_exact_unshield(1, false);
-                let (c1, c2, cf) = hdr.verify(&inputs).map_err(|e| anyhow!("{e}"))?;
-                let mut pub_outputs = Vec::with_capacity(12 + inputs.len());
-                pub_outputs.push(hdr.auth_domain);
-                pub_outputs.push(hdr.root);
-                for inp in &inputs {
-                    pub_outputs.push(inp.nf);
-                }
-                pub_outputs.push(tzel_host::u64_to_felt(hdr.v_pub));
-                pub_outputs.push(hdr.asset_pub);
-                pub_outputs.push(tzel_host::u64_to_felt(hdr.fee));
-                pub_outputs.push(hdr.recipient);
-                pub_outputs.push(c1);
-                pub_outputs.push(hdr.change_1.memo_ct_hash);
-                pub_outputs.push(c2);
-                pub_outputs.push(hdr.change_2.memo_ct_hash);
-                pub_outputs.push(cf);
-                pub_outputs.push(hdr.fee_note.memo_ct_hash);
+                let cms = hdr.verify(&inputs).map_err(|e| anyhow!("{e}"))?;
+                let pub_outputs = tzel_host::unshield_public_outputs(&hdr, &inputs, cms);
                 let pre = tzel_host::wrap_bootloader_output_preimage(
                     tzel_host::PROGRAM_HASH_UNSHIELD,
                     &pub_outputs,

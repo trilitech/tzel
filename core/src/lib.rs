@@ -1997,6 +1997,28 @@ impl CircuitKind {
             CircuitKind::Unshield => &hashes.unshield,
         }
     }
+
+    pub fn from_executable_path(executable_path: &std::path::Path) -> Result<Self, String> {
+        let candidate = executable_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .or_else(|| executable_path.to_str());
+        match candidate {
+            Some("shield" | "tzel_run_shield.executable.json" | "run_shield.executable.json") => {
+                Ok(CircuitKind::Shield)
+            }
+            Some(
+                "transfer" | "tzel_run_transfer.executable.json" | "run_transfer.executable.json",
+            ) => Ok(CircuitKind::Transfer),
+            Some(
+                "unshield" | "tzel_run_unshield.executable.json" | "run_unshield.executable.json",
+            ) => Ok(CircuitKind::Unshield),
+            _ => Err(format!(
+                "unknown TzEL circuit executable name: {}",
+                executable_path.display()
+            )),
+        }
+    }
 }
 
 /// Demo HTTP ledger / operator deposit request: a `deposit:<hex>` recipient

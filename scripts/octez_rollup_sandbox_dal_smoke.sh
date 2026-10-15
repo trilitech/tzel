@@ -618,8 +618,10 @@ main() {
   deposit_to_bridge "${ticketer_address}" "${rollup_address}" "${shield_pool_recipient}" "${shield_total_debit}"
 
   local tez_asset_hex="0000000000000000000000000000000000000000000000000000000000000000"
+  local pubkey_hex="${shield_pool_recipient#deposit:}"
+  pubkey_hex="${pubkey_hex#pool:}"
   local balance_key
-  balance_key="/tzel/v1/state/deposits/balance/${tez_asset_hex}/${shield_pool_recipient#pool:}"
+  balance_key="/tzel/v1/state/deposits/balance/${tez_asset_hex}/${pubkey_hex}"
   await_rollup_u64 "${balance_key}" "${shield_total_debit}" "public bridge balance"
 
   local shield_payload_file

@@ -1782,7 +1782,10 @@ let test_ledger_transfer_memo_mismatch () =
   Alcotest.(check bool) "memo2 mismatch" true (Result.is_error r2);
   let r3 = Tzel.Ledger.apply_transfer ledger tpub
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:wrong in
-  Alcotest.(check bool) "memo3 mismatch" true (Result.is_error r3)
+  Alcotest.(check bool) "memo3 mismatch" true (Result.is_error r3);
+  let r_c2 = Tzel.Ledger.apply_transfer ledger ~memo_ct_hash_change_2:wrong tpub
+    ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:mch in
+  Alcotest.(check bool) "memo_change_2 mismatch" true (Result.is_error r_c2)
 
 let make_unshield_pub ~auth_domain ~root ~nullifiers ?(v_pub=0L) ?(asset_pub=Tzel.Felt.zero) ?(fee=0L)
     ~recipient_string
