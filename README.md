@@ -33,13 +33,10 @@ A UTXO-based private transaction system where:
 
 ```bash
 # Build everything
-cargo build --release -p tzel-wallet-app -p tzel-ledger-app
-cd apps/prover && cargo build --release && cd ../..
-cd cairo && scarb build && cd ..
+cargo build --release -p tzel-wallet-app -p tzel-ledger-app -p tzel-prover-app
 
 # Run the ledger with proof verification (verified mode)
-# If you launch it from elsewhere, also pass --executables-dir /abs/path/to/cairo/target/dev
-target/release/sp-ledger --port 8080 --reprove-bin apps/prover/target/release/reprove &
+target/release/sp-ledger --port 8080 --reprove-bin target/release/reprove &
 
 # Run the developer/test wallet harness. The shield path is rollup-only
 # (see `tzel-wallet shield --pubkey-hash <hex> --amount <v>` against a
@@ -51,7 +48,7 @@ target/release/sp-client -w producer.json address | sed -n '2,$p' > producer-add
 target/release/sp-client -w alice.json scan -l http://localhost:8080
 target/release/sp-client -w alice.json balance
 
-# Run the STARK proofs (requires ~13 GB RAM)
+# Run the STARK proofs
 ./apps/prover/bench.sh
 ```
 
@@ -61,10 +58,10 @@ For deployment-oriented installs with standard paths instead of a workspace chec
 - ops host (rollup node + DAL node + `tzel-operator`): `ops/shadownet/README.md`
 - prover layout: `ops/prover/README.md`
 - watch-only detection service: `docs/wallet_detection_service.md`
-- shared binary installer: `./scripts/install_tzel_binaries.sh --prefix /usr/local --executables-dir /opt/tzel/cairo/target/dev`
+- shared binary installer: `./scripts/install_tzel_binaries.sh --prefix /usr/local`
 - live public-box smoke: `TZEL_SMOKE_L1_RECIPIENT=tz1... ./scripts/shadownet_live_e2e_smoke.sh /etc/tzel/shadownet.env`
 
-> **WARNING:** The ledger refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
+> **WARNING:** The ledger refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `shield` / `transfer` / `unshield` program hashes from `reprove`. `--trust-me-bro` is never appropriate for real value.
 >
 > **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, pubkey_hash binding, deposit-pool, and memo-hash checks. Its `/deposit` endpoint credits an aggregated pool keyed by `pubkey_hash` and `/shield` debits one — both demo-only and unauthenticated, not appropriate for a real public endpoint. The wallet's primary shield path is `tzel-wallet shield --pubkey-hash <hex> --amount <v>` against a configured rollup profile.
 >

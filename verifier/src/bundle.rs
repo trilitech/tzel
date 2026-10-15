@@ -50,6 +50,11 @@ impl ProofBundle {
             .map_err(|e| anyhow!("circuit verification FAILED: {e}"))?;
         let proof = leanvm::Proof::from_bytes(raw_leanvm_proof)
             .map_err(|e| anyhow!("deserialize leanVM proof: {e}"))?;
+        if !proof.is_zero_knowledge() {
+            return Err(anyhow!(
+                "circuit verification FAILED: non-ZK STARK proof rejected; zero-knowledge proof required"
+            ));
+        }
         leanvm_program()
             .verify(expected_output.into(), &proof)
             .map_err(|e| anyhow!("circuit verification FAILED: {e}"))?;

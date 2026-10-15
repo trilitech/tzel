@@ -215,14 +215,8 @@ fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     assert_eq!(transfer_resp.index_3, 4);
     assert_eq!(transfer_resp.index_4, 5);
 
-    // Phase C: transfer appended a 4th note (the zero-value change_2
-    // placeholder) so the current tree root no longer matches the
-    // scenario's pre-recorded `unshield.root`. Use the live root so the
-    // unshield's Merkle inclusion check works against the actual tree.
-    let mut adjusted_unshield = scenario.unshield.clone();
-    adjusted_unshield.root = ledger.tree.root();
     let unshield_resp = ledger
-        .unshield(&unshield_req(&adjusted_unshield, &scenario.auth_domain))
+        .unshield(&unshield_req(&scenario.unshield, &scenario.auth_domain))
         .expect("unshield");
     assert_eq!(unshield_resp.change_index, None);
     // Producer note appears after the 6 prior notes
@@ -232,9 +226,7 @@ fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     // Pool drained.
     assert!(ledger.deposit_balances.get(&pubkey_hash).is_none());
     assert_eq!(ledger.withdrawals, scenario.expected.withdrawals.clone());
-    // Phase C: tree size = scenario.expected + 1 zero-value change_2 + 1
-    // producer = +1 vs the pre-Phase-C count.
-    assert_eq!(ledger.tree.leaves.len(), scenario.expected.tree_size + 1);
+    assert_eq!(ledger.tree.leaves.len(), scenario.expected.tree_size);
     assert_eq!(ledger.nullifiers.len(), scenario.expected.nullifier_count);
 }
 

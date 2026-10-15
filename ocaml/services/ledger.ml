@@ -402,25 +402,19 @@ let apply_transfer ledger (pub : Transaction.transfer_public)
     | Ok () ->
       append_commitment ledger pub.cm_1;
       append_commitment ledger pub.cm_2;
-      if not (Felt.is_zero pub.cm_3) then
-        append_commitment ledger pub.cm_3;
-      if not (Felt.is_zero pub.cm_4) || Felt.is_zero pub.cm_3 then
-        append_commitment ledger pub.cm_4;
+      append_commitment ledger pub.cm_3;
+      append_commitment ledger pub.cm_4;
       Ok ()
 
-let apply_unshield ledger ~recipient_string (pub : Transaction.unshield_public)
-    ~memo_ct_hash_change ~memo_ct_hash_fee =
+let apply_unshield ledger ~recipient_string ?(memo_ct_hash_change_2 = Felt.zero)
+    (pub : Transaction.unshield_public) ~memo_ct_hash_change ~memo_ct_hash_fee =
   if Int64.compare pub.v_pub 0L <= 0 then
     Error "v_pub must be positive"
   else
   match normalize_l1_withdrawal_recipient recipient_string with
   | Error e -> Error e
   | Ok recipient_string ->
-  if Felt.equal pub.asset_pub Asset_registry.asset_tez
-     && String.length recipient_string >= 3
-     && String.sub recipient_string 0 3 = "KT1" then
-    Error "tez unshield recipient must be an implicit account (tz1/tz2/tz3/tz4); KT1 recipients are only supported for FA2 withdrawals"
-  else if not (Felt.equal pub.auth_domain ledger.auth_domain) then
+  if not (Felt.equal pub.auth_domain ledger.auth_domain) then
     Error "auth_domain mismatch"
   else if not (is_valid_root ledger pub.root) then
     Error "unknown root"
@@ -437,6 +431,9 @@ let apply_unshield ledger ~recipient_string (pub : Transaction.unshield_public)
         if not (Felt.is_zero pub.cm_change)
            && not (Felt.equal memo_ct_hash_change pub.memo_ct_hash_change) then
           Error "memo_ct_hash_change mismatch"
+        else if not (Felt.is_zero pub.cm_change_2)
+           && not (Felt.equal memo_ct_hash_change_2 pub.memo_ct_hash_change_2) then
+          Error "memo_ct_hash_change_2 mismatch"
         else begin
           insert_nullifiers ledger pub.nullifiers;
           if not (Felt.is_zero pub.cm_change) then

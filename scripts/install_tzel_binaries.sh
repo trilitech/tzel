@@ -47,6 +47,10 @@ while [[ $# -gt 0 ]]; do
       CONFIG_ADMIN_DIR="$2"
       shift 2
       ;;
+    --executables-dir)
+      echo "note: --executables-dir is deprecated and ignored (leanVM embeds the guest ELF in reprove)" >&2
+      shift 2
+      ;;
     --build-only)
       BUILD_ONLY=1
       shift

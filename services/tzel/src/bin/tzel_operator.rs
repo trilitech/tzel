@@ -1592,7 +1592,10 @@ fn run_command_collect_output(
 }
 
 fn extract_operation_hash(output: &str) -> Option<String> {
-    extract_token_with_prefix(output, 'o')
+    output.lines().find_map(|line| {
+        let (_, tail) = line.split_once("Operation hash is")?;
+        extract_token_with_prefix(tail, 'o')
+    })
 }
 
 fn extract_block_hash(output: &str) -> Option<String> {
@@ -2667,6 +2670,27 @@ mod tests {
             extract_operation_hash(&err).as_deref(),
             Some("ooTimeoutHash123456789ABCDEFG"),
             "partial output (the op hash) must survive a timeout kill"
+        );
+    }
+
+    #[test]
+    fn extract_operation_hash_ignores_foreign_hashes_in_conflict_errors() {
+        assert_eq!(
+            extract_operation_hash(
+                "Manager tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx already has the operation ooForeignOpHash123456789ABCDEFG in the current block."
+            ),
+            None
+        );
+        assert_eq!(
+            extract_operation_hash(
+                "Error: prevalidation error: mempool already contains a conflicting operation ooForeignOpHash123456789ABCDEFG"
+            ),
+            None
+        );
+        assert_eq!(
+            extract_operation_hash("Operation hash is 'ooInjectedOpHash123456789ABCDEFG'")
+                .as_deref(),
+            Some("ooInjectedOpHash123456789ABCDEFG")
         );
     }
 

@@ -33,12 +33,8 @@ impl DirectProofVerifier {
         }
     }
 
-    pub fn from_executables_dir(
-        allow_trust_me_bro: bool,
-        executables_dir: &str,
-    ) -> Result<Self, String> {
-        let program_hashes = load_program_hashes(executables_dir)?;
-        Ok(Self::verified(allow_trust_me_bro, program_hashes))
+    pub fn verified_leanvm(allow_trust_me_bro: bool) -> Self {
+        Self::verified(allow_trust_me_bro, leanvm_program_hashes())
     }
 
     pub fn from_kernel_config(config: &KernelVerifierConfig) -> Result<Self, String> {
@@ -165,23 +161,21 @@ pub fn compute_executable_program_hash(
         .file_name()
         .and_then(|s| s.to_str())
         .or_else(|| executable_path.to_str());
-    if let Some(name) = candidate {
-        if name.contains("unshield") {
-            return Ok(tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_UNSHIELD));
-        } else if name.contains("transfer") {
-            return Ok(tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_TRANSFER));
-        } else if name.contains("shield") {
-            return Ok(tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_SHIELD));
+    match candidate {
+        Some("shield" | "tzel_run_shield.executable.json" | "run_shield.executable.json") => {
+            Ok(tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_SHIELD))
         }
+        Some(
+            "transfer" | "tzel_run_transfer.executable.json" | "run_transfer.executable.json",
+        ) => Ok(tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_TRANSFER)),
+        Some(
+            "unshield" | "tzel_run_unshield.executable.json" | "run_unshield.executable.json",
+        ) => Ok(tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_UNSHIELD)),
+        _ => Err(format!(
+            "unknown TzEL circuit executable name: {}",
+            executable_path.display()
+        )),
     }
-    Err(format!(
-        "unknown TzEL circuit executable name: {}",
-        executable_path.display()
-    ))
-}
-
-pub fn load_program_hashes(_executables_dir: &str) -> Result<ProgramHashes, String> {
-    Ok(leanvm_program_hashes())
 }
 
 #[cfg(test)]
@@ -351,9 +345,28 @@ mod tests {
     }
 
     #[test]
-    fn test_load_program_hashes_returns_leanvm_hashes() {
-        let hashes = load_program_hashes("/unused/executables-dir").unwrap();
-        assert_eq!(hashes, leanvm_program_hashes());
+    fn test_compute_executable_program_hash_requires_canonical_name() {
+        let hashes = leanvm_program_hashes();
+        assert_eq!(
+            compute_executable_program_hash(std::path::Path::new(
+                "tzel_run_shield.executable.json"
+            ))
+            .unwrap(),
+            hashes.shield
+        );
+        assert_eq!(
+            compute_executable_program_hash(std::path::Path::new("run_transfer.executable.json"))
+                .unwrap(),
+            hashes.transfer
+        );
+        assert_eq!(
+            compute_executable_program_hash(std::path::Path::new("unshield")).unwrap(),
+            hashes.unshield
+        );
+        assert!(
+            compute_executable_program_hash(std::path::Path::new("/nonexistent/foo_shield_v0.json"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -461,15 +474,32 @@ mod tests {
 
         let proof = Proof::Stark {
             proof_bytes,
-            output_preimage,
+            output_preimage: output_preimage.clone(),
         };
-        let verifier = DirectProofVerifier::verified(false, leanvm_program_hashes());
+        let verifier = DirectProofVerifier::verified_leanvm(false);
         verifier
             .validate(&proof, CircuitKind::Transfer)
             .expect("leanVM ZK STARK transfer proof should validate");
 
         // Wrong circuit must be rejected.
         assert!(verifier.validate(&proof, CircuitKind::Unshield).is_err());
+
+        // Non-ZK (plain STARK) proof must be rejected by DirectProofVerifier.
+        let plain_proven = leanvm::Prover::new(leanvm::Rate::MIN)
+            .prove(&program, &run.advice)
+            .expect("leanVM plain proof succeeds");
+        let plain_proof = Proof::Stark {
+            proof_bytes: ProofBundle::encode_leanvm_proof_bytes(&plain_proven.proof.to_bytes())
+                .unwrap(),
+            output_preimage,
+        };
+        let err = verifier
+            .validate(&plain_proof, CircuitKind::Transfer)
+            .unwrap_err();
+        assert!(
+            err.contains("non-ZK STARK proof rejected"),
+            "non-ZK proof must be rejected, got: {err}"
+        );
 
         // Tampered output_preimage must be rejected.
         let mut tampered = proof.clone();

@@ -32,6 +32,10 @@ struct Cli {
     #[arg(long)]
     arguments_file: Option<PathBuf>,
 
+    /// Prove a built-in synthetic sample transaction when --arguments-file is omitted
+    #[arg(long)]
+    sample: bool,
+
     /// DEBUG ONLY: non-ZK plain STARK proof
     #[arg(long)]
     debug_single_level: bool,
@@ -58,27 +62,31 @@ fn get_peak_memory_kb() -> Option<u64> {
 }
 
 fn infer_circuit_kind(executable: &Path) -> Result<CircuitKind> {
-    let name = executable
+    let candidate = executable
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("");
-    if name.contains("unshield") {
-        Ok(CircuitKind::Unshield)
-    } else if name.contains("transfer") {
-        Ok(CircuitKind::Transfer)
-    } else if name.contains("shield") {
-        Ok(CircuitKind::Shield)
-    } else {
-        Err(anyhow!(
+        .or_else(|| executable.to_str());
+    match candidate {
+        Some("shield" | "tzel_run_shield.executable.json" | "run_shield.executable.json") => {
+            Ok(CircuitKind::Shield)
+        }
+        Some(
+            "transfer" | "tzel_run_transfer.executable.json" | "run_transfer.executable.json",
+        ) => Ok(CircuitKind::Transfer),
+        Some(
+            "unshield" | "tzel_run_unshield.executable.json" | "run_unshield.executable.json",
+        ) => Ok(CircuitKind::Unshield),
+        _ => Err(anyhow!(
             "cannot infer TzEL circuit kind from executable path '{}'",
             executable.display()
-        ))
+        )),
     }
 }
 
 fn build_leanvm_run(
     executable: &Path,
     args_file: Option<&Path>,
+    allow_sample: bool,
 ) -> Result<(Vec<F>, tzel_host::Run)> {
     let circuit = infer_circuit_kind(executable)?;
     let (preimage_felts, run) = if let Some(path) = args_file {
@@ -92,7 +100,7 @@ fn build_leanvm_run(
             CircuitKind::Unshield => tzel_host::parse_cairo_unshield_args(&args)
                 .map_err(|e| anyhow!("{e}"))?,
         }
-    } else {
+    } else if allow_sample {
         match circuit {
             CircuitKind::Shield => {
                 let (tx, run) = tzel_host::build_exact_shield(tzel_host::ASSET_TEZ);
@@ -150,6 +158,10 @@ fn build_leanvm_run(
                 (pre, run)
             }
         }
+    } else {
+        return Err(anyhow!(
+            "--arguments-file is required (or pass --sample to prove a built-in sample transaction)"
+        ));
     };
     let output_preimage = preimage_felts
         .iter()
@@ -198,8 +210,11 @@ fn main() -> Result<()> {
     eprintln!("Loading circuit from {:?}", cli.executable);
     let t_total = Instant::now();
 
-    let (output_preimage, run) =
-        build_leanvm_run(&cli.executable, cli.arguments_file.as_deref())?;
+    let (output_preimage, run) = build_leanvm_run(
+        &cli.executable,
+        cli.arguments_file.as_deref(),
+        cli.sample,
+    )?;
 
     // INSECURE SANDBOX/CI ONLY (gated by --cfg tzel_insecure_sandbox; no
     // prod build sets it).
@@ -284,20 +299,29 @@ fn prove_and_package(
             .prove(program, &run.advice)
             .map_err(|e| anyhow!("leanVM ZK prove failed: {e}"))?
     };
-    assert_eq!(proven.output, run.expected);
+    if proven.output != run.expected {
+        return Err(anyhow!(
+            "leanVM guest output digest did not match host expected digest"
+        ));
+    }
     let prove_ms = t_prove.elapsed().as_millis();
 
     let raw_proof_bytes = proven.proof.to_bytes();
-    let t_verify = Instant::now();
-    let decoded =
-        LeanProof::from_bytes(&raw_proof_bytes).map_err(|e| anyhow!("decode leanVM proof: {e}"))?;
-    program
-        .verify(proven.output, &decoded)
-        .map_err(|e| anyhow!("leanVM verify failed: {e}"))?;
-    let verify_ms = t_verify.elapsed().as_millis();
-
     let compressed = ProofBundle::encode_leanvm_proof_bytes(&raw_proof_bytes)?;
     let bundle = ProofBundle::from_proof_parts(compressed, output_preimage);
+
+    let t_verify = Instant::now();
+    if debug_single_level {
+        let decoded = LeanProof::from_bytes(&raw_proof_bytes)
+            .map_err(|e| anyhow!("decode leanVM proof: {e}"))?;
+        program
+            .verify(proven.output, &decoded)
+            .map_err(|e| anyhow!("leanVM verify failed: {e}"))?;
+    } else {
+        bundle.verify()?;
+    }
+    let verify_ms = t_verify.elapsed().as_millis();
+
     Ok((bundle, prove_ms, verify_ms, proven.stats.cycles()))
 }
 
@@ -330,13 +354,32 @@ mod tests {
     }
 
     #[test]
-    fn debug_single_level_produces_verifiable_proof_bundle() {
+    fn missing_arguments_file_without_sample_flag_is_rejected() {
         let executable = Path::new("tzel_run_shield.executable.json");
-        let (output_preimage, run) = build_leanvm_run(executable, None).unwrap();
+        let err = build_leanvm_run(executable, None, false)
+            .err()
+            .expect("missing --arguments-file without --sample should fail")
+            .to_string();
+        assert!(
+            err.contains("--arguments-file is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn debug_single_level_bundle_is_rejected_by_zk_verifier() {
+        let executable = Path::new("tzel_run_shield.executable.json");
+        let (output_preimage, run) = build_leanvm_run(executable, None, true).unwrap();
         let program = Program::from_elf(tzel_host::ELF).unwrap();
         let (bundle, _, _, _) =
             prove_and_package(&program, &run, output_preimage, true).unwrap();
         let expected_hash = compute_executable_program_hash(executable).unwrap();
-        verify_bundle_for_program_hash(&bundle, &expected_hash).unwrap();
+        let err = verify_bundle_for_program_hash(&bundle, &expected_hash)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-ZK STARK proof rejected"),
+            "non-ZK debug bundle must be rejected by ProofBundle::verify, got: {err}"
+        );
     }
 }

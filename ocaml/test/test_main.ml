@@ -1710,7 +1710,7 @@ let test_ledger_transfer () =
   let result = Tzel.Ledger.apply_transfer ledger tpub
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:mch in
   Alcotest.(check bool) "transfer ok" true (Result.is_ok result);
-  Alcotest.(check int) "tree size" 5 (Tzel.Ledger.tree_size ledger)
+  Alcotest.(check int) "tree size" 6 (Tzel.Ledger.tree_size ledger)
 
 let test_ledger_transfer_wrong_domain () =
   let auth_domain = Tzel.Hash.hash_tag "domain1" in
@@ -1892,6 +1892,46 @@ let test_ledger_unshield_change_memo_mismatch () =
   Alcotest.(check int) "tree unchanged" 0 (Tzel.Ledger.tree_size ledger);
   Alcotest.(check bool) "nullifier not recorded" false
     (Hashtbl.mem ledger.nullifier_set (Tzel.Felt.to_hex nf))
+
+let test_ledger_unshield_change_2_memo_mismatch () =
+  let auth_domain = Tzel.Hash.hash_tag "domain" in
+  let ledger = Tzel.Ledger.create ~auth_domain in
+  let root = Tzel.Ledger.current_root ledger in
+  let cm_change_2 = Tzel.Hash.hash_tag "change-2" in
+  let cm_fee = Tzel.Hash.hash_tag "fee" in
+  let mch = Tzel.Felt.zero in
+  let nf = Tzel.Hash.hash_tag "nf-change-2-mismatch" in
+  let upub = make_unshield_pub ~auth_domain ~root ~nullifiers:[nf]
+    ~v_pub:1000L ~fee:1L ~recipient_string:test_l1_recipient
+    ~cm_change_2 ~mh_change_2:(Tzel.Felt.of_u64 42) ~cm_fee ~mh_fee:mch () in
+  let result = Tzel.Ledger.apply_unshield ledger
+    ~recipient_string:test_l1_recipient
+    ~memo_ct_hash_change_2:(Tzel.Felt.of_u64 999) upub
+    ~memo_ct_hash_change:mch ~memo_ct_hash_fee:mch in
+  Alcotest.(check bool) "change_2 memo mismatch" true (Result.is_error result);
+  Alcotest.(check withdrawal_list) "no withdrawal queued" []
+    (Tzel.Ledger.withdrawals ledger);
+  Alcotest.(check int) "tree unchanged" 0 (Tzel.Ledger.tree_size ledger);
+  Alcotest.(check bool) "nullifier not recorded" false
+    (Hashtbl.mem ledger.nullifier_set (Tzel.Felt.to_hex nf))
+
+let test_ledger_unshield_accepts_kt1_recipient () =
+  let auth_domain = Tzel.Hash.hash_tag "domain" in
+  let ledger = Tzel.Ledger.create ~auth_domain in
+  let root = Tzel.Ledger.current_root ledger in
+  let mch = Tzel.Felt.zero in
+  let cm_fee = Tzel.Hash.hash_tag "fee-kt1" in
+  let nf = Tzel.Hash.hash_tag "nf-kt1" in
+  let kt1_recipient = "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc" in
+  let upub = make_unshield_pub ~auth_domain ~root ~nullifiers:[nf]
+    ~v_pub:2000L ~fee:1L ~recipient_string:kt1_recipient
+    ~cm_fee () in
+  let result = Tzel.Ledger.apply_unshield ledger
+    ~recipient_string:kt1_recipient upub
+    ~memo_ct_hash_change:mch ~memo_ct_hash_fee:mch in
+  Alcotest.(check bool) "kt1 unshield ok" true (Result.is_ok result);
+  Alcotest.(check withdrawal_list) "kt1 withdrawal queued" [(kt1_recipient, 2000L)]
+    (Tzel.Ledger.withdrawals ledger)
 
 let test_ledger_unshield_fee_memo_mismatch () =
   let auth_domain = Tzel.Hash.hash_tag "domain" in
@@ -2391,7 +2431,7 @@ let test_multi_shield_transfer_unshield () =
   let r = Tzel.Ledger.apply_transfer ledger tpub
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:mch in
   Alcotest.(check bool) "transfer ok" true (Result.is_ok r);
-  Alcotest.(check int) "tree after transfer (4 + 3)" 7
+  Alcotest.(check int) "tree after transfer (4 + 4)" 8
     (Tzel.Ledger.tree_size ledger);
   (* Unshield *)
   let new_root = Tzel.Ledger.current_root ledger in
@@ -2580,6 +2620,8 @@ let () =
       Alcotest.test_case "unshield wrong recipient" `Quick test_ledger_unshield_wrong_recipient;
       Alcotest.test_case "unshield wrong domain" `Quick test_ledger_unshield_wrong_domain;
       Alcotest.test_case "unshield change memo mismatch" `Quick test_ledger_unshield_change_memo_mismatch;
+      Alcotest.test_case "unshield change_2 memo mismatch" `Quick test_ledger_unshield_change_2_memo_mismatch;
+      Alcotest.test_case "unshield accepts KT1 recipient" `Quick test_ledger_unshield_accepts_kt1_recipient;
       Alcotest.test_case "unshield fee memo mismatch" `Quick test_ledger_unshield_fee_memo_mismatch;
       Alcotest.test_case "fa2 derive_asset_id golden" `Quick test_asset_registry_derive_asset_id_golden;
       Alcotest.test_case "fa2 registry compose+lookup" `Quick test_asset_registry_compose_and_lookup;

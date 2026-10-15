@@ -289,6 +289,7 @@ pub fn generate_interop_scenario() -> InteropScenario {
 
     tree.append(transfer_cm_1);
     tree.append(transfer_cm_2);
+    tree.append(ZERO);
     tree.append(transfer_cm_3);
     let root_after_transfer = tree.root();
 
@@ -360,7 +361,7 @@ pub fn generate_interop_scenario() -> InteropScenario {
                 recipient: INTEROP_L1_RECIPIENT.into(),
                 amount: 99_999,
             }],
-            tree_size: 6,
+            tree_size: 7,
             nullifier_count: 2,
         },
         fa2: Some(fa2),

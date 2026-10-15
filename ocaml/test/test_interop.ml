@@ -149,7 +149,9 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     memo_ct_hash_fee = felt_of_hex (json_string (json_field "memo_ct_hash_fee" unshield));
   } in
   begin match Tzel.Ledger.apply_unshield ledger
-                ~recipient_string:recipient unshield_pub
+                ~recipient_string:recipient
+                ~memo_ct_hash_change_2:unshield_pub.memo_ct_hash_change_2
+                unshield_pub
                 ~memo_ct_hash_change:unshield_pub.memo_ct_hash_change
                 ~memo_ct_hash_fee:unshield_pub.memo_ct_hash_fee with
   | Ok () -> ()
@@ -242,7 +244,9 @@ let test_rust_fa2_flow_applies_on_ocaml_ledger () =
     memo_ct_hash_fee = felt_of_hex (json_string (json_field "memo_ct_hash_fee" unshield));
   } in
   begin match Tzel.Ledger.apply_unshield ledger
-                ~recipient_string:recipient unshield_pub
+                ~recipient_string:recipient
+                ~memo_ct_hash_change_2:unshield_pub.memo_ct_hash_change_2
+                unshield_pub
                 ~memo_ct_hash_change:unshield_pub.memo_ct_hash_change
                 ~memo_ct_hash_fee:unshield_pub.memo_ct_hash_fee with
   | Ok () -> ()

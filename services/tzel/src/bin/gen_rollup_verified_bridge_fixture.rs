@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tzel_services::*;
-use tzel_verifier::{load_program_hashes, DirectProofVerifier, ProofBundle as VerifyProofBundle};
+use tzel_verifier::{leanvm_program_hashes, DirectProofVerifier, ProofBundle as VerifyProofBundle};
 
 const FIXTURE_PATH: &str = "tezos/rollup-kernel/testdata/verified_bridge_flow.json";
 const BRIDGE_TICKETER: &str = "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc";
@@ -98,7 +98,7 @@ fn main() -> Result<(), String> {
 
 fn build_fixture() -> Result<VerifiedBridgeFixture, String> {
     let auth_domain = default_auth_domain();
-    let program_hashes = load_program_hashes(executables_dir().to_str().unwrap())?;
+    let program_hashes = leanvm_program_hashes();
     let wallet = load_base_wallet_fixture()?;
 
     let alice_addr_0 = fixture_address(&wallet, 0)?;

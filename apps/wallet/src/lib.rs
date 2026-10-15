@@ -10939,16 +10939,16 @@ fn cmd_shield_rollup(
     // (asset_id, pubkey_hash) — the user's --asset selects which
     // pool to drain.
     //
-    // Phase E.5 (bug #2): the producer-fee output note is permanently
-    // tez (DAL slot publisher liquidity argument), so when the user
-    // shields a non-tez asset the kernel debits `producer_fee` from a
-    // SEPARATE (ASSET_TEZ, pubkey_hash) pool. We mirror that split
-    // here: the asset pool funds (v + tx_fee); the user's tez pool
-    // (if shielding FA2) funds producer_fee. Without this client-side
-    // split, the wallet would either misreport "insufficient
-    // balance" (when the asset pool lacks the extra producer_fee
-    // worth of an unrelated unit) or build a request the kernel
-    // would reject for an empty/underfunded tez pool.
+    // Phase E.5 (bug #2): both the burned rollup `fee` and the
+    // producer-fee output note are denominated in tez (DAL slot publisher
+    // liquidity argument), so when the user shields a non-tez asset the
+    // kernel debits `v` from the (asset_id, pubkey_hash) pool and debits
+    // `fee + producer_fee` from the separate (ASSET_TEZ, pubkey_hash)
+    // pool. We mirror that split here: the asset pool funds `v`; the
+    // user's tez pool (if shielding FA2) funds `fee + producer_fee`.
+    // Without this client-side split, the wallet would either misreport
+    // "insufficient balance" or build a request the kernel would reject
+    // for an empty/underfunded tez pool.
     let is_tez_shield = asset_id == ASSET_TEZ;
     let pool_balance = rollup
         .try_read_deposit_balance(&head_hash, &asset_id, &pubkey_hash)?

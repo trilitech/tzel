@@ -210,8 +210,7 @@ fn test_transfer_5_inputs_proof_roundtrip() {
         proof_bytes: bundle.proof_bytes,
         output_preimage: bundle.output_preimage,
     };
-    DirectProofVerifier::from_executables_dir(false, &executables_dir())
-        .expect("test executables should provide program hashes")
+    DirectProofVerifier::verified_leanvm(false)
         .validate(&proof, CircuitKind::Transfer)
         .expect("n=5 transfer proof should verify with canonical metadata");
 }
@@ -256,8 +255,7 @@ fn test_transfer_mixed_assets_proof_roundtrip() {
         proof_bytes: bundle.proof_bytes,
         output_preimage: bundle.output_preimage,
     };
-    DirectProofVerifier::from_executables_dir(false, &executables_dir())
-        .expect("test executables should provide program hashes")
+    DirectProofVerifier::verified_leanvm(false)
         .validate(&proof, CircuitKind::Transfer)
         .expect("mixed-asset transfer proof should verify with canonical metadata");
 }

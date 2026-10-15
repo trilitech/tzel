@@ -125,6 +125,7 @@ let () =
 
   ignore (Tzel.Merkle.append_with_leaves tree transfer_note_1.cm);
   ignore (Tzel.Merkle.append_with_leaves tree transfer_note_2.cm);
+  ignore (Tzel.Merkle.append_with_leaves tree Tzel.Felt.zero);
   ignore (Tzel.Merkle.append_with_leaves tree transfer_note_3.cm);
   let root_after_transfer = Tzel.Merkle.root_with_leaves tree in
   let bob_nf = Tzel.Note.nullifier bob_addr0.nk_spend transfer_note_2.cm 3 in
@@ -237,7 +238,7 @@ let () =
             "amount", `Int 99_999;
           ];
         ];
-        "tree_size", `Int 6;
+        "tree_size", `Int 7;
         "nullifier_count", `Int 2;
       ];
       "fa2", `Assoc [
