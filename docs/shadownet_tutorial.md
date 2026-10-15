@@ -1,15 +1,7 @@
-# Ushuaianet Tutorial
+# Shadownet Tutorial
 
-This tutorial covers an Ushuaianet `deposit -> shield -> send -> unshield`
-flow against the deployed TzEL rollup using the public Ushuaianet host.
-
-> **Naming note:** a few wallet-CLI subcommands and ops-host file paths
-> still use the legacy `shadownet` spelling (`profile init-shadownet`,
-> `/etc/tzel/shadownet.env`, `ops/shadownet/`, `scripts/shadownet_*.sh`,
-> `--source-alias tzelshadownet`). They are kept as-is in this tutorial
-> because renaming them would touch the wallet CLI surface, the systemd
-> units, and CI tests; that rename is tracked separately. Everywhere else,
-> "Ushuaianet" is the correct name.
+This tutorial covers a Shadownet `deposit -> shield -> send -> unshield`
+flow against the deployed TzEL rollup using the public Shadownet host.
 
 > **Status note:** the protocol uses **deposit pools** keyed by a wallet-
 > derived pubkey hash. The L1 deposit transaction credits the pool keyed
@@ -35,7 +27,7 @@ burn fee.
 
 It assumes:
 
-- a public Ushuaianet host running `octez-node`, `octez-dal-node`,
+- a public Shadownet host running `octez-node`, `octez-dal-node`,
   `octez-smart-rollup-node`, and `tzel-operator`
 - a live rollup `sr1...`
 - a live bridge ticketer `KT1...`
@@ -57,34 +49,35 @@ If `check` reports missing durable note payloads while the tree size is non-zero
 that deployment cannot support private note sync and should be replaced with a
 fresh rollup origination using the committed kernel build.
 
-## 0. Ushuaianet Network Parameters
+## 0. Shadownet Network Parameters
 
-The currently deployed TzEL rollup runs on **Ushuaianet**. The L1 / DAL /
+The currently deployed TzEL rollup runs on **Shadownet**. The L1 / DAL /
 explorer endpoints below are stable; the rollup address and bridge ticketer
-are tied to a specific origination and will change if Ushuaianet is
+are tied to a specific origination and will change if Shadownet is
 re-originated.
 
 | Parameter | Value |
 |---|---|
-| Octez network identifier | `ushuaianet` |
-| Public L1 RPC | `https://rpc.ushuaianet.teztnets.com` |
-| L1 snapshot (rolling) | `https://snapshots.tzinit.org/ushuaianet/rolling` |
-| DAL bootstrap P2P | `dal.ushuaianet.teztnets.com:11732` |
-| Faucet | `https://faucet.ushuaianet.teztnets.com` |
-| TzKT explorer | `https://ushuaianet.tzkt.io` |
-| TzEL rollup address | `sr193pvbiGEhrxYnhgKcpaiWVRJmWjWYCaqH` |
-| TzEL bridge ticketer | `KT1F8CR34VPaiMVYwSbucpdEYQ2itTJsqV9A` |
+| Octez network identifier | `shadownet` |
+| Public L1 RPC | `https://rpc.shadownet.teztnets.com` |
+| L1 snapshot (rolling) | `https://snapshots.tzinit.org/shadownet/rolling` |
+| DAL bootstrap P2P | `dal.shadownet.teztnets.com:11732` |
+| Faucet | `https://faucet.shadownet.teztnets.com` |
+| TzKT explorer | `https://shadownet.tzkt.io` |
+| TzEL rollup address | `sr1Psv7PdY533c4njAW4qg2acbMhi8goqxcK` |
+| TzEL bridge ticketer | `KT1RCZzNe8G4VQ94YWqb6Xz4q9WGWVdMWSB4` |
 | Default DAL fee (mutez) | `100000` |
 | DAL fee address | full PaymentAddress JSON — see §5 |
 
 If you originated your own rollup, substitute your own `sr1…` / `KT1…`
 values for the canonical ones above.
 
-> **Withdrawal period:** Ushuaianet's commitment period is short — withdrawals
-> become executable on L1 in roughly 6 to 7 minutes after the unshield batch
-> is finalized, vs. ~14 days on Shadownet. The wallet's `unshield` command
-> emits the L1 outbox transfer; you still need to call the rollup's
-> `execute_outbox_message` once the period elapses (covered in §10).
+> **Withdrawal period:** Shadownet's refutation (challenge) window is long.
+> `smart_rollup_challenge_window_in_blocks` is `201600` at a 6-second block
+> time, so an unshield's L1 outbox transfer only becomes executable
+> **~14 days** after the commitment covering it is cemented. The wallet's
+> `unshield` command emits the L1 outbox transfer immediately; you then call
+> the rollup's `execute_outbox_message` once the window elapses (covered in §10).
 
 ## 1. Install The Required Binaries
 
@@ -121,23 +114,21 @@ sudo cp ops/shadownet/shadownet.env.example /etc/tzel/shadownet.env
 
 Edit `/etc/tzel/shadownet.env`:
 
-- set `TZEL_ROLLUP_ADDRESS=sr193pvbiGEhrxYnhgKcpaiWVRJmWjWYCaqH` (or your
+- set `TZEL_ROLLUP_ADDRESS=sr1Psv7PdY533c4njAW4qg2acbMhi8goqxcK` (or your
   re-originated value — see §0)
-- set `TZEL_BRIDGE_TICKETER=KT1F8CR34VPaiMVYwSbucpdEYQ2itTJsqV9A` (or your
+- set `TZEL_BRIDGE_TICKETER=KT1RCZzNe8G4VQ94YWqb6Xz4q9WGWVdMWSB4` (or your
   re-originated ticketer)
-- set `TZEL_OCTEZ_NETWORK=ushuaianet` (the env file template still shows the
-  old default — override it explicitly so `octez-node config init` and
-  `--network` pick up Ushuaianet)
-- set `TZEL_L1_SNAPSHOT_URL=https://snapshots.tzinit.org/ushuaianet/rolling`
-- set `TZEL_DAL_BOOTSTRAP_PEER=dal.ushuaianet.teztnets.com:11732`
+- set `TZEL_OCTEZ_NETWORK=shadownet` so `octez-node config init` and
+  `--network` resolve Shadownet
+- set `TZEL_L1_SNAPSHOT_URL=https://snapshots.tzinit.org/shadownet/rolling`
+- set `TZEL_DAL_BOOTSTRAP_PEER=dal.shadownet.teztnets.com:11732`
 - set `TZEL_DAL_PUBLIC_ADDR=<PUBLIC_IP_OR_DNS>:11732`
 - make sure `TZEL_SOURCE_ALIAS` matches the account you will fund and use
 - set `TZEL_OPERATOR_BEARER_TOKEN_FILE=/etc/tzel/operator-bearer-token`
 
-> The legacy `ops/shadownet/shadownet.env.example` template predates the
-> Ushuaianet rename and has Shadownet-era defaults. The `TZEL_OCTEZ_NETWORK`,
-> `TZEL_L1_SNAPSHOT_URL`, and `TZEL_DAL_BOOTSTRAP_PEER` overrides above are
-> what flip the box onto Ushuaianet without renaming the file.
+The `ops/shadownet/shadownet.env.example` template is the Shadownet operator
+template; it does not pre-define `TZEL_OCTEZ_NETWORK`, `TZEL_L1_SNAPSHOT_URL`,
+or `TZEL_DAL_BOOTSTRAP_PEER`, so set those three explicitly as above.
 
 Initialize state:
 
@@ -145,8 +136,8 @@ Initialize state:
 sudo ./scripts/init_shadownet_operator_box.sh /etc/tzel/shadownet.env
 ```
 
-Import a funded Ushuaianet key (top up via the faucet at
-`https://faucet.ushuaianet.teztnets.com` if needed — Ushuaianet baking
+Import a funded Shadownet key (top up via the faucet at
+`https://faucet.shadownet.teztnets.com` if needed — Shadownet baking
 needs ~6000 ꜩ; the L1 account `tzel-operator` injects from only needs
 enough to cover gas plus the bridge ticket amounts you intend to
 deposit):
@@ -173,24 +164,24 @@ If this machine is behind a firewall, open:
 
 These commands are one-time per deployed rollup. They must be run from a
 checkout of `trilitech/tzel` at the kernel commit currently deployed on
-Ushuaianet (`558c2b2` — i.e. `main` HEAD as of the Ushuaianet bring-up).
-A divergent kernel will produce a different `auth_domain` /
-`*_program_hash`, and the `configure-verifier` payload below would silently
-mismatch the running rollup.
+Shadownet (`0bbd0660176432ccfad698b257525d8c3076615f` — the pinned build
+commit for this deployment). A divergent kernel will produce a different
+`auth_domain` / `*_program_hash`, and the `configure-verifier` payload below
+would silently mismatch the running rollup.
 
 ```bash
-git fetch origin && git checkout 558c2b2
+git fetch origin && git checkout 0bbd0660176432ccfad698b257525d8c3076615f
 ```
 
-Set the shell variables first. Use the canonical Ushuaianet values from §0
+Set the shell variables first. Use the canonical Shadownet values from §0
 (or substitute your own re-originated values):
 
 ```bash
 export OPERATOR_URL=http://127.0.0.1:8787
 export OPERATOR_BEARER_TOKEN="$(cat /etc/tzel/operator-bearer-token)"
 
-export ROLLUP_ADDRESS=sr193pvbiGEhrxYnhgKcpaiWVRJmWjWYCaqH
-export BRIDGE_TICKETER=KT1F8CR34VPaiMVYwSbucpdEYQ2itTJsqV9A
+export ROLLUP_ADDRESS=sr1Psv7PdY533c4njAW4qg2acbMhi8goqxcK
+export BRIDGE_TICKETER=KT1RCZzNe8G4VQ94YWqb6Xz4q9WGWVdMWSB4
 ```
 
 Extract the verifier configuration values from the checked-in verified fixture:
@@ -249,14 +240,12 @@ For a single-command end-to-end smoke on a prepared public box, see:
 TZEL_SMOKE_L1_RECIPIENT=tz1REPLACE_ME ./scripts/shadownet_live_e2e_smoke.sh /etc/tzel/shadownet.env
 ```
 
-(The script name still has the legacy `shadownet_` prefix — see the naming
-note at the top of this file. It uses whatever network is configured in
-`shadownet.env`, so once the env file points at Ushuaianet the script
-exercises Ushuaianet.)
+(The script uses whatever network is configured in `shadownet.env`, so with
+the env file pointing at Shadownet it exercises Shadownet.)
 
 ## 4. Decide Where To Run The Wallet
 
-Simplest option: run the wallet on the public Ushuaianet host itself.
+Simplest option: run the wallet on the public Shadownet host itself.
 
 If you want to run it from another machine, create SSH tunnels first:
 
@@ -280,8 +269,8 @@ export OPERATOR_BEARER_TOKEN="$(cat /etc/tzel/operator-bearer-token)"
 Use a dedicated working directory:
 
 ```bash
-mkdir -p /tmp/tzel-ushuaianet-live
-cd /tmp/tzel-ushuaianet-live
+mkdir -p /tmp/tzel-shadownet-live
+cd /tmp/tzel-shadownet-live
 ```
 
 Create wallet files:
@@ -298,33 +287,32 @@ Create wallet files:
 > hold. Wallets pick a publisher to pay by setting `dal_fee_address` to
 > the address that publisher has advertised.
 >
-> For Ushuaianet, the DAL slot publisher running on the public host
+> For Shadownet, the DAL slot publisher running on the public host
 > advertises the PaymentAddress in
-> [`docs/ushuaianet/operator-fee-address.json`](ushuaianet/operator-fee-address.json) — copy
+> [`docs/shadownet/operator-fee-address.json`](shadownet/operator-fee-address.json) — copy
 > it into your working directory and point your wallet at it. Failure
 > modes are covered in §12.
 
-Copy the DAL fee address advertised by the public Ushuaianet host (from
+Copy the DAL fee address advertised by the public Shadownet host (from
 your `tzel` checkout):
 
 ```bash
-cp <tzel-checkout>/docs/ushuaianet/operator-fee-address.json ushuaianet-operator-fee-address.json
+cp <tzel-checkout>/docs/shadownet/operator-fee-address.json shadownet-operator-fee-address.json
 ```
 
 Or fetch it directly:
 
 ```bash
 curl -fsSL \
-  https://raw.githubusercontent.com/trilitech/tzel/main/docs/ushuaianet/operator-fee-address.json \
-  -o ushuaianet-operator-fee-address.json
+  https://raw.githubusercontent.com/trilitech/tzel/main/docs/shadownet/operator-fee-address.json \
+  -o shadownet-operator-fee-address.json
 ```
 
 (If you are running your own DAL slot publisher, generate the equivalent
 file from its DAL-fee wallet — `wallet receive --json` followed by
 `export-view`, in that order from the same wallet state.)
 
-Create wallet profiles for Ushuaianet (the CLI subcommand is still spelled
-`init-shadownet` — see the naming note at the top of this file):
+Create wallet profiles for Shadownet (the CLI subcommand is `init-shadownet`):
 
 ```bash
 /usr/local/bin/tzel-wallet \
@@ -334,7 +322,7 @@ Create wallet profiles for Ushuaianet (the CLI subcommand is still spelled
   --rollup-address "$ROLLUP_ADDRESS" \
   --bridge-ticketer "$BRIDGE_TICKETER" \
   --dal-fee 100000 \
-  --dal-fee-address ushuaianet-operator-fee-address.json \
+  --dal-fee-address shadownet-operator-fee-address.json \
   --operator-url http://127.0.0.1:8787 \
   --operator-bearer-token "$OPERATOR_BEARER_TOKEN" \
   --source-alias "$SOURCE_ALIAS" \
@@ -347,7 +335,7 @@ Create wallet profiles for Ushuaianet (the CLI subcommand is still spelled
   --rollup-address "$ROLLUP_ADDRESS" \
   --bridge-ticketer "$BRIDGE_TICKETER" \
   --dal-fee 100000 \
-  --dal-fee-address ushuaianet-operator-fee-address.json \
+  --dal-fee-address shadownet-operator-fee-address.json \
   --operator-url http://127.0.0.1:8787 \
   --operator-bearer-token "$OPERATOR_BEARER_TOKEN" \
   --source-alias "$SOURCE_ALIAS" \
@@ -356,7 +344,7 @@ Create wallet profiles for Ushuaianet (the CLI subcommand is still spelled
 
 Notes:
 
-- `dal_fee_address` is the PaymentAddress that Ushuaianet's DAL slot
+- `dal_fee_address` is the PaymentAddress that Shadownet's DAL slot
   publisher advertises (full record with `ek_v` and `ek_d`, not just
   the auth fields). Each shield/transfer/unshield encrypts the DAL
   fee note to this address — see the callout above. `--dal-fee-address`
@@ -503,7 +491,7 @@ Acceptance:
 
 ## 10. Unshield Bob's Funds Back To L1
 
-Pick an L1 recipient (Bob's public Ushuaianet address, or any tz/KT1 you
+Pick an L1 recipient (Bob's public Shadownet address, or any tz/KT1 you
 control) and unshield. The wallet emits an L1 outbox transfer; the rollup's
 commitment period must elapse before it can be executed.
 
@@ -529,9 +517,11 @@ Track the submission:
 ```
 
 Once the submission reaches `submitted_to_l1`, the outbox message is queued.
-**On Ushuaianet the commitment period is short — wait roughly 6 to 7 minutes**
-for the rollup to publish the executable commitment, then dispatch the
-outbox message:
+**On Shadownet the refutation window is ~14 days** (`smart_rollup_challenge_window_in_blocks`
+is `201600` at 6-second blocks), so `execute-outbox` only succeeds after the
+commitment covering your unshield has been cemented — roughly two weeks after the
+batch finalizes. Until then it returns "commitment not yet finalized". Once the
+window has elapsed, dispatch the outbox message:
 
 ```bash
 /usr/local/bin/tzel-wallet \
@@ -546,7 +536,7 @@ execute_outbox_message ...` as a manual fallback.)
 Verify the L1 transfer landed:
 
 ```bash
-curl -fsS "https://rpc.ushuaianet.teztnets.com/chains/main/blocks/head/context/contracts/${L1_RECIPIENT}/balance"
+curl -fsS "https://rpc.shadownet.teztnets.com/chains/main/blocks/head/context/contracts/${L1_RECIPIENT}/balance"
 ```
 
 ## 11. Evidence To Keep
@@ -557,7 +547,7 @@ For the first successful live run, save:
 - the submission ids returned by `tzel-operator` for `shield`, `send`, and `unshield`
 - the submission status JSON for each
 - the rollup address and bridge ticketer
-- TzKT links for the L1 ops (https://ushuaianet.tzkt.io/<op_hash>)
+- TzKT links for the L1 ops (https://shadownet.tzkt.io/<op_hash>)
 - the L1 outbox-execution op hash
 - wallet `balance` and `sync` output before and after
 
@@ -576,18 +566,18 @@ For the first successful live run, save:
 - Shield rejected with "fee below minimum":
   - the rollup's `required_tx_fee` ticked up since the wallet quoted it. Re-run shield (the wallet re-quotes on each invocation); regenerate the proof if necessary.
 - `tzel-operator` returns `502 DAL fee note is not detectable by the configured operator fee address`:
-  - `dal_fee_address` does not match the address Ushuaianet's DAL slot publisher advertises. Re-run `profile init-shadownet` with `--dal-fee-address ushuaianet-operator-fee-address.json` (or patch `wallet.json.network.json` in place — the field is embedded JSON).
+  - `dal_fee_address` does not match the address Shadownet's DAL slot publisher advertises. Re-run `profile init-shadownet` with `--dal-fee-address shadownet-operator-fee-address.json` (or patch `wallet.json.network.json` in place — the field is embedded JSON).
 - `execute-outbox` rejected as "commitment not yet finalized":
-  - the Ushuaianet commitment period (~6.5 min) has not elapsed. Wait and retry.
+  - the Shadownet refutation (challenge) window (~14 days) has not elapsed. Wait and retry.
 
 ## 13. Minimal Success Bar
 
-We can say "Ushuaianet shielded tx is working" when all of the following are true:
+We can say "Shadownet shielded tx is working" when all of the following are true:
 
 - one live `deposit -> shield` succeeds
 - one live `send` succeeds (Bob can independently sync and observe the received note)
 - one live `unshield -> execute-outbox` round-trip lands the funds back on L1
-- the flow is reproducible on the public Ushuaianet host from a clean wallet directory
+- the flow is reproducible on the public Shadownet host from a clean wallet directory
 
 ## 14. Multiasset / FA2 Flows
 

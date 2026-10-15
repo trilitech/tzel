@@ -4234,6 +4234,11 @@ enum UserCmd {
     Balance,
     /// Check whether the wallet profile, operator, and rollup node are usable.
     Check,
+    /// Confirm the wallet's network profile points at the rollup the live
+    /// rollup node actually serves. A one-shot cross-check (no wallet-state
+    /// reads) the daemon/entrypoint can run at startup to surface a
+    /// profile/rollup mismatch up front instead of only mid-deposit.
+    CheckNetwork,
     /// Deposit tez on L1 into a fresh self-owned pool. The wallet
     /// allocates a new auth-tree address, derives a deterministic blind,
     /// computes `pubkey_hash = H(0x04, auth_domain, auth_root,
@@ -4600,6 +4605,7 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         | UserCmd::Balance
         | UserCmd::Addresses
         | UserCmd::Check
+        | UserCmd::CheckNetwork
         | UserCmd::Status { .. }
         | UserCmd::ExportDetect { .. }
         | UserCmd::ExportView { .. }
@@ -4636,6 +4642,7 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Sync { .. } => "sync",
         UserCmd::Balance => "balance",
         UserCmd::Check => "check",
+        UserCmd::CheckNetwork => "check-network",
         UserCmd::Deposit { .. } => "deposit",
         UserCmd::RecoverDeposits { .. } => "recover-deposits",
         UserCmd::Shield { .. } => "shield",
@@ -4674,6 +4681,10 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Check => {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_wallet_check(&cli.wallet, &profile)
+        }
+        UserCmd::CheckNetwork => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            cmd_check_network(&profile)
         }
         UserCmd::Deposit {
             amount,
@@ -6045,7 +6056,7 @@ fn apply_scan_feed_finalize(
     w: &mut WalletFile,
     seen_cms: &[F],
     nullifiers: impl IntoIterator<Item = F>,
-    pool_balances: &std::collections::HashMap<(F, F), u64>,
+    pool_balances: &std::collections::HashMap<F, u64>,
 ) -> ScanSummary {
     let mut known_cms: std::collections::HashSet<F> =
         w.notes.iter().map(|n| n.cm).collect();
@@ -6061,8 +6072,7 @@ fn apply_scan_feed_finalize(
 
     let before_pools = w.pending_deposits.len();
     w.pending_deposits.retain(|p| {
-        let drained_on_chain =
-            pool_balances.get(&(p.asset_id, p.pubkey_hash)).copied().unwrap_or(0) == 0;
+        let drained_on_chain = pool_balances.get(&p.pubkey_hash).copied().unwrap_or(0) == 0;
         let cm_observed = p
             .shielded_cm
             .as_ref()
@@ -9217,6 +9227,25 @@ fn print_deposit_pool_summary(
             drained_pending_scan
         );
     }
+}
+
+/// Standalone preflight: confirm the wallet's network profile points at the
+/// rollup the live rollup node actually serves. Reuses the same
+/// `ensure_rollup_address_matches` cross-check the deposit/shield flows run,
+/// so the daemon/entrypoint can surface a profile/rollup mismatch at startup
+/// instead of only mid-deposit. No wallet-state reads — just the one RPC.
+fn cmd_check_network(profile: &WalletNetworkProfile) -> Result<(), String> {
+    let rollup = RollupRpc::new(profile);
+    rollup.ensure_rollup_address_matches()?;
+    user_out!(
+        json: {
+            "network" => &profile.network,
+            "rollup_address" => &profile.rollup_address,
+        },
+        human: "OK: wallet profile '{}' matches rollup node at {}",
+        profile.network, profile.rollup_address
+    );
+    Ok(())
 }
 
 fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), String> {
@@ -13230,6 +13259,47 @@ mod network_profile_tests {
     }
 
     #[test]
+    fn cmd_check_network_ok_when_rollup_node_serves_the_profile_rollup() {
+        // The standalone `check-network` preflight only cross-checks the
+        // served rollup address against the profile — no wallet-state reads.
+        // When the node serves the rollup the profile pins, it succeeds so
+        // the daemon/entrypoint can gate startup on it.
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([(
+            "/global/smart_rollup_address".into(),
+            // Matches `rollup_profile_for_url`'s pinned `rollup_address`.
+            (200, "\"sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP\"".into()),
+        )]));
+
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        assert_eq!(profile.rollup_address, "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP");
+
+        cmd_check_network(&profile).expect("check-network must accept a matching rollup node");
+    }
+
+    #[test]
+    fn cmd_check_network_fails_when_rollup_node_serves_a_different_rollup() {
+        // Mirror of the deposit-path guard: a node serving a different
+        // rollup than the profile pins must be rejected with the same clear
+        // mismatch error, so a wrong `rollup_node_url` is caught at startup.
+        let other_address = "sr1Ghp7iJC91k5tukgzMQTfUbY2t8ssVaHJk";
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([(
+            "/global/smart_rollup_address".into(),
+            (200, format!("\"{}\"", other_address)),
+        )]));
+
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        assert_ne!(profile.rollup_address, other_address);
+
+        let err = cmd_check_network(&profile)
+            .expect_err("check-network must reject a wrong-rollup mock node");
+        assert!(
+            err.contains("rollup-node served address")
+                && err.contains("does not match wallet profile.rollup_address"),
+            "expected rollup-address mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
     fn cmd_recover_deposits_finds_funded_pool_from_seed_alone() {
         // After wallet-file loss the user keeps the seed. The new
         // `tzel-wallet recover-deposits` command brute-forces the
@@ -14834,12 +14904,7 @@ mod network_profile_tests {
         use std::collections::HashMap;
         let pkh: F = felt_tag(b"pool-pinned-test");
         let pkh_hex = hex::encode(pkh);
-        let key = format!(
-            "{}{}/{}",
-            DURABLE_DEPOSIT_BALANCE_PREFIX,
-            hex::encode(ASSET_TEZ),
-            pkh_hex
-        );
+        let key = format!("{}{}", DURABLE_DEPOSIT_BALANCE_PREFIX, pkh_hex);
 
         let block_old = "BLpinnedold";
         let block_new = "BLpinnednew";
@@ -14889,7 +14954,6 @@ mod network_profile_tests {
         let profile = super::tests::rollup_profile_for_url(&base_url);
         let rpc = RollupRpc::new(&profile);
         let pending = vec![PendingDeposit {
-            asset_id: ASSET_TEZ,
             pubkey_hash: pkh,
             blind: felt_tag(b"pool-pinned-blind"),
             address_index: 0,
@@ -14902,7 +14966,7 @@ mod network_profile_tests {
         let pinned = rpc
             .load_pool_balances_at_block(block_old, &pending)
             .expect("load_pool_balances_at_block must succeed");
-        let pinned_value = pinned.get(&(ASSET_TEZ, pkh)).copied();
+        let pinned_value = pinned.get(&pkh).copied();
         assert_eq!(
             pinned_value,
             Some(value_old),
@@ -15070,7 +15134,6 @@ mod network_profile_tests {
         wallet.scanned = 0;
         let pkh = felt_tag(b"finalize-pin-pool-pkh");
         wallet.pending_deposits.push(PendingDeposit {
-            asset_id: ASSET_TEZ,
             pubkey_hash: pkh,
             blind: felt_tag(b"finalize-pin-blind"),
             address_index: 0,
@@ -15099,12 +15162,7 @@ mod network_profile_tests {
 
         let pkh_hex = hex::encode(pkh);
         let pool_key =
-            format!(
-            "{}{}/{}",
-            DURABLE_DEPOSIT_BALANCE_PREFIX,
-            hex::encode(ASSET_TEZ),
-            pkh_hex
-        );
+            format!("{}{}", DURABLE_DEPOSIT_BALANCE_PREFIX, pkh_hex);
         let value_old: u64 = 1_000_000;
         let tree_size: u64 = 1;
 
@@ -15293,7 +15351,6 @@ mod network_profile_tests {
         let mut wallet = super::tests::test_wallet(1);
         let pkh = felt_tag(b"finalize-pin-pool-pkh-fixture");
         wallet.pending_deposits.push(PendingDeposit {
-            asset_id: ASSET_TEZ,
             pubkey_hash: pkh,
             blind: felt_tag(b"finalize-pin-blind-fixture"),
             address_index: 0,
@@ -15305,12 +15362,7 @@ mod network_profile_tests {
 
         let pkh_hex = hex::encode(pkh);
         let pool_key =
-            format!(
-            "{}{}/{}",
-            DURABLE_DEPOSIT_BALANCE_PREFIX,
-            hex::encode(ASSET_TEZ),
-            pkh_hex
-        );
+            format!("{}{}", DURABLE_DEPOSIT_BALANCE_PREFIX, pkh_hex);
         let value_old: u64 = 1_000_000;
 
         let mut routes: HashMap<String, (u16, String)> = HashMap::new();
@@ -15406,7 +15458,7 @@ mod network_profile_tests {
             .load_pool_balances_at_head(&wallet.pending_deposits)
             .expect("regression helper succeeds");
         assert_eq!(
-            drained_pool.get(&(ASSET_TEZ, pkh)).copied().unwrap_or(0),
+            drained_pool.get(&pkh).copied().unwrap_or(0),
             0,
             "regression read at block_new must see drained pool"
         );
