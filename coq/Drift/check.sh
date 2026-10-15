@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# coq/Drift/check.sh — fail if any Cairo source file's SHA-256 differs
+# coq/Drift/check.sh — fail if any circuit source file's SHA-256 differs
 # from the SHA pinned in coq/MANIFEST.toml. CI runs this on every
-# coq/** or cairo/src/**.cairo change.
+# coq/** or third_party/leanvm/programs/tzel/guest/src/** change.
 #
-# Drift means: the Cairo source has moved out of sync with its Coq
+# Drift means: the circuit source has moved out of sync with its Coq
 # mirror. Resolving drift requires (a) re-reading the affected Coq
-# mirror and updating it if the Cairo change had semantic impact, and
+# mirror and updating it if the circuit change had semantic impact, and
 # (b) bumping the SHA in MANIFEST.toml in the same commit.
 
 set -euo pipefail
@@ -26,28 +26,30 @@ with open(manifest_path, "rb") as f:
 mirrors = data.get("mirror", [])
 failures = []
 for entry in mirrors:
-    cairo_path = f"{repo_root}/{entry['cairo']}"
+    rel_path = entry.get("source") or entry["cairo"]
+    source_path = f"{repo_root}/{rel_path}"
     expected = entry["sha256"]
-    with open(cairo_path, "rb") as f:
+    with open(source_path, "rb") as f:
         actual = hashlib.sha256(f.read()).hexdigest()
     if actual != expected:
-        failures.append((entry["cairo"], expected, actual, entry["coq"]))
+        failures.append((rel_path, expected, actual, entry["coq"]))
 
 if failures:
-    print("DRIFT DETECTED — Cairo source has changed since the manifest was last")
+    print("DRIFT DETECTED — circuit source has changed since the manifest was last")
     print("updated; the Coq model may no longer reflect the circuit it claims to")
     print("model.")
     print()
-    for cairo, expected, actual, coq_files in failures:
-        print(f"  {cairo}")
+    for src, expected, actual, coq_files in failures:
+        print(f"  {src}")
         print(f"    manifest SHA-256: {expected}")
         print(f"    current SHA-256:  {actual}")
         print(f"    coq mirror(s):    {', '.join(coq_files)}")
     print()
-    print("Action: re-read each affected Coq mirror against the new Cairo source,")
+    print("Action: re-read each affected Coq mirror against the new circuit source,")
     print("update the mirror if the change had semantic impact, and bump the SHA")
     print("in coq/MANIFEST.toml in the same commit.")
     sys.exit(1)
 
-print(f"OK: all {len(mirrors)} Cairo↔Coq mirrors match.")
+print(f"OK: all {len(mirrors)} circuit↔Coq mirrors match.")
 PY
+
