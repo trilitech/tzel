@@ -174,6 +174,7 @@ fn commit_for_address_asset(address: &PaymentAddress, v: u64, rseed: &F, asset: 
     commit(&address.d_j, v, asset, &rcm, &otag)
 }
 
+#[cfg(test)]
 fn commit_for_address(address: &PaymentAddress, v: u64, rseed: &F) -> F {
     commit_for_address_asset(address, v, rseed, &ASSET_TEZ)
 }

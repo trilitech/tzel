@@ -271,7 +271,7 @@ print(data["auth_domain"])
 print(data["shield_program_hash"])
 print(data["transfer_program_hash"])
 print(data["unshield_program_hash"])
-print(data["shield_deposit_id"])
+print(data["shield_pool_recipient"])
 print(data["shield_amount"])
 print(data["shield_total_debit"])
 print(data["shield_tree_size_after"])
@@ -366,6 +366,9 @@ read_rollup_u64() {
 import json, string, sys
 
 raw = sys.stdin.read().strip()
+if raw in ("", "null"):
+    print(0)
+    raise SystemExit(0)
 payload = json.loads(raw) if raw.startswith("\"") else raw
 payload = payload.strip()
 if payload.startswith(("0x", "0X")):
@@ -590,12 +593,12 @@ main() {
   local fixture_fields
   fixture_fields="$(extract_fixture_fields "$(fixture_metadata)")"
   mapfile -t fixture_lines <<<"${fixture_fields}"
-  local auth_domain_hex shield_hash_hex transfer_hash_hex unshield_hash_hex shield_deposit_id shield_amount shield_total_debit shield_tree_size_after
+  local auth_domain_hex shield_hash_hex transfer_hash_hex unshield_hash_hex shield_pool_recipient shield_amount shield_total_debit shield_tree_size_after
   auth_domain_hex="${fixture_lines[0]}"
   shield_hash_hex="${fixture_lines[1]}"
   transfer_hash_hex="${fixture_lines[2]}"
   unshield_hash_hex="${fixture_lines[3]}"
-  shield_deposit_id="${fixture_lines[4]}"
+  shield_pool_recipient="${fixture_lines[4]}"
   shield_amount="${fixture_lines[5]}"
   shield_total_debit="${fixture_lines[6]}"
   shield_tree_size_after="${fixture_lines[7]}"
@@ -612,10 +615,11 @@ main() {
   publish_payload_via_dal_and_inject_pointer "${rollup_address}" configure-bridge "${bridge_payload_file}"
   await_bridge_ticketer "${ticketer_address}"
 
-  deposit_to_bridge "${ticketer_address}" "${rollup_address}" "${shield_deposit_id}" "${shield_total_debit}"
+  deposit_to_bridge "${ticketer_address}" "${rollup_address}" "${shield_pool_recipient}" "${shield_total_debit}"
 
+  local tez_asset_hex="0000000000000000000000000000000000000000000000000000000000000000"
   local balance_key
-  balance_key="/tzel/v1/state/balances/by-key/$(printf '%s' "${shield_deposit_id}" | xxd -ps -c 0)"
+  balance_key="/tzel/v1/state/deposits/balance/${tez_asset_hex}/${shield_pool_recipient#pool:}"
   await_rollup_u64 "${balance_key}" "${shield_total_debit}" "public bridge balance"
 
   local shield_payload_file

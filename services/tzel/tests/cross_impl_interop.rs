@@ -252,18 +252,18 @@ fn test_ocaml_fa2_flow_applies_on_rust_ledger() {
 
     let mut ledger = Ledger::with_auth_domain(scenario.auth_domain);
 
-    // Dual-pool funding: the (fa2, pubkey) pool covers v + fee; the
-    // (ASSET_TEZ, pubkey) pool covers producer_fee (producer fees are
-    // permanently tez).
+    // Dual-pool funding: the (fa2, pubkey) pool covers v; the
+    // (ASSET_TEZ, pubkey) pool covers fee + producer_fee (rollup fees
+    // and producer fees are permanently tez).
     let (pubkey_hash, shield_req_built) =
         shield_req(&fa2.shield, &fa2.asset_id, &scenario.auth_domain);
     let recipient = deposit_recipient_string(&pubkey_hash);
     ledger
-        .deposit_asset(&fa2.asset_id, &recipient, fa2.shield.v + fa2.shield.fee)
+        .deposit_asset(&fa2.asset_id, &recipient, fa2.shield.v)
         .expect("fa2 pool");
     ledger
-        .deposit(&recipient, fa2.shield.producer_fee)
-        .expect("tez pool for producer fee");
+        .deposit(&recipient, fa2.shield.fee + fa2.shield.producer_fee)
+        .expect("tez pool for fee + producer fee");
 
     let shield_resp = ledger.shield(&shield_req_built).expect("fa2 shield");
     assert_eq!(shield_resp.cm, fa2.shield.cm);

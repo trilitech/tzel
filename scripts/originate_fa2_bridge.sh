@@ -112,8 +112,9 @@ ORIG_OUT="$(octez-client originate contract "$ORIG_ALIAS" \
     exit 1
   }
 
-# Extract the KT1 address from the origination receipt.
-KT1="$(echo "$ORIG_OUT" | grep -oE 'KT1[a-km-zA-HJ-NP-Z1-9]{33}' | head -1 || true)"
+# Extract the newly originated KT1 address from the origination receipt
+# (use tail -1 so we do not match $FA2_CONTRACT_ADDR echoed in the init storage).
+KT1="$(echo "$ORIG_OUT" | grep -oE 'KT1[a-km-zA-HJ-NP-Z1-9]{33}' | tail -1 || true)"
 if [[ -z "$KT1" ]]; then
   echo "error: could not extract KT1 from octez-client output:" >&2
   echo "$ORIG_OUT" >&2

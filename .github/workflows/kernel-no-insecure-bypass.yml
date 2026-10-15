@@ -33,10 +33,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - name: Set up Rust nightly
+      - name: Set up Rust
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master @ 2026-04-30
         with:
-          toolchain: nightly-2025-07-14
+          toolchain: 1.93.0
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo registry + target
@@ -49,7 +49,7 @@ jobs:
           # Scrub every channel that can enable the skip: the global RUSTFLAGS
           # aliases AND TZEL_INSECURE_SANDBOX (read by the kernel's build.rs).
           unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS TZEL_INSECURE_SANDBOX
-          cargo +nightly-2025-07-14 build --release \
+          cargo build --release \
             -p tzel-rollup-kernel --target wasm32-unknown-unknown
 
       - name: Assert the production WASM carries NO insecure-bypass marker
@@ -68,7 +68,7 @@ jobs:
         run: |
           # Use the production trigger (TZEL_INSECURE_SANDBOX, read by build.rs),
           # so this exercises the SAME path the sandbox lane uses — not RUSTFLAGS.
-          TZEL_INSECURE_SANDBOX=1 cargo +nightly-2025-07-14 build --release \
+          TZEL_INSECURE_SANDBOX=1 cargo build --release \
             -p tzel-rollup-kernel --target wasm32-unknown-unknown
           wasm=target/wasm32-unknown-unknown/release/tzel_rollup_kernel.wasm
           if ! grep -a -q 'TZEL_INSECURE_SANDBOX_PROOF_SKIP' "$wasm"; then

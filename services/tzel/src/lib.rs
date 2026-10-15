@@ -231,15 +231,6 @@ fn load_program_hashes(reprove_bin: &str, executables_dir: &str) -> Result<Progr
     let transfer = base.join(CircuitKind::Transfer.executable_filename());
     let unshield = base.join(CircuitKind::Unshield.executable_filename());
 
-    for path in [&shield, &transfer, &unshield] {
-        if !path.exists() {
-            return Err(format!(
-                "missing Cairo executable required for verified mode: {}",
-                path.display()
-            ));
-        }
-    }
-
     Ok(ProgramHashes {
         shield: compute_program_hash(reprove_bin, &shield)?,
         transfer: compute_program_hash(reprove_bin, &transfer)?,
@@ -2168,16 +2159,14 @@ mod tests {
     /// With ||, cm!=ZERO alone would enter the client path and unwrap() None → panic.
 
 
-    /// Group 5c: transfer and unshield with 7 inputs (max) must succeed, 8 must fail.
+    /// Group 5c: transfer and unshield with 5 inputs (max) must succeed, 6 must fail.
     /// Kills: replace > with ==/>=  in N > MAX_INPUTS check
     #[test]
     fn test_mutant_transfer_max_inputs() {
         let (mut ledger, _, _, root, enc) = setup_with_note();
 
-        // N=7 should be accepted (> mutation turns N > 7 into N == 7, rejecting 7)
-        // We can't easily create 7 real notes here, so test the boundary:
-        // N=8 must be rejected
-        let nfs: Vec<F> = (0..8).map(|_| random_felt()).collect();
+        // N=6 must be rejected
+        let nfs: Vec<F> = (0..6).map(|_| random_felt()).collect();
         let (cm_3a, enc_3a, _mh_3a) = test_output_note(0x4C);
         let r = ledger.transfer(&TransferReq {
             root,
@@ -2193,15 +2182,15 @@ mod tests {
             enc_4: enc_3a.clone(),
             proof: Proof::TrustMeBro,
         });
-        assert!(r.is_err(), "N=8 transfer must be rejected");
+        assert!(r.is_err(), "N=6 transfer must be rejected");
         assert!(r.unwrap_err().contains("bad nullifier count"));
 
-        // N=7 should pass the count check (may fail on nullifier/root, that's fine)
-        let nfs7: Vec<F> = (0..7).map(|_| random_felt()).collect();
+        // N=5 should pass the count check (may fail on nullifier/root, that's fine)
+        let nfs5: Vec<F> = (0..5).map(|_| random_felt()).collect();
         let (cm_3b, enc_3b, _mh_3b) = test_output_note(0x4D);
         let r = ledger.transfer(&TransferReq {
             root,
-            nullifiers: nfs7,
+            nullifiers: nfs5,
             fee: TEST_FEE,
             cm_1: random_felt(),
             cm_2: random_felt(),
@@ -2217,7 +2206,7 @@ mod tests {
         if let Err(e) = &r {
             assert!(
                 !e.contains("bad nullifier count"),
-                "N=7 should pass the count check, got: {}",
+                "N=5 should pass the count check, got: {}",
                 e
             );
         }
@@ -2228,11 +2217,11 @@ mod tests {
     fn test_mutant_unshield_max_inputs() {
         let (mut ledger, _, _, root, _) = setup_with_note();
 
-        let nfs8: Vec<F> = (0..8).map(|_| random_felt()).collect();
+        let nfs6: Vec<F> = (0..6).map(|_| random_felt()).collect();
         let (cm_fee_a, enc_fee_a, _mh_fee_a) = test_output_note(0x4E);
         let r = ledger.unshield(&UnshieldReq {
             root,
-            nullifiers: nfs8,
+            nullifiers: nfs6,
             v_pub: 100,
             fee: TEST_FEE,
             recipient: TEST_L1_RECIPIENT.into(),
@@ -2247,11 +2236,11 @@ mod tests {
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("bad nullifier count"));
 
-        let nfs7: Vec<F> = (0..7).map(|_| random_felt()).collect();
+        let nfs5: Vec<F> = (0..5).map(|_| random_felt()).collect();
         let (cm_fee_b, enc_fee_b, _mh_fee_b) = test_output_note(0x4F);
         let r = ledger.unshield(&UnshieldReq {
             root,
-            nullifiers: nfs7,
+            nullifiers: nfs5,
             v_pub: 100,
             fee: TEST_FEE,
             recipient: TEST_L1_RECIPIENT.into(),
@@ -2266,7 +2255,7 @@ mod tests {
         if let Err(e) = &r {
             assert!(
                 !e.contains("bad nullifier count"),
-                "N=7 should pass count check, got: {}",
+                "N=5 should pass count check, got: {}",
                 e
             );
         }

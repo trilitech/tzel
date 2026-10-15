@@ -10,8 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tzel_services::*;
 use tzel_verifier::{DirectProofVerifier, ProofBundle as VerifyProofBundle};
 
-const PROVER_TOOLCHAIN: &str = "+nightly-2025-07-14";
-
 static SP_LEDGER_BIN: OnceLock<String> = OnceLock::new();
 static REPROVE_BIN: OnceLock<String> = OnceLock::new();
 static INTEGRATION_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -69,7 +67,7 @@ fn sp_ledger() -> String {
 /// Path to the reprove binary in the workspace target dir.
 fn reprove_bin_path() -> String {
     workspace_root()
-        .join("apps/prover/target/release/reprove")
+        .join("target/release/reprove")
         .to_str()
         .unwrap()
         .to_string()
@@ -78,10 +76,10 @@ fn reprove_bin_path() -> String {
 fn build_reprove_bin() -> String {
     REPROVE_BIN
         .get_or_init(|| {
-            let path = workspace_root().join("apps/prover/target/release/reprove");
+            let path = workspace_root().join("target/release/reprove");
             let out = Command::new("cargo")
-                .current_dir(workspace_root().join("apps/prover"))
-                .args([PROVER_TOOLCHAIN, "build", "--release", "--bin", "reprove"])
+                .current_dir(workspace_root())
+                .args(["build", "--release", "-p", "tzel-prover-app", "--bin", "reprove"])
                 .output()
                 .expect("failed to build reprover binary");
             assert!(
@@ -95,27 +93,21 @@ fn build_reprove_bin() -> String {
         .clone()
 }
 
-/// Path to compiled Cairo executables
 fn executables_dir() -> String {
-    let path = workspace_root().join("cairo/target/dev");
-    path.to_str().unwrap().to_string()
+    workspace_root().to_str().unwrap().to_string()
 }
 
 fn has_reprover() -> bool {
     std::path::Path::new(&reprove_bin_path()).exists()
-        && std::path::Path::new(&executables_dir())
-            .join("run_shield.executable.json")
-            .exists()
 }
 
 fn generate_stark_bundle(executable_filename: &str, args: &[String]) -> VerifyProofBundle {
-    let executable = format!("{}/{}", executables_dir(), executable_filename);
     let args_file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(args_file.path(), serde_json::to_string(args).unwrap()).unwrap();
     let proof_file = tempfile::NamedTempFile::new().unwrap();
 
     let out = Command::new(build_reprove_bin())
-        .arg(&executable)
+        .arg(executable_filename)
         .arg("--arguments-file")
         .arg(args_file.path())
         .arg("--output")
@@ -190,24 +182,25 @@ fn test_ledger_refuses_insecure_startup() {
 }
 
 /// Slow, ignored by default: prove a max-input transfer witness directly.
-/// This is the explicit guard against N=7 trace-budget or tail-slicing failures.
+/// This is the explicit guard against N=5 trace-budget or tail-slicing failures.
 #[test]
 #[ignore = "slow real-proof max-input proof"]
-fn test_transfer_7_inputs_proof_roundtrip() {
+fn test_transfer_5_inputs_proof_roundtrip() {
     let _guard = integration_test_guard();
+    let _ = build_reprove_bin();
     if !has_reprover() {
-        eprintln!("SKIP: reprover binary or Cairo executables not found.");
+        eprintln!("SKIP: reprover binary not found.");
         return;
     }
 
-    let witness = proof_bench::build_transfer_bench_witness(7);
+    let witness = proof_bench::build_transfer_bench_witness(5);
     let bundle = generate_stark_bundle("run_transfer.executable.json", &witness.args);
     let public_outputs = bootloader_cairo_array_public_outputs(&bundle.output_preimage);
 
     assert_eq!(
         public_outputs,
         witness.expected_public_outputs.as_slice(),
-        "n=7 transfer proof public outputs must match the witness, including the final nullifier",
+        "n=5 transfer proof public outputs must match the witness, including the final nullifier",
     );
     assert!(
         !bundle.proof_bytes.is_empty(),
@@ -220,7 +213,7 @@ fn test_transfer_7_inputs_proof_roundtrip() {
     DirectProofVerifier::from_executables_dir(false, &executables_dir())
         .expect("test executables should provide program hashes")
         .validate(&proof, CircuitKind::Transfer)
-        .expect("n=7 transfer proof should verify with canonical metadata");
+        .expect("n=5 transfer proof should verify with canonical metadata");
 }
 
 /// Slow, ignored by default: prove a MIXED-ASSET transfer witness

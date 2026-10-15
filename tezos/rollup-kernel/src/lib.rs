@@ -1464,11 +1464,10 @@ fn prepare_durable_shield_commit<H: Host>(
         ));
     }
 
-    // 1. Validate the asset pool balance. The user's (asset_id,
-    // pubkey_hash) pool pays for the recipient note + kernel fee.
-    // For tez shields this also covers the producer fee (same
-    // asset); for FA2 shields producer_fee comes out of the user's
-    // tez pool below.
+    // 1. Validate the asset pool balance. For tez shields the (ASSET_TEZ,
+    // pubkey_hash) pool pays `v + fee + producer_fee`. For FA2 shields
+    // the (asset_id, pubkey_hash) pool pays `v` and the user's tez pool
+    // below pays `fee + producer_fee`.
     let is_tez_shield = *prepared.asset_id() == tzel_core::ASSET_TEZ;
     let asset_required = if is_tez_shield {
         prepared
@@ -1503,36 +1502,34 @@ fn prepare_durable_shield_commit<H: Host>(
     let balance = u64::from_le_bytes(balance_bytes.try_into().unwrap());
     if balance < asset_required {
         return Err(format!(
-            "deposit pool ({}, {}) balance {} too small for v + fee{} = {}",
+            "deposit pool ({}, {}) balance {} too small for v{} = {}",
             hex::encode(prepared.asset_id()),
             hex::encode(prepared.pubkey_hash()),
             balance,
-            if is_tez_shield { " + producer_fee" } else { "" },
+            if is_tez_shield { " + fee + producer_fee" } else { "" },
             asset_required,
         ));
     }
     let new_balance = balance - asset_required;
 
     // For FA2 shields, also validate + plan the debit on the
-    // (ASSET_TEZ, pubkey_hash) pool for producer_fee. Without this
-    // separate debit, an FA2 shield would mint producer_fee tez
-    // into the commitment tree out of nothing — drainable by the
-    // producer (or anyone holding the resulting note) at unshield
-    // time, backed by other users' real tez deposits.
+    // (ASSET_TEZ, pubkey_hash) pool for fee + producer_fee. Without this
+    // separate debit, an FA2 shield would burn FA2 tokens as if they were
+    // tez and mint producer_fee tez into the commitment tree out of nothing.
     let (tez_balance_path, new_tez_balance) = if is_tez_shield {
         (None, 0u64)
     } else {
         let tez_path = deposit_balance_path(&tzel_core::ASSET_TEZ, prepared.pubkey_hash());
         let tez_bytes = ledger.host.read_store(&tez_path, 8).ok_or_else(|| {
             format!(
-                "no tez deposit pool at pubkey_hash {} — non-tez shields require a tez pool to fund producer_fee ({})",
+                "no tez deposit pool at pubkey_hash {} — non-tez shields require a tez pool to fund fee + producer_fee ({})",
                 hex::encode(prepared.pubkey_hash()),
                 prepared.producer_fee_tez_debit(),
             )
         })?;
         if tez_bytes.is_empty() {
             return Err(format!(
-                "no tez deposit pool at pubkey_hash {} — non-tez shields require a tez pool to fund producer_fee ({})",
+                "no tez deposit pool at pubkey_hash {} — non-tez shields require a tez pool to fund fee + producer_fee ({})",
                 hex::encode(prepared.pubkey_hash()),
                 prepared.producer_fee_tez_debit(),
             ));
@@ -1546,7 +1543,7 @@ fn prepare_durable_shield_commit<H: Host>(
         let tez_balance = u64::from_le_bytes(tez_bytes.try_into().unwrap());
         if tez_balance < prepared.producer_fee_tez_debit() {
             return Err(format!(
-                "tez deposit pool at pubkey_hash {} balance {} too small for producer_fee = {}",
+                "tez deposit pool at pubkey_hash {} balance {} too small for fee + producer_fee = {}",
                 hex::encode(prepared.pubkey_hash()),
                 tez_balance,
                 prepared.producer_fee_tez_debit(),
@@ -3028,7 +3025,8 @@ mod tests {
 
         match read_last_result(&host).unwrap() {
             KernelResult::Unshield(UnshieldResp {
-                change_index, change_index_2,
+                change_index,
+                change_index_2: _,
                 producer_index,
             }) => {
                 assert_eq!(change_index, Some(0));
@@ -3202,7 +3200,8 @@ mod tests {
         assert_eq!(host.outputs.len(), 1);
         match read_last_result(&host).unwrap() {
             KernelResult::Unshield(UnshieldResp {
-                change_index, change_index_2,
+                change_index,
+                change_index_2: _,
                 producer_index,
             }) => {
                 assert_eq!(change_index, None);
@@ -3249,7 +3248,8 @@ mod tests {
 
         match read_last_result(&host).unwrap() {
             KernelResult::Unshield(UnshieldResp {
-                change_index, change_index_2,
+                change_index,
+                change_index_2: _,
                 producer_index,
             }) => {
                 assert_eq!(change_index, Some(0));
@@ -4441,8 +4441,8 @@ mod tests {
             recipient: recipient.into(),
             cm_change,
             enc_change,
-            cm_change_2: ZERO,
-            enc_change_2: None,
+            cm_change_2,
+            enc_change_2,
             cm_fee,
             enc_fee,
             proof: sample_kernel_test_proof(),
@@ -4836,12 +4836,10 @@ mod tests {
         );
 
         // ─── 1. FA2 + tez deposits land in their respective pools.
-        // The FA2 pool covers the recipient note + kernel fee; the
-        // tez pool covers the producer_fee tez (a permanent
-        // requirement of the multiasset bridge, see
-        // prepare_shield's split-debit comment).
-        let fa2_deposit_amount = v + MIN_TX_FEE;
-        let tez_deposit_amount = producer_fee;
+        // The FA2 pool covers the recipient FA2 note (v); the tez
+        // pool covers the rollup fee + producer_fee tez.
+        let fa2_deposit_amount = v;
+        let tez_deposit_amount = MIN_TX_FEE + producer_fee;
         host.inputs.push_back(InputMessage {
             level: 2,
             id: 0,

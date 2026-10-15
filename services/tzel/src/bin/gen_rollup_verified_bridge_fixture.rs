@@ -28,7 +28,6 @@ use std::process::Command;
 use tzel_services::*;
 use tzel_verifier::{load_program_hashes, DirectProofVerifier, ProofBundle as VerifyProofBundle};
 
-const PROVER_TOOLCHAIN: &str = "+nightly-2025-07-14";
 const FIXTURE_PATH: &str = "tezos/rollup-kernel/testdata/verified_bridge_flow.json";
 const BRIDGE_TICKETER: &str = "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc";
 const WITHDRAWAL_RECIPIENT: &str = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
@@ -731,10 +730,7 @@ fn generate_stark_bundle(
     executable_filename: &str,
     args: &[String],
 ) -> Result<VerifyProofBundle, String> {
-    let executable = executables_dir().join(executable_filename);
-    if !executable.exists() {
-        return Err(format!("missing executable {}", executable.display()));
-    }
+    let executable = PathBuf::from(executable_filename);
 
     let args_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
     std::fs::write(
@@ -767,14 +763,14 @@ fn generate_stark_bundle(
 }
 
 fn build_reprove_bin() -> PathBuf {
-    let path = workspace_root().join("apps/prover/target/release/reprove");
+    let path = workspace_root().join("target/release/reprove");
     if path.exists() {
         return path;
     }
 
     let output = Command::new("cargo")
-        .current_dir(workspace_root().join("apps/prover"))
-        .args([PROVER_TOOLCHAIN, "build", "--release", "--bin", "reprove"])
+        .current_dir(workspace_root())
+        .args(["build", "--release", "-p", "tzel-prover-app", "--bin", "reprove"])
         .output()
         .expect("failed to build reprove");
     assert!(
@@ -795,7 +791,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn executables_dir() -> PathBuf {
-    workspace_root().join("cairo/target/dev")
+    workspace_root()
 }
 
 fn base_wallet_fixture_path() -> PathBuf {

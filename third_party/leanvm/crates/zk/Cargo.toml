@@ -1,0 +1,24 @@
+[package]
+name = "zk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+primitives.workspace = true
+fiat_shamir.workspace = true
+pcs.workspace = true
+thiserror.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rand_core = { version = "0.9", features = ["os_rng"] }
+
+[dev-dependencies]
+primitives = { workspace = true, features = ["test-util"] }

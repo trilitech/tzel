@@ -1981,9 +1981,9 @@ let test_fa2_shield_dual_pool () =
   Alcotest.(check bool) "pub.asset_producer = tez" true (Tzel.Felt.is_zero pub.asset_producer);
   Alcotest.(check bool) "recipient note carries fa2" true (Tzel.Felt.equal recipient_note.asset fa2);
   Alcotest.(check bool) "producer note carries tez" true (Tzel.Felt.is_zero producer_note.asset);
-  (* Fund the FA2 pool with v+fee=5100 and the tez pool with producer_fee=3. *)
-  Tzel.Ledger.credit_deposit ledger ~asset_id:fa2 ~pubkey_hash:pub.pubkey_hash ~amount:5100L ();
-  Tzel.Ledger.credit_deposit ledger ~pubkey_hash:pub.pubkey_hash ~amount:3L ();
+  (* Fund the FA2 pool with v=5000 and the tez pool with fee+producer_fee=103. *)
+  Tzel.Ledger.credit_deposit ledger ~asset_id:fa2 ~pubkey_hash:pub.pubkey_hash ~amount:5000L ();
+  Tzel.Ledger.credit_deposit ledger ~pubkey_hash:pub.pubkey_hash ~amount:103L ();
   let result =
     Tzel.Ledger.apply_shield ledger ~pub ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
   in

@@ -206,11 +206,11 @@ let test_rust_fa2_flow_applies_on_ocaml_ledger () =
     cm_new = shield_cm; cm_producer = shield_producer_cm;
     memo_ct_hash = shield_mch; producer_memo_ct_hash = shield_prod_mch;
   } in
-  (* Dual-pool funding: FA2 pool covers v+fee; tez pool covers producer_fee. *)
+  (* Dual-pool funding: FA2 pool covers v; tez pool covers fee + producer_fee. *)
   Tzel.Ledger.credit_deposit ledger ~asset_id ~pubkey_hash:shield_pubkey_hash
-    ~amount:(Int64.add shield_v shield_fee) ();
+    ~amount:shield_v ();
   Tzel.Ledger.credit_deposit ledger ~pubkey_hash:shield_pubkey_hash
-    ~amount:shield_producer_fee ();
+    ~amount:(Int64.add shield_fee shield_producer_fee) ();
   begin match Tzel.Ledger.apply_shield ledger ~pub:shield_pub
                 ~memo_ct_hash:shield_mch ~producer_memo_ct_hash:shield_prod_mch with
   | Ok () -> ()

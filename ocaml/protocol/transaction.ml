@@ -128,9 +128,9 @@ let shield_sighash ~auth_domain ~pubkey_hash ~(v_pub : int64) ~(fee : int64)
       Felt.of_int 0x03;
       auth_domain;
       pubkey_hash;
-      Felt.of_u64 (Int64.to_int v_pub);
-      Felt.of_u64 (Int64.to_int fee);
-      Felt.of_u64 (Int64.to_int producer_fee);
+      Felt.of_int64 v_pub;
+      Felt.of_int64 fee;
+      Felt.of_int64 producer_fee;
       asset_new;
       asset_producer;
       cm_new;
@@ -149,7 +149,7 @@ let transfer_sighash (pub : transfer_public) =
     [Felt.of_int 0x01; pub.auth_domain; pub.root]
     @ pub.nullifiers
     @ [
-        Felt.of_u64 (Int64.to_int pub.fee);
+        Felt.of_int64 pub.fee;
         pub.cm_1; pub.cm_2; pub.cm_3; pub.cm_4;
         pub.memo_ct_hash_1; pub.memo_ct_hash_2;
         pub.memo_ct_hash_3; pub.memo_ct_hash_4;
@@ -166,9 +166,9 @@ let unshield_sighash (pub : unshield_public) =
     [Felt.of_int 0x02; pub.auth_domain; pub.root]
     @ pub.nullifiers
     @ [
-        Felt.of_u64 (Int64.to_int pub.v_pub);
+        Felt.of_int64 pub.v_pub;
         pub.asset_pub;
-        Felt.of_u64 (Int64.to_int pub.fee);
+        Felt.of_int64 pub.fee;
         pub.recipient_id;
         pub.cm_change; pub.memo_ct_hash_change;
         pub.cm_change_2; pub.memo_ct_hash_change_2;

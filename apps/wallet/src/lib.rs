@@ -880,6 +880,14 @@ impl WalletFile {
         self.notes.iter().map(|n| n.v as u128).sum()
     }
 
+    fn tez_balance(&self) -> u128 {
+        self.notes
+            .iter()
+            .filter(|n| n.asset_id == ASSET_TEZ)
+            .map(|n| n.v as u128)
+            .sum()
+    }
+
     fn pending_nullifier_set(&self) -> std::collections::HashSet<F> {
         self.pending_spends
             .iter()
@@ -896,11 +904,29 @@ impl WalletFile {
             .sum()
     }
 
+    fn tez_available_balance(&self) -> u128 {
+        let pending = self.pending_nullifier_set();
+        self.notes
+            .iter()
+            .filter(|note| note.asset_id == ASSET_TEZ && !pending.contains(&note_nullifier(note)))
+            .map(|note| note.v as u128)
+            .sum()
+    }
+
     fn pending_outgoing_balance(&self) -> u128 {
         let pending = self.pending_nullifier_set();
         self.notes
             .iter()
             .filter(|note| pending.contains(&note_nullifier(note)))
+            .map(|note| note.v as u128)
+            .sum()
+    }
+
+    fn tez_pending_outgoing_balance(&self) -> u128 {
+        let pending = self.pending_nullifier_set();
+        self.notes
+            .iter()
+            .filter(|note| note.asset_id == ASSET_TEZ && pending.contains(&note_nullifier(note)))
             .map(|note| note.v as u128)
             .sum()
     }
@@ -983,6 +1009,11 @@ impl WalletFile {
         asset_id: &F,
         amount: u64,
     ) -> Result<Vec<usize>, String> {
+        let label = if asset_id == &ASSET_TEZ {
+            "tez".to_string()
+        } else {
+            hex::encode(asset_id)
+        };
         let pending = self.pending_nullifier_set();
         let mut indexed: Vec<(usize, u64)> = self
             .notes
@@ -1000,6 +1031,14 @@ impl WalletFile {
             selected.push(i);
             sum += v as u128;
             if sum >= amount as u128 {
+                if selected.len() > 5 {
+                    return Err(format!(
+                        "selected {} {} notes to cover {} but the circuit caps inputs at 5 — consolidate notes first",
+                        selected.len(),
+                        label,
+                        amount,
+                    ));
+                }
                 return Ok(selected);
             }
         }
@@ -1015,11 +1054,6 @@ impl WalletFile {
             .filter(|n| &n.asset_id == asset_id && pending.contains(&note_nullifier(n)))
             .map(|n| n.v as u128)
             .sum();
-        let label = if asset_id == &ASSET_TEZ {
-            "tez".to_string()
-        } else {
-            hex::encode(asset_id)
-        };
         Err(format!(
             "insufficient {} funds: have {} available ({} pending) need {}",
             label, available, pending_amt, amount
@@ -5465,12 +5499,14 @@ fn compute_address_breakdown(w: &WalletFile) -> AddressBreakdown {
         std::collections::HashMap::new();
     let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     for note in &w.notes {
-        let bal = totals_balance.entry(note.addr_index).or_default();
-        *bal = bal.saturating_add(note.v);
         *counts.entry(note.addr_index).or_default() += 1;
-        if !pending.contains(&note_nullifier(note)) {
-            let avail = totals_available.entry(note.addr_index).or_default();
-            *avail = avail.saturating_add(note.v);
+        if note.asset_id == ASSET_TEZ {
+            let bal = totals_balance.entry(note.addr_index).or_default();
+            *bal = bal.saturating_add(note.v);
+            if !pending.contains(&note_nullifier(note)) {
+                let avail = totals_available.entry(note.addr_index).or_default();
+                *avail = avail.saturating_add(note.v);
+            }
         }
     }
 
@@ -6056,7 +6092,7 @@ fn apply_scan_feed_finalize(
     w: &mut WalletFile,
     seen_cms: &[F],
     nullifiers: impl IntoIterator<Item = F>,
-    pool_balances: &std::collections::HashMap<F, u64>,
+    pool_balances: &std::collections::HashMap<(F, F), u64>,
 ) -> ScanSummary {
     let mut known_cms: std::collections::HashSet<F> =
         w.notes.iter().map(|n| n.cm).collect();
@@ -6072,7 +6108,11 @@ fn apply_scan_feed_finalize(
 
     let before_pools = w.pending_deposits.len();
     w.pending_deposits.retain(|p| {
-        let drained_on_chain = pool_balances.get(&p.pubkey_hash).copied().unwrap_or(0) == 0;
+        let drained_on_chain = pool_balances
+            .get(&(p.asset_id, p.pubkey_hash))
+            .copied()
+            .unwrap_or(0)
+            == 0;
         let cm_observed = p
             .shielded_cm
             .as_ref()
@@ -9103,7 +9143,7 @@ fn cmd_balance(path: &str) -> Result<(), String> {
     println!("Private balance: {}", tez_total);
     if !w.pending_spends.is_empty() {
         println!("Private available: {}", tez_available);
-        println!("Pending outgoing: {}", w.pending_outgoing_balance());
+        println!("Pending outgoing: {}", w.tez_pending_outgoing_balance());
         println!("Pending operations: {}", w.pending_spends.len());
     }
 
@@ -9152,17 +9192,47 @@ fn cmd_balance(path: &str) -> Result<(), String> {
 fn cmd_user_balance(path: &str) -> Result<(), String> {
     let w = load_wallet(path)?;
     user_out!(
-        json: { "private_available" => w.available_balance() },
-        human: "Private available: {}", w.available_balance()
+        json: { "private_available" => w.tez_available_balance() },
+        human: "Private available: {}", w.tez_available_balance()
     );
     user_out!(
-        json: { "private_tracked_total" => w.balance() },
-        human: "Private tracked total: {}", w.balance()
+        json: { "private_tracked_total" => w.tez_balance() },
+        human: "Private tracked total: {}", w.tez_balance()
     );
     user_out!(
-        json: { "private_pending_outgoing" => w.pending_outgoing_balance() },
-        human: "Private pending outgoing: {}", w.pending_outgoing_balance()
+        json: { "private_pending_outgoing" => w.tez_pending_outgoing_balance() },
+        human: "Private pending outgoing: {}", w.tez_pending_outgoing_balance()
     );
+    let totals = w.balance_by_asset();
+    let available = w.available_balance_by_asset();
+    let avail_map: std::collections::HashMap<F, u128> = available.iter().cloned().collect();
+    if totals.iter().any(|(asset, _)| *asset != ASSET_TEZ) {
+        if json_mode() {
+            let by_asset: Vec<serde_json::Value> = totals
+                .iter()
+                .map(|(asset, total)| {
+                    let avail = avail_map.get(asset).copied().unwrap_or(0);
+                    serde_json::json!({
+                        "asset_id": hex::encode(asset),
+                        "total": total,
+                        "available": avail,
+                    })
+                })
+                .collect();
+            user_json_put("balances_by_asset", serde_json::Value::Array(by_asset));
+        } else {
+            println!("Per-asset balance:");
+            for (asset, total) in &totals {
+                let avail = avail_map.get(asset).copied().unwrap_or(0);
+                let label = if *asset == ASSET_TEZ {
+                    "tez".to_string()
+                } else {
+                    hex::encode(asset)
+                };
+                println!("  {}: {} (available: {})", label, total, avail);
+            }
+        }
+    }
     user_out!(
         json: { "tracked_notes" => w.notes.len() },
         human: "Tracked notes: {}", w.notes.len()
@@ -9192,7 +9262,11 @@ fn print_deposit_pool_summary(
     balances: &std::collections::HashMap<(F, F), u64>,
 ) {
     let funded_count = balances.len();
-    let total_funded: u64 = balances.values().sum();
+    let total_tez_funded: u64 = balances
+        .iter()
+        .filter(|((asset, _), _)| *asset == ASSET_TEZ)
+        .map(|(_, bal)| *bal)
+        .sum();
     let mut drained_pending_scan = 0usize;
     let mut awaiting_credit = 0usize;
     for p in &w.pending_deposits {
@@ -9208,13 +9282,24 @@ fn print_deposit_pool_summary(
     user_out!(
         json: {
             "deposit_pools_funded" => funded_count,
-            "deposit_pools_total_mutez" => total_funded,
+            "deposit_pools_total_mutez" => total_tez_funded,
             "deposit_pools_awaiting_credit" => awaiting_credit,
             "deposit_pools_drained_pending_prune" => drained_pending_scan,
         },
         human: "Deposit pools: {} funded, total balance {} mutez",
-        funded_count, total_funded
+        funded_count, total_tez_funded
     );
+    let mut fa2_funded: std::collections::BTreeMap<F, u64> = std::collections::BTreeMap::new();
+    for ((asset, _), bal) in balances {
+        if *asset != ASSET_TEZ {
+            *fa2_funded.entry(*asset).or_insert(0) += *bal;
+        }
+    }
+    if !fa2_funded.is_empty() && !json_mode() {
+        for (asset, total) in fa2_funded {
+            println!("Deposit pools (asset {}): {} units", hex::encode(asset), total);
+        }
+    }
     if awaiting_credit > 0 && !json_mode() {
         println!(
             "Deposit pools awaiting on-chain credit: {}",
@@ -9594,7 +9679,12 @@ fn cmd_rollup_sync(
     summary.found = total_found;
     save_wallet(path, &w)?;
 
-    let total_funded: u64 = summary.pool_balances.values().sum();
+    let total_funded: u64 = summary
+        .pool_balances
+        .iter()
+        .filter(|((asset, _), _)| *asset == ASSET_TEZ)
+        .map(|(_, bal)| *bal)
+        .sum();
     let mut pools_awaiting_credit = 0usize;
     let mut pools_drained_pending_scan = 0usize;
     for p in &w.pending_deposits {
@@ -9613,7 +9703,7 @@ fn cmd_rollup_sync(
         summary.spent,
         summary.confirmed_pending,
         summary.pruned_drained_pools,
-        w.available_balance(),
+        w.tez_available_balance(),
         total_funded,
         pools_awaiting_credit,
         pools_drained_pending_scan,
@@ -9956,7 +10046,7 @@ fn cmd_bridge_deposit(
         println!("{}", submission.output);
     }
     println!(
-        "Run `tzel-wallet shield --pubkey-hash {} --amount <v> --to <addr>` once the \
+        "Run `tzel-wallet shield --pubkey-hash {}` once the \
          deposit settles on the rollup.",
         pubkey_hash_hex(&pubkey_hash)
     );
@@ -10528,6 +10618,9 @@ fn cmd_unshield(
     recipient: &str,
     pc: &ProveConfig,
 ) -> Result<(), String> {
+    if amount == 0 {
+        return Err("unshield requires non-zero amount (v_pub > 0)".into());
+    }
     let recipient = validate_l1_withdrawal_recipient(recipient)?;
     let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
     let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
@@ -10866,28 +10959,28 @@ fn cmd_shield_rollup(
                 pubkey_hash_hex(&pubkey_hash),
             )
         })?;
+    let tez_fees = fee
+        .checked_add(producer_fee)
+        .ok_or_else(|| "fee + producer_fee overflow".to_string())?;
     let asset_min_fees = if is_tez_shield {
         // Same pool covers tx_fee + producer_fee.
-        fee.checked_add(producer_fee)
-            .ok_or_else(|| "fee + producer_fee overflow".to_string())?
+        tez_fees
     } else {
-        fee
+        // FA2 pool only covers v; the tez pool covers tx_fee + producer_fee.
+        0
     };
     if pool_balance < asset_min_fees {
         return Err(format!(
-            "deposit pool {} balance {} < required asset-side fees {} ({})",
+            "deposit pool {} balance {} < required asset-side fees {} (tx_fee {} + producer_fee {})",
             pubkey_hash_hex(&pubkey_hash),
             pool_balance,
             asset_min_fees,
-            if is_tez_shield {
-                format!("tx_fee {} + producer_fee {}", fee, producer_fee)
-            } else {
-                format!("tx_fee {}", fee)
-            },
+            fee,
+            producer_fee,
         ));
     }
     // For FA2 shields, also verify the user's tez pool can cover
-    // producer_fee. This mirrors the kernel-side check in
+    // tx_fee + producer_fee. This mirrors the kernel-side check in
     // prepare_shield / prepare_durable_shield_commit so the wallet
     // catches the failure early instead of submitting a doomed
     // request.
@@ -10896,17 +10989,19 @@ fn cmd_shield_rollup(
             .try_read_deposit_balance(&head_hash, &ASSET_TEZ, &pubkey_hash)?
             .ok_or_else(|| {
                 format!(
-                    "FA2 shield requires a tez deposit pool at {} to fund producer_fee ({}); none found",
+                    "FA2 shield requires a tez deposit pool at {} to fund tx_fee + producer_fee ({}); none found",
                     pubkey_hash_hex(&pubkey_hash),
-                    producer_fee,
+                    tez_fees,
                 )
             })?;
-        if tez_pool_balance < producer_fee {
+        if tez_pool_balance < tez_fees {
             return Err(format!(
-                "FA2 shield: tez deposit pool {} balance {} < producer_fee {} (producer-fee notes are permanently tez)",
+                "FA2 shield: tez deposit pool {} balance {} < tx_fee {} + producer_fee {} = {} (rollup and producer fees are permanently tez)",
                 pubkey_hash_hex(&pubkey_hash),
                 tez_pool_balance,
+                fee,
                 producer_fee,
+                tez_fees,
             ));
         }
     }
@@ -11164,7 +11259,7 @@ fn cmd_transfer_rollup(
     //     recipient amount AND tez notes covering fee + producer_fee.
     //     change_1 carries the FA2 refund, change_2 carries the tez
     //     refund (producer-fee tez stays pinned via the circuit).
-    //     The combined input count must still be <= MAX_INPUTS (7).
+    //     The combined input count must still be <= MAX_INPUTS (5).
     let is_tez = recipient_asset_id == ASSET_TEZ;
     let mut selected: Vec<usize>;
     let change_primary: u64; // FA2 (or tez) refund routed to change_1
@@ -11187,9 +11282,9 @@ fn cmd_transfer_rollup(
         // Tez notes for the fees.
         let tez_idx = w.select_notes_of_asset(&ASSET_TEZ, tez_fees)?;
         let tez_sum: u128 = tez_idx.iter().map(|&i| w.notes[i].v as u128).sum();
-        if fa2_idx.len() + tez_idx.len() > 7 {
+        if fa2_idx.len() + tez_idx.len() > 5 {
             return Err(format!(
-                "multi-asset transfer needs {} inputs ({} fa2 + {} tez) but the circuit caps inputs at 7 — consolidate notes first",
+                "multi-asset transfer needs {} inputs ({} fa2 + {} tez) but the circuit caps inputs at 5 — consolidate notes first",
                 fa2_idx.len() + tez_idx.len(),
                 fa2_idx.len(),
                 tez_idx.len(),
@@ -11496,6 +11591,9 @@ fn cmd_unshield_rollup(
         "deposit_id": serde_json::Value::Null,
         "recipient": recipient.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
     });
+    if amount == 0 {
+        return Err("unshield requires non-zero amount (v_pub > 0)".into());
+    }
     let rollup = RollupRpc::new(profile);
     let recipient = resolve_rollup_unshield_recipient(&rollup, recipient)?;
     let snapshot = rollup.load_state_snapshot_at_head()?;
@@ -11530,9 +11628,9 @@ fn cmd_unshield_rollup(
         let fa2_sum: u128 = fa2_idx.iter().map(|&i| w.notes[i].v as u128).sum();
         let tez_idx = w.select_notes_of_asset(&ASSET_TEZ, tez_fees)?;
         let tez_sum: u128 = tez_idx.iter().map(|&i| w.notes[i].v as u128).sum();
-        if fa2_idx.len() + tez_idx.len() > 7 {
+        if fa2_idx.len() + tez_idx.len() > 5 {
             return Err(format!(
-                "multi-asset unshield needs {} inputs ({} fa2 + {} tez) but the circuit caps inputs at 7 — consolidate notes first",
+                "multi-asset unshield needs {} inputs ({} fa2 + {} tez) but the circuit caps inputs at 5 — consolidate notes first",
                 fa2_idx.len() + tez_idx.len(),
                 fa2_idx.len(),
                 tez_idx.len(),
@@ -13765,6 +13863,66 @@ mod network_profile_tests {
     }
 
     #[test]
+    fn tez_balance_helpers_and_address_breakdown_exclude_fa2_units() {
+        let mut w = super::tests::test_wallet(2);
+        let acc = w.account();
+        let fa2_asset = derive_asset_id("KT1FA2IsolationTest");
+        let push_note = |w: &mut WalletFile,
+                         acc: &Account,
+                         addr_index: u32,
+                         value: u64,
+                         asset_id: F| {
+            let addr = w.addresses[addr_index as usize].clone();
+            let nk_sp = derive_nk_spend(&acc.nk, &addr.d_j);
+            let nk_tg = derive_nk_tag(&nk_sp);
+            let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tg);
+            let rseed = random_felt();
+            let rcm = derive_rcm(&rseed);
+            let cm = commit(&addr.d_j, value, &asset_id, &rcm, &otag);
+            w.notes.push(Note {
+                nk_spend: nk_sp,
+                nk_tag: nk_tg,
+                auth_root: addr.auth_root,
+                d_j: addr.d_j,
+                v: value,
+                rseed,
+                cm,
+                index: w.notes.len(),
+                addr_index,
+                asset_id,
+            });
+        };
+
+        push_note(&mut w, &acc, 0, 1_000, ASSET_TEZ);
+        push_note(&mut w, &acc, 0, 2_000, ASSET_TEZ);
+        push_note(&mut w, &acc, 0, 500_000, fa2_asset);
+        push_note(&mut w, &acc, 1, 750_000, fa2_asset);
+
+        // Mark one tez note (2_000) and one FA2 note (500_000) as pending-spent.
+        let nf_tez = note_nullifier(&w.notes[1]);
+        let nf_fa2 = note_nullifier(&w.notes[2]);
+        w.pending_spends.push(PendingSpend {
+            nullifiers: vec![nf_tez, nf_fa2],
+            description: "mixed pending".into(),
+            operation_hash: None,
+        });
+
+        assert_eq!(w.tez_balance(), 3_000);
+        assert_eq!(w.tez_available_balance(), 1_000);
+        assert_eq!(w.tez_pending_outgoing_balance(), 2_000);
+
+        let report = compute_address_breakdown(&w);
+        assert_eq!(report.total, 3_000);
+        assert_eq!(report.total_available, 1_000);
+        assert_eq!(report.addresses[0].balance, 3_000);
+        assert_eq!(report.addresses[0].available, 1_000);
+        assert_eq!(report.addresses[0].notes, 3);
+        assert_eq!(report.addresses[1].balance, 0);
+        assert_eq!(report.addresses[1].available, 0);
+        assert_eq!(report.addresses[1].notes, 1);
+    }
+
+    #[test]
     fn civil_from_days_matches_known_dates() {
         // 1970-01-01 = 0 days since epoch
         assert_eq!(civil_from_days(0), (1970, 1, 1));
@@ -14904,7 +15062,12 @@ mod network_profile_tests {
         use std::collections::HashMap;
         let pkh: F = felt_tag(b"pool-pinned-test");
         let pkh_hex = hex::encode(pkh);
-        let key = format!("{}{}", DURABLE_DEPOSIT_BALANCE_PREFIX, pkh_hex);
+        let key = format!(
+            "{}{}/{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
+            pkh_hex
+        );
 
         let block_old = "BLpinnedold";
         let block_new = "BLpinnednew";
@@ -14959,6 +15122,7 @@ mod network_profile_tests {
             address_index: 0,
             auth_domain: felt_tag(b"auth-domain-pinned"),
             amount: 0,
+            asset_id: ASSET_TEZ,
             operation_hash: None,
             shielded_cm: None,
         }];
@@ -14966,7 +15130,7 @@ mod network_profile_tests {
         let pinned = rpc
             .load_pool_balances_at_block(block_old, &pending)
             .expect("load_pool_balances_at_block must succeed");
-        let pinned_value = pinned.get(&pkh).copied();
+        let pinned_value = pinned.get(&(ASSET_TEZ, pkh)).copied();
         assert_eq!(
             pinned_value,
             Some(value_old),
@@ -15139,6 +15303,7 @@ mod network_profile_tests {
             address_index: 0,
             auth_domain: felt_tag(b"finalize-pin-auth"),
             amount: 1_000_000,
+            asset_id: ASSET_TEZ,
             operation_hash: None,
             shielded_cm: Some(observed_cm),
         });
@@ -15161,8 +15326,12 @@ mod network_profile_tests {
         let note_key = indexed_durable_key(DURABLE_NOTE_PREFIX, 0);
 
         let pkh_hex = hex::encode(pkh);
-        let pool_key =
-            format!("{}{}", DURABLE_DEPOSIT_BALANCE_PREFIX, pkh_hex);
+        let pool_key = format!(
+            "{}{}/{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
+            pkh_hex
+        );
         let value_old: u64 = 1_000_000;
         let tree_size: u64 = 1;
 
@@ -15356,13 +15525,18 @@ mod network_profile_tests {
             address_index: 0,
             auth_domain: felt_tag(b"finalize-pin-auth-fixture"),
             amount: 1_000_000,
+            asset_id: ASSET_TEZ,
             operation_hash: None,
             shielded_cm: Some(observed_cm),
         });
 
         let pkh_hex = hex::encode(pkh);
-        let pool_key =
-            format!("{}{}", DURABLE_DEPOSIT_BALANCE_PREFIX, pkh_hex);
+        let pool_key = format!(
+            "{}{}/{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(ASSET_TEZ),
+            pkh_hex
+        );
         let value_old: u64 = 1_000_000;
 
         let mut routes: HashMap<String, (u16, String)> = HashMap::new();
@@ -15458,7 +15632,7 @@ mod network_profile_tests {
             .load_pool_balances_at_head(&wallet.pending_deposits)
             .expect("regression helper succeeds");
         assert_eq!(
-            drained_pool.get(&pkh).copied().unwrap_or(0),
+            drained_pool.get(&(ASSET_TEZ, pkh)).copied().unwrap_or(0),
             0,
             "regression read at block_new must see drained pool"
         );

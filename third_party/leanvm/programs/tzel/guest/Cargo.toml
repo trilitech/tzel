@@ -1,0 +1,11 @@
+[package]
+name = "tzel-guest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+leanvm_guest = { path = "../../../sdk" }
+thiserror = { version = "2", default-features = false }
+
+[workspace]

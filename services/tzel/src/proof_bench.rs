@@ -6,7 +6,7 @@ use tzel_core::{
     ASSET_TEZ, AUTH_DEPTH, AUTH_TREE_SIZE, DEPTH, F, MIN_TX_FEE, WOTS_CHAINS, ZERO,
 };
 
-pub const MAX_BENCH_INPUTS: usize = 7;
+pub const MAX_BENCH_INPUTS: usize = 5;
 
 #[derive(Clone, Debug)]
 pub struct BenchWitness {

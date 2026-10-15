@@ -29,7 +29,7 @@ use tzel_core::kernel_wire::{
 use tzel_core::kernel_wire::{
     KernelShieldReq, KernelStarkProof, KernelTransferReq, KernelUnshieldReq,
 };
-use tzel_core::{default_auth_domain, deposit_recipient_string, hash, ProgramHashes, ASSET_TEZ, F, ZERO};
+use tzel_core::{default_auth_domain, deposit_recipient_string, hash, ProgramHashes, ASSET_TEZ, F};
 
 /// Test-only deterministic pubkey_hash derived from a label. The real
 /// pubkey_hash is `H(0x04, auth_domain, auth_root, auth_pub_seed,
