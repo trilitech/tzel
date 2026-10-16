@@ -4597,13 +4597,16 @@ esac
         );
 
         // Case 0b: when `/chains/main/blocks/300/operation_hashes/3` returns 404
-        // (pruned block on a rolling node), the canonical scan skips level 300 and
-        // resolves at level 301; by contrast, a transient 500 on `operation_hashes/3`
-        // keeps waiting without skipping level 300 or dropping `inclusion_block`.
-        let pruned_level_endpoint = spawn_mock_http_server(HashMap::from([
+        // (pruned block on a rolling node), the canonical scan skips level 300,
+        // records `skipped_pruned_levels = true` while waiting (or notes it in the
+        // `Retry` reason on TTL expiry), and resets `skipped_pruned_levels = false`
+        // once resolved at a later level; by contrast, a transient 500 on
+        // `operation_hashes/3` keeps waiting without skipping level 300 or dropping
+        // `inclusion_block`.
+        let pruned_waiting_endpoint = spawn_mock_http_server(HashMap::from([
             (
                 "/chains/main/blocks/head/header".into(),
-                (200, "{\"level\":304}".into()),
+                (200, "{\"level\":303}".into()),
             ),
             (
                 "/chains/main/blocks/head/context/constants".into(),
@@ -4615,22 +4618,76 @@ esac
             ),
             (
                 "/chains/main/blocks/301/operation_hashes/3".into(),
+                (200, "[]".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(pruned_waiting_endpoint.clone());
+        config.octez_node_endpoint = Some(pruned_waiting_endpoint.clone());
+
+        let mut stored_pruned = stored_submission(submission.clone(), Some(vec![1, 2, 3, 4]), &[1]);
+        stored_pruned.chunk_meta[0].injected_level = Some(300);
+        stored_pruned = maybe_advance_submission(&config, stored_pruned).unwrap();
+        assert_eq!(
+            stored_pruned.submission.dal_chunks[0].published_level,
+            UNRESOLVED_PUBLISHED_LEVEL
+        );
+        assert_eq!(stored_pruned.chunk_meta[0].scan_cursor, Some(302));
+        assert!(stored_pruned.chunk_meta[0].skipped_pruned_levels);
+
+        let mut meta_expired = ChunkMeta {
+            attempts: 1,
+            injected_level: Some(300),
+            scan_cursor: None,
+            inclusion_block: None,
+            inclusion_block_failures: 0,
+            skipped_pruned_levels: false,
+            max_operations_ttl: Some(1),
+        };
+        let mut dirty_expired = false;
+        let mut budget_expired = MAX_INCLUSION_SCAN_LEVELS_PER_TICK;
+        let mut cached_head_expired = None;
+        match resolve_unresolved_chunk_level(
+            Some(&pruned_waiting_endpoint),
+            Some("ooReorgedOp123456789ABCDEFG"),
+            &mut meta_expired,
+            &mut dirty_expired,
+            &mut budget_expired,
+            &mut cached_head_expired,
+        ) {
+            UnresolvedChunkResolution::Retry(reason) => {
+                assert!(
+                    reason.contains("(pruned levels skipped during scan)"),
+                    "unexpected retry reason: {reason}"
+                );
+            }
+            other => panic!("expected Retry after pruned scan expiry, got {other:?}"),
+        }
+
+        let pruned_level_endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/chains/main/blocks/head/header".into(),
+                (200, "{\"level\":304}".into()),
+            ),
+            (
+                "/chains/main/blocks/head/context/constants".into(),
+                (200, "{\"max_operations_time_to_live\":600}".into()),
+            ),
+            (
+                "/chains/main/blocks/302/operation_hashes/3".into(),
                 (200, "[\"ooReorgedOp123456789ABCDEFG\"]".into()),
             ),
             (
-                "/levels/301/slots/0/status".into(),
+                "/levels/302/slots/0/status".into(),
                 (200, "\"waiting_attestation\"".into()),
             ),
         ]));
         config.dal_node_endpoint = Some(pruned_level_endpoint.clone());
         config.octez_node_endpoint = Some(pruned_level_endpoint);
 
-        let mut stored_pruned = stored_submission(submission.clone(), Some(vec![1, 2, 3, 4]), &[1]);
-        stored_pruned.chunk_meta[0].injected_level = Some(300);
         let resolved_after_pruned = maybe_advance_submission(&config, stored_pruned).unwrap();
         assert_eq!(
             resolved_after_pruned.submission.dal_chunks[0].published_level,
-            301
+            302
         );
         assert!(!resolved_after_pruned.chunk_meta[0].skipped_pruned_levels);
 
