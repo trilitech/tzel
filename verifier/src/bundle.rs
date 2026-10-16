@@ -66,7 +66,7 @@ impl ProofBundle {
 
     pub fn verify(&self) -> Result<()> {
         use std::io::Read;
-        let mut decoder = zstd::stream::read::Decoder::new(&self.proof_bytes[..])
+        let decoder = zstd::stream::read::Decoder::new(&self.proof_bytes[..])
             .map_err(|e| anyhow!("zstd decoder init: {e}"))?;
         let mut proof_bytes = Vec::new();
         decoder

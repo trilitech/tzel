@@ -2077,12 +2077,15 @@ fn configure_verifier<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
     config: &KernelVerifierConfig,
 ) -> Result<(), String> {
-    #[cfg(feature = "proof-verifier")]
-    DirectProofVerifier::from_kernel_config(config)?;
-
     if read_verifier_config(ledger.host)?.is_some() {
         return Err("rollup verifier is already configured".into());
     }
+    if config.verified_program_hashes != tzel_core::ProgramHashes::leanvm() {
+        return Err("verified_program_hashes do not match canonical leanVM program hashes".into());
+    }
+    #[cfg(feature = "proof-verifier")]
+    DirectProofVerifier::from_kernel_config(config)?;
+
     ledger.write_felt(PATH_AUTH_DOMAIN, &config.auth_domain);
     let encoded = encode_kernel_verifier_config(config)?;
     ledger.host.write_store(PATH_VERIFIER_CONFIG, &encoded);
@@ -3621,6 +3624,53 @@ mod tests {
     }
 
     #[test]
+    fn rejects_verifier_configuration_with_non_canonical_program_hashes() {
+        let mut host = MockHost::default();
+        let bad_config = KernelVerifierConfig {
+            auth_domain: sample_felt(0x55),
+            verified_program_hashes: ProgramHashes {
+                shield: [1u8; 32],
+                transfer: [2u8; 32],
+                unshield: [3u8; 32],
+            },
+        };
+        host.inputs.push_back(InputMessage {
+            level: 1,
+            id: 0,
+            payload: encode_external_kernel_message(&signed_verifier_message(bad_config)),
+        });
+        run_with_host(&mut host);
+
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => assert!(
+                message.contains(
+                    "verified_program_hashes do not match canonical leanVM program hashes"
+                ),
+                "unexpected error: {message}"
+            ),
+            other => panic!("expected bad program hashes rejection, got: {:?}", other),
+        }
+        // Because the bad config was rejected before persisting, a subsequent valid
+        // one-shot configuration succeeds.
+        let valid_domain = sample_felt(0x56);
+        let valid_config = KernelVerifierConfig {
+            auth_domain: valid_domain,
+            verified_program_hashes: sample_program_hashes(),
+        };
+        host.inputs.push_back(InputMessage {
+            level: 2,
+            id: 0,
+            payload: encode_external_kernel_message(&signed_verifier_message(valid_config)),
+        });
+        run_with_host(&mut host);
+        assert!(matches!(
+            read_last_result(&host).unwrap(),
+            KernelResult::Configured
+        ));
+        assert_eq!(read_ledger(&host).unwrap().auth_domain, valid_domain);
+    }
+
+    #[test]
     fn rejects_verifier_reconfiguration_once_configured() {
         // The verifier config is one-shot: any second configure-verifier
         // message — same fields, different auth_domain, different
@@ -4645,11 +4695,7 @@ mod tests {
     }
 
     fn sample_program_hashes() -> ProgramHashes {
-        ProgramHashes {
-            shield: [1u8; 32],
-            transfer: [2u8; 32],
-            unshield: [3u8; 32],
-        }
+        ProgramHashes::leanvm()
     }
 
     fn sample_kernel_test_proof() -> KernelStarkProof {

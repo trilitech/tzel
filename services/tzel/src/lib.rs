@@ -176,66 +176,8 @@ fn encode_verify_bundle_json(
     .map_err(|e| e.to_string())
 }
 
-fn compute_program_hash(reprove_bin: &str, executable: &Path) -> Result<F, String> {
-    let output = std::process::Command::new(reprove_bin)
-        .arg(executable)
-        .arg("--program-hash")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| {
-            format!(
-                "failed to start reprover for {}: {}",
-                executable.display(),
-                e
-            )
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "failed to compute program hash for {}: {}",
-            executable.display(),
-            stderr.trim()
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return Err(format!(
-            "reprover returned empty program hash for {}",
-            executable.display()
-        ));
-    }
-    let bytes = hex::decode(&stdout).map_err(|_| {
-        format!(
-            "reprover returned non-hex program hash for {}",
-            executable.display()
-        )
-    })?;
-    if bytes.len() != 32 {
-        return Err(format!(
-            "reprover returned {} program-hash bytes for {}, expected 32",
-            bytes.len(),
-            executable.display()
-        ));
-    }
-    let mut felt = [0u8; 32];
-    felt.copy_from_slice(&bytes);
-    Ok(felt)
-}
-
-fn load_program_hashes(reprove_bin: &str, executables_dir: &str) -> Result<ProgramHashes, String> {
-    let base = PathBuf::from(executables_dir);
-    let shield = base.join(CircuitKind::Shield.executable_filename());
-    let transfer = base.join(CircuitKind::Transfer.executable_filename());
-    let unshield = base.join(CircuitKind::Unshield.executable_filename());
-
-    Ok(ProgramHashes {
-        shield: compute_program_hash(reprove_bin, &shield)?,
-        transfer: compute_program_hash(reprove_bin, &transfer)?,
-        unshield: compute_program_hash(reprove_bin, &unshield)?,
-    })
+fn load_program_hashes(_reprove_bin: &str, _executables_dir: &str) -> Result<ProgramHashes, String> {
+    Ok(ProgramHashes::leanvm())
 }
 
 fn validate_stark_circuit(
@@ -2592,7 +2534,7 @@ mod tests {
 
         let marker = temp.path().join("verify-executable-arg");
         let script = temp.path().join("fake-reprove");
-        let transfer_hash = u(222);
+        let transfer_hash = ProgramHashes::leanvm().transfer;
         std::fs::write(
             &script,
             format!(

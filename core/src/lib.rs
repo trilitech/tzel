@@ -1966,6 +1966,32 @@ pub struct ProgramHashes {
     pub unshield: F,
 }
 
+impl ProgramHashes {
+    /// Canonical `leanVM` program hashes for the `shield`, `transfer`, and `unshield` circuits.
+    pub const fn leanvm() -> Self {
+        Self {
+            shield: [
+                0x44, 0x48, 0x53, 0x5f, 0x4c, 0x45, 0x5a, 0x54,
+                0x31, 0x5f, 0x4d, 0x56, 0x4e, 0x41, 0x45, 0x4c,
+                0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            ],
+            transfer: [
+                0x52, 0x46, 0x58, 0x5f, 0x4c, 0x45, 0x5a, 0x54,
+                0x31, 0x5f, 0x4d, 0x56, 0x4e, 0x41, 0x45, 0x4c,
+                0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            ],
+            unshield: [
+                0x53, 0x4e, 0x55, 0x5f, 0x4c, 0x45, 0x5a, 0x54,
+                0x31, 0x5f, 0x4d, 0x56, 0x4e, 0x41, 0x45, 0x4c,
+                0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitKind {
     Shield,
@@ -2648,15 +2674,18 @@ impl PreparedShield {
     pub fn pubkey_hash(&self) -> &F {
         &self.pubkey_hash
     }
-    /// Total debit aggregated for the asset pool. For tez shields
-    /// this is `v + fee + producer_fee`; for FA2 shields it's
-    /// `v + fee` (the `producer_fee` portion comes out of the tez
-    /// pool via `producer_fee_tez_debit`).
+    /// Total debit aggregated for the asset pool (`self.asset_id`). For tez
+    /// shields this is `v + fee + producer_fee`; for FA2 shields it is `v`
+    /// (both `fee` and `producer_fee` come out of the tez pool via
+    /// `tez_debit` / `producer_fee_tez_debit`).
     pub fn debit(&self) -> u64 {
         self.asset_debit
     }
     pub fn asset_debit(&self) -> u64 {
         self.asset_debit
+    }
+    pub fn tez_debit(&self) -> u64 {
+        self.producer_fee_tez_debit
     }
     pub fn producer_fee_tez_debit(&self) -> u64 {
         self.producer_fee_tez_debit

@@ -232,7 +232,12 @@ fn exact_merkle_path(subtree_root_lvl3: &Felt, pos: u64, seed: u64) -> (Felt, [F
 
 /// Build a valid TzEL-Exact `ShieldTx` witness (`asset_new` can be `ASSET_TEZ` or an FA2 asset).
 pub fn build_exact_shield(asset_new: Felt) -> (ShieldTx, Run) {
-    let key = ExactXmssKey::generate(101, 7);
+    build_exact_shield_with_auth_idx(asset_new, 7)
+}
+
+/// Build a valid TzEL-Exact `ShieldTx` witness with a specific XMSS leaf index `auth_idx`.
+pub fn build_exact_shield_with_auth_idx(asset_new: Felt, auth_idx: u32) -> (ShieldTx, Run) {
+    let key = ExactXmssKey::generate(101, auth_idx);
     let auth_domain = exact::hash1(&[0xD00D_0001, 0, 0, 0]);
     let nk_spend = exact::hash1(&[0x7777, 1, 0, 0]);
     let nk_tag = exact::derive_nk_tag(&nk_spend);
@@ -1392,7 +1397,7 @@ mod tests {
     fn zk_table_heights_are_independent_of_private_witness_values() {
         let program = Program::from_elf(ELF).expect("valid tzel.elf");
 
-        // Shield: tez vs FA2 asset routing
+        // Shield: tez vs FA2 asset routing, plus varying private XMSS leaf index bit patterns
         let (_, shield_tez) = build_exact_shield(ASSET_TEZ);
         let (_, shield_fa2) = build_exact_shield(FA2_ASSET_FELT);
         let m_shield_tez = program.measure(&shield_tez.advice).unwrap();
@@ -1402,6 +1407,15 @@ mod tests {
             "Shield table counts must not leak private witness values"
         );
         assert_eq!(m_shield_tez.proven_rows, m_shield_fa2.proven_rows);
+        for auth_idx in [0u32, 341, 682, 1023] {
+            let (_, shield_idx) = build_exact_shield_with_auth_idx(ASSET_TEZ, auth_idx);
+            let m_idx = program.measure(&shield_idx.advice).unwrap();
+            assert_eq!(
+                m_shield_tez.counts, m_idx.counts,
+                "Shield table counts must not leak private auth_idx ({auth_idx})"
+            );
+            assert_eq!(m_shield_tez.proven_rows, m_idx.proven_rows);
+        }
 
         // Transfer (fixed public shape n_inputs = 2): single-asset tez vs mixed FA2+tez
         // (exercises both branches of the 2-accumulator asset router and different output values/assets).
@@ -1418,7 +1432,10 @@ mod tests {
 
     #[test]
     fn elf_digest_is_pinned_to_program_hash_version_tags() {
-        // Guard against rebuilding `tzel.elf` without bumping `PROGRAM_HASH_{SHIELD,TRANSFER,UNSHIELD}`.
+        // 1. Guard against rebuilding `tzel.elf` without bumping `PROGRAM_HASH_{SHIELD,TRANSFER,UNSHIELD}`.
+        // We hash the loaded `leanvm::Guest` segments (`entry_pc`, `log_ram`, `log_advice`, `text`, `image`)
+        // as well as the raw ELF bytes.
+        let loaded = leanvm::Guest::from_elf(ELF).expect("valid tzel.elf");
         let mut pv = PublicValues::new();
         pv.commit(&u64_to_felt(ELF.len() as u64));
         for chunk in ELF.chunks(32) {
@@ -1462,6 +1479,32 @@ mod tests {
                 7296736276791755098
             ],
             "tzel.elf changed! If this guest change is intentional, bump PROGRAM_HASH_{{SHIELD,TRANSFER,UNSHIELD}} version tags and update this pinned ELF digest."
+        );
+
+        // 2. Guard against editing `../guest` sources without regenerating `tzel.elf`:
+        // rebuild `tzel-guest` from source and verify that its loaded `leanvm::Guest`
+        // (`entry_pc`, `log_ram`, `log_advice`, `text`, `image`) matches the checked-in `tzel.elf`.
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let guest_dir = manifest_dir.join("../guest");
+        let target_dir = manifest_dir.join("../../../../../target/tzel-guest-verify");
+        let status = std::process::Command::new(
+            std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
+        )
+        .current_dir(&guest_dir)
+        .env("RUSTC_BOOTSTRAP", "1")
+        .args(["build", "--release", "--target-dir"])
+        .arg(&target_dir)
+        .status()
+        .expect("failed to invoke cargo build for tzel-guest");
+        assert!(status.success(), "cargo build --release in tzel-guest failed");
+        let rebuilt_elf_path = target_dir.join("riscv64im-unknown-none-elf/release/tzel-guest");
+        let rebuilt_bytes =
+            std::fs::read(&rebuilt_elf_path).expect("failed to read rebuilt tzel-guest ELF");
+        let rebuilt_guest =
+            leanvm::Guest::from_elf(&rebuilt_bytes).expect("rebuilt tzel-guest ELF must be valid");
+        assert_eq!(
+            rebuilt_guest, loaded,
+            "checked-in tzel.elf is out of sync with third_party/leanvm/programs/tzel/guest! Rebuild tzel.elf and bump PROGRAM_HASH_{{SHIELD,TRANSFER,UNSHIELD}} if intentional."
         );
     }
 

@@ -38,6 +38,11 @@ impl DirectProofVerifier {
     }
 
     pub fn from_kernel_config(config: &KernelVerifierConfig) -> Result<Self, String> {
+        if config.verified_program_hashes != leanvm_program_hashes() {
+            return Err(
+                "verified_program_hashes do not match canonical leanVM program hashes".into(),
+            );
+        }
         Ok(Self::verified(
             false,
             config.verified_program_hashes.clone(),
@@ -296,9 +301,10 @@ mod tests {
 
     #[test]
     fn test_direct_verifier_validate_kernel_uses_host_conversion() {
+        let hashes = leanvm_program_hashes();
         let verifier = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
             auth_domain: f(77),
-            verified_program_hashes: sample_hashes(),
+            verified_program_hashes: hashes.clone(),
         })
         .unwrap();
 
@@ -306,7 +312,7 @@ mod tests {
             .validate_kernel(
                 &KernelStarkProof {
                     proof_bytes: vec![1, 2, 3],
-                    output_preimage: vec![f(1), f(4), f(22), f(99), f(100)],
+                    output_preimage: vec![f(1), f(4), hashes.transfer, f(99), f(100)],
                 },
                 CircuitKind::Transfer,
             )
@@ -318,7 +324,7 @@ mod tests {
     fn test_from_kernel_config_disables_trust_me_bro() {
         let verifier = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
             auth_domain: f(77),
-            verified_program_hashes: sample_hashes(),
+            verified_program_hashes: leanvm_program_hashes(),
         })
         .unwrap();
 
@@ -326,6 +332,19 @@ mod tests {
             .validate(&Proof::TrustMeBro, CircuitKind::Shield)
             .unwrap_err();
         assert!(err.contains("TrustMeBro proofs rejected"));
+    }
+
+    #[test]
+    fn test_from_kernel_config_rejects_mismatched_program_hashes() {
+        let err = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
+            auth_domain: f(77),
+            verified_program_hashes: sample_hashes(),
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("verified_program_hashes do not match canonical leanVM program hashes"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -180,11 +180,7 @@ fn signed_verifier_message(config: KernelVerifierConfig) -> KernelInboxMessage {
 }
 
 fn sample_program_hashes() -> ProgramHashes {
-    ProgramHashes {
-        shield: hash(b"tzel-test-shield"),
-        transfer: hash(b"tzel-test-transfer"),
-        unshield: hash(b"tzel-test-unshield"),
-    }
+    ProgramHashes::leanvm()
 }
 
 fn default_verifier_config() -> KernelVerifierConfig {
@@ -539,18 +535,42 @@ fn verified_bridge_rejects_transfer_when_program_hashes_do_not_match_fixture() {
     let mut bad_hashes = fixture.program_hashes.clone();
     bad_hashes.transfer[0] ^= 0x01;
 
+    // 1. A ConfigureVerifier message with non-canonical program hashes is rejected
+    // up front without freezing the one-shot verifier slot.
+    let mut bad_config_host = TestHost::default();
+    bad_config_host.push_input(
+        0,
+        0,
+        encode_external_kernel_message(signed_verifier_message(KernelVerifierConfig {
+            auth_domain: fixture.auth_domain,
+            verified_program_hashes: bad_hashes,
+        })),
+    );
+    run_with_host(&mut bad_config_host);
+    match read_last_result(&bad_config_host).unwrap() {
+        KernelResult::Error { message } => {
+            assert!(
+                message.contains("verified_program_hashes do not match canonical leanVM program hashes"),
+                "unexpected verifier config error: {message}"
+            );
+        }
+        other => panic!("unexpected rollup result: {:?}", other),
+    }
+
+    // 2. When configured with canonical program hashes, a transfer proof whose
+    // output_preimage carries a mismatched program hash is rejected without mutating state.
     let mut host = TestHost::default();
-    configure_verified_bridge_with_hashes(&mut host, fixture, bad_hashes);
+    configure_verified_bridge(&mut host, fixture);
     apply_fixture_deposit(&mut host, fixture, 2);
     apply_fixture_shield(&mut host, fixture, 3);
 
     let before_transfer = read_ledger(&host).unwrap();
+    let mut bad_transfer = kernel_transfer_req_from_fixture(&fixture.transfer);
+    bad_transfer.proof.output_preimage[2][0] ^= 0x01;
     host.push_input(
         4,
         0,
-        encode_external_kernel_message(KernelInboxMessage::Transfer(
-            kernel_transfer_req_from_fixture(&fixture.transfer),
-        )),
+        encode_external_kernel_message(KernelInboxMessage::Transfer(bad_transfer)),
     );
     run_with_host(&mut host);
 

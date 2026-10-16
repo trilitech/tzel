@@ -2059,6 +2059,32 @@ let test_fa2_shield_requires_tez_pool () =
     (Tzel.Ledger.deposit_balance ledger ~asset_id:fa2 ~pubkey_hash:pub.pubkey_hash () = Some 5100L);
   Alcotest.(check int) "tree unchanged" 0 (Tzel.Ledger.tree_size ledger)
 
+let test_fa2_shield_debit_overflow_rejected () =
+  (* Regression test: Int64.add fee producer_fee (for FA2 tez debit) or
+     Int64.add v_pub fee (for tez shield debit) wrapping around to a negative
+     value must be rejected by checked_add_nonneg instead of bypassing the
+     balance >= debit check. *)
+  let auth_domain = Tzel.Hash.hash_tag "test-domain" in
+  let ledger = Tzel.Ledger.create ~auth_domain in
+  let recipient = derive_test_address (Tzel.Keys.derive (Tzel.Felt.of_u64 12)) 0 in
+  let producer = derive_test_address (Tzel.Keys.derive (Tzel.Felt.of_u64 700)) 0 in
+  let fa2 = Tzel.Asset_registry.derive_asset_id fa2_ticketer in
+  let (pub, _rn, _pn, mch, prod_mch) =
+    build_fa2_shield ~auth_domain ~asset_new:fa2 ~recipient ~producer
+      ~v_pub:5000L ~fee:Int64.max_int ~producer_fee:2L
+  in
+  Tzel.Ledger.credit_deposit ledger ~asset_id:fa2 ~pubkey_hash:pub.pubkey_hash ~amount:5000L ();
+  Tzel.Ledger.credit_deposit ledger ~pubkey_hash:pub.pubkey_hash ~amount:10L ();
+  let result =
+    Tzel.Ledger.apply_shield ledger ~pub ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
+  in
+  Alcotest.(check bool) "rejected: fee + producer_fee overflow" true (Result.is_error result);
+  Alcotest.(check bool) "fa2 pool intact" true
+    (Tzel.Ledger.deposit_balance ledger ~asset_id:fa2 ~pubkey_hash:pub.pubkey_hash () = Some 5000L);
+  Alcotest.(check bool) "tez pool intact" true
+    (Tzel.Ledger.deposit_balance ledger ~pubkey_hash:pub.pubkey_hash () = Some 10L);
+  Alcotest.(check int) "tree unchanged" 0 (Tzel.Ledger.tree_size ledger)
+
 let test_fa2_unshield_records_asset () =
   let auth_domain = Tzel.Hash.hash_tag "domain" in
   let ledger = Tzel.Ledger.create ~auth_domain in
@@ -2630,6 +2656,7 @@ let () =
       Alcotest.test_case "fa2 registry compose+lookup" `Quick test_asset_registry_compose_and_lookup;
       Alcotest.test_case "fa2 shield dual pool" `Quick test_fa2_shield_dual_pool;
       Alcotest.test_case "fa2 shield requires tez pool" `Quick test_fa2_shield_requires_tez_pool;
+      Alcotest.test_case "fa2 shield debit overflow rejected" `Quick test_fa2_shield_debit_overflow_rejected;
       Alcotest.test_case "fa2 unshield records asset" `Quick test_fa2_unshield_records_asset;
       Alcotest.test_case "root history" `Quick test_ledger_root_history;
       Alcotest.test_case "root history prunes oldest" `Quick test_ledger_root_history_prunes_oldest;

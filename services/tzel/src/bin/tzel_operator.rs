@@ -1491,20 +1491,6 @@ fn encode_targeted_rollup_message(rollup_address: &str, payload: &[u8]) -> Resul
 // tune per-network block times.
 const OCTEZ_CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn temp_output_path(kind: &str) -> Result<PathBuf, String> {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "tzel-operator-{}-{}-{}.log",
-        std::process::id(),
-        kind,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("system clock error: {}", e))?
-            .as_nanos()
-    ));
-    Ok(path)
-}
-
 fn run_command_collect_output(
     mut command: std::process::Command,
     program_name: &str,
@@ -1515,12 +1501,18 @@ fn run_command_collect_output(
     // deadlock. Files also let us recover partial output after a timeout-kill —
     // octez-client prints the injected op hash *before* it waits for
     // confirmation, and callers use that hash for idempotency on a timeout.
-    let stdout_path = temp_output_path("out")?;
-    let stderr_path = temp_output_path("err")?;
-    let stdout_file = std::fs::File::create(&stdout_path)
+    // Using `NamedTempFile` avoids symlink-following and guarantees cleanup on
+    // any early error return.
+    let stdout_temp = tempfile::NamedTempFile::new()
         .map_err(|e| format!("create stdout capture for {}: {}", program_name, e))?;
-    let stderr_file = std::fs::File::create(&stderr_path)
+    let stderr_temp = tempfile::NamedTempFile::new()
         .map_err(|e| format!("create stderr capture for {}: {}", program_name, e))?;
+    let stdout_file = stdout_temp
+        .reopen()
+        .map_err(|e| format!("reopen stdout capture for {}: {}", program_name, e))?;
+    let stderr_file = stderr_temp
+        .reopen()
+        .map_err(|e| format!("reopen stderr capture for {}: {}", program_name, e))?;
     command.stdout(stdout_file).stderr(stderr_file);
 
     let mut child = command
@@ -1528,37 +1520,37 @@ fn run_command_collect_output(
         .map_err(|e| format!("failed to start {}: {}", program_name, e))?;
 
     let deadline = Instant::now() + timeout;
+    let mut poll_interval = Duration::from_millis(5);
     let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                if now >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
                     timed_out = true;
                     break None;
                 }
-                std::thread::sleep(Duration::from_millis(200));
+                let sleep_for = poll_interval.min(deadline - now);
+                std::thread::sleep(sleep_for);
+                poll_interval = (poll_interval * 2).min(Duration::from_millis(50));
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&stdout_path);
-                let _ = std::fs::remove_file(&stderr_path);
                 return Err(format!("failed to wait for {}: {}", program_name, e));
             }
         }
     };
 
-    let stdout = std::fs::read_to_string(&stdout_path)
+    let stdout = std::fs::read_to_string(stdout_temp.path())
         .unwrap_or_default()
         .trim()
         .to_string();
-    let stderr = std::fs::read_to_string(&stderr_path)
+    let stderr = std::fs::read_to_string(stderr_temp.path())
         .unwrap_or_default()
         .trim()
         .to_string();
-    let _ = std::fs::remove_file(&stdout_path);
-    let _ = std::fs::remove_file(&stderr_path);
     let combined = match (stdout.is_empty(), stderr.is_empty()) {
         (true, true) => String::new(),
         (false, true) => stdout,
