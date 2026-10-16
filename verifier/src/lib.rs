@@ -214,6 +214,11 @@ mod tests {
     }
 
     #[test]
+    fn test_core_program_hashes_leanvm_matches_host_constants() {
+        assert_eq!(ProgramHashes::leanvm(), leanvm_program_hashes());
+    }
+
+    #[test]
     fn test_check_proof_shape_rejects_disallowed_trust_me_bro() {
         let err = check_proof_shape(&Proof::TrustMeBro, false, false).unwrap_err();
         assert!(err.contains("TrustMeBro proofs rejected"));

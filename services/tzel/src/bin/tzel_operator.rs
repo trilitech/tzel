@@ -1142,23 +1142,43 @@ fn publish_dal_chunk_with_protocol(
     for _attempt in 0..attempts {
         let slot_index = select_slot_index(config, number_of_slots)?;
         let publish = post_dal_slot(dal_node_endpoint, slot_index, payload)?;
-        let output = match publish_dal_commitment(
+        let (operation_hash, published_level) = match publish_dal_commitment(
             config,
             &publish.commitment,
             slot_index,
             &publish.commitment_proof,
         ) {
-            Ok(output) => output,
+            Ok(output) => {
+                let operation_hash = extract_operation_hash(&output);
+                let block_hash = extract_block_hash(&output).ok_or_else(|| {
+                    format!("missing block hash in dal commitment output: {}", output)
+                })?;
+                let published_level = fetch_block_level(octez_node_endpoint, &block_hash)?;
+                (operation_hash, published_level)
+            }
             Err(err) if is_slot_header_collision(&err) => {
                 last_slot_error = Some(err);
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                // Idempotency (matches inject_direct_message): octez-client prints
+                // the operation hash as soon as the commitment op is injected, before
+                // waiting for `-w 1` block inclusion. If `-w 1` times out after
+                // injection, record the chunk with the extracted operation hash and
+                // either the block level (if a block hash was also printed) or the
+                // current head level so the reconciler tracks it instead of failing
+                // the submission and re-injecting a counter-conflicting duplicate.
+                if let Some(op_hash) = extract_operation_hash(&err) {
+                    let published_level = match extract_block_hash(&err) {
+                        Some(block_hash) => fetch_block_level(octez_node_endpoint, &block_hash)?,
+                        None => fetch_head_level(octez_node_endpoint)?,
+                    };
+                    (Some(op_hash), published_level)
+                } else {
+                    return Err(err);
+                }
+            }
         };
-        let operation_hash = extract_operation_hash(&output);
-        let block_hash = extract_block_hash(&output)
-            .ok_or_else(|| format!("missing block hash in dal commitment output: {}", output))?;
-        let published_level = fetch_block_level(octez_node_endpoint, &block_hash)?;
         return Ok(RollupDalChunk {
             slot_index,
             published_level,
@@ -3466,6 +3486,65 @@ mod tests {
         let log = std::fs::read_to_string(log_path).unwrap();
         assert!(log.contains("publish"));
         assert!(log.contains("slot"));
+    }
+
+    #[test]
+    fn dal_publish_timeout_after_injection_records_chunk_instead_of_failing() {
+        let script_dir = tempfile::tempdir().unwrap();
+        let client_path = script_dir.path().join("octez-client");
+        // Simulate octez-client injecting the DAL commitment operation and printing
+        // its hash, then timing out on `-w 1` confirmation before printing a block hash.
+        let script = "#!/bin/sh\necho \"Operation hash is 'ooDalTimedOut123456789ABCDEFG'\"\necho 'Error: timed out waiting for operation inclusion' >&2\nexit 1\n";
+        std::fs::write(&client_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&client_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&client_path, perms).unwrap();
+        }
+        let mut config = config_with_client(&client_path);
+        config.direct_max_message_bytes = 1;
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8192}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1timeout\",\"commitment_proof\":\"proof-t\"}".into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/head/header".into(),
+                (200, "{\"level\":456}".into()),
+            ),
+            (
+                "/levels/456/slots/0/status".into(),
+                (404, "not found".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let req = SubmitRollupMessageReq {
+            kind: RollupSubmissionKind::ConfigureBridge,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            payload: sample_configure_bridge_payload(),
+        };
+        let submission = process_submission(&config, req).unwrap();
+        assert_eq!(submission.status, RollupSubmissionStatus::CommitmentIncluded);
+        assert_eq!(submission.dal_chunks.len(), 1);
+        assert_eq!(
+            submission.dal_chunks[0].operation_hash.as_deref(),
+            Some("ooDalTimedOut123456789ABCDEFG")
+        );
+        assert_eq!(submission.dal_chunks[0].published_level, 456);
     }
 
     #[test]

@@ -6474,8 +6474,10 @@ mod tests {
         fn prop_select_notes_returns_valid_covering_set(
             values in prop::collection::vec(1u64..10_000, 1..12)
         ) {
-            let total = values.iter().copied().sum::<u64>();
-            let amount = 1 + (total / 2);
+            let mut sorted = values.clone();
+            sorted.sort_unstable_by(|a, b| b.cmp(a));
+            let top5_total: u64 = sorted.iter().take(5).copied().sum();
+            let amount = 1 + (top5_total / 2);
             let mut w = test_wallet(0);
             w.notes = values.iter().enumerate().map(|(i, v)| Note {
                 nk_spend: ZERO,
@@ -6491,6 +6493,7 @@ mod tests {
             }).collect();
 
             let selected = w.select_notes(amount).expect("selection should succeed");
+            prop_assert!(selected.len() <= 5);
             let mut seen = std::collections::HashSet::new();
             let mut selected_sum: u128 = 0;
             for i in selected {
@@ -11809,7 +11812,9 @@ fn cmd_unshield_rollup(
             args.push(felt_to_hex(&w.notes[si].asset_id));
         }
 
-        // change_1: primary refund (same asset as exit_asset_id).
+        // change_1: primary refund (same asset as exit_asset_id when active;
+        // must be zero / ASSET_TEZ when has_change_val == 0 to satisfy
+        // UnshieldChangeSlot::commitment_or_zero in tzel-guest).
         args.push(felt_u64_to_hex(has_change_val));
         if let Some(cd) = &change_data {
             args.push(felt_to_hex(&cd.d_j));
@@ -11824,7 +11829,11 @@ fn cmd_unshield_rollup(
                 args.push("0x0".to_string());
             }
         }
-        args.push(felt_to_hex(&exit_asset_id));
+        args.push(felt_to_hex(if has_change_val == 1 {
+            &exit_asset_id
+        } else {
+            &ASSET_TEZ
+        }));
 
         // change_2: tez refund (only non-zero for FA2 exits).
         args.push(felt_u64_to_hex(has_change_2_val));
@@ -12479,6 +12488,242 @@ mod network_profile_tests {
             octez_log.trim().is_empty(),
             "unexpected octez invocations: {octez_log}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmd_unshield_rollup_exact_fa2_exit_zeroes_disabled_change_1_asset() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let fa2_asset_id = derive_asset_id("KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc");
+        let fa2_note_value = 50_000u64;
+        let tez_note_value = MIN_TX_FEE + 1;
+        let mut wallet = super::tests::test_wallet(1);
+        let addr = wallet.addresses[0].clone();
+        let acc = wallet.account();
+        let nk_spend = derive_nk_spend(&acc.nk, &addr.d_j);
+        let nk_tag = derive_nk_tag(&nk_spend);
+        let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tag);
+
+        let rseed_fa2 = felt_tag(b"exact-fa2-unshield-note");
+        let cm_fa2 = commit(&addr.d_j, fa2_note_value, &fa2_asset_id, &derive_rcm(&rseed_fa2), &otag);
+        wallet.notes.push(Note {
+            nk_spend,
+            nk_tag,
+            auth_root: addr.auth_root,
+            d_j: addr.d_j,
+            v: fa2_note_value,
+            rseed: rseed_fa2,
+            cm: cm_fa2,
+            index: 0,
+            addr_index: 0,
+            asset_id: fa2_asset_id,
+        });
+
+        let rseed_tez = felt_tag(b"exact-fa2-unshield-tez-fee");
+        let cm_tez = commit(&addr.d_j, tez_note_value, &ASSET_TEZ, &derive_rcm(&rseed_tez), &otag);
+        wallet.notes.push(Note {
+            nk_spend,
+            nk_tag,
+            auth_root: addr.auth_root,
+            d_j: addr.d_j,
+            v: tez_note_value,
+            rseed: rseed_tez,
+            cm: cm_tez,
+            index: 1,
+            addr_index: 0,
+            asset_id: ASSET_TEZ,
+        });
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let note_0 = super::tests::note_memo_for_wallet_address_with_asset(
+            &wallet,
+            0,
+            fa2_note_value,
+            rseed_fa2,
+            None,
+            &fa2_asset_id,
+        );
+        let note_1 =
+            super::tests::note_memo_for_wallet_address(&wallet, 0, tez_note_value, rseed_tez, None);
+        let encoded_0 = canonical_wire::encode_published_note(&cm_fa2, &note_0.enc).unwrap();
+        let encoded_1 = canonical_wire::encode_published_note(&cm_tez, &note_1.enc).unwrap();
+        let root = MerkleTree::from_leaves(vec![cm_fa2, cm_tez]).root();
+
+        let captured_args_path = dir.path().join("captured_args.json");
+        let reprove = dir.path().join("fake-reprove-fa2.sh");
+        std::fs::write(
+            &reprove,
+            format!(
+                "#!/bin/sh\nset -eu\nout=''\nargs_in=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--output' ]; then\n    out=\"$2\"\n    shift 2\n  elif [ \"$1\" = '--arguments-file' ]; then\n    args_in=\"$2\"\n    shift 2\n  else\n    shift\n  fi\ndone\ncp \"$args_in\" '{}'\nprintf '%s' '{{\"proof_bytes\":\"de\",\"output_preimage\":[]}}' > \"$out\"\n",
+                captured_args_path.display()
+            ),
+        )
+        .expect("write fake reprove");
+        std::fs::set_permissions(&reprove, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake reprove");
+
+        let cfg = tzel_services::kernel_wire::KernelVerifierConfig {
+            auth_domain: default_auth_domain(),
+            verified_program_hashes: ProgramHashes {
+                shield: hash(b"test-shield"),
+                transfer: hash(b"test-transfer"),
+                unshield: hash(b"test-unshield"),
+            },
+        };
+        let encoded_cfg = tzel_services::kernel_wire::encode_kernel_verifier_config(&cfg).unwrap();
+
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            ("/global/block/head/hash".into(), (200, "\"BLfa2head\"".into())),
+            ("/global/block/BLfa2head/level".into(), (200, "10".into())),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_AUTH_DOMAIN
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_SIZE
+                ),
+                (200, format!("\"{}\"", hex::encode(2u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_ROOT
+                ),
+                (200, format!("\"{}\"", hex::encode(root))),
+            ),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, encoded_0.len().to_string()),
+            ),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", hex::encode(&encoded_0))),
+            ),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 1)
+                ),
+                (200, encoded_1.len().to_string()),
+            ),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 1)
+                ),
+                (200, format!("\"{}\"", hex::encode(&encoded_1))),
+            ),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_VERIFIER_CONFIG
+                ),
+                (200, encoded_cfg.len().to_string()),
+            ),
+            (
+                format!(
+                    "/global/block/BLfa2head/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_VERIFIER_CONFIG
+                ),
+                (200, format!("\"{}\"", hex::encode(&encoded_cfg))),
+            ),
+        ]));
+        let operator_url = super::tests::spawn_mock_http_server(HashMap::from([(
+            "/v1/rollup/submissions".into(),
+            (
+                200,
+                serde_json::to_string(&SubmitRollupMessageResp {
+                    submission: RollupSubmission {
+                        id: "sub-fa2-unshield".into(),
+                        kind: RollupSubmissionKind::Unshield,
+                        rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                        status: RollupSubmissionStatus::PendingDal,
+                        transport: RollupSubmissionTransport::Dal,
+                        operation_hash: Some("ooFa2Unshield".into()),
+                        dal_chunks: vec![],
+                        commitment: None,
+                        published_level: None,
+                        slot_index: None,
+                        payload_hash: None,
+                        payload_len: 123,
+                        detail: Some("queued".into()),
+                    },
+                })
+                .unwrap(),
+            ),
+        )]));
+        let mut profile = super::tests::rollup_profile_for_url(&base_url);
+        profile.operator_url = Some(operator_url);
+        profile.operator_bearer_token = Some("operator-secret".into());
+
+        let pc = ProveConfig {
+            skip_proof: false,
+            reprove_bin: reprove.to_str().unwrap().into(),
+            executables_dir: "cairo/target/dev".into(),
+            proving_service_url: None,
+        };
+        let recipient = "tz1LhXujSfRndomkcC64pCpkkjLWQwsmCUMk";
+
+        // Exact-amount FA2 unshield: amount == fa2_note_value, so change_primary == 0.
+        cmd_unshield_rollup(
+            wallet_path_str,
+            &profile,
+            fa2_note_value,
+            None,
+            Some(recipient),
+            fa2_asset_id,
+            &pc,
+        )
+        .expect("exact-amount FA2 unshield should succeed");
+
+        let captured_json = std::fs::read_to_string(&captured_args_path).expect("read captured args");
+        let args: Vec<String> = serde_json::from_str(&captured_json).expect("parse captured args");
+        let n = 2usize;
+        let change_1_base = 7 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + n;
+        // has_change_val == 0
+        assert_eq!(args[change_1_base], felt_u64_to_hex(0));
+        // Disabled change_1 slot must emit ASSET_TEZ (zero) for its asset field so
+        // UnshieldChangeSlot::commitment_or_zero in tzel-guest accepts it.
+        assert_eq!(args[change_1_base + 8], felt_to_hex(&ASSET_TEZ));
+        // Meanwhile asset_pub and primary_non_tez_asset at the end of args remain fa2_asset_id.
+        assert_eq!(args[args.len() - 2], felt_to_hex(&fa2_asset_id));
+        assert_eq!(args[args.len() - 1], felt_to_hex(&fa2_asset_id));
     }
 
     #[test]

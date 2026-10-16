@@ -1472,7 +1472,7 @@ fn prepare_durable_shield_commit<H: Host>(
     let asset_required = if is_tez_shield {
         prepared
             .asset_debit()
-            .checked_add(prepared.producer_fee_tez_debit())
+            .checked_add(prepared.tez_debit())
             .ok_or_else(|| "shield combined debit overflow".to_string())?
     } else {
         prepared.asset_debit()
@@ -1524,14 +1524,14 @@ fn prepare_durable_shield_commit<H: Host>(
             format!(
                 "no tez deposit pool at pubkey_hash {} — non-tez shields require a tez pool to fund fee + producer_fee ({})",
                 hex::encode(prepared.pubkey_hash()),
-                prepared.producer_fee_tez_debit(),
+                prepared.tez_debit(),
             )
         })?;
         if tez_bytes.is_empty() {
             return Err(format!(
                 "no tez deposit pool at pubkey_hash {} — non-tez shields require a tez pool to fund fee + producer_fee ({})",
                 hex::encode(prepared.pubkey_hash()),
-                prepared.producer_fee_tez_debit(),
+                prepared.tez_debit(),
             ));
         }
         if tez_bytes.len() != 8 {
@@ -1541,15 +1541,15 @@ fn prepare_durable_shield_commit<H: Host>(
             ));
         }
         let tez_balance = u64::from_le_bytes(tez_bytes.try_into().unwrap());
-        if tez_balance < prepared.producer_fee_tez_debit() {
+        if tez_balance < prepared.tez_debit() {
             return Err(format!(
                 "tez deposit pool at pubkey_hash {} balance {} too small for fee + producer_fee = {}",
                 hex::encode(prepared.pubkey_hash()),
                 tez_balance,
-                prepared.producer_fee_tez_debit(),
+                prepared.tez_debit(),
             ));
         }
-        (Some(tez_path), tez_balance - prepared.producer_fee_tez_debit())
+        (Some(tez_path), tez_balance - prepared.tez_debit())
     };
 
     // 2. Reject shield replays. The kernel records each successfully

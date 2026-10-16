@@ -1968,6 +1968,8 @@ pub struct ProgramHashes {
 
 impl ProgramHashes {
     /// Canonical `leanVM` program hashes for the `shield`, `transfer`, and `unshield` circuits.
+    /// Kept in sync with `tzel_host::PROGRAM_HASH_{SHIELD,TRANSFER,UNSHIELD}` via
+    /// `tzel_verifier::tests::test_core_program_hashes_leanvm_matches_host_constants`.
     pub const fn leanvm() -> Self {
         Self {
             shield: [
@@ -2660,7 +2662,7 @@ pub struct PreparedShield {
     /// debits are summed into a single pool operation by
     /// `commit_prepared_shield`. The split is logical, not
     /// per-call.
-    pub producer_fee_tez_debit: u64,
+    pub tez_debit: u64,
     pub client_cm: F,
     pub client_enc: EncryptedNote,
     pub producer_cm: F,
@@ -2675,9 +2677,9 @@ impl PreparedShield {
         &self.pubkey_hash
     }
     /// Total debit aggregated for the asset pool (`self.asset_id`). For tez
-    /// shields this is `v + fee + producer_fee`; for FA2 shields it is `v`
+    /// shields this is `v + fee`; for FA2 shields it is `v`
     /// (both `fee` and `producer_fee` come out of the tez pool via
-    /// `tez_debit` / `producer_fee_tez_debit`).
+    /// `tez_debit`).
     pub fn debit(&self) -> u64 {
         self.asset_debit
     }
@@ -2685,10 +2687,7 @@ impl PreparedShield {
         self.asset_debit
     }
     pub fn tez_debit(&self) -> u64 {
-        self.producer_fee_tez_debit
-    }
-    pub fn producer_fee_tez_debit(&self) -> u64 {
-        self.producer_fee_tez_debit
+        self.tez_debit
     }
     pub fn client_note(&self) -> (&F, &EncryptedNote) {
         (&self.client_cm, &self.client_enc)
@@ -2753,7 +2752,7 @@ pub fn prepare_shield<S: LedgerState>(
     //     FA2 note value (v), while the (ASSET_TEZ, pubkey_hash) pool
     //     pays BOTH the tez rollup fee (fee >= MIN_TX_FEE) and the
     //     tez producer_fee note (fee + producer_fee).
-    let (asset_debit, producer_fee_tez_debit) = if req.asset_id == ASSET_TEZ {
+    let (asset_debit, tez_debit) = if req.asset_id == ASSET_TEZ {
         let d = req
             .v
             .checked_add(req.fee)
@@ -2779,7 +2778,7 @@ pub fn prepare_shield<S: LedgerState>(
     let asset_required = if req.asset_id == ASSET_TEZ {
         // Same pool covers both debits.
         asset_debit
-            .checked_add(producer_fee_tez_debit)
+            .checked_add(tez_debit)
             .ok_or_else(|| "shield debit overflow (v + fee + producer_fee)".to_string())?
     } else {
         asset_debit
@@ -2806,13 +2805,13 @@ pub fn prepare_shield<S: LedgerState>(
                 format!(
                     "no tez deposit pool at pubkey_hash {} — non-tez shields require a separate tez pool to fund fee + producer_fee ({})",
                     hex::encode(&req.pubkey_hash),
-                    producer_fee_tez_debit,
+                    tez_debit,
                 )
             })?;
-        if tez_pool_balance < producer_fee_tez_debit {
+        if tez_pool_balance < tez_debit {
             return Err(format!(
                 "tez deposit pool balance ({}) too small for fee + producer_fee ({}) — required because rollup fees and producer fees are permanently tez",
-                tez_pool_balance, producer_fee_tez_debit,
+                tez_pool_balance, tez_debit,
             ));
         }
     }
@@ -2877,7 +2876,7 @@ pub fn prepare_shield<S: LedgerState>(
         asset_id: req.asset_id,
         pubkey_hash: req.pubkey_hash,
         asset_debit,
-        producer_fee_tez_debit,
+        tez_debit,
         client_cm: req.client_cm,
         client_enc: req.client_enc.clone(),
         producer_cm: req.producer_cm,
@@ -2910,12 +2909,12 @@ pub fn commit_prepared_shield<S: LedgerState>(
     if prepared.asset_id == ASSET_TEZ {
         let combined = prepared
             .asset_debit
-            .checked_add(prepared.producer_fee_tez_debit)
+            .checked_add(prepared.tez_debit)
             .ok_or_else(|| "shield combined debit overflow".to_string())?;
         state.debit_deposit(&ASSET_TEZ, &prepared.pubkey_hash, combined)?;
     } else {
         state.debit_deposit(&prepared.asset_id, &prepared.pubkey_hash, prepared.asset_debit)?;
-        state.debit_deposit(&ASSET_TEZ, &prepared.pubkey_hash, prepared.producer_fee_tez_debit)?;
+        state.debit_deposit(&ASSET_TEZ, &prepared.pubkey_hash, prepared.tez_debit)?;
     }
     state.mark_applied_shield(prepared.client_cm)?;
     let index = state.append_note(prepared.client_cm, prepared.client_enc)?;

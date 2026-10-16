@@ -1708,6 +1708,7 @@ let test_ledger_transfer () =
   let tpub = make_transfer_pub ~auth_domain ~root ~nullifiers:[nf]
     ~cm_1:cm1 ~cm_2:cm2 ~cm_3:cm3 () in
   let result = Tzel.Ledger.apply_transfer ledger tpub
+    ~memo_ct_hash_change_2:mch
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:mch in
   Alcotest.(check bool) "transfer ok" true (Result.is_ok result);
   Alcotest.(check int) "tree size" 6 (Tzel.Ledger.tree_size ledger)
@@ -1721,6 +1722,7 @@ let test_ledger_transfer_wrong_domain () =
     ~auth_domain:(Tzel.Hash.hash_tag "wrong-domain")
     ~root ~nullifiers:[] () in
   let result = Tzel.Ledger.apply_transfer ledger tpub
+    ~memo_ct_hash_change_2:mch
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:mch in
   Alcotest.(check bool) "wrong domain" true (Result.is_error result)
 
@@ -1731,6 +1733,7 @@ let test_ledger_transfer_unknown_root () =
   let mch = Tzel.Felt.zero in
   let tpub = make_transfer_pub ~auth_domain ~root:fake_root ~nullifiers:[] () in
   let result = Tzel.Ledger.apply_transfer ledger tpub
+    ~memo_ct_hash_change_2:mch
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:mch in
   Alcotest.(check bool) "unknown root" true (Result.is_error result)
 
@@ -1745,6 +1748,7 @@ let test_ledger_nullifier_double_spend () =
     ~cm_2:(Tzel.Hash.hash_tag "cm2")
     ~cm_3:(Tzel.Hash.hash_tag "cm3") () in
   ignore (Tzel.Ledger.apply_transfer ledger tpub
+    ~memo_ct_hash_change_2:mch
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:mch);
   (* Use same nullifier again *)
   let new_root = Tzel.Ledger.current_root ledger in
@@ -1753,6 +1757,7 @@ let test_ledger_nullifier_double_spend () =
     ~cm_2:(Tzel.Hash.hash_tag "cm5")
     ~cm_3:(Tzel.Hash.hash_tag "cm6") () in
   let result = Tzel.Ledger.apply_transfer ledger tpub2
+    ~memo_ct_hash_change_2:mch
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:mch in
   Alcotest.(check bool) "double spend rejected" true (Result.is_error result)
 
@@ -1764,6 +1769,7 @@ let test_ledger_duplicate_nullifier_in_tx () =
   let nf = Tzel.Hash.hash_tag "nf" in
   let tpub = make_transfer_pub ~auth_domain ~root ~nullifiers:[nf; nf] () in
   let result = Tzel.Ledger.apply_transfer ledger tpub
+    ~memo_ct_hash_change_2:mch
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:mch in
   Alcotest.(check bool) "duplicate nf in tx rejected" true (Result.is_error result)
 
@@ -1775,12 +1781,15 @@ let test_ledger_transfer_memo_mismatch () =
   let tpub = make_transfer_pub ~auth_domain ~root ~nullifiers:[] () in
   let wrong = Tzel.Felt.of_u64 1 in
   let r1 = Tzel.Ledger.apply_transfer ledger tpub
+    ~memo_ct_hash_change_2:mch
     ~memo_ct_hash_1:wrong ~memo_ct_hash_2:mch ~memo_ct_hash_3:mch in
   Alcotest.(check bool) "memo1 mismatch" true (Result.is_error r1);
   let r2 = Tzel.Ledger.apply_transfer ledger tpub
+    ~memo_ct_hash_change_2:mch
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:wrong ~memo_ct_hash_3:mch in
   Alcotest.(check bool) "memo2 mismatch" true (Result.is_error r2);
   let r3 = Tzel.Ledger.apply_transfer ledger tpub
+    ~memo_ct_hash_change_2:mch
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:wrong in
   Alcotest.(check bool) "memo3 mismatch" true (Result.is_error r3);
   let r_c2 = Tzel.Ledger.apply_transfer ledger ~memo_ct_hash_change_2:wrong tpub
@@ -1809,7 +1818,7 @@ let test_ledger_unshield () =
     ~v_pub:5000L ~fee:1L ~recipient_string:test_l1_recipient
     ~cm_fee () in
   let result = Tzel.Ledger.apply_unshield ledger
-    ~recipient_string:test_l1_recipient upub
+    ~recipient_string:test_l1_recipient ~memo_ct_hash_change_2:mch upub
     ~memo_ct_hash_change:mch ~memo_ct_hash_fee:mch in
   Alcotest.(check bool) "unshield ok" true (Result.is_ok result);
   Alcotest.(check withdrawal_list) "withdrawal queued" [(test_l1_recipient, 5000L)]
@@ -1828,7 +1837,7 @@ let test_ledger_unshield_with_change () =
     ~v_pub:3000L ~fee:1L ~recipient_string:test_l1_recipient
     ~cm_change ~mh_change:mch ~cm_fee () in
   let result = Tzel.Ledger.apply_unshield ledger
-    ~recipient_string:test_l1_recipient upub
+    ~recipient_string:test_l1_recipient ~memo_ct_hash_change_2:mch upub
     ~memo_ct_hash_change:mch ~memo_ct_hash_fee:mch in
   Alcotest.(check bool) "unshield with change ok" true (Result.is_ok result);
   Alcotest.(check int) "tree has change + fee" 2 (Tzel.Ledger.tree_size ledger);
@@ -1843,7 +1852,7 @@ let test_ledger_unshield_rejects_invalid_l1_recipient () =
   let upub = make_unshield_pub ~auth_domain ~root ~nullifiers:[nf]
     ~v_pub:1000L ~fee:1L ~recipient_string:test_bad_checksum_l1_recipient () in
   let result = Tzel.Ledger.apply_unshield ledger
-    ~recipient_string:test_bad_checksum_l1_recipient upub
+    ~recipient_string:test_bad_checksum_l1_recipient ~memo_ct_hash_change_2:Tzel.Felt.zero upub
     ~memo_ct_hash_change:Tzel.Felt.zero ~memo_ct_hash_fee:Tzel.Felt.zero in
   Alcotest.(check bool) "invalid recipient" true (Result.is_error result);
   Alcotest.(check withdrawal_list) "no withdrawal queued" []
@@ -1859,7 +1868,7 @@ let test_ledger_unshield_wrong_recipient () =
   let upub = make_unshield_pub ~auth_domain ~root ~nullifiers:[]
     ~v_pub:1000L ~fee:1L ~recipient_string:test_l1_recipient () in
   let result = Tzel.Ledger.apply_unshield ledger
-    ~recipient_string:test_alt_l1_recipient upub
+    ~recipient_string:test_alt_l1_recipient ~memo_ct_hash_change_2:Tzel.Felt.zero upub
     ~memo_ct_hash_change:Tzel.Felt.zero ~memo_ct_hash_fee:Tzel.Felt.zero in
   Alcotest.(check bool) "wrong recipient" true (Result.is_error result)
 
@@ -1871,7 +1880,7 @@ let test_ledger_unshield_wrong_domain () =
     ~auth_domain:(Tzel.Hash.hash_tag "wrong") ~root ~nullifiers:[]
     ~v_pub:1000L ~fee:1L ~recipient_string:test_l1_recipient () in
   let result = Tzel.Ledger.apply_unshield ledger
-    ~recipient_string:test_l1_recipient upub
+    ~recipient_string:test_l1_recipient ~memo_ct_hash_change_2:Tzel.Felt.zero upub
     ~memo_ct_hash_change:Tzel.Felt.zero ~memo_ct_hash_fee:Tzel.Felt.zero in
   Alcotest.(check bool) "wrong domain" true (Result.is_error result)
 
@@ -1887,7 +1896,7 @@ let test_ledger_unshield_change_memo_mismatch () =
     ~v_pub:1000L ~fee:1L ~recipient_string:test_l1_recipient
     ~cm_change ~mh_change:mch ~cm_fee ~mh_fee:mch () in
   let result = Tzel.Ledger.apply_unshield ledger
-    ~recipient_string:test_l1_recipient upub
+    ~recipient_string:test_l1_recipient ~memo_ct_hash_change_2:mch upub
     ~memo_ct_hash_change:(Tzel.Felt.of_u64 999) ~memo_ct_hash_fee:mch in
   Alcotest.(check bool) "change memo mismatch" true (Result.is_error result);
   Alcotest.(check withdrawal_list) "no withdrawal queued" []
@@ -1918,6 +1927,46 @@ let test_ledger_unshield_change_2_memo_mismatch () =
   Alcotest.(check bool) "nullifier not recorded" false
     (Hashtbl.mem ledger.nullifier_set (Tzel.Felt.to_hex nf))
 
+let test_ledger_unshield_zero_change_rejects_nonzero_memo_hash () =
+  let auth_domain = Tzel.Hash.hash_tag "domain" in
+  let ledger = Tzel.Ledger.create ~auth_domain in
+  let root = Tzel.Ledger.current_root ledger in
+  let cm_fee = Tzel.Hash.hash_tag "fee" in
+  let mch = Tzel.Felt.zero in
+  let nonzero = Tzel.Felt.of_u64 999 in
+  let nf = Tzel.Hash.hash_tag "nf-zero-change-nonzero-memo" in
+  let upub = make_unshield_pub ~auth_domain ~root ~nullifiers:[nf]
+    ~v_pub:1000L ~fee:1L ~recipient_string:test_l1_recipient
+    ~cm_fee ~mh_fee:mch () in
+  (* Non-zero caller memo_ct_hash_change with zero cm_change rejected *)
+  let r1 = Tzel.Ledger.apply_unshield ledger
+    ~recipient_string:test_l1_recipient ~memo_ct_hash_change_2:mch upub
+    ~memo_ct_hash_change:nonzero ~memo_ct_hash_fee:mch in
+  Alcotest.(check bool) "nonzero memo_ct_hash_change with zero cm_change rejected"
+    true (Result.is_error r1);
+  (* Non-zero caller memo_ct_hash_change_2 with zero cm_change_2 rejected *)
+  let r2 = Tzel.Ledger.apply_unshield ledger
+    ~recipient_string:test_l1_recipient ~memo_ct_hash_change_2:nonzero upub
+    ~memo_ct_hash_change:mch ~memo_ct_hash_fee:mch in
+  Alcotest.(check bool) "nonzero memo_ct_hash_change_2 with zero cm_change_2 rejected"
+    true (Result.is_error r2);
+  (* Non-zero pub.memo_ct_hash_change with zero cm_change rejected even if caller matches *)
+  let upub_bad1 = { upub with memo_ct_hash_change = nonzero } in
+  let r3 = Tzel.Ledger.apply_unshield ledger
+    ~recipient_string:test_l1_recipient ~memo_ct_hash_change_2:mch upub_bad1
+    ~memo_ct_hash_change:nonzero ~memo_ct_hash_fee:mch in
+  Alcotest.(check bool) "nonzero pub.memo_ct_hash_change with zero cm_change rejected"
+    true (Result.is_error r3);
+  (* Non-zero pub.memo_ct_hash_change_2 with zero cm_change_2 rejected even if caller matches *)
+  let upub_bad2 = { upub with memo_ct_hash_change_2 = nonzero } in
+  let r4 = Tzel.Ledger.apply_unshield ledger
+    ~recipient_string:test_l1_recipient ~memo_ct_hash_change_2:nonzero upub_bad2
+    ~memo_ct_hash_change:mch ~memo_ct_hash_fee:mch in
+  Alcotest.(check bool) "nonzero pub.memo_ct_hash_change_2 with zero cm_change_2 rejected"
+    true (Result.is_error r4);
+  Alcotest.(check bool) "nullifier not recorded" false
+    (Hashtbl.mem ledger.nullifier_set (Tzel.Felt.to_hex nf))
+
 let test_ledger_unshield_accepts_kt1_recipient () =
   let auth_domain = Tzel.Hash.hash_tag "domain" in
   let ledger = Tzel.Ledger.create ~auth_domain in
@@ -1930,7 +1979,7 @@ let test_ledger_unshield_accepts_kt1_recipient () =
     ~v_pub:2000L ~fee:1L ~recipient_string:kt1_recipient
     ~cm_fee () in
   let result = Tzel.Ledger.apply_unshield ledger
-    ~recipient_string:kt1_recipient upub
+    ~recipient_string:kt1_recipient ~memo_ct_hash_change_2:mch upub
     ~memo_ct_hash_change:mch ~memo_ct_hash_fee:mch in
   Alcotest.(check bool) "kt1 unshield ok" true (Result.is_ok result);
   Alcotest.(check withdrawal_list) "kt1 withdrawal queued" [(kt1_recipient, 2000L)]
@@ -1947,7 +1996,7 @@ let test_ledger_unshield_fee_memo_mismatch () =
     ~v_pub:1000L ~fee:1L ~recipient_string:test_l1_recipient
     ~cm_fee ~mh_fee:mch () in
   let result = Tzel.Ledger.apply_unshield ledger
-    ~recipient_string:test_l1_recipient upub
+    ~recipient_string:test_l1_recipient ~memo_ct_hash_change_2:mch upub
     ~memo_ct_hash_change:mch ~memo_ct_hash_fee:(Tzel.Felt.of_u64 999) in
   Alcotest.(check bool) "fee memo mismatch" true (Result.is_error result);
   Alcotest.(check withdrawal_list) "no withdrawal queued" []
@@ -2097,7 +2146,7 @@ let test_fa2_unshield_records_asset () =
     ~v_pub:4000L ~asset_pub:fa2 ~fee:1L ~recipient_string:test_l1_recipient
     ~cm_fee () in
   let result = Tzel.Ledger.apply_unshield ledger
-    ~recipient_string:test_l1_recipient upub
+    ~recipient_string:test_l1_recipient ~memo_ct_hash_change_2:mch upub
     ~memo_ct_hash_change:mch ~memo_ct_hash_fee:mch in
   Alcotest.(check bool) "fa2 unshield ok" true (Result.is_ok result);
   (* The withdrawal record carries the FA2 asset_id so the L1 outbox routes
@@ -2232,8 +2281,9 @@ let test_prover_verify_auth_domain () =
   let bad_outputs = [Tzel.Felt.of_u64 99] in
   Alcotest.(check bool) "auth domain mismatch" true
     (Result.is_error (Tzel.Prover.verify_auth_domain config bad_outputs));
+  let empty = [] in
   Alcotest.(check bool) "empty outputs" true
-    (Result.is_error (Tzel.Prover.verify_auth_domain config []))
+    (Result.is_error (Tzel.Prover.verify_auth_domain config empty))
 
 let test_prover_witness_json () =
   let note : Tzel.Prover.shield_note_witness = {
@@ -2458,6 +2508,7 @@ let test_multi_shield_transfer_unshield () =
     memo_ct_hash_1 = mch; memo_ct_hash_2 = mch; memo_ct_hash_3 = mch;
   } in
   let r = Tzel.Ledger.apply_transfer ledger tpub
+    ~memo_ct_hash_change_2:mch
     ~memo_ct_hash_1:mch ~memo_ct_hash_2:mch ~memo_ct_hash_3:mch in
   Alcotest.(check bool) "transfer ok" true (Result.is_ok r);
   Alcotest.(check int) "tree after transfer (4 + 4)" 8
@@ -2475,7 +2526,7 @@ let test_multi_shield_transfer_unshield () =
     memo_ct_hash_fee = mch;
   } in
   let r2 = Tzel.Ledger.apply_unshield ledger
-    ~recipient_string:test_l1_recipient upub
+    ~recipient_string:test_l1_recipient ~memo_ct_hash_change_2:mch upub
     ~memo_ct_hash_change:mch ~memo_ct_hash_fee:mch in
   Alcotest.(check bool) "unshield ok" true (Result.is_ok r2);
   Alcotest.(check withdrawal_list) "withdrawal queued" [(test_l1_recipient, 1500L)]
@@ -2650,6 +2701,7 @@ let () =
       Alcotest.test_case "unshield wrong domain" `Quick test_ledger_unshield_wrong_domain;
       Alcotest.test_case "unshield change memo mismatch" `Quick test_ledger_unshield_change_memo_mismatch;
       Alcotest.test_case "unshield change_2 memo mismatch" `Quick test_ledger_unshield_change_2_memo_mismatch;
+      Alcotest.test_case "unshield zero change rejects nonzero memo hash" `Quick test_ledger_unshield_zero_change_rejects_nonzero_memo_hash;
       Alcotest.test_case "unshield accepts KT1 recipient" `Quick test_ledger_unshield_accepts_kt1_recipient;
       Alcotest.test_case "unshield fee memo mismatch" `Quick test_ledger_unshield_fee_memo_mismatch;
       Alcotest.test_case "fa2 derive_asset_id golden" `Quick test_asset_registry_derive_asset_id_golden;

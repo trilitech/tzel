@@ -405,7 +405,7 @@ let apply_shield ledger ~(pub : Transaction.shield_public)
     end
   end
 
-let apply_transfer ledger ?(memo_ct_hash_change_2 = Felt.zero)
+let apply_transfer ledger ~memo_ct_hash_change_2
     (pub : Transaction.transfer_public)
     ~memo_ct_hash_1 ~memo_ct_hash_2 ~memo_ct_hash_3 =
   if not (Felt.equal pub.auth_domain ledger.auth_domain) then
@@ -436,7 +436,7 @@ let apply_transfer ledger ?(memo_ct_hash_change_2 = Felt.zero)
 
 (* Apply an unshield transaction. Amounts in the OCaml ledger mirror are
    represented as positive signed [int64] values in [1, Int64.max_int]. *)
-let apply_unshield ledger ~recipient_string ?(memo_ct_hash_change_2 = Felt.zero)
+let apply_unshield ledger ~recipient_string ~memo_ct_hash_change_2
     (pub : Transaction.unshield_public) ~memo_ct_hash_change ~memo_ct_hash_fee =
   if Int64.compare pub.v_pub 0L <= 0 then
     Error "v_pub must be positive"
@@ -460,9 +460,15 @@ let apply_unshield ledger ~recipient_string ?(memo_ct_hash_change_2 = Felt.zero)
       match validate_nullifiers ledger pub.nullifiers with
       | Error e -> Error e
       | Ok () ->
-        if not (Felt.is_zero pub.cm_change)
+        if Felt.is_zero pub.cm_change
+           && not (Felt.is_zero memo_ct_hash_change && Felt.is_zero pub.memo_ct_hash_change) then
+          Error "memo_ct_hash_change must be zero when cm_change is zero"
+        else if not (Felt.is_zero pub.cm_change)
            && not (Felt.equal memo_ct_hash_change pub.memo_ct_hash_change) then
           Error "memo_ct_hash_change mismatch"
+        else if Felt.is_zero pub.cm_change_2
+           && not (Felt.is_zero memo_ct_hash_change_2 && Felt.is_zero pub.memo_ct_hash_change_2) then
+          Error "memo_ct_hash_change_2 must be zero when cm_change_2 is zero"
         else if not (Felt.is_zero pub.cm_change_2)
            && not (Felt.equal memo_ct_hash_change_2 pub.memo_ct_hash_change_2) then
           Error "memo_ct_hash_change_2 mismatch"

@@ -1475,7 +1475,7 @@ mod tests {
                 11212739744090798557,
                 7296736276791755098
             ],
-            "tzel.elf changed! If this guest change is intentional, bump PROGRAM_HASH_{{SHIELD,TRANSFER,UNSHIELD}} version tags and update this pinned ELF digest."
+            "tzel.elf changed! If this guest change is intentional, bump PROGRAM_HASH_{{SHIELD,TRANSFER,UNSHIELD}} version tags (and tzel_core::ProgramHashes::leanvm()) and update this pinned ELF digest."
         );
 
         // 2. Guard against editing `../guest` sources without regenerating `tzel.elf`:
@@ -1514,7 +1514,7 @@ mod tests {
                 6821128577967752786,
                 16041536885558460047,
             ],
-            "third_party/leanvm/programs/tzel/guest sources changed! Regenerate tzel.elf, bump PROGRAM_HASH_{{SHIELD,TRANSFER,UNSHIELD}} version tags, and update both pinned digests."
+            "third_party/leanvm/programs/tzel/guest sources changed! Regenerate tzel.elf, bump PROGRAM_HASH_{{SHIELD,TRANSFER,UNSHIELD}} version tags (and tzel_core::ProgramHashes::leanvm()), and update both pinned digests."
         );
     }
 
