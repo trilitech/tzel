@@ -2786,53 +2786,53 @@ pub fn prepare_shield<S: LedgerState>(
         (req.v, tez_d)
     };
 
-    let pool_balance = state
-        .deposit_balance(&req.asset_id, &req.pubkey_hash)?
-        .ok_or_else(|| {
-            format!(
-                "no deposit pool for (asset_id {}, pubkey_hash {}); submit an L1 bridge deposit first",
-                hex::encode(&req.asset_id),
-                hex::encode(&req.pubkey_hash),
-            )
-        })?;
-    let asset_required = if req.asset_id == ASSET_TEZ {
-        // Same pool covers both debits.
-        asset_debit
-            .checked_add(tez_debit)
-            .ok_or_else(|| "shield debit overflow (v + fee + producer_fee)".to_string())?
-    } else {
-        asset_debit
+    let prepared = PreparedShield {
+        asset_id: req.asset_id,
+        pubkey_hash: req.pubkey_hash,
+        asset_debit,
+        tez_debit,
+        client_cm: req.client_cm,
+        client_enc: req.client_enc.clone(),
+        producer_cm: req.producer_cm,
+        producer_enc: req.producer_enc.clone(),
     };
-    if pool_balance < asset_required {
-        return Err(format!(
-            "deposit pool balance ({}) too small for {}{}",
-            pool_balance,
-            if req.asset_id == ASSET_TEZ {
-                "v + fee + producer_fee ("
-            } else {
-                "v ("
-            },
-            format!("{})", asset_required),
-        ));
-    }
 
-    // For FA2 shields the user must also have a tez pool at the
-    // same pubkey_hash to cover fee + producer_fee.
-    if req.asset_id != ASSET_TEZ {
-        let tez_pool_balance = state
-            .deposit_balance(&ASSET_TEZ, &req.pubkey_hash)?
+    for (idx, (pool_asset_id, required_debit)) in prepared.pool_debits()?.into_iter().enumerate() {
+        let pool_balance = state
+            .deposit_balance(&pool_asset_id, &req.pubkey_hash)?
             .ok_or_else(|| {
-                format!(
-                    "no tez deposit pool at pubkey_hash {} — non-tez shields require a separate tez pool to fund fee + producer_fee ({})",
-                    hex::encode(&req.pubkey_hash),
-                    tez_debit,
-                )
+                if idx == 0 {
+                    format!(
+                        "no deposit pool for (asset_id {}, pubkey_hash {}); submit an L1 bridge deposit first",
+                        hex::encode(&pool_asset_id),
+                        hex::encode(&req.pubkey_hash),
+                    )
+                } else {
+                    format!(
+                        "no tez deposit pool at pubkey_hash {} — non-tez shields require a separate tez pool to fund fee + producer_fee ({})",
+                        hex::encode(&req.pubkey_hash),
+                        required_debit,
+                    )
+                }
             })?;
-        if tez_pool_balance < tez_debit {
-            return Err(format!(
-                "tez deposit pool balance ({}) too small for fee + producer_fee ({}) — required because rollup fees and producer fees are permanently tez",
-                tez_pool_balance, tez_debit,
-            ));
+        if pool_balance < required_debit {
+            return Err(if idx == 0 {
+                format!(
+                    "deposit pool balance ({}) too small for {}{})",
+                    pool_balance,
+                    if req.asset_id == ASSET_TEZ {
+                        "v + fee + producer_fee ("
+                    } else {
+                        "v ("
+                    },
+                    required_debit,
+                )
+            } else {
+                format!(
+                    "tez deposit pool balance ({}) too small for fee + producer_fee ({}) — required because rollup fees and producer fees are permanently tez",
+                    pool_balance, required_debit,
+                )
+            });
         }
     }
 
@@ -2892,16 +2892,7 @@ pub fn prepare_shield<S: LedgerState>(
 
     state.ensure_note_capacity(2)?;
 
-    Ok(PreparedShield {
-        asset_id: req.asset_id,
-        pubkey_hash: req.pubkey_hash,
-        asset_debit,
-        tez_debit,
-        client_cm: req.client_cm,
-        client_enc: req.client_enc.clone(),
-        producer_cm: req.producer_cm,
-        producer_enc: req.producer_enc.clone(),
-    })
+    Ok(prepared)
 }
 
 /// Commit a `PreparedShield`. The order is: (1) debit balance — single-shot
