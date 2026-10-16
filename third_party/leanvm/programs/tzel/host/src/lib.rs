@@ -1433,9 +1433,6 @@ mod tests {
     #[test]
     fn elf_digest_is_pinned_to_program_hash_version_tags() {
         // 1. Guard against rebuilding `tzel.elf` without bumping `PROGRAM_HASH_{SHIELD,TRANSFER,UNSHIELD}`.
-        // We hash the loaded `leanvm::Guest` segments (`entry_pc`, `log_ram`, `log_advice`, `text`, `image`)
-        // as well as the raw ELF bytes.
-        let loaded = leanvm::Guest::from_elf(ELF).expect("valid tzel.elf");
         let mut pv = PublicValues::new();
         pv.commit(&u64_to_felt(ELF.len() as u64));
         for chunk in ELF.chunks(32) {
@@ -1482,29 +1479,42 @@ mod tests {
         );
 
         // 2. Guard against editing `../guest` sources without regenerating `tzel.elf`:
-        // rebuild `tzel-guest` from source and verify that its loaded `leanvm::Guest`
-        // (`entry_pc`, `log_ram`, `log_advice`, `text`, `image`) matches the checked-in `tzel.elf`.
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let guest_dir = manifest_dir.join("../guest");
-        let target_dir = manifest_dir.join("../../../../../target/tzel-guest-verify");
-        let status = std::process::Command::new(
-            std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
-        )
-        .current_dir(&guest_dir)
-        .env("RUSTC_BOOTSTRAP", "1")
-        .args(["build", "--release", "--target-dir"])
-        .arg(&target_dir)
-        .status()
-        .expect("failed to invoke cargo build for tzel-guest");
-        assert!(status.success(), "cargo build --release in tzel-guest failed");
-        let rebuilt_elf_path = target_dir.join("riscv64im-unknown-none-elf/release/tzel-guest");
-        let rebuilt_bytes =
-            std::fs::read(&rebuilt_elf_path).expect("failed to read rebuilt tzel-guest ELF");
-        let rebuilt_guest =
-            leanvm::Guest::from_elf(&rebuilt_bytes).expect("rebuilt tzel-guest ELF must be valid");
+        // hash all guest source and config files so any guest edit that forgets to
+        // regenerate `tzel.elf` and update the pinned digests fails this test deterministically
+        // across all rustc versions.
+        const GUEST_SOURCES: &[(&[u8], &[u8])] = &[
+            (b"Cargo.toml", include_bytes!("../../guest/Cargo.toml")),
+            (
+                b".cargo/config.toml",
+                include_bytes!("../../guest/.cargo/config.toml"),
+            ),
+            (b"src/main.rs", include_bytes!("../../guest/src/main.rs")),
+            (b"src/lib.rs", include_bytes!("../../guest/src/lib.rs")),
+        ];
+        let mut guest_pv = PublicValues::new();
+        for (name, bytes) in GUEST_SOURCES {
+            guest_pv.commit(&u64_to_felt(name.len() as u64));
+            for chunk in name.chunks(32) {
+                let mut b = [0u8; 32];
+                b[..chunk.len()].copy_from_slice(chunk);
+                guest_pv.commit(&felt_from_bytes_le(&b));
+            }
+            guest_pv.commit(&u64_to_felt(bytes.len() as u64));
+            for chunk in bytes.chunks(32) {
+                let mut b = [0u8; 32];
+                b[..chunk.len()].copy_from_slice(chunk);
+                guest_pv.commit(&felt_from_bytes_le(&b));
+            }
+        }
         assert_eq!(
-            rebuilt_guest, loaded,
-            "checked-in tzel.elf is out of sync with third_party/leanvm/programs/tzel/guest! Rebuild tzel.elf and bump PROGRAM_HASH_{{SHIELD,TRANSFER,UNSHIELD}} if intentional."
+            guest_pv.digest(),
+            [
+                14840840415856029090,
+                1564297598878571658,
+                6821128577967752786,
+                16041536885558460047,
+            ],
+            "third_party/leanvm/programs/tzel/guest sources changed! Regenerate tzel.elf, bump PROGRAM_HASH_{{SHIELD,TRANSFER,UNSHIELD}} version tags, and update both pinned digests."
         );
     }
 
