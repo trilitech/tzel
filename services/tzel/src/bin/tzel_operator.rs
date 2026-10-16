@@ -20,7 +20,7 @@ use tezos_smart_rollup_encoding::{inbox::ExternalMessageFrame, smart_rollup::Sma
 #[cfg(any(test, debug_assertions))]
 use tzel_core::{auth_leaf_hash, derive_auth_pub_seed};
 use tzel_core::{
-    commit, decrypt_memo, derive_kem_keys, derive_rcm, detect, hash, ASSET_TEZ,
+    commit, decrypt_memo, derive_kem_keys, derive_rcm, detect, hash,
     kernel_wire::{
         decode_kernel_inbox_message, encode_kernel_inbox_message, kernel_bridge_config_sighash,
         kernel_verifier_config_sighash, KernelDalChunkPointer, KernelDalPayloadKind,
@@ -31,7 +31,7 @@ use tzel_core::{
         RollupDalChunk, RollupSubmission, RollupSubmissionKind, RollupSubmissionStatus,
         RollupSubmissionTransport, SubmitRollupMessageReq, SubmitRollupMessageResp,
     },
-    owner_tag, verify_wots_signature_against_leaf, EncryptedNote, PaymentAddress, F,
+    owner_tag, verify_wots_signature_against_leaf, EncryptedNote, PaymentAddress, ASSET_TEZ, F,
 };
 
 const DEFAULT_DIRECT_MAX_MESSAGE_BYTES: usize = 4096;
@@ -149,6 +149,10 @@ struct StoredSubmission {
     chunk_attempts: Vec<u32>,
     #[serde(default)]
     chunk_injected_levels: Vec<Option<i32>>,
+    #[serde(default)]
+    chunk_scan_cursors: Vec<Option<i32>>,
+    #[serde(default)]
+    chunk_inclusion_blocks: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -218,6 +222,11 @@ struct BlockHeaderResp {
     level: i32,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ContextConstantsResp {
+    max_operations_ttl: i32,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ReconcileSummary {
     visited: usize,
@@ -227,6 +236,7 @@ struct ReconcileSummary {
 
 const MAX_DAL_CHUNK_ATTEMPTS: u32 = 8;
 const MAX_WAITING_ATTESTATION_LEVEL_AGE: i32 = 12;
+const DEFAULT_MAX_OPERATIONS_TTL: i32 = 120;
 
 fn main() {
     let cli = Cli::parse();
@@ -799,6 +809,8 @@ fn process_submission(
         payload: Some(req.payload.clone()),
         chunk_attempts: vec![],
         chunk_injected_levels: vec![],
+        chunk_scan_cursors: vec![],
+        chunk_inclusion_blocks: vec![],
     };
 
     if targeted_bytes.len() <= config.direct_max_message_bytes {
@@ -815,27 +827,34 @@ fn process_submission(
                 persist_submission(config, &stored)?;
                 return Ok(stored.submission);
             }
-            Err(err) => {
+            Err(CmdError::Timeout { message, output }) => {
                 stored.submission.transport = RollupSubmissionTransport::DirectInbox;
                 // Idempotency: octez-client prints the op hash the moment the op
-                // is injected, before it waits for confirmation. If a hash is
-                // present the op reached the node and the error is a
-                // post-injection confirmation timeout / RPC blip — record it as
-                // SubmittedToL1 rather than Failed, because re-injecting would
+                // is injected, before it waits for confirmation. If the command
+                // timed out after printing the hash, the op reached the node and
+                // the error is a post-injection confirmation timeout — record it
+                // as SubmittedToL1 rather than Failed, because re-injecting would
                 // duplicate it. Inclusion is not verified here; a dropped op is
                 // caught by the caller's settlement timeout.
-                if let Some(op_hash) = extract_operation_hash(&err) {
+                if let Some(op_hash) = extract_operation_hash(&output) {
                     stored.submission.status = RollupSubmissionStatus::SubmittedToL1;
                     stored.submission.operation_hash = Some(op_hash);
                     stored.submission.detail =
-                        Some(format!("injected; confirmation unverified: {}", err));
+                        Some(format!("injected; confirmation unverified: {}", message));
                     persist_submission(config, &stored)?;
                     return Ok(stored.submission);
                 }
                 stored.submission.status = RollupSubmissionStatus::Failed;
-                stored.submission.detail = Some(err.clone());
+                stored.submission.detail = Some(message.clone());
                 persist_submission(config, &stored)?;
-                return Err(err);
+                return Err(message);
+            }
+            Err(CmdError::Failed { message }) => {
+                stored.submission.transport = RollupSubmissionTransport::DirectInbox;
+                stored.submission.status = RollupSubmissionStatus::Failed;
+                stored.submission.detail = Some(message.clone());
+                persist_submission(config, &stored)?;
+                return Err(message);
             }
         }
     }
@@ -887,16 +906,27 @@ enum UnresolvedChunkResolution {
 fn resolve_unresolved_chunk_level(
     octez_node_endpoint: Option<&str>,
     op_hash: Option<&str>,
+    inclusion_block: &mut Option<String>,
     injected_level: &mut Option<i32>,
+    scan_cursor: &mut Option<i32>,
     dirty_metadata: &mut bool,
 ) -> UnresolvedChunkResolution {
-    let Some(op_hash) = op_hash else {
-        return UnresolvedChunkResolution::Retry(
-            "unresolved chunk missing operation_hash".into(),
-        );
-    };
     let Some(octez_node_endpoint) = octez_node_endpoint else {
         return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
+    };
+    if let Some(block_hash) = inclusion_block.as_deref() {
+        return match fetch_block_level(octez_node_endpoint, block_hash) {
+            Ok(level) if level > UNRESOLVED_PUBLISHED_LEVEL => {
+                *inclusion_block = None;
+                *injected_level = None;
+                *scan_cursor = None;
+                UnresolvedChunkResolution::Resolved(level)
+            }
+            Ok(_) | Err(_) => UnresolvedChunkResolution::Waiting("waiting_inclusion".into()),
+        };
+    }
+    let Some(op_hash) = op_hash else {
+        return UnresolvedChunkResolution::Retry("unresolved chunk missing operation_hash".into());
     };
     let head_level = match fetch_head_level(octez_node_endpoint) {
         Ok(level) if level > UNRESOLVED_PUBLISHED_LEVEL => level,
@@ -904,29 +934,42 @@ fn resolve_unresolved_chunk_level(
             return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
         }
     };
+    let max_ops_ttl =
+        fetch_max_operations_ttl(octez_node_endpoint).unwrap_or(DEFAULT_MAX_OPERATIONS_TTL);
     if injected_level.is_none() {
+        let lookback = head_level.saturating_sub(max_ops_ttl).max(1);
         *injected_level = Some(head_level);
+        if scan_cursor.is_none() {
+            *scan_cursor = Some(lookback);
+        }
         *dirty_metadata = true;
     }
     let start_level = injected_level.unwrap_or(head_level).max(1);
-    let scan_end = head_level.min(start_level.saturating_add(MAX_WAITING_ATTESTATION_LEVEL_AGE));
-    for level in start_level..=scan_end {
+    let deadline_level = start_level.saturating_add(max_ops_ttl);
+    let scan_start = scan_cursor.unwrap_or(start_level).max(1);
+    let scan_end = head_level.min(deadline_level);
+    for level in scan_start..=scan_end {
         match block_contains_manager_operation(octez_node_endpoint, level, op_hash) {
             Ok(true) => {
+                *inclusion_block = None;
                 *injected_level = None;
+                *scan_cursor = None;
                 return UnresolvedChunkResolution::Resolved(level);
             }
-            Ok(false) => {}
+            Ok(false) => {
+                *scan_cursor = Some(level.saturating_add(1));
+                *dirty_metadata = true;
+            }
             Err(_) => {
                 return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
             }
         }
     }
-    let age = head_level.saturating_sub(start_level);
-    if age >= MAX_WAITING_ATTESTATION_LEVEL_AGE {
+    if head_level >= deadline_level {
+        let age = head_level.saturating_sub(start_level);
         UnresolvedChunkResolution::Retry(format!(
-            "unresolved operation {} not included after {} levels",
-            op_hash, age
+            "unresolved operation {} not included after {} levels (ttl {})",
+            op_hash, age, max_ops_ttl
         ))
     } else {
         UnresolvedChunkResolution::Waiting("waiting_inclusion".into())
@@ -967,7 +1010,9 @@ fn maybe_advance_submission(
             let resolution = resolve_unresolved_chunk_level(
                 config.octez_node_endpoint.as_deref(),
                 op_hash.as_deref(),
+                &mut stored.chunk_inclusion_blocks[idx],
                 &mut stored.chunk_injected_levels[idx],
+                &mut stored.chunk_scan_cursors[idx],
                 &mut dirty_metadata,
             );
             match resolution {
@@ -976,11 +1021,11 @@ fn maybe_advance_submission(
                     update_submission_commitment_summary(&mut stored.submission)?;
                     // Persist immediately so a subsequent `fetch_dal_slot_status`
                     // error on this or a later chunk cannot lose the resolved level.
-                    let _ = persist_submission(config, &stored);
+                    persist_submission(config, &stored)?;
                 }
                 UnresolvedChunkResolution::Waiting(state) => {
                     if dirty_metadata {
-                        let _ = persist_submission(config, &stored);
+                        persist_submission(config, &stored)?;
                     }
                     status_lines.push(format!(
                         "chunk[{idx}] slot {} op {} => {}",
@@ -993,7 +1038,7 @@ fn maybe_advance_submission(
                 }
                 UnresolvedChunkResolution::Retry(reason) => {
                     if dirty_metadata {
-                        let _ = persist_submission(config, &stored);
+                        persist_submission(config, &stored)?;
                     }
                     status_lines.push(format!(
                         "chunk[{idx}] slot {} op {} => dropped",
@@ -1064,7 +1109,7 @@ fn maybe_advance_submission(
                 return Ok(stored);
             }
             let chunk_bytes = submission_chunk_bytes(payload, &stored.submission, idx)?;
-            let (published_chunk, injected_level) = publish_dal_chunk(config, chunk_bytes)?;
+            let (published_chunk, meta) = publish_dal_chunk(config, chunk_bytes)?;
             republished_lines.push(format!(
                 "republished chunk[{idx}] attempt {} -> slot {} level {} ({})",
                 attempts + 1,
@@ -1074,7 +1119,9 @@ fn maybe_advance_submission(
             ));
             stored.submission.dal_chunks[idx] = published_chunk;
             stored.chunk_attempts[idx] = attempts + 1;
-            stored.chunk_injected_levels[idx] = injected_level;
+            stored.chunk_injected_levels[idx] = meta.injected_level;
+            stored.chunk_scan_cursors[idx] = None;
+            stored.chunk_inclusion_blocks[idx] = meta.inclusion_block;
         }
         update_submission_commitment_summary(&mut stored.submission)?;
         stored.submission.status = RollupSubmissionStatus::CommitmentIncluded;
@@ -1107,22 +1154,25 @@ fn maybe_advance_submission(
     // contains a conflicting operation"), failing the shield spuriously.
     let output = match inject_direct_message(config, &targeted_bytes, true) {
         Ok(output) => output,
-        Err(err) => {
-            // Idempotency (see process_submission): if octez-client already
-            // printed the op hash the pointer op reached the node, so record it
-            // and stop here — returning Err would leave status Attested and make
-            // the reconciler inject a duplicate pointer next tick.
-            if let Some(op_hash) = extract_operation_hash(&err) {
+        Err(CmdError::Timeout { message, output }) => {
+            // Idempotency (see process_submission): if octez-client timed out
+            // after printing the op hash, the pointer op reached the node, so
+            // record it and stop here — returning Err would leave status Attested
+            // and make the reconciler inject a duplicate pointer next tick.
+            if let Some(op_hash) = extract_operation_hash(&output) {
                 stored.submission.status = RollupSubmissionStatus::SubmittedToL1;
                 stored.submission.operation_hash = Some(op_hash);
                 stored.submission.detail = Some(format!(
                     "All DAL chunks attested; pointer injected, confirmation unverified\n{}\n{}",
                     status_lines.join("\n"),
-                    err
+                    message
                 ));
                 return Ok(stored);
             }
-            return Err(err);
+            return Err(message);
+        }
+        Err(CmdError::Failed { message }) => {
+            return Err(message);
         }
     };
     stored.submission.status = RollupSubmissionStatus::SubmittedToL1;
@@ -1185,7 +1235,7 @@ fn resume_pending_dal_submission(
     }
     let total_chunks = payload.len().div_ceil(chunk_size);
     for chunk in payload[already_published..].chunks(chunk_size) {
-        let (published_chunk, injected_level) = publish_dal_chunk_with_protocol(
+        let (published_chunk, meta) = publish_dal_chunk_with_protocol(
             config,
             dal_node_endpoint,
             octez_node_endpoint,
@@ -1194,7 +1244,9 @@ fn resume_pending_dal_submission(
         )?;
         stored.submission.dal_chunks.push(published_chunk);
         stored.chunk_attempts.push(1);
-        stored.chunk_injected_levels.push(injected_level);
+        stored.chunk_injected_levels.push(meta.injected_level);
+        stored.chunk_scan_cursors.push(None);
+        stored.chunk_inclusion_blocks.push(meta.inclusion_block);
         stored.submission.detail = Some(format!(
             "Published {} / {} DAL chunk(s)",
             stored.submission.dal_chunks.len(),
@@ -1217,10 +1269,16 @@ fn resume_pending_dal_submission(
     Ok(())
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PublishedDalChunkMeta {
+    injected_level: Option<i32>,
+    inclusion_block: Option<String>,
+}
+
 fn publish_dal_chunk(
     config: &OperatorConfig,
     payload: &[u8],
-) -> Result<(RollupDalChunk, Option<i32>), String> {
+) -> Result<(RollupDalChunk, PublishedDalChunkMeta), String> {
     let dal_node_endpoint = config
         .dal_node_endpoint
         .as_deref()
@@ -1257,14 +1315,22 @@ fn publish_dal_chunk_with_protocol(
     octez_node_endpoint: &str,
     number_of_slots: u64,
     payload: &[u8],
-) -> Result<(RollupDalChunk, Option<i32>), String> {
+) -> Result<(RollupDalChunk, PublishedDalChunkMeta), String> {
     validate_dal_slot_range(config, number_of_slots)?;
     let attempts = dal_slot_attempt_budget(config, number_of_slots);
     let mut last_slot_error = None;
     for _attempt in 0..attempts {
         let slot_index = select_slot_index(config, number_of_slots)?;
         let publish = post_dal_slot(dal_node_endpoint, slot_index, payload)?;
-        let (operation_hash, published_level) = match publish_dal_commitment(
+        // Sample `head` before injecting so we have a sound lower bound for an
+        // unresolved inclusion scan: an operation injected after `pre_head`
+        // cannot be included at or below `pre_head`, so `pre_head + 1` is the
+        // earliest level it could land in (including when `-w 1` races a timeout
+        // kill right as block `pre_head + 1` is baked).
+        let pre_head = fetch_head_level(octez_node_endpoint)
+            .ok()
+            .filter(|&lvl| lvl > UNRESOLVED_PUBLISHED_LEVEL);
+        let (operation_hash, published_level, inclusion_block) = match publish_dal_commitment(
             config,
             &publish.commitment,
             slot_index,
@@ -1272,13 +1338,15 @@ fn publish_dal_chunk_with_protocol(
         ) {
             Ok(output) => {
                 let operation_hash = extract_operation_hash(&output);
-                let published_level = match extract_block_hash(&output) {
+                let (published_level, inclusion_block) = match extract_block_hash(&output) {
                     Some(block_hash) => match fetch_block_level(octez_node_endpoint, &block_hash) {
-                        Ok(level) => level,
-                        Err(_) if operation_hash.is_some() => UNRESOLVED_PUBLISHED_LEVEL,
+                        Ok(level) => (level, None),
+                        Err(_) if operation_hash.is_some() => {
+                            (UNRESOLVED_PUBLISHED_LEVEL, Some(block_hash))
+                        }
                         Err(err) => return Err(err),
                     },
-                    None if operation_hash.is_some() => UNRESOLVED_PUBLISHED_LEVEL,
+                    None if operation_hash.is_some() => (UNRESOLVED_PUBLISHED_LEVEL, None),
                     None => {
                         return Err(format!(
                             "missing block hash in dal commitment output: {}",
@@ -1286,7 +1354,7 @@ fn publish_dal_chunk_with_protocol(
                         ))
                     }
                 };
-                (operation_hash, published_level)
+                (operation_hash, published_level, inclusion_block)
             }
             Err(err) if is_slot_header_collision(err.output()) => {
                 last_slot_error = Some(err.to_string());
@@ -1305,12 +1373,16 @@ fn publish_dal_chunk_with_protocol(
                 //     have `op_hash`, or the op hash proving injection is lost.
                 //   - Only recover on `CmdError::Timeout`, not on `CmdError::Failed`.
                 if let Some(op_hash) = extract_operation_hash(&output) {
-                    let published_level = extract_block_hash(&output)
-                        .and_then(|block_hash| {
-                            fetch_block_level(octez_node_endpoint, &block_hash).ok()
-                        })
-                        .unwrap_or(UNRESOLVED_PUBLISHED_LEVEL);
-                    (Some(op_hash), published_level)
+                    let (published_level, inclusion_block) = match extract_block_hash(&output) {
+                        Some(block_hash) => {
+                            match fetch_block_level(octez_node_endpoint, &block_hash) {
+                                Ok(level) => (level, None),
+                                Err(_) => (UNRESOLVED_PUBLISHED_LEVEL, Some(block_hash)),
+                            }
+                        }
+                        None => (UNRESOLVED_PUBLISHED_LEVEL, None),
+                    };
+                    (Some(op_hash), published_level, inclusion_block)
                 } else {
                     return Err(message);
                 }
@@ -1319,13 +1391,12 @@ fn publish_dal_chunk_with_protocol(
                 return Err(message);
             }
         };
-        let injected_level = if published_level <= UNRESOLVED_PUBLISHED_LEVEL {
-            fetch_head_level(octez_node_endpoint)
-                .ok()
-                .filter(|&lvl| lvl > UNRESOLVED_PUBLISHED_LEVEL)
-        } else {
-            None
-        };
+        let injected_level =
+            if published_level <= UNRESOLVED_PUBLISHED_LEVEL && inclusion_block.is_none() {
+                pre_head.map(|lvl| lvl.saturating_add(1))
+            } else {
+                None
+            };
         return Ok((
             RollupDalChunk {
                 slot_index,
@@ -1334,7 +1405,10 @@ fn publish_dal_chunk_with_protocol(
                 commitment: publish.commitment,
                 operation_hash,
             },
-            injected_level,
+            PublishedDalChunkMeta {
+                injected_level,
+                inclusion_block,
+            },
         ));
     }
     Err(last_slot_error
@@ -1352,6 +1426,16 @@ fn align_chunk_attempts(stored: &mut StoredSubmission) {
         stored.chunk_injected_levels.resize(len, None);
     } else if stored.chunk_injected_levels.len() > len {
         stored.chunk_injected_levels.truncate(len);
+    }
+    if stored.chunk_scan_cursors.len() < len {
+        stored.chunk_scan_cursors.resize(len, None);
+    } else if stored.chunk_scan_cursors.len() > len {
+        stored.chunk_scan_cursors.truncate(len);
+    }
+    if stored.chunk_inclusion_blocks.len() < len {
+        stored.chunk_inclusion_blocks.resize(len, None);
+    } else if stored.chunk_inclusion_blocks.len() > len {
+        stored.chunk_inclusion_blocks.truncate(len);
     }
 }
 
@@ -1544,12 +1628,10 @@ fn block_contains_manager_operation(
             level, e
         )
     })?;
-    let hashes: Vec<String> = resp.into_body().read_json().map_err(|e| {
-        format!(
-            "parse block operation_hashes at level {}: {}",
-            level, e
-        )
-    })?;
+    let hashes: Vec<String> = resp
+        .into_body()
+        .read_json()
+        .map_err(|e| format!("parse block operation_hashes at level {}: {}", level, e))?;
     Ok(hashes.iter().any(|h| h == operation_hash))
 }
 
@@ -1582,6 +1664,21 @@ fn fetch_head_level(endpoint: &str) -> Result<i32, String> {
         .read_json()
         .map_err(|e| format!("parse block head header: {}", e))?;
     Ok(header.level)
+}
+
+fn fetch_max_operations_ttl(endpoint: &str) -> Result<i32, String> {
+    let url = format!(
+        "{}/chains/main/blocks/head/context/constants",
+        endpoint.trim_end_matches('/')
+    );
+    let resp = ureq::get(&url)
+        .call()
+        .map_err(|e| format!("context constants request failed: {}", e))?;
+    let constants: ContextConstantsResp = resp
+        .into_body()
+        .read_json()
+        .map_err(|e| format!("parse context constants: {}", e))?;
+    Ok(constants.max_operations_ttl.max(1))
 }
 
 fn fetch_dal_slot_status(
@@ -1667,8 +1764,8 @@ fn inject_direct_message(
     config: &OperatorConfig,
     bytes: &[u8],
     wait_for_inclusion: bool,
-) -> Result<String, String> {
-    let payload_file = write_temp_payload(bytes)?;
+) -> Result<String, CmdError> {
+    let payload_file = write_temp_payload(bytes).map_err(|message| CmdError::Failed { message })?;
     let payload = format!("bin:{}", payload_file.display());
     let mut command = std::process::Command::new(&config.octez_client_bin);
     if let Some(dir) = &config.octez_client_dir {
@@ -1695,8 +1792,7 @@ fn inject_direct_message(
         command,
         &config.octez_client_bin,
         config.octez_client_timeout,
-    )
-    .map_err(|e| e.to_string());
+    );
     let _ = std::fs::remove_file(&payload_file);
     result
 }
@@ -2222,6 +2318,8 @@ mod tests {
             payload,
             chunk_attempts: chunk_attempts.to_vec(),
             chunk_injected_levels: vec![None; len],
+            chunk_scan_cursors: vec![None; len],
+            chunk_inclusion_blocks: vec![None; len],
         }
     }
 
@@ -2820,15 +2918,16 @@ mod tests {
 
     #[test]
     fn pointer_inject_error_with_op_hash_is_recorded_not_retried() {
-        // octez-client prints the op hash the instant it injects, then errors
-        // during the confirmation wait (timeout / RPC blip). Because the op
-        // reached the node, the submission must land as SubmittedToL1 with that
-        // hash — NOT propagate an error (which would make the reconciler inject
-        // a duplicate pointer op next tick).
+        // octez-client prints the op hash the instant it injects, then times
+        // out during the `-w 1` confirmation wait. Because the op reached the
+        // node, the submission must land as SubmittedToL1 with that hash — NOT
+        // propagate an error (which would make the reconciler inject a
+        // duplicate pointer op next tick).
         let script_dir = make_client_script(
-            "#!/bin/sh\necho 'Operation hash is ooPointerHash123456789ABCDEFG'\nexit 1\n",
+            "#!/bin/sh\necho 'Operation hash is ooPointerHash123456789ABCDEFG'\nsleep 10\n",
         );
         let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.octez_client_timeout = Duration::from_millis(100);
         let endpoint = spawn_mock_http_server(HashMap::from([
             (
                 "/levels/101/slots/3/status".into(),
@@ -2893,14 +2992,72 @@ mod tests {
     }
 
     #[test]
+    fn pointer_inject_non_timeout_failure_with_op_hash_returns_error() {
+        // A non-timeout `CmdError::Failed` exit on pointer injection (or direct
+        // inbox injection) must surface as an error even if output contains an
+        // `Operation hash is ...` line.
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooPointerFailed123456789ABCDEFG'\necho 'Fatal error: simulation failed' >&2\nexit 1\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        let endpoint = spawn_mock_http_server(HashMap::from([(
+            "/levels/101/slots/3/status".into(),
+            (200, "{\"kind\":\"attested\",\"attestation_lag\":8}".into()),
+        )]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let submission = RollupSubmission {
+            id: "sub-ptr-fail".into(),
+            kind: RollupSubmissionKind::Shield,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            status: RollupSubmissionStatus::CommitmentIncluded,
+            transport: RollupSubmissionTransport::Dal,
+            operation_hash: Some("ooCommitmentHash123456789ABCDEFG".into()),
+            dal_chunks: vec![RollupDalChunk {
+                slot_index: 3,
+                published_level: 101,
+                payload_len: 128,
+                commitment: "commitment-1".into(),
+                operation_hash: Some("ooChunkOne123456789ABCDEFG".into()),
+            }],
+            commitment: Some("commitment-1".into()),
+            published_level: Some(101),
+            slot_index: Some(3),
+            payload_hash: Some(hex::encode([0x44; 32])),
+            payload_len: 128,
+            detail: None,
+        };
+
+        let err = maybe_advance_submission(&config, stored_submission(submission, None, &[]))
+            .unwrap_err();
+        assert!(err.contains("simulation failed"), "unexpected error: {err}");
+
+        // Direct inbox path must also fail rather than recording SubmittedToL1.
+        let direct_err = process_submission(
+            &config,
+            SubmitRollupMessageReq {
+                kind: RollupSubmissionKind::Shield,
+                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                payload: sample_small_direct_payload(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            direct_err.contains("simulation failed"),
+            "unexpected direct error: {direct_err}"
+        );
+    }
+
+    #[test]
     fn run_command_times_out_and_keeps_partial_output() {
         // A command that emits an op hash and then blocks past the deadline must
         // be killed and surface a timeout error that still carries the hash, so
         // callers can apply the injected-but-unconfirmed idempotency path.
         let mut command = std::process::Command::new("sh");
-        command.arg("-c").arg(
-            "echo 'Operation hash is ooTimeoutHash123456789ABCDEFG'; sleep 30",
-        );
+        command
+            .arg("-c")
+            .arg("echo 'Operation hash is ooTimeoutHash123456789ABCDEFG'; sleep 30");
         let started = Instant::now();
         let err = run_command_collect_output(command, "octez-client", Duration::from_millis(500))
             .expect_err("command that outlives the timeout must error");
@@ -3757,7 +3914,9 @@ esac
         let mut config = config_with_client(&client_path);
         config.direct_max_message_bytes = 1;
         config.octez_client_timeout = Duration::from_millis(100);
-        let endpoint = spawn_mock_http_server(HashMap::from([
+        // At publish time `pre_head` is 456, so `pre_head + 1 = 457` is recorded
+        // as the lower bound for the inclusion scan.
+        let publish_endpoint = spawn_mock_http_server(HashMap::from([
             (
                 "/protocol_parameters".into(),
                 (
@@ -3774,6 +3933,42 @@ esac
             ),
             (
                 "/chains/main/blocks/head/header".into(),
+                (200, "{\"level\":456}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(publish_endpoint.clone());
+        config.octez_node_endpoint = Some(publish_endpoint);
+
+        let req = SubmitRollupMessageReq {
+            kind: RollupSubmissionKind::ConfigureBridge,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            payload: sample_configure_bridge_payload(),
+        };
+        let submission = process_submission(&config, req).unwrap();
+        assert_eq!(
+            submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
+        assert_eq!(submission.dal_chunks.len(), 1);
+        assert_eq!(
+            submission.dal_chunks[0].operation_hash.as_deref(),
+            Some("ooDalTimedOut123456789ABCDEFG")
+        );
+        assert_eq!(
+            submission.dal_chunks[0].published_level,
+            UNRESOLVED_PUBLISHED_LEVEL
+        );
+        assert_eq!(submission.published_level, None);
+        let stored_after_publish =
+            load_stored_submission(&config.state_dir, &submission.id).unwrap();
+        assert_eq!(stored_after_publish.chunk_injected_levels, vec![Some(457)]);
+
+        // Next reconciler tick sees head=457, resolves the inclusion block level
+        // via non-blocking `/chains/main/blocks/457/operation_hashes/3` scan,
+        // and advances the submission once the slot at level 457 is attested.
+        let reconcile_endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/chains/main/blocks/head/header".into(),
                 (200, "{\"level\":457}".into()),
             ),
             (
@@ -3785,30 +3980,8 @@ esac
                 (200, "\"attested\"".into()),
             ),
         ]));
-        config.dal_node_endpoint = Some(endpoint.clone());
-        config.octez_node_endpoint = Some(endpoint);
-
-        let req = SubmitRollupMessageReq {
-            kind: RollupSubmissionKind::ConfigureBridge,
-            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
-            payload: sample_configure_bridge_payload(),
-        };
-        let submission = process_submission(&config, req).unwrap();
-        assert_eq!(submission.status, RollupSubmissionStatus::CommitmentIncluded);
-        assert_eq!(submission.dal_chunks.len(), 1);
-        assert_eq!(
-            submission.dal_chunks[0].operation_hash.as_deref(),
-            Some("ooDalTimedOut123456789ABCDEFG")
-        );
-        assert_eq!(
-            submission.dal_chunks[0].published_level,
-            UNRESOLVED_PUBLISHED_LEVEL
-        );
-        assert_eq!(submission.published_level, None);
-
-        // Next reconciler tick resolves the inclusion block level via non-blocking
-        // `/chains/main/blocks/<lvl>/operation_hashes/3` scan and advances the
-        // submission once the slot at level 457 is attested.
+        config.dal_node_endpoint = Some(reconcile_endpoint.clone());
+        config.octez_node_endpoint = Some(reconcile_endpoint);
         let summary = reconcile_pending_submissions(&config).unwrap();
         assert_eq!(summary.errors, 0);
         let updated = load_submission(&config.state_dir, &submission.id).unwrap();
@@ -3901,7 +4074,10 @@ esac
             payload: sample_configure_bridge_payload(),
         };
         let submission = process_submission(&config, req).unwrap();
-        assert_eq!(submission.status, RollupSubmissionStatus::CommitmentIncluded);
+        assert_eq!(
+            submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
         assert_eq!(
             submission.dal_chunks[0].operation_hash.as_deref(),
             Some("ooOkNoBlockHash123456789ABCDEFG")
@@ -3911,16 +4087,21 @@ esac
             UNRESOLVED_PUBLISHED_LEVEL
         );
         let stored = load_stored_submission(&config.state_dir, &submission.id).unwrap();
-        assert_eq!(stored.chunk_injected_levels, vec![Some(300)]);
+        assert_eq!(stored.chunk_injected_levels, vec![Some(301)]);
     }
 
     #[test]
-    fn unresolved_chunk_dropped_operation_republishes_after_ttl() {
+    fn dal_publish_with_block_hash_but_failed_block_header_rpc_persists_block_hash_and_resolves_directly(
+    ) {
         let script_dir = make_client_script(
-            "#!/bin/sh\necho \"Operation hash is 'ooRepublished123456789ABCDEFG'\"\necho \"Operation found in block: BLRepublished123456789ABCDEFG\"\n",
+            "#!/bin/sh\necho \"Operation hash is 'ooKnownBlockOp123456789ABCDEFG'\"\necho \"Operation found in block: BLKnownBlockHash123456789ABCDEFG\"\n",
         );
         let mut config = config_with_client(&script_dir.path().join("octez-client"));
-        let mut routes = HashMap::from([
+        config.direct_max_message_bytes = 1;
+        // At publish time, `/chains/main/blocks/BLKnownBlockHash123456789ABCDEFG/header`
+        // fails (500), so `published_level` stays UNRESOLVED_PUBLISHED_LEVEL,
+        // but `BLKnownBlockHash123456789ABCDEFG` is persisted in `chunk_inclusion_blocks`.
+        let publish_endpoint = spawn_mock_http_server(HashMap::from([
             (
                 "/protocol_parameters".into(),
                 (
@@ -3932,30 +4113,97 @@ esac
                 "/slots?slot_index=0&padding=%00".into(),
                 (
                     200,
-                    "{\"commitment\":\"sh1repub\",\"commitment_proof\":\"proof-r\"}".into(),
+                    "{\"commitment\":\"sh1knownblock\",\"commitment_proof\":\"proof-kb\"}".into(),
                 ),
             ),
             (
                 "/chains/main/blocks/head/header".into(),
-                (
-                    200,
-                    format!("{{\"level\":{}}}", 100 + MAX_WAITING_ATTESTATION_LEVEL_AGE),
-                ),
+                (200, "{\"level\":299}".into()),
             ),
             (
-                "/chains/main/blocks/BLRepublished123456789ABCDEFG/header".into(),
-                (200, "{\"level\":120}".into()),
+                "/chains/main/blocks/BLKnownBlockHash123456789ABCDEFG/header".into(),
+                (500, "temporary header rpc failure".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(publish_endpoint.clone());
+        config.octez_node_endpoint = Some(publish_endpoint);
+
+        let req = SubmitRollupMessageReq {
+            kind: RollupSubmissionKind::ConfigureBridge,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            payload: sample_configure_bridge_payload(),
+        };
+        let submission = process_submission(&config, req).unwrap();
+        assert_eq!(
+            submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
+        assert_eq!(
+            submission.dal_chunks[0].published_level,
+            UNRESOLVED_PUBLISHED_LEVEL
+        );
+        let stored = load_stored_submission(&config.state_dir, &submission.id).unwrap();
+        assert_eq!(
+            stored.chunk_inclusion_blocks,
+            vec![Some("BLKnownBlockHash123456789ABCDEFG".into())]
+        );
+        assert_eq!(stored.chunk_injected_levels, vec![None]);
+
+        // On the next reconcile tick, `fetch_block_level` succeeds for the
+        // persisted block hash and resolves directly to level 300 without
+        // needing any `/operation_hashes/3` scan.
+        let reconcile_endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/chains/main/blocks/BLKnownBlockHash123456789ABCDEFG/header".into(),
+                (200, "{\"level\":300}".into()),
+            ),
+            (
+                "/levels/300/slots/0/status".into(),
+                (200, "\"waiting_attestation\"".into()),
+            ),
+            (
+                "/chains/main/blocks/head/header".into(),
+                (200, "{\"level\":305}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(reconcile_endpoint.clone());
+        config.octez_node_endpoint = Some(reconcile_endpoint);
+        let summary = reconcile_pending_submissions(&config).unwrap();
+        assert_eq!(summary.errors, 0);
+        let resolved = load_stored_submission(&config.state_dir, &submission.id).unwrap();
+        assert_eq!(resolved.submission.dal_chunks[0].published_level, 300);
+        assert_eq!(resolved.submission.published_level, Some(300));
+        assert_eq!(resolved.chunk_inclusion_blocks, vec![None]);
+    }
+
+    #[test]
+    fn unresolved_chunk_dropped_operation_republishes_after_ttl() {
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho \"Operation hash is 'ooRepublished123456789ABCDEFG'\"\necho \"Operation found in block: BLRepublished123456789ABCDEFG\"\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        // Use `max_operations_ttl = 20` (> MAX_WAITING_ATTESTATION_LEVEL_AGE = 12)
+        // so tick 1 at head=114 (age=14 > 12) must NOT prematurely declare the
+        // operation dropped, and must persist `chunk_scan_cursors = [Some(115)]`.
+        let mut tick1_routes = HashMap::from([
+            (
+                "/chains/main/blocks/head/header".into(),
+                (200, "{\"level\":114}".into()),
+            ),
+            (
+                "/chains/main/blocks/head/context/constants".into(),
+                (200, "{\"max_operations_ttl\":20}".into()),
             ),
         ]);
-        for lvl in 100..=(100 + MAX_WAITING_ATTESTATION_LEVEL_AGE) {
-            routes.insert(
+        for lvl in 100..=114 {
+            tick1_routes.insert(
                 format!("/chains/main/blocks/{lvl}/operation_hashes/3"),
                 (200, "[]".into()),
             );
         }
-        let endpoint = spawn_mock_http_server(routes);
-        config.dal_node_endpoint = Some(endpoint.clone());
-        config.octez_node_endpoint = Some(endpoint);
+        let tick1_endpoint = spawn_mock_http_server(tick1_routes);
+        config.dal_node_endpoint = Some(tick1_endpoint.clone());
+        config.octez_node_endpoint = Some(tick1_endpoint);
 
         let submission = RollupSubmission {
             id: "sub-dropped".into(),
@@ -3980,18 +4228,132 @@ esac
         };
         let mut stored = stored_submission(submission, Some(vec![1, 2, 3, 4]), &[1]);
         stored.chunk_injected_levels = vec![Some(100)];
+        persist_submission(&config, &stored).unwrap();
 
-        let advanced = maybe_advance_submission(&config, stored).unwrap();
+        let after_tick1 = maybe_advance_submission(&config, stored).unwrap();
+        assert_eq!(after_tick1.chunk_attempts, vec![1]);
+        assert_eq!(
+            after_tick1.submission.dal_chunks[0].published_level,
+            UNRESOLVED_PUBLISHED_LEVEL
+        );
+        assert_eq!(after_tick1.chunk_scan_cursors, vec![Some(115)]);
+        let persisted_tick1 = load_stored_submission(&config.state_dir, "sub-dropped").unwrap();
+        assert_eq!(persisted_tick1.chunk_scan_cursors, vec![Some(115)]);
+
+        // Tick 2 at head=120 (`>= start_level (100) + max_operations_ttl (20)`):
+        // only levels 115..=120 are served (100..=114 are omitted, proving the
+        // persisted cursor avoids re-scanning them), and the chunk is then
+        // declared dropped and republished.
+        let mut tick2_routes = HashMap::from([
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8192}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1repub\",\"commitment_proof\":\"proof-r\"}".into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/head/header".into(),
+                (200, "{\"level\":120}".into()),
+            ),
+            (
+                "/chains/main/blocks/head/context/constants".into(),
+                (200, "{\"max_operations_ttl\":20}".into()),
+            ),
+            (
+                "/chains/main/blocks/BLRepublished123456789ABCDEFG/header".into(),
+                (200, "{\"level\":121}".into()),
+            ),
+        ]);
+        for lvl in 115..=120 {
+            tick2_routes.insert(
+                format!("/chains/main/blocks/{lvl}/operation_hashes/3"),
+                (200, "[]".into()),
+            );
+        }
+        let tick2_endpoint = spawn_mock_http_server(tick2_routes);
+        config.dal_node_endpoint = Some(tick2_endpoint.clone());
+        config.octez_node_endpoint = Some(tick2_endpoint);
+
+        let advanced = maybe_advance_submission(&config, after_tick1).unwrap();
         assert_eq!(advanced.chunk_attempts, vec![2]);
-        assert_eq!(advanced.submission.dal_chunks[0].published_level, 120);
+        assert_eq!(advanced.submission.dal_chunks[0].published_level, 121);
         assert_eq!(
             advanced.submission.dal_chunks[0].operation_hash.as_deref(),
             Some("ooRepublished123456789ABCDEFG")
         );
+        assert_eq!(advanced.chunk_scan_cursors, vec![None]);
     }
 
     #[test]
-    fn unresolved_chunk_transient_rpc_error_waits_and_persists_resolved_level_before_status_error() {
+    fn unresolved_chunk_lazy_init_looks_back_and_does_not_expire_immediately() {
+        let script_dir = make_client_script("#!/bin/sh\nexit 1\n");
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        // When `chunk_injected_levels` was `None` (because `pre_head` failed at
+        // publish time), the first reconcile tick at head=50 with ttl=5 must
+        // look back to 45 (`50 - 5`) to catch inclusion before the first tick,
+        // while keeping the expiry deadline at `50 + 5 = 55` so it does not
+        // expire on that first tick if the op is still in the mempool.
+        let mut routes = HashMap::from([
+            (
+                "/chains/main/blocks/head/header".into(),
+                (200, "{\"level\":50}".into()),
+            ),
+            (
+                "/chains/main/blocks/head/context/constants".into(),
+                (200, "{\"max_operations_ttl\":5}".into()),
+            ),
+        ]);
+        for lvl in 45..=50 {
+            routes.insert(
+                format!("/chains/main/blocks/{lvl}/operation_hashes/3"),
+                (200, "[]".into()),
+            );
+        }
+        let endpoint = spawn_mock_http_server(routes);
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let submission = RollupSubmission {
+            id: "sub-lazy".into(),
+            kind: RollupSubmissionKind::Shield,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            status: RollupSubmissionStatus::CommitmentIncluded,
+            transport: RollupSubmissionTransport::Dal,
+            operation_hash: Some("ooLazyOp123456789ABCDEFG".into()),
+            dal_chunks: vec![RollupDalChunk {
+                slot_index: 0,
+                published_level: UNRESOLVED_PUBLISHED_LEVEL,
+                payload_len: 4,
+                commitment: "sh1lazy".into(),
+                operation_hash: Some("ooLazyOp123456789ABCDEFG".into()),
+            }],
+            commitment: Some("sh1lazy".into()),
+            published_level: None,
+            slot_index: Some(0),
+            payload_hash: Some(hex::encode([0x56; 32])),
+            payload_len: 4,
+            detail: None,
+        };
+        let stored = stored_submission(submission, Some(vec![1, 2, 3, 4]), &[1]);
+        persist_submission(&config, &stored).unwrap();
+
+        let advanced = maybe_advance_submission(&config, stored).unwrap();
+        assert_eq!(advanced.chunk_attempts, vec![1]);
+        assert_eq!(advanced.chunk_injected_levels, vec![Some(50)]);
+        assert_eq!(advanced.chunk_scan_cursors, vec![Some(51)]);
+    }
+
+    #[test]
+    fn unresolved_chunk_transient_rpc_error_waits_and_persists_resolved_level_before_status_error()
+    {
         let script_dir = make_client_script("#!/bin/sh\nexit 1\n");
         let mut config = config_with_client(&script_dir.path().join("octez-client"));
         // 1) When head/operation_hashes RPC fails transiently (500), the chunk stays
@@ -4065,6 +4427,7 @@ esac
         assert_eq!(persisted.submission.dal_chunks[0].published_level, 201);
         assert_eq!(persisted.submission.published_level, Some(201));
         assert_eq!(persisted.chunk_injected_levels, vec![None]);
+        assert_eq!(persisted.chunk_scan_cursors, vec![None]);
     }
 
     #[test]
