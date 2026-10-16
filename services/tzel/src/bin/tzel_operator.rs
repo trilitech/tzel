@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use std::time::{Duration, Instant};
 use tezos_data_encoding_05::enc::BinWriter as _;
@@ -130,6 +130,7 @@ struct OperatorConfig {
     octez_client_timeout: Duration,
     id_counter: AtomicU64,
     slot_counter: AtomicU64,
+    reconcile_cursor: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +156,8 @@ struct ChunkMeta {
     #[serde(default)]
     inclusion_block: Option<String>,
     #[serde(default)]
+    inclusion_block_failures: u32,
+    #[serde(default)]
     max_operations_ttl: Option<i32>,
 }
 
@@ -165,6 +168,7 @@ impl Default for ChunkMeta {
             injected_level: None,
             scan_cursor: None,
             inclusion_block: None,
+            inclusion_block_failures: 0,
             max_operations_ttl: None,
         }
     }
@@ -263,6 +267,7 @@ const MAX_DAL_CHUNK_ATTEMPTS: u32 = 8;
 const MAX_WAITING_ATTESTATION_LEVEL_AGE: i32 = 12;
 const TENDERBAKE_FINALITY_LAG: i32 = 2;
 const MAX_INCLUSION_SCAN_LEVELS_PER_TICK: i32 = 32;
+const MAX_INCLUSION_BLOCK_LOOKUP_FAILURES: u32 = 3;
 
 fn main() {
     let cli = Cli::parse();
@@ -333,6 +338,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             octez_client_timeout: OCTEZ_CLIENT_TIMEOUT,
             id_counter: AtomicU64::new(0),
             slot_counter: AtomicU64::new(0),
+            reconcile_cursor: AtomicU64::new(0),
         }),
         advance_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -740,7 +746,13 @@ fn reconcile_pending_submissions(config: &OperatorConfig) -> Result<ReconcileSum
     let mut summary = ReconcileSummary::default();
     let mut scan_budget = MAX_INCLUSION_SCAN_LEVELS_PER_TICK;
     let mut cached_head_level: Option<Result<i32, String>> = None;
-    for path in submission_paths(&config.state_dir)? {
+    let mut paths = submission_paths(&config.state_dir)?;
+    if !paths.is_empty() {
+        let start =
+            (config.reconcile_cursor.fetch_add(1, Ordering::Relaxed) as usize) % paths.len();
+        paths.rotate_left(start);
+    }
+    for path in paths {
         let Some(id) = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -979,6 +991,7 @@ fn resolve_unresolved_chunk_level(
                 match block_contains_manager_operation(octez_node_endpoint, level, op_hash) {
                     Ok(true) => {
                         meta.inclusion_block = None;
+                        meta.inclusion_block_failures = 0;
                         meta.injected_level = None;
                         meta.scan_cursor = None;
                         meta.max_operations_ttl = None;
@@ -991,6 +1004,7 @@ fn resolve_unresolved_chunk_level(
                         // `level - TENDERBAKE_FINALITY_LAG` if unset so a canonical
                         // branch inclusion a block or two earlier is still scanned.
                         meta.inclusion_block = None;
+                        meta.inclusion_block_failures = 0;
                         if meta.injected_level.is_none() {
                             meta.injected_level =
                                 Some(level.saturating_sub(TENDERBAKE_FINALITY_LAG).max(1));
@@ -998,9 +1012,22 @@ fn resolve_unresolved_chunk_level(
                         *dirty_metadata = true;
                     }
                     Err(_) => {
-                        // Transient RPC failure checking `operation_hashes/3`: keep
-                        // `inclusion_block` intact and retry on the next tick.
-                        return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
+                        meta.inclusion_block_failures =
+                            meta.inclusion_block_failures.saturating_add(1);
+                        *dirty_metadata = true;
+                        if meta.inclusion_block_failures < MAX_INCLUSION_BLOCK_LOOKUP_FAILURES {
+                            // Transient RPC failure checking `operation_hashes/3`: keep
+                            // `inclusion_block` intact and retry on the next tick.
+                            return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
+                        }
+                        // Persistent non-404 failure at finalized `level`: fall back
+                        // to the canonical scan so the chunk cannot stay stuck forever.
+                        meta.inclusion_block = None;
+                        meta.inclusion_block_failures = 0;
+                        if meta.injected_level.is_none() {
+                            meta.injected_level =
+                                Some(level.saturating_sub(TENDERBAKE_FINALITY_LAG).max(1));
+                        }
                     }
                 }
             }
@@ -1009,12 +1036,21 @@ fn resolve_unresolved_chunk_level(
                 // forgotten), clear `inclusion_block` and fall through to the scan
                 // so the chunk cannot wait forever.
                 meta.inclusion_block = None;
+                meta.inclusion_block_failures = 0;
                 *dirty_metadata = true;
             }
             Err(BlockLookupError::Other(_)) => {
-                // Transient RPC error (e.g. 500 or timeout): keep `inclusion_block`
-                // intact and wait for the next tick.
-                return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
+                meta.inclusion_block_failures = meta.inclusion_block_failures.saturating_add(1);
+                *dirty_metadata = true;
+                if meta.inclusion_block_failures < MAX_INCLUSION_BLOCK_LOOKUP_FAILURES {
+                    // Transient RPC error (e.g. 500 or timeout): keep `inclusion_block`
+                    // intact and wait for the next tick.
+                    return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
+                }
+                // Persistent non-404 failure looking up `block_hash`: clear
+                // `inclusion_block` and fall through to the canonical scan.
+                meta.inclusion_block = None;
+                meta.inclusion_block_failures = 0;
             }
         }
     }
@@ -1052,6 +1088,7 @@ fn resolve_unresolved_chunk_level(
             match block_contains_manager_operation(octez_node_endpoint, level, op_hash) {
                 Ok(true) => {
                     meta.inclusion_block = None;
+                    meta.inclusion_block_failures = 0;
                     meta.injected_level = None;
                     meta.scan_cursor = None;
                     meta.max_operations_ttl = None;
@@ -1247,6 +1284,7 @@ fn maybe_advance_submission_with_budget(
                 injected_level: meta.injected_level,
                 scan_cursor: None,
                 inclusion_block: meta.inclusion_block,
+                inclusion_block_failures: 0,
                 max_operations_ttl: None,
             };
             update_submission_commitment_summary(&mut stored.submission)?;
@@ -1392,6 +1430,7 @@ fn resume_pending_dal_submission(
             injected_level: meta.injected_level,
             scan_cursor: None,
             inclusion_block: meta.inclusion_block,
+            inclusion_block_failures: 0,
             max_operations_ttl: None,
         });
         stored.submission.detail = Some(format!(
@@ -1671,12 +1710,29 @@ impl std::fmt::Display for CmdError {
 }
 
 const HTTP_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+// Uploading up to a full ~126 KB slot while the DAL node computes the
+// commitment and proof can exceed `HTTP_RPC_TIMEOUT` under load; give slot
+// publication the same 60s ceiling as `octez-client` commands.
+const DAL_SLOT_POST_TIMEOUT: Duration = OCTEZ_CLIENT_TIMEOUT;
 
-fn http_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(HTTP_RPC_TIMEOUT))
-        .build()
-        .into()
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(HTTP_RPC_TIMEOUT))
+            .build()
+            .into()
+    })
+}
+
+fn dal_slot_post_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(DAL_SLOT_POST_TIMEOUT))
+            .build()
+            .into()
+    })
 }
 
 fn fetch_dal_protocol_parameters(endpoint: &str) -> Result<DalProtocolParametersResp, String> {
@@ -1702,7 +1758,7 @@ fn post_dal_slot(
     );
     let body = serde_json::to_string(&json!({ "invalid_utf8_string": payload }))
         .map_err(|e| format!("serialize DAL slot publish body: {}", e))?;
-    let resp = http_agent()
+    let resp = dal_slot_post_agent()
         .post(&url)
         .header("Content-Type", "application/json")
         .send(body)
@@ -2008,11 +2064,12 @@ fn run_command_collect_output(
     })?;
     command.stdout(stdout_file).stderr(stderr_file);
 
+    const LINUX_ETXTBSY_ERRNO: i32 = 26;
     let mut spawn_attempts = 0u32;
     let mut child = loop {
         match command.spawn() {
             Ok(child) => break child,
-            Err(e) if e.raw_os_error() == Some(26) && spawn_attempts < 10 => {
+            Err(e) if e.raw_os_error() == Some(LINUX_ETXTBSY_ERRNO) && spawn_attempts < 10 => {
                 spawn_attempts += 1;
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -2218,6 +2275,7 @@ mod tests {
             octez_client_timeout: OCTEZ_CLIENT_TIMEOUT,
             id_counter: AtomicU64::new(0),
             slot_counter: AtomicU64::new(0),
+            reconcile_cursor: AtomicU64::new(0),
         }
     }
 
@@ -4419,8 +4477,11 @@ esac
             detail: None,
         };
 
-        // Case 0: a transient 500 on `/blocks/<hash>/header` must NOT drop the
-        // `inclusion_block` hint (it returns `Waiting("waiting_inclusion")`).
+        // Case 0: up to `MAX_INCLUSION_BLOCK_LOOKUP_FAILURES - 1` transient 500
+        // responses on `/blocks/<hash>/header` keep `inclusion_block` intact,
+        // and the `MAX_INCLUSION_BLOCK_LOOKUP_FAILURES`-th failure clears the
+        // hint and falls back to the canonical scan so a persistent non-404
+        // error cannot wedge the chunk forever.
         let transient_500_endpoint = spawn_mock_http_server(HashMap::from([
             (
                 "/chains/main/blocks/head/header".into(),
@@ -4430,6 +4491,22 @@ esac
                 "/chains/main/blocks/BLTransient500Block123456789ABCDEFG/header".into(),
                 (500, "temporary node error".into()),
             ),
+            (
+                "/chains/main/blocks/head/context/constants".into(),
+                (200, "{\"max_operations_time_to_live\":600}".into()),
+            ),
+            (
+                "/chains/main/blocks/300/operation_hashes/3".into(),
+                (200, "[]".into()),
+            ),
+            (
+                "/chains/main/blocks/301/operation_hashes/3".into(),
+                (200, "[\"ooReorgedOp123456789ABCDEFG\"]".into()),
+            ),
+            (
+                "/levels/301/slots/0/status".into(),
+                (200, "\"waiting_attestation\"".into()),
+            ),
         ]));
         config.dal_node_endpoint = Some(transient_500_endpoint.clone());
         config.octez_node_endpoint = Some(transient_500_endpoint);
@@ -4437,17 +4514,32 @@ esac
         let mut stored_500 = stored_submission(submission.clone(), Some(vec![1, 2, 3, 4]), &[1]);
         stored_500.chunk_meta[0].inclusion_block =
             Some("BLTransient500Block123456789ABCDEFG".into());
-        stored_500.chunk_meta[0].injected_level = None;
-        let after_500 = maybe_advance_submission(&config, stored_500).unwrap();
+        stored_500.chunk_meta[0].injected_level = Some(300);
+        for expected_failures in 1..MAX_INCLUSION_BLOCK_LOOKUP_FAILURES {
+            stored_500 = maybe_advance_submission(&config, stored_500).unwrap();
+            assert_eq!(
+                stored_500.submission.dal_chunks[0].published_level,
+                UNRESOLVED_PUBLISHED_LEVEL
+            );
+            assert_eq!(
+                stored_500.chunk_meta[0].inclusion_block.as_deref(),
+                Some("BLTransient500Block123456789ABCDEFG")
+            );
+            assert_eq!(
+                stored_500.chunk_meta[0].inclusion_block_failures,
+                expected_failures
+            );
+        }
+        let resolved_after_500s = maybe_advance_submission(&config, stored_500).unwrap();
         assert_eq!(
-            after_500.submission.dal_chunks[0].published_level,
-            UNRESOLVED_PUBLISHED_LEVEL
+            resolved_after_500s.submission.dal_chunks[0].published_level,
+            301
         );
+        assert_eq!(resolved_after_500s.chunk_meta[0].inclusion_block, None);
         assert_eq!(
-            after_500.chunk_meta[0].inclusion_block.as_deref(),
-            Some("BLTransient500Block123456789ABCDEFG")
+            resolved_after_500s.chunk_meta[0].inclusion_block_failures,
+            0
         );
-        assert_eq!(after_500.chunk_meta[0].injected_level, None);
 
         // Case A: `inclusion_block` returns 404 (reorged out and forgotten by node),
         // so `resolve_unresolved_chunk_level` clears `inclusion_block`, falls back
@@ -4536,9 +4628,10 @@ esac
         // Two unresolved submissions in the same `reconcile_pending_submissions`
         // pass share `MAX_INCLUSION_SCAN_LEVELS_PER_TICK = 32` total `/operation_hashes/3`
         // requests (and fetch `/chains/main/blocks/head/header` only once):
-        // sub-1 scans 32 levels (`100..=131`) and exhausts the tick's budget, so
-        // sub-2 waits without issuing any `/operation_hashes/3` requests until
-        // the next tick.
+        // on tick 1 (`reconcile_cursor = 0`), sub-1 scans 32 levels (`100..=131`)
+        // and exhausts the tick's budget, so sub-2 waits; on tick 2 (`reconcile_cursor = 1`),
+        // `reconcile_pending_submissions` rotates the starting submission so sub-2
+        // is visited first and advances (`150..=181`) instead of starving behind sub-1.
         let mut routes = HashMap::from([
             (
                 "/chains/main/blocks/head/header".into(),
@@ -4549,7 +4642,7 @@ esac
                 (200, "{\"max_operations_time_to_live\":600}".into()),
             ),
         ]);
-        for lvl in 100..=131 {
+        for lvl in (100..=131).chain(150..=181) {
             routes.insert(
                 format!("/chains/main/blocks/{lvl}/operation_hashes/3"),
                 (200, "[]".into()),
@@ -4587,17 +4680,32 @@ esac
             persist_submission(&config, &stored).unwrap();
         }
 
-        let summary = reconcile_pending_submissions(&config).unwrap();
-        assert_eq!(summary.errors, 0);
+        let summary1 = reconcile_pending_submissions(&config).unwrap();
+        assert_eq!(summary1.errors, 0);
         let sub1 = load_stored_submission(&config.state_dir, "sub-budget-1").unwrap();
         let sub2 = load_stored_submission(&config.state_dir, "sub-budget-2").unwrap();
         assert_eq!(
             sub1.chunk_meta[0].scan_cursor,
             Some(100 + MAX_INCLUSION_SCAN_LEVELS_PER_TICK)
         );
-        // sub-2's cursor was not advanced on this tick because sub-1 consumed the
+        // sub-2's cursor was not advanced on tick 1 because sub-1 consumed the
         // entire 32-level per-tick budget.
         assert_eq!(sub2.chunk_meta[0].scan_cursor, None);
+
+        // On tick 2, rotation visits sub-2 first so it gets the 32-level budget
+        // even though sub-1 still has unresolved levels remaining (`132..=198`).
+        let summary2 = reconcile_pending_submissions(&config).unwrap();
+        assert_eq!(summary2.errors, 0);
+        let sub1_tick2 = load_stored_submission(&config.state_dir, "sub-budget-1").unwrap();
+        let sub2_tick2 = load_stored_submission(&config.state_dir, "sub-budget-2").unwrap();
+        assert_eq!(
+            sub1_tick2.chunk_meta[0].scan_cursor,
+            Some(100 + MAX_INCLUSION_SCAN_LEVELS_PER_TICK)
+        );
+        assert_eq!(
+            sub2_tick2.chunk_meta[0].scan_cursor,
+            Some(150 + MAX_INCLUSION_SCAN_LEVELS_PER_TICK)
+        );
     }
 
     #[test]
