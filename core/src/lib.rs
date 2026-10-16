@@ -2689,6 +2689,26 @@ impl PreparedShield {
     pub fn tez_debit(&self) -> u64 {
         self.tez_debit
     }
+    /// Ordered per-pool debits `(asset_id, amount)` to apply at
+    /// `self.pubkey_hash`. For tez shields (`asset_id == ASSET_TEZ`), the
+    /// recipient note (`v`) and tez fees (`fee + producer_fee`) collapse
+    /// into a single `(ASSET_TEZ, asset_debit + tez_debit)` entry; for
+    /// non-tez (FA2) shields, returns `[(asset_id, asset_debit),
+    /// (ASSET_TEZ, tez_debit)]`.
+    pub fn pool_debits(&self) -> Result<Vec<(F, u64)>, String> {
+        if self.asset_id == ASSET_TEZ {
+            let combined = self
+                .asset_debit
+                .checked_add(self.tez_debit)
+                .ok_or_else(|| "shield combined debit overflow".to_string())?;
+            Ok(vec![(ASSET_TEZ, combined)])
+        } else {
+            Ok(vec![
+                (self.asset_id, self.asset_debit),
+                (ASSET_TEZ, self.tez_debit),
+            ])
+        }
+    }
     pub fn client_note(&self) -> (&F, &EncryptedNote) {
         (&self.client_cm, &self.client_enc)
     }
@@ -2899,22 +2919,8 @@ pub fn commit_prepared_shield<S: LedgerState>(
     state: &mut S,
     prepared: PreparedShield,
 ) -> Result<ShieldResp, String> {
-    // For tez shields the asset and tez debits collapse onto the
-    // same pool, so we do a single combined call to keep the
-    // existing storage-write pattern (one entry touched). For FA2
-    // shields we MUST debit both pools — the (asset_id, pubkey)
-    // pool covers the recipient note (`v`), and the
-    // (ASSET_TEZ, pubkey) pool covers the rollup fee + producer-fee
-    // tez note (`fee + producer_fee`).
-    if prepared.asset_id == ASSET_TEZ {
-        let combined = prepared
-            .asset_debit
-            .checked_add(prepared.tez_debit)
-            .ok_or_else(|| "shield combined debit overflow".to_string())?;
-        state.debit_deposit(&ASSET_TEZ, &prepared.pubkey_hash, combined)?;
-    } else {
-        state.debit_deposit(&prepared.asset_id, &prepared.pubkey_hash, prepared.asset_debit)?;
-        state.debit_deposit(&ASSET_TEZ, &prepared.pubkey_hash, prepared.tez_debit)?;
+    for (pool_asset_id, debit_amount) in prepared.pool_debits()? {
+        state.debit_deposit(&pool_asset_id, &prepared.pubkey_hash, debit_amount)?;
     }
     state.mark_applied_shield(prepared.client_cm)?;
     let index = state.append_note(prepared.client_cm, prepared.client_enc)?;
@@ -7609,5 +7615,47 @@ mod tests {
         );
         bytes.extend_from_slice(record.recipient.as_bytes());
         assert_eq!(bytes.len(), encoded_len);
+    }
+
+    #[test]
+    fn test_prepared_shield_pool_debits_for_tez_and_fa2() {
+        let dummy_enc = EncryptedNote {
+            ct_d: vec![0; ML_KEM768_CIPHERTEXT_BYTES],
+            tag: 0,
+            ct_v: vec![0; ML_KEM768_CIPHERTEXT_BYTES],
+            nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
+            encrypted_data: vec![0; ENCRYPTED_NOTE_BYTES],
+            outgoing_ct: vec![0; OUTGOING_RECOVERY_CT_BYTES],
+        };
+        let tez_shield = PreparedShield {
+            asset_id: ASSET_TEZ,
+            pubkey_hash: [0x11; 32],
+            asset_debit: 500 + MIN_TX_FEE,
+            tez_debit: 7,
+            client_cm: [0x21; 32],
+            client_enc: dummy_enc.clone(),
+            producer_cm: [0x22; 32],
+            producer_enc: dummy_enc.clone(),
+        };
+        assert_eq!(
+            tez_shield.pool_debits().unwrap(),
+            vec![(ASSET_TEZ, 500 + MIN_TX_FEE + 7)]
+        );
+
+        let fa2_asset = derive_asset_id("KT1Fa2Bridge");
+        let fa2_shield = PreparedShield {
+            asset_id: fa2_asset,
+            pubkey_hash: [0x11; 32],
+            asset_debit: 500,
+            tez_debit: MIN_TX_FEE + 7,
+            client_cm: [0x21; 32],
+            client_enc: dummy_enc.clone(),
+            producer_cm: [0x22; 32],
+            producer_enc: dummy_enc,
+        };
+        assert_eq!(
+            fa2_shield.pool_debits().unwrap(),
+            vec![(fa2_asset, 500), (ASSET_TEZ, MIN_TX_FEE + 7)]
+        );
     }
 }

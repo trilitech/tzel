@@ -6469,6 +6469,36 @@ mod tests {
         w.addresses[j as usize].payment_address(&ek_v, &ek_d)
     }
 
+    #[test]
+    fn select_notes_rejects_when_more_than_five_inputs_needed() {
+        let mut w = test_wallet(0);
+        w.notes = (0..6)
+            .map(|i| Note {
+                nk_spend: ZERO,
+                nk_tag: ZERO,
+                auth_root: ZERO,
+                d_j: ZERO,
+                v: 10,
+                rseed: ZERO,
+                cm: u64_to_felt(i as u64 + 1),
+                index: i,
+                addr_index: 0,
+                asset_id: ASSET_TEZ,
+            })
+            .collect();
+
+        let five = w.select_notes(50).expect("5 notes of 10 should cover 50");
+        assert_eq!(five.len(), 5);
+
+        let err = w
+            .select_notes(51)
+            .expect_err("covering 51 with six notes of 10 requires 6 inputs and must fail");
+        assert!(
+            err.contains("caps inputs at 5"),
+            "expected 'caps inputs at 5' in error, got: {err}"
+        );
+    }
+
     proptest! {
         #[test]
         fn prop_select_notes_returns_valid_covering_set(
@@ -11715,8 +11745,6 @@ fn cmd_unshield_rollup(
         let mut wots_sigs: Vec<Vec<F>> = vec![];
         let mut auth_pub_seeds: Vec<F> = vec![];
 
-        let has_change_val: u64 = if change_primary > 0 { 1 } else { 0 };
-        let has_change_2_val: u64 = if change_tez > 0 { 1 } else { 0 };
         let recipient_f = hash(recipient.as_bytes());
         let mh_change_f = change_data.as_ref().map(|cd| cd.mh).unwrap_or(ZERO);
         let mh_change_2_f = change_data_2.as_ref().map(|cd| cd.mh).unwrap_or(ZERO);
@@ -11813,10 +11841,10 @@ fn cmd_unshield_rollup(
         }
 
         // change_1: primary refund (same asset as exit_asset_id when active;
-        // must be zero / ASSET_TEZ when has_change_val == 0 to satisfy
+        // all 8 slot fields must be zero / ASSET_TEZ when disabled to satisfy
         // UnshieldChangeSlot::commitment_or_zero in tzel-guest).
-        args.push(felt_u64_to_hex(has_change_val));
         if let Some(cd) = &change_data {
+            args.push(felt_u64_to_hex(1));
             args.push(felt_to_hex(&cd.d_j));
             args.push(felt_u64_to_hex(change_primary));
             args.push(felt_to_hex(&cd.rseed));
@@ -11824,20 +11852,18 @@ fn cmd_unshield_rollup(
             args.push(felt_to_hex(&cd.auth_pub_seed));
             args.push(felt_to_hex(&cd.nk_tag));
             args.push(felt_to_hex(&cd.mh));
+            args.push(felt_to_hex(&exit_asset_id));
         } else {
+            args.push(felt_u64_to_hex(0));
             for _ in 0..7 {
                 args.push("0x0".to_string());
             }
+            args.push(felt_to_hex(&ASSET_TEZ));
         }
-        args.push(felt_to_hex(if has_change_val == 1 {
-            &exit_asset_id
-        } else {
-            &ASSET_TEZ
-        }));
 
         // change_2: tez refund (only non-zero for FA2 exits).
-        args.push(felt_u64_to_hex(has_change_2_val));
         if let Some(cd) = &change_data_2 {
+            args.push(felt_u64_to_hex(1));
             args.push(felt_to_hex(&cd.d_j));
             args.push(felt_u64_to_hex(change_tez));
             args.push(felt_to_hex(&cd.rseed));
@@ -11845,12 +11871,14 @@ fn cmd_unshield_rollup(
             args.push(felt_to_hex(&cd.auth_pub_seed));
             args.push(felt_to_hex(&cd.nk_tag));
             args.push(felt_to_hex(&cd.mh));
+            args.push(felt_to_hex(&ASSET_TEZ));
         } else {
+            args.push(felt_u64_to_hex(0));
             for _ in 0..7 {
                 args.push("0x0".to_string());
             }
+            args.push(felt_to_hex(&ASSET_TEZ));
         }
-        args.push(felt_to_hex(&ASSET_TEZ));
 
         args.push(felt_to_hex(&producer_address.d_j));
         args.push(felt_u64_to_hex(profile.dal_fee));

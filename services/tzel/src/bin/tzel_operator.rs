@@ -897,7 +897,74 @@ fn maybe_advance_submission(
     let mut status_lines = Vec::with_capacity(stored.submission.dal_chunks.len());
     let mut retry_indices: Vec<(usize, String)> = Vec::new();
     let mut waiting_indices = Vec::new();
-    for (idx, chunk) in stored.submission.dal_chunks.iter().enumerate() {
+    let mut waiting_for_attestation = false;
+    let mut resolved_any_level = false;
+    for idx in 0..stored.submission.dal_chunks.len() {
+        if stored.submission.dal_chunks[idx].published_level <= UNRESOLVED_PUBLISHED_LEVEL {
+            let slot_index = stored.submission.dal_chunks[idx].slot_index;
+            let Some(op_hash) = stored.submission.dal_chunks[idx].operation_hash.clone() else {
+                retry_indices.push((idx, "unresolved chunk missing operation_hash".into()));
+                continue;
+            };
+            match wait_for_operation_inclusion(config, &op_hash) {
+                Ok(output) => {
+                    if let (Some(block_hash), Some(octez_node_endpoint)) = (
+                        extract_block_hash(&output),
+                        config.octez_node_endpoint.as_deref(),
+                    ) {
+                        if let Ok(level) = fetch_block_level(octez_node_endpoint, &block_hash) {
+                            if level > UNRESOLVED_PUBLISHED_LEVEL {
+                                stored.submission.dal_chunks[idx].published_level = level;
+                                resolved_any_level = true;
+                            }
+                        }
+                    }
+                    if stored.submission.dal_chunks[idx].published_level
+                        <= UNRESOLVED_PUBLISHED_LEVEL
+                    {
+                        status_lines.push(format!(
+                            "chunk[{idx}] slot {} op {} => waiting_inclusion",
+                            slot_index, op_hash
+                        ));
+                        waiting_for_attestation = true;
+                        continue;
+                    }
+                }
+                Err(err) if is_command_timeout(&err) => {
+                    if let (Some(block_hash), Some(octez_node_endpoint)) = (
+                        extract_block_hash(&err),
+                        config.octez_node_endpoint.as_deref(),
+                    ) {
+                        if let Ok(level) = fetch_block_level(octez_node_endpoint, &block_hash) {
+                            if level > UNRESOLVED_PUBLISHED_LEVEL {
+                                stored.submission.dal_chunks[idx].published_level = level;
+                                resolved_any_level = true;
+                            }
+                        }
+                    }
+                    if stored.submission.dal_chunks[idx].published_level
+                        <= UNRESOLVED_PUBLISHED_LEVEL
+                    {
+                        status_lines.push(format!(
+                            "chunk[{idx}] slot {} op {} => waiting_inclusion",
+                            slot_index, op_hash
+                        ));
+                        waiting_for_attestation = true;
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    status_lines.push(format!(
+                        "chunk[{idx}] slot {} op {} => inclusion_failed",
+                        slot_index, op_hash
+                    ));
+                    retry_indices.push((idx, format!("inclusion wait failed: {}", err)));
+                    continue;
+                }
+            }
+        }
+
+        let chunk = &stored.submission.dal_chunks[idx];
         let status =
             fetch_dal_slot_status(dal_node_endpoint, chunk.published_level, chunk.slot_index)?;
         status_lines.push(format!(
@@ -910,8 +977,10 @@ fn maybe_advance_submission(
             waiting_indices.push(idx);
         }
     }
+    if resolved_any_level {
+        update_submission_commitment_summary(&mut stored.submission)?;
+    }
 
-    let mut waiting_for_attestation = false;
     if !waiting_indices.is_empty() {
         if let Some(octez_node_endpoint) = config.octez_node_endpoint.as_deref() {
             match fetch_head_level(octez_node_endpoint) {
@@ -1129,6 +1198,14 @@ fn publish_dal_chunk(config: &OperatorConfig, payload: &[u8]) -> Result<RollupDa
     )
 }
 
+/// Sentinel `published_level` stored on a `RollupDalChunk` when the DAL
+/// commitment operation was injected (we have its `operation_hash`) but its
+/// inclusion block level could not yet be determined (either `-w 1` timed out
+/// before printing `Operation found in block`, or the follow-up block header
+/// RPC failed). The reconciler resolves the inclusion block via
+/// `wait_for_operation_inclusion` before querying DAL slot status.
+const UNRESOLVED_PUBLISHED_LEVEL: i32 = 0;
+
 fn publish_dal_chunk_with_protocol(
     config: &OperatorConfig,
     dal_node_endpoint: &str,
@@ -1153,7 +1230,11 @@ fn publish_dal_chunk_with_protocol(
                 let block_hash = extract_block_hash(&output).ok_or_else(|| {
                     format!("missing block hash in dal commitment output: {}", output)
                 })?;
-                let published_level = fetch_block_level(octez_node_endpoint, &block_hash)?;
+                let published_level = match fetch_block_level(octez_node_endpoint, &block_hash) {
+                    Ok(level) => level,
+                    Err(_) if operation_hash.is_some() => UNRESOLVED_PUBLISHED_LEVEL,
+                    Err(err) => return Err(err),
+                };
                 (operation_hash, published_level)
             }
             Err(err) if is_slot_header_collision(&err) => {
@@ -1161,19 +1242,29 @@ fn publish_dal_chunk_with_protocol(
                 continue;
             }
             Err(err) => {
-                // Idempotency (matches inject_direct_message): octez-client prints
-                // the operation hash as soon as the commitment op is injected, before
-                // waiting for `-w 1` block inclusion. If `-w 1` times out after
-                // injection, record the chunk with the extracted operation hash and
-                // either the block level (if a block hash was also printed) or the
-                // current head level so the reconciler tracks it instead of failing
-                // the submission and re-injecting a counter-conflicting duplicate.
-                if let Some(op_hash) = extract_operation_hash(&err) {
-                    let published_level = match extract_block_hash(&err) {
-                        Some(block_hash) => fetch_block_level(octez_node_endpoint, &block_hash)?,
-                        None => fetch_head_level(octez_node_endpoint)?,
-                    };
-                    (Some(op_hash), published_level)
+                // Idempotency: octez-client prints `Operation hash is ...` as
+                // soon as the commitment op is injected, before waiting for
+                // `-w 1` inclusion. If the command timed out after injection:
+                //   - Never guess `head` as `published_level`: an op that timed
+                //     out before `Operation found in block` was not included at
+                //     `head` (it will land at `head + 1` or later), and querying
+                //     `/levels/{head}/slots/{i}/status` could observe another
+                //     publisher's commitment on the same slot.
+                //   - Never propagate a follow-up RPC error with `?` once we
+                //     have `op_hash`, or the op hash proving injection is lost.
+                //   - Only recover on a command timeout (`is_command_timeout`),
+                //     not on non-timeout non-zero exits (e.g. rejected/failed op).
+                if is_command_timeout(&err) {
+                    if let Some(op_hash) = extract_operation_hash(&err) {
+                        let published_level = extract_block_hash(&err)
+                            .and_then(|block_hash| {
+                                fetch_block_level(octez_node_endpoint, &block_hash).ok()
+                            })
+                            .unwrap_or(UNRESOLVED_PUBLISHED_LEVEL);
+                        (Some(op_hash), published_level)
+                    } else {
+                        return Err(err);
+                    }
                 } else {
                     return Err(err);
                 }
@@ -1237,7 +1328,8 @@ fn update_submission_commitment_summary(submission: &mut RollupSubmission) -> Re
         .first()
         .ok_or_else(|| "DAL submission unexpectedly produced zero chunks".to_string())?;
     submission.commitment = Some(first.commitment.clone());
-    submission.published_level = Some(first.published_level);
+    submission.published_level =
+        (first.published_level > UNRESOLVED_PUBLISHED_LEVEL).then_some(first.published_level);
     submission.slot_index = Some(first.slot_index);
     Ok(())
 }
@@ -1281,6 +1373,12 @@ fn validate_dal_slot_range(config: &OperatorConfig, number_of_slots: u64) -> Res
 
 fn is_slot_header_collision(err: &str) -> bool {
     err.to_ascii_lowercase().contains("already proposed")
+}
+
+fn is_command_timeout(err: &str) -> bool {
+    err.lines()
+        .next()
+        .is_some_and(|first| first.contains(" timed out after "))
 }
 
 fn fetch_dal_protocol_parameters(endpoint: &str) -> Result<DalProtocolParametersResp, String> {
@@ -1345,6 +1443,32 @@ fn publish_dal_commitment(
         .arg("with")
         .arg("proof")
         .arg(proof);
+    run_command_collect_output(command, &config.octez_client_bin, OCTEZ_CLIENT_TIMEOUT)
+}
+
+fn wait_for_operation_inclusion(
+    config: &OperatorConfig,
+    operation_hash: &str,
+) -> Result<String, String> {
+    let mut command = std::process::Command::new(&config.octez_client_bin);
+    if let Some(dir) = &config.octez_client_dir {
+        command.arg("-d").arg(dir);
+    }
+    if let Some(endpoint) = &config.octez_node_endpoint {
+        command.arg("-E").arg(endpoint);
+    }
+    if let Some(protocol) = &config.octez_protocol {
+        command.arg("-p").arg(protocol);
+    }
+    command
+        .arg("wait")
+        .arg("for")
+        .arg(operation_hash)
+        .arg("to")
+        .arg("be")
+        .arg("included")
+        .arg("--check-previous")
+        .arg("60");
     run_command_collect_output(command, &config.octez_client_bin, OCTEZ_CLIENT_TIMEOUT)
 }
 
@@ -1426,9 +1550,12 @@ fn dal_pointer_from_submission(
             .dal_chunks
             .iter()
             .map(|chunk| -> Result<KernelDalChunkPointer, String> {
+                if chunk.published_level <= UNRESOLVED_PUBLISHED_LEVEL {
+                    return Err("chunk published_level is not yet resolved".to_string());
+                }
                 Ok(KernelDalChunkPointer {
                     published_level: u64::try_from(chunk.published_level)
-                        .map_err(|_| "published_level must be non-negative".to_string())?,
+                        .map_err(|_| "published_level must be positive".to_string())?,
                     slot_index: u8::try_from(chunk.slot_index)
                         .map_err(|_| "slot_index does not fit in u8".to_string())?,
                     payload_len: u64::try_from(chunk.payload_len)
@@ -1611,12 +1738,17 @@ fn extract_operation_hash(output: &str) -> Option<String> {
 }
 
 fn extract_block_hash(output: &str) -> Option<String> {
-    extract_token_with_prefix(output, 'B')
+    output.lines().find_map(|line| {
+        let (_, tail) = line.split_once("Operation found in block")?;
+        extract_token_with_prefix(tail, 'B')
+    })
 }
 
 fn extract_token_with_prefix(output: &str, prefix: char) -> Option<String> {
     output
-        .split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | '(' | ')'))
+        .split(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | ':' | '(' | ')')
+        })
         .find_map(|token| {
             if token.starts_with(prefix)
                 && token.len() >= 20
@@ -3489,12 +3621,30 @@ mod tests {
     }
 
     #[test]
-    fn dal_publish_timeout_after_injection_records_chunk_instead_of_failing() {
+    fn dal_publish_timeout_after_injection_records_chunk_and_resolves_level_later() {
         let script_dir = tempfile::tempdir().unwrap();
         let client_path = script_dir.path().join("octez-client");
         // Simulate octez-client injecting the DAL commitment operation and printing
-        // its hash, then timing out on `-w 1` confirmation before printing a block hash.
-        let script = "#!/bin/sh\necho \"Operation hash is 'ooDalTimedOut123456789ABCDEFG'\"\necho 'Error: timed out waiting for operation inclusion' >&2\nexit 1\n";
+        // its hash, then timing out on `-w 1` confirmation; on a later `wait for`
+        // reconciliation call, return the actual inclusion block hash.
+        let script = r#"#!/bin/sh
+case "$*" in
+  *"wait for ooDalTimedOut123456789ABCDEFG to be included"*)
+    echo "Operation found in block: BKiLedvfcefN4vB5tC9PQZ1D6pA28F1u4B8v7z4D9sE6R3gK1wM (pass: 3, offset: 0)"
+    exit 0
+    ;;
+  *"publish dal commitment"*)
+    echo "octez-client timed out after 60s"
+    echo "Operation hash is 'ooDalTimedOut123456789ABCDEFG'"
+    exit 1
+    ;;
+  *)
+    echo "Operation hash is 'ooPointerOp123456789ABCDEFG'"
+    echo "Operation found in block: BLockGenesis111111111111111111111111111111111111111"
+    exit 0
+    ;;
+esac
+"#;
         std::fs::write(&client_path, script).unwrap();
         #[cfg(unix)]
         {
@@ -3521,12 +3671,13 @@ mod tests {
                 ),
             ),
             (
-                "/chains/main/blocks/head/header".into(),
-                (200, "{\"level\":456}".into()),
+                "/chains/main/blocks/BKiLedvfcefN4vB5tC9PQZ1D6pA28F1u4B8v7z4D9sE6R3gK1wM/header"
+                    .into(),
+                (200, "{\"level\":457}".into()),
             ),
             (
-                "/levels/456/slots/0/status".into(),
-                (404, "not found".into()),
+                "/levels/457/slots/0/status".into(),
+                (200, "\"attested\"".into()),
             ),
         ]));
         config.dal_node_endpoint = Some(endpoint.clone());
@@ -3544,7 +3695,80 @@ mod tests {
             submission.dal_chunks[0].operation_hash.as_deref(),
             Some("ooDalTimedOut123456789ABCDEFG")
         );
-        assert_eq!(submission.dal_chunks[0].published_level, 456);
+        assert_eq!(
+            submission.dal_chunks[0].published_level,
+            UNRESOLVED_PUBLISHED_LEVEL
+        );
+        assert_eq!(submission.published_level, None);
+
+        // Next reconciler tick resolves the inclusion block level via `wait for`
+        // and advances the submission once the slot at level 457 is attested.
+        let summary = reconcile_pending_submissions(&config).unwrap();
+        assert_eq!(summary.errors, 0);
+        let updated = load_submission(&config.state_dir, &submission.id).unwrap();
+        assert_eq!(updated.dal_chunks[0].published_level, 457);
+        assert_eq!(updated.published_level, Some(457));
+        assert_eq!(updated.status, RollupSubmissionStatus::SubmittedToL1);
+    }
+
+    #[test]
+    fn dal_publish_non_timeout_failure_after_op_hash_returns_error() {
+        let script_dir = tempfile::tempdir().unwrap();
+        let client_path = script_dir.path().join("octez-client");
+        let script = "#!/bin/sh\necho \"Operation hash is 'ooFailedOp123456789ABCDEFG'\"\necho 'Fatal error: simulation failed after precheck' >&2\nexit 1\n";
+        std::fs::write(&client_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&client_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&client_path, perms).unwrap();
+        }
+        let mut config = config_with_client(&client_path);
+        config.direct_max_message_bytes = 1;
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8192}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1fail\",\"commitment_proof\":\"proof-f\"}".into(),
+                ),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let req = SubmitRollupMessageReq {
+            kind: RollupSubmissionKind::ConfigureBridge,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            payload: sample_configure_bridge_payload(),
+        };
+        let err = process_submission(&config, req).unwrap_err();
+        assert!(
+            err.contains("simulation failed after precheck"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_block_hash_requires_operation_found_in_block_anchor() {
+        let noisy_output = "Branch: BNoiseBranchHash11111111111111111111111111111111111\nOperation hash is 'ooSomeOp123456789'\n";
+        assert_eq!(extract_block_hash(noisy_output), None);
+
+        let anchored_output = format!(
+            "{noisy_output}Operation found in block: BKiLedvfcefN4vB5tC9PQZ1D6pA28F1u4B8v7z4D9sE6R3gK1wM (pass: 3, offset: 0)\n"
+        );
+        assert_eq!(
+            extract_block_hash(&anchored_output).as_deref(),
+            Some("BKiLedvfcefN4vB5tC9PQZ1D6pA28F1u4B8v7z4D9sE6R3gK1wM")
+        );
     }
 
     #[test]
