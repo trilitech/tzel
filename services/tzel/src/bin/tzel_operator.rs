@@ -158,7 +158,7 @@ struct ChunkMeta {
     #[serde(default)]
     inclusion_block_failures: u32,
     #[serde(default)]
-    scan_level_failures: u32,
+    skipped_pruned_levels: bool,
     #[serde(default)]
     max_operations_ttl: Option<i32>,
 }
@@ -171,7 +171,7 @@ impl Default for ChunkMeta {
             scan_cursor: None,
             inclusion_block: None,
             inclusion_block_failures: 0,
-            scan_level_failures: 0,
+            skipped_pruned_levels: false,
             max_operations_ttl: None,
         }
     }
@@ -1001,51 +1001,31 @@ fn resolve_unresolved_chunk_level(
                     Ok(true) => {
                         meta.inclusion_block = None;
                         meta.inclusion_block_failures = 0;
-                        meta.scan_level_failures = 0;
+                        meta.skipped_pruned_levels = false;
                         meta.injected_level = None;
                         meta.scan_cursor = None;
                         meta.max_operations_ttl = None;
                         return UnresolvedChunkResolution::Resolved(level);
                     }
-                    Ok(false) => {
+                    Ok(false) | Err(BlockLookupError::NotFound) => {
                         // Confirmed non-canonical on the main chain at finalized `level`
-                        // (e.g. reorged away): clear `inclusion_block` and fall through
-                        // to the canonical scan, seeding `injected_level` with
-                        // `level - TENDERBAKE_FINALITY_LAG` if unset so a canonical
-                        // branch inclusion a block or two earlier is still scanned.
+                        // (e.g. reorged away), or `operation_hashes/3` at `level` returned
+                        // 404 (pruned): clear `inclusion_block` and fall through to the
+                        // canonical scan without moving `scan_cursor` past `level`, seeding
+                        // `injected_level` with `level - TENDERBAKE_FINALITY_LAG` if unset
+                        // so a canonical branch inclusion a block or two earlier is scanned.
                         meta.inclusion_block = None;
-                        meta.scan_level_failures = 0;
                         if meta.injected_level.is_none() {
                             meta.injected_level =
                                 Some(level.saturating_sub(TENDERBAKE_FINALITY_LAG).max(1));
                         }
                         *dirty_metadata = true;
                     }
-                    Err(_) => {
-                        meta.scan_level_failures = meta.scan_level_failures.saturating_add(1);
-                        *dirty_metadata = true;
-                        if meta.scan_level_failures < MAX_INCLUSION_BLOCK_LOOKUP_FAILURES {
-                            // Transient RPC failure checking `operation_hashes/3`: keep
-                            // `inclusion_block` intact and retry on the next tick.
-                            return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
-                        }
-                        // Persistent failure at finalized `level` (e.g. a pruned block
-                        // returning 404 on `operation_hashes/3`): clear `inclusion_block`
-                        // and fall through to the canonical scan so the chunk cannot
-                        // stay stuck forever.
-                        meta.inclusion_block = None;
-                        meta.scan_level_failures = 0;
-                        if meta.injected_level.is_none() {
-                            meta.injected_level =
-                                Some(level.saturating_sub(TENDERBAKE_FINALITY_LAG).max(1));
-                        }
-                        if meta
-                            .scan_cursor
-                            .unwrap_or_else(|| meta.injected_level.unwrap_or(level))
-                            == level
-                        {
-                            meta.scan_cursor = Some(level.saturating_add(1));
-                        }
+                    Err(BlockLookupError::Other(_)) => {
+                        // Transient RPC failure checking `operation_hashes/3` at the
+                        // hinted `level`: keep `inclusion_block` intact and retry on
+                        // the next tick rather than dropping or skipping `level`.
+                        return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
                     }
                 }
             }
@@ -1107,29 +1087,31 @@ fn resolve_unresolved_chunk_level(
                 Ok(true) => {
                     meta.inclusion_block = None;
                     meta.inclusion_block_failures = 0;
-                    meta.scan_level_failures = 0;
+                    meta.skipped_pruned_levels = false;
                     meta.injected_level = None;
                     meta.scan_cursor = None;
                     meta.max_operations_ttl = None;
                     return UnresolvedChunkResolution::Resolved(level);
                 }
                 Ok(false) => {
-                    meta.scan_level_failures = 0;
                     meta.scan_cursor = Some(level.saturating_add(1));
                     *dirty_metadata = true;
                 }
-                Err(_) => {
-                    meta.scan_level_failures = meta.scan_level_failures.saturating_add(1);
-                    *dirty_metadata = true;
-                    if meta.scan_level_failures < MAX_INCLUSION_BLOCK_LOOKUP_FAILURES {
-                        return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
-                    }
-                    // Skip a persistently unqueryable level (e.g. a rolling/pruned node
-                    // returning 404 on `operation_hashes/3` at `level`) after
-                    // `MAX_INCLUSION_BLOCK_LOOKUP_FAILURES` consecutive failures so the
-                    // scan can still advance to later levels or reach TTL expiry.
-                    meta.scan_level_failures = 0;
+                Err(BlockLookupError::NotFound) => {
+                    // A rolling/pruned node returned 404 on finalized `level`'s
+                    // `operation_hashes/3`: skip the pruned level and record that
+                    // history was incomplete so the chunk can still resolve at a
+                    // later retained level or expire at TTL.
+                    eprintln!(
+                        "reconciler: block operation_hashes at finalized level {} returned 404 (pruned) while scanning for {}; skipping level",
+                        level, op_hash
+                    );
+                    meta.skipped_pruned_levels = true;
                     meta.scan_cursor = Some(level.saturating_add(1));
+                    *dirty_metadata = true;
+                }
+                Err(BlockLookupError::Other(_)) => {
+                    return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
                 }
             }
         }
@@ -1137,9 +1119,14 @@ fn resolve_unresolved_chunk_level(
     let scanned_through_deadline = meta.scan_cursor.unwrap_or(start_level) > deadline_level;
     if final_head >= deadline_level && scanned_through_deadline {
         let age = final_head.saturating_sub(start_level);
+        let pruned_note = if meta.skipped_pruned_levels {
+            " (pruned levels skipped during scan)"
+        } else {
+            ""
+        };
         UnresolvedChunkResolution::Retry(format!(
-            "unresolved operation {} not included after {} finalized levels (ttl {})",
-            op_hash, age, max_ops_ttl
+            "unresolved operation {} not included after {} finalized levels (ttl {}){}",
+            op_hash, age, max_ops_ttl, pruned_note
         ))
     } else {
         UnresolvedChunkResolution::Waiting("waiting_inclusion".into())
@@ -1315,7 +1302,7 @@ fn maybe_advance_submission_with_budget(
                 scan_cursor: None,
                 inclusion_block: meta.inclusion_block,
                 inclusion_block_failures: 0,
-                scan_level_failures: 0,
+                skipped_pruned_levels: false,
                 max_operations_ttl: None,
             };
             update_submission_commitment_summary(&mut stored.submission)?;
@@ -1462,7 +1449,7 @@ fn resume_pending_dal_submission(
             scan_cursor: None,
             inclusion_block: meta.inclusion_block,
             inclusion_block_failures: 0,
-            scan_level_failures: 0,
+            skipped_pruned_levels: false,
             max_operations_ttl: None,
         });
         stored.submission.detail = Some(format!(
@@ -1842,22 +1829,28 @@ fn block_contains_manager_operation(
     endpoint: &str,
     level: i32,
     operation_hash: &str,
-) -> Result<bool, String> {
+) -> Result<bool, BlockLookupError> {
     let url = format!(
         "{}/chains/main/blocks/{}/operation_hashes/3",
         endpoint.trim_end_matches('/'),
         level
     );
-    let resp = http_agent().get(&url).call().map_err(|e| {
-        format!(
-            "block operation_hashes request failed at level {}: {}",
+    let resp = match http_agent().get(&url).call() {
+        Ok(resp) => resp,
+        Err(ureq::Error::StatusCode(404)) => return Err(BlockLookupError::NotFound),
+        Err(e) => {
+            return Err(BlockLookupError::Other(format!(
+                "block operation_hashes request failed at level {}: {}",
+                level, e
+            )))
+        }
+    };
+    let hashes: Vec<String> = resp.into_body().read_json().map_err(|e| {
+        BlockLookupError::Other(format!(
+            "parse block operation_hashes at level {}: {}",
             level, e
-        )
+        ))
     })?;
-    let hashes: Vec<String> = resp
-        .into_body()
-        .read_json()
-        .map_err(|e| format!("parse block operation_hashes at level {}: {}", level, e))?;
     Ok(hashes.iter().any(|h| h == operation_hash))
 }
 
@@ -4603,10 +4596,10 @@ esac
             0
         );
 
-        // Case 0b: when `/chains/main/blocks/300/operation_hashes/3` persistently
-        // fails (e.g. 404 on a pruned block in a rolling node), the canonical scan
-        // retries level 300 up to `MAX_INCLUSION_BLOCK_LOOKUP_FAILURES` times and
-        // then advances `scan_cursor` past level 300 to resolve at level 301.
+        // Case 0b: when `/chains/main/blocks/300/operation_hashes/3` returns 404
+        // (pruned block on a rolling node), the canonical scan skips level 300 and
+        // resolves at level 301; by contrast, a transient 500 on `operation_hashes/3`
+        // keeps waiting without skipping level 300 or dropping `inclusion_block`.
         let pruned_level_endpoint = spawn_mock_http_server(HashMap::from([
             (
                 "/chains/main/blocks/head/header".into(),
@@ -4634,23 +4627,64 @@ esac
 
         let mut stored_pruned = stored_submission(submission.clone(), Some(vec![1, 2, 3, 4]), &[1]);
         stored_pruned.chunk_meta[0].injected_level = Some(300);
-        for expected_failures in 1..MAX_INCLUSION_BLOCK_LOOKUP_FAILURES {
-            stored_pruned = maybe_advance_submission(&config, stored_pruned).unwrap();
-            assert_eq!(
-                stored_pruned.submission.dal_chunks[0].published_level,
-                UNRESOLVED_PUBLISHED_LEVEL
-            );
-            assert_eq!(
-                stored_pruned.chunk_meta[0].scan_level_failures,
-                expected_failures
-            );
-        }
         let resolved_after_pruned = maybe_advance_submission(&config, stored_pruned).unwrap();
         assert_eq!(
             resolved_after_pruned.submission.dal_chunks[0].published_level,
             301
         );
-        assert_eq!(resolved_after_pruned.chunk_meta[0].scan_level_failures, 0);
+        assert!(!resolved_after_pruned.chunk_meta[0].skipped_pruned_levels);
+
+        let op_hashes_500_endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/chains/main/blocks/head/header".into(),
+                (200, "{\"level\":304}".into()),
+            ),
+            (
+                "/chains/main/blocks/head/context/constants".into(),
+                (200, "{\"max_operations_time_to_live\":600}".into()),
+            ),
+            (
+                "/chains/main/blocks/BLHint300Block123456789ABCDEFG/header".into(),
+                (200, "{\"level\":300}".into()),
+            ),
+            (
+                "/chains/main/blocks/300/operation_hashes/3".into(),
+                (500, "transient op hashes error".into()),
+            ),
+            (
+                "/chains/main/blocks/301/operation_hashes/3".into(),
+                (200, "[\"ooReorgedOp123456789ABCDEFG\"]".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(op_hashes_500_endpoint.clone());
+        config.octez_node_endpoint = Some(op_hashes_500_endpoint);
+
+        let mut stored_op_500 = stored_submission(submission.clone(), Some(vec![1, 2, 3, 4]), &[1]);
+        stored_op_500.chunk_meta[0].inclusion_block = Some("BLHint300Block123456789ABCDEFG".into());
+        stored_op_500.chunk_meta[0].injected_level = Some(300);
+        for _ in 0..4 {
+            stored_op_500 = maybe_advance_submission(&config, stored_op_500).unwrap();
+            assert_eq!(
+                stored_op_500.submission.dal_chunks[0].published_level,
+                UNRESOLVED_PUBLISHED_LEVEL
+            );
+            assert_eq!(
+                stored_op_500.chunk_meta[0].inclusion_block.as_deref(),
+                Some("BLHint300Block123456789ABCDEFG")
+            );
+            assert_eq!(stored_op_500.chunk_meta[0].scan_cursor, None);
+            assert!(!stored_op_500.chunk_meta[0].skipped_pruned_levels);
+        }
+        stored_op_500.chunk_meta[0].inclusion_block = None;
+        for _ in 0..4 {
+            stored_op_500 = maybe_advance_submission(&config, stored_op_500).unwrap();
+            assert_eq!(
+                stored_op_500.submission.dal_chunks[0].published_level,
+                UNRESOLVED_PUBLISHED_LEVEL
+            );
+            assert_eq!(stored_op_500.chunk_meta[0].scan_cursor, None);
+            assert!(!stored_op_500.chunk_meta[0].skipped_pruned_levels);
+        }
 
         // Case A: `inclusion_block` returns 404 (reorged out and forgotten by node),
         // so `resolve_unresolved_chunk_level` clears `inclusion_block`, falls back
