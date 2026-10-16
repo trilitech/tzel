@@ -158,6 +158,8 @@ struct ChunkMeta {
     #[serde(default)]
     inclusion_block_failures: u32,
     #[serde(default)]
+    scan_level_failures: u32,
+    #[serde(default)]
     max_operations_ttl: Option<i32>,
 }
 
@@ -169,6 +171,7 @@ impl Default for ChunkMeta {
             scan_cursor: None,
             inclusion_block: None,
             inclusion_block_failures: 0,
+            scan_level_failures: 0,
             max_operations_ttl: None,
         }
     }
@@ -746,13 +749,8 @@ fn reconcile_pending_submissions(config: &OperatorConfig) -> Result<ReconcileSum
     let mut summary = ReconcileSummary::default();
     let mut scan_budget = MAX_INCLUSION_SCAN_LEVELS_PER_TICK;
     let mut cached_head_level: Option<Result<i32, String>> = None;
-    let mut paths = submission_paths(&config.state_dir)?;
-    if !paths.is_empty() {
-        let start =
-            (config.reconcile_cursor.fetch_add(1, Ordering::Relaxed) as usize) % paths.len();
-        paths.rotate_left(start);
-    }
-    for path in paths {
+    let mut pending = Vec::new();
+    for path in submission_paths(&config.state_dir)? {
         let Some(id) = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -768,14 +766,21 @@ fn reconcile_pending_submissions(config: &OperatorConfig) -> Result<ReconcileSum
                 continue;
             }
         };
-        if !matches!(
+        if matches!(
             stored.submission.status,
             RollupSubmissionStatus::PendingDal
                 | RollupSubmissionStatus::CommitmentIncluded
                 | RollupSubmissionStatus::Attested
         ) {
-            continue;
+            pending.push((id, stored));
         }
+    }
+    if !pending.is_empty() {
+        let start =
+            (config.reconcile_cursor.fetch_add(1, Ordering::Relaxed) as usize) % pending.len();
+        pending.rotate_left(start);
+    }
+    for (id, stored) in pending {
         summary.visited += 1;
         let original = stored.clone();
         match maybe_advance_submission_with_budget(
@@ -981,6 +986,10 @@ fn resolve_unresolved_chunk_level(
     if let Some(block_hash) = meta.inclusion_block.clone() {
         match fetch_block_level(octez_node_endpoint, &block_hash) {
             Ok(level) if level > UNRESOLVED_PUBLISHED_LEVEL => {
+                if meta.inclusion_block_failures != 0 {
+                    meta.inclusion_block_failures = 0;
+                    *dirty_metadata = true;
+                }
                 if level > final_head {
                     return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
                 }
@@ -992,6 +1001,7 @@ fn resolve_unresolved_chunk_level(
                     Ok(true) => {
                         meta.inclusion_block = None;
                         meta.inclusion_block_failures = 0;
+                        meta.scan_level_failures = 0;
                         meta.injected_level = None;
                         meta.scan_cursor = None;
                         meta.max_operations_ttl = None;
@@ -1004,7 +1014,7 @@ fn resolve_unresolved_chunk_level(
                         // `level - TENDERBAKE_FINALITY_LAG` if unset so a canonical
                         // branch inclusion a block or two earlier is still scanned.
                         meta.inclusion_block = None;
-                        meta.inclusion_block_failures = 0;
+                        meta.scan_level_failures = 0;
                         if meta.injected_level.is_none() {
                             meta.injected_level =
                                 Some(level.saturating_sub(TENDERBAKE_FINALITY_LAG).max(1));
@@ -1012,21 +1022,29 @@ fn resolve_unresolved_chunk_level(
                         *dirty_metadata = true;
                     }
                     Err(_) => {
-                        meta.inclusion_block_failures =
-                            meta.inclusion_block_failures.saturating_add(1);
+                        meta.scan_level_failures = meta.scan_level_failures.saturating_add(1);
                         *dirty_metadata = true;
-                        if meta.inclusion_block_failures < MAX_INCLUSION_BLOCK_LOOKUP_FAILURES {
+                        if meta.scan_level_failures < MAX_INCLUSION_BLOCK_LOOKUP_FAILURES {
                             // Transient RPC failure checking `operation_hashes/3`: keep
                             // `inclusion_block` intact and retry on the next tick.
                             return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
                         }
-                        // Persistent non-404 failure at finalized `level`: fall back
-                        // to the canonical scan so the chunk cannot stay stuck forever.
+                        // Persistent failure at finalized `level` (e.g. a pruned block
+                        // returning 404 on `operation_hashes/3`): clear `inclusion_block`
+                        // and fall through to the canonical scan so the chunk cannot
+                        // stay stuck forever.
                         meta.inclusion_block = None;
-                        meta.inclusion_block_failures = 0;
+                        meta.scan_level_failures = 0;
                         if meta.injected_level.is_none() {
                             meta.injected_level =
                                 Some(level.saturating_sub(TENDERBAKE_FINALITY_LAG).max(1));
+                        }
+                        if meta
+                            .scan_cursor
+                            .unwrap_or_else(|| meta.injected_level.unwrap_or(level))
+                            == level
+                        {
+                            meta.scan_cursor = Some(level.saturating_add(1));
                         }
                     }
                 }
@@ -1089,17 +1107,29 @@ fn resolve_unresolved_chunk_level(
                 Ok(true) => {
                     meta.inclusion_block = None;
                     meta.inclusion_block_failures = 0;
+                    meta.scan_level_failures = 0;
                     meta.injected_level = None;
                     meta.scan_cursor = None;
                     meta.max_operations_ttl = None;
                     return UnresolvedChunkResolution::Resolved(level);
                 }
                 Ok(false) => {
+                    meta.scan_level_failures = 0;
                     meta.scan_cursor = Some(level.saturating_add(1));
                     *dirty_metadata = true;
                 }
                 Err(_) => {
-                    return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
+                    meta.scan_level_failures = meta.scan_level_failures.saturating_add(1);
+                    *dirty_metadata = true;
+                    if meta.scan_level_failures < MAX_INCLUSION_BLOCK_LOOKUP_FAILURES {
+                        return UnresolvedChunkResolution::Waiting("waiting_inclusion".into());
+                    }
+                    // Skip a persistently unqueryable level (e.g. a rolling/pruned node
+                    // returning 404 on `operation_hashes/3` at `level`) after
+                    // `MAX_INCLUSION_BLOCK_LOOKUP_FAILURES` consecutive failures so the
+                    // scan can still advance to later levels or reach TTL expiry.
+                    meta.scan_level_failures = 0;
+                    meta.scan_cursor = Some(level.saturating_add(1));
                 }
             }
         }
@@ -1285,6 +1315,7 @@ fn maybe_advance_submission_with_budget(
                 scan_cursor: None,
                 inclusion_block: meta.inclusion_block,
                 inclusion_block_failures: 0,
+                scan_level_failures: 0,
                 max_operations_ttl: None,
             };
             update_submission_commitment_summary(&mut stored.submission)?;
@@ -1431,6 +1462,7 @@ fn resume_pending_dal_submission(
             scan_cursor: None,
             inclusion_block: meta.inclusion_block,
             inclusion_block_failures: 0,
+            scan_level_failures: 0,
             max_operations_ttl: None,
         });
         stored.submission.detail = Some(format!(
@@ -4479,9 +4511,39 @@ esac
 
         // Case 0: up to `MAX_INCLUSION_BLOCK_LOOKUP_FAILURES - 1` transient 500
         // responses on `/blocks/<hash>/header` keep `inclusion_block` intact,
-        // and the `MAX_INCLUSION_BLOCK_LOOKUP_FAILURES`-th failure clears the
-        // hint and falls back to the canonical scan so a persistent non-404
-        // error cannot wedge the chunk forever.
+        // a successful `fetch_block_level` (even when `level > final_head` returns
+        // early) resets `inclusion_block_failures` to 0 so only *consecutive*
+        // failures count, and the `MAX_INCLUSION_BLOCK_LOOKUP_FAILURES`-th
+        // consecutive failure clears the hint and falls back to the canonical scan.
+        let unfinalized_ok_endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/chains/main/blocks/head/header".into(),
+                (200, "{\"level\":301}".into()),
+            ),
+            (
+                "/chains/main/blocks/BLTransient500Block123456789ABCDEFG/header".into(),
+                (200, "{\"level\":300}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(unfinalized_ok_endpoint.clone());
+        config.octez_node_endpoint = Some(unfinalized_ok_endpoint);
+        let mut stored_reset = stored_submission(submission.clone(), Some(vec![1, 2, 3, 4]), &[1]);
+        stored_reset.chunk_meta[0].inclusion_block =
+            Some("BLTransient500Block123456789ABCDEFG".into());
+        stored_reset.chunk_meta[0].inclusion_block_failures =
+            MAX_INCLUSION_BLOCK_LOOKUP_FAILURES - 1;
+        let after_ok_unfinalized = maybe_advance_submission(&config, stored_reset).unwrap();
+        assert_eq!(
+            after_ok_unfinalized.chunk_meta[0].inclusion_block_failures,
+            0
+        );
+        assert_eq!(
+            after_ok_unfinalized.chunk_meta[0]
+                .inclusion_block
+                .as_deref(),
+            Some("BLTransient500Block123456789ABCDEFG")
+        );
+
         let transient_500_endpoint = spawn_mock_http_server(HashMap::from([
             (
                 "/chains/main/blocks/head/header".into(),
@@ -4540,6 +4602,55 @@ esac
             resolved_after_500s.chunk_meta[0].inclusion_block_failures,
             0
         );
+
+        // Case 0b: when `/chains/main/blocks/300/operation_hashes/3` persistently
+        // fails (e.g. 404 on a pruned block in a rolling node), the canonical scan
+        // retries level 300 up to `MAX_INCLUSION_BLOCK_LOOKUP_FAILURES` times and
+        // then advances `scan_cursor` past level 300 to resolve at level 301.
+        let pruned_level_endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/chains/main/blocks/head/header".into(),
+                (200, "{\"level\":304}".into()),
+            ),
+            (
+                "/chains/main/blocks/head/context/constants".into(),
+                (200, "{\"max_operations_time_to_live\":600}".into()),
+            ),
+            (
+                "/chains/main/blocks/300/operation_hashes/3".into(),
+                (404, "pruned block".into()),
+            ),
+            (
+                "/chains/main/blocks/301/operation_hashes/3".into(),
+                (200, "[\"ooReorgedOp123456789ABCDEFG\"]".into()),
+            ),
+            (
+                "/levels/301/slots/0/status".into(),
+                (200, "\"waiting_attestation\"".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(pruned_level_endpoint.clone());
+        config.octez_node_endpoint = Some(pruned_level_endpoint);
+
+        let mut stored_pruned = stored_submission(submission.clone(), Some(vec![1, 2, 3, 4]), &[1]);
+        stored_pruned.chunk_meta[0].injected_level = Some(300);
+        for expected_failures in 1..MAX_INCLUSION_BLOCK_LOOKUP_FAILURES {
+            stored_pruned = maybe_advance_submission(&config, stored_pruned).unwrap();
+            assert_eq!(
+                stored_pruned.submission.dal_chunks[0].published_level,
+                UNRESOLVED_PUBLISHED_LEVEL
+            );
+            assert_eq!(
+                stored_pruned.chunk_meta[0].scan_level_failures,
+                expected_failures
+            );
+        }
+        let resolved_after_pruned = maybe_advance_submission(&config, stored_pruned).unwrap();
+        assert_eq!(
+            resolved_after_pruned.submission.dal_chunks[0].published_level,
+            301
+        );
+        assert_eq!(resolved_after_pruned.chunk_meta[0].scan_level_failures, 0);
 
         // Case A: `inclusion_block` returns 404 (reorged out and forgotten by node),
         // so `resolve_unresolved_chunk_level` clears `inclusion_block`, falls back
@@ -4630,8 +4741,9 @@ esac
         // requests (and fetch `/chains/main/blocks/head/header` only once):
         // on tick 1 (`reconcile_cursor = 0`), sub-1 scans 32 levels (`100..=131`)
         // and exhausts the tick's budget, so sub-2 waits; on tick 2 (`reconcile_cursor = 1`),
-        // `reconcile_pending_submissions` rotates the starting submission so sub-2
-        // is visited first and advances (`150..=181`) instead of starving behind sub-1.
+        // `reconcile_pending_submissions` rotates across active submissions only
+        // (ignoring terminal `SubmittedToL1`/`Failed` files) so sub-2 is visited
+        // first and advances (`150..=181`) instead of starving behind sub-1.
         let mut routes = HashMap::from([
             (
                 "/chains/main/blocks/head/header".into(),
@@ -4651,6 +4763,31 @@ esac
         let endpoint = spawn_mock_http_server(routes);
         config.dal_node_endpoint = Some(endpoint.clone());
         config.octez_node_endpoint = Some(endpoint);
+
+        // Persist terminal submissions that sort before `sub-budget-1` so rotating
+        // raw `submission_paths` before filtering to active statuses would still
+        // visit `sub-budget-1` first on tick 2.
+        for (term_id, status) in [
+            ("sub-a-terminal-1", RollupSubmissionStatus::SubmittedToL1),
+            ("sub-a-terminal-2", RollupSubmissionStatus::Failed),
+        ] {
+            let term_sub = RollupSubmission {
+                id: term_id.into(),
+                kind: RollupSubmissionKind::Shield,
+                rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                status,
+                transport: RollupSubmissionTransport::DirectInbox,
+                operation_hash: None,
+                dal_chunks: vec![],
+                commitment: None,
+                published_level: None,
+                slot_index: None,
+                payload_hash: None,
+                payload_len: 0,
+                detail: None,
+            };
+            persist_submission(&config, &stored_submission(term_sub, None, &[])).unwrap();
+        }
 
         for (id, start_lvl) in [("sub-budget-1", 100), ("sub-budget-2", 150)] {
             let sub = RollupSubmission {
@@ -4692,8 +4829,9 @@ esac
         // entire 32-level per-tick budget.
         assert_eq!(sub2.chunk_meta[0].scan_cursor, None);
 
-        // On tick 2, rotation visits sub-2 first so it gets the 32-level budget
-        // even though sub-1 still has unresolved levels remaining (`132..=198`).
+        // On tick 2, rotation over active submissions visits sub-2 first so it
+        // gets the 32-level budget even though sub-1 still has unresolved levels
+        // remaining (`132..=198`) and terminal files precede both on disk.
         let summary2 = reconcile_pending_submissions(&config).unwrap();
         assert_eq!(summary2.errors, 0);
         let sub1_tick2 = load_stored_submission(&config.state_dir, "sub-budget-1").unwrap();
