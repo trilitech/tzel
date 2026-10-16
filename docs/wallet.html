@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>TzEL Wallet — Private transactions in one command</title>
-  <meta name="description" content="Install the TzEL wallet in one command. Docker container, self-custodial keys, Temple wallet pairing, Ushuaianet testnet.">
+  <meta name="description" content="Install the TzEL wallet in one command. Docker container, self-custodial keys, Temple wallet pairing, Shadownet testnet.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
@@ -40,6 +40,7 @@
     html { scroll-behavior: smooth; }
 
     body {
+      padding-top: var(--mb-h); /* clear the fixed migration banner */
       font-family: var(--font);
       background:
         radial-gradient(circle at top left, rgba(13, 97, 255, 0.18), transparent 32%),
@@ -108,7 +109,7 @@
 
     nav {
       position: fixed;
-      top: 0;
+      top: var(--mb-h); /* sit just below the migration banner */
       left: 0;
       right: 0;
       z-index: 100;
@@ -800,14 +801,39 @@
 
     code.ic { font-family: var(--mono); color: var(--blue-light); font-size: 0.9em; }
     code.ic-plain { font-family: var(--mono); font-size: 0.88em; }
+
+    /* Migration notice — Ushuaianet → Shadownet (remove after cutover). */
+    :root { --mb-h: 44px; }
+    .migration-banner {
+      position: fixed; inset: 0 0 auto 0; z-index: 101;
+      display: flex; align-items: center; justify-content: center; gap: 10px;
+      min-height: var(--mb-h); padding: 8px 20px; box-sizing: border-box;
+      text-align: center; font-family: var(--font); font-size: 0.9rem;
+      line-height: 1.4; color: #fff;
+      background: linear-gradient(135deg, #0d61ff 0%, #14b8ac 100%);
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
+    }
+    .migration-banner strong { color: #fff; font-weight: 700; }
+    .migration-banner .mb-dot {
+      width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+      background: #fff; box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.25);
+    }
+    @media (max-width: 640px) {
+      :root { --mb-h: 60px; }
+      .migration-banner { font-size: 0.82rem; padding: 8px 14px; }
+    }
   </style>
 </head>
 <body>
+  <div class="migration-banner" role="status">
+    <span class="mb-dot" aria-hidden="true"></span>
+    <span><strong>Heads up:</strong> TzEL has moved from Ushuaianet to <strong>Shadownet</strong>.</span>
+  </div>
   <div class="page-shell">
     <nav>
       <div class="nav-inner">
         <a href="/" class="logo">
-          <div class="logo-icon"><svg viewBox="0 0 47 64" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tz-grad" x1="0" y1="0" x2="47" y2="64" gradientUnits="userSpaceOnUse"><stop stop-color="#0D61FF"/><stop offset="1" stop-color="#24D0C4"/></linearGradient></defs><path fill="url(#tz-grad)" d="M30.252 63.441c-4.55 0-7.864-1.089-9.946-3.267-2.08-2.177-3.121-4.525-3.121-7.041 0-.92.181-1.694.544-2.323a3.993 3.993 0 0 1 1.489-1.489c.629-.363 1.403-.544 2.323-.544.92 0 1.693.181 2.323.544.629.363 1.125.86 1.488 1.489.363.629.544 1.403.544 2.323 0 1.113-.266 2.02-.798 2.722-.533.702-1.162 1.161-1.888 1.38.63.87 1.622 1.487 2.977 1.85 1.355.388 2.71.581 4.065.581 1.887 0 3.593-.508 5.118-1.524 1.524-1.017 2.65-2.517 3.376-4.501.726-1.984 1.089-4.235 1.089-6.752 0-2.734-.4-5.07-1.198-7.005-.775-1.96-1.924-3.412-3.449-4.356a9.21 9.21 0 0 0-4.936-1.415c-1.162 0-2.613.484-4.356 1.452l-3.194 1.597v-1.597L37.076 16.4H17.185v19.89c0 1.646.363 3.001 1.089 4.066s1.839 1.597 3.34 1.597c1.16 0 2.274-.387 3.339-1.162a11.803 11.803 0 0 0 2.758-2.83c.097-.219.218-.376.363-.473a.723.723 0 0 1 .472-.181c.266 0 .58.133.944.4.339.386.508.834.508 1.342a9.243 9.243 0 0 1-.182 1.017c-.822 1.839-1.96 3.242-3.412 4.21a8.457 8.457 0 0 1-4.79 1.452c-4.308 0-7.285-.847-8.93-2.54-1.645-1.695-2.468-3.994-2.468-6.897V16.4H.052v-3.703h10.164v-8.42L7.893 1.952V.066h6.751l2.54 1.306v11.325l26.28-.072 2.614 2.613-16.116 16.116a10.807 10.807 0 0 1 3.049-.726c1.742 0 3.702.557 5.88 1.67 2.202 1.089 3.896 2.59 5.081 4.5 1.186 1.888 1.948 3.703 2.287 5.445.363 1.743.545 3.291.545 4.646 0 3.098-.654 5.977-1.96 8.64-1.307 2.661-3.291 4.645-5.953 5.952-2.662 1.307-5.542 1.96-8.639 1.96z"/></svg></div>
+          <div class="logo-icon"><svg viewBox="0 0 193 237" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs><linearGradient id="tz-grad" x1="0" y1="0" x2="193" y2="237" gradientUnits="userSpaceOnUse"><stop stop-color="#0D61FF"/><stop offset="1" stop-color="#24D0C4"/></linearGradient></defs><path fill="url(#tz-grad)" d="M175.8,171.2c-2.3-40.7-53.5-59.2-58.4-61.1c-0.2-0.1-0.2-0.3-0.1-0.5l52.8-53v-5.7c0-0.9-0.8-1.7-1.7-1.7H71.1V17.3l0,0V7.7l-35.9,7.5v5.4h2c0,0,8.8,0,8.8,8.8v19.7H18.2c-0.5,0-1,0.5-1,1v12.5h28.9c0,0,0,13.3,0,28.8v39.1c0,21.3,13.7,36.1,37.7,34.1c5.1-0.4,9.8-2.4,13.8-5c1.8-1.2,2.9-3.1,2.9-5.3v-6.7c-7.8,5.2-14.4,4.9-14.4,4.9c-15.2,0-14.9-19.3-14.9-19.3V62.6h70l-50.4,50.8c-0.1,6.7-0.2,11.9-0.2,12c0,0.2,0.1,0.3,0.3,0.3c46.2,7.8,58.7,37.7,58.7,46.4c0,0,5,42.3-37.3,45.2c0,0-27.7,1.2-32.6-9.9c-0.2-0.4,0-0.8,0.4-1c4.6-2.1,7.7-6.2,7.7-11.7c0-8.2-5-14.9-15.5-14.9c-8.5,0-15.5,6.7-15.5,14.9c0,0-4,35.6,55.4,34.6C180,228.1,175.8,171.2,175.8,171.2z"/></svg></div>
           TzEL
         </a>
         <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="nav-menu" aria-label="Toggle navigation menu">
@@ -818,7 +844,7 @@
         <div class="nav-links" id="nav-menu">
           <a href="#how-it-works">How it works</a>
           <a href="index.html">TzEL home</a>
-          <a href="https://github.com/trilitech/tzel/blob/main/docs/ushuaianet_tutorial.md" target="_blank" rel="noreferrer">Tutorial</a>
+          <a href="https://github.com/trilitech/tzel/blob/main/docs/shadownet_tutorial.md" target="_blank" rel="noreferrer">Tutorial</a>
           <a href="whitepaper.pdf" target="_blank" rel="noreferrer">Whitepaper</a>
           <a href="https://github.com/trilitech/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">View on GitHub</a>
         </div>
@@ -828,12 +854,12 @@
     <!-- ════ Hero ════ -->
     <section class="hero">
       <div class="hero-content">
-        <div class="hero-badge">Ushuaianet testnet &mdash; experimental</div>
+        <div class="hero-badge">Shadownet testnet &mdash; experimental</div>
         <h1>Private transactions.<br><span class="gradient-text">One command.</span></h1>
         <p class="hero-sub">
           The TzEL wallet runs as a self-contained Docker container on your machine.
           Your keys never leave your device. One command installs, starts, and connects
-          to the Ushuaianet testnet.
+          to the Shadownet testnet.
         </p>
 
         <div class="install-block">
@@ -857,7 +883,7 @@
 
         <div class="hero-actions">
           <a href="#how-it-works" class="btn btn-primary">How it works</a>
-          <a href="https://github.com/trilitech/tzel/blob/main/docs/ushuaianet_tutorial.md" class="btn btn-outline" target="_blank" rel="noreferrer">Read the tutorial</a>
+          <a href="https://github.com/trilitech/tzel/blob/main/docs/shadownet_tutorial.md" class="btn btn-outline" target="_blank" rel="noreferrer">Read the tutorial</a>
         </div>
       </div>
     </section>
@@ -891,7 +917,7 @@
         <div class="step">
           <div class="step-num">Step 04</div>
           <h3>Shield and send</h3>
-          <p>Connect Temple wallet to fund an initial shield. After shielding, you can send private transactions on Ushuaianet. The wallet delegates proof generation to the Ushuaianet proving service.</p>
+          <p>Connect Temple wallet to fund an initial shield. After shielding, you can send private transactions on Shadownet. The wallet delegates proof generation to the Shadownet proving service.</p>
         </div>
       </div>
     </div>
@@ -941,16 +967,16 @@
 
       <div class="feature">
         <div>
-          <h3>Authorize locally.<br>Prove on Ushuaianet.</h3>
+          <h3>Authorize locally.<br>Prove on Shadownet.</h3>
           <p>TzEL separates spending authority from proof generation. When you initiate a private send, your wallet signs the transaction locally with a hash-based one-time signature. That signature is then checked <em>inside</em> the STARK proof itself &mdash; the prover cannot change what you authorized.</p>
-          <p>The STARK proof is large, so rather than generating it on your laptop, the wallet delegates to the Ushuaianet proving service. The prover sees the transaction you signed but cannot produce a valid proof for any other transaction. Your spend key never leaves the container.</p>
+          <p>The STARK proof is large, so rather than generating it on your laptop, the wallet delegates to the Shadownet proving service. The prover sees the transaction you signed but cannot produce a valid proof for any other transaction. Your spend key never leaves the container.</p>
         </div>
         <div class="feature-visual">
           <span class="dim">wallet (your machine):</span><br>
           &nbsp;&nbsp;authorize tx<br>
           &nbsp;&nbsp;&rarr; <span class="hl">hash-based OTS signature</span><br>
           <br>
-          <span class="dim">proving service (Ushuaianet):</span><br>
+          <span class="dim">proving service (Shadownet):</span><br>
           &nbsp;&nbsp;receive signed tx<br>
           &nbsp;&nbsp;&rarr; build <span class="hl">STARK proof</span><br>
           &nbsp;&nbsp;cannot change tx or<br>
@@ -1020,7 +1046,7 @@
     <!-- ════ Warning ════ -->
     <div class="warning-banner">
       <div class="warning-inner">
-        <strong>Experimental software &mdash; Ushuaianet testnet only.</strong>
+        <strong>Experimental software &mdash; Shadownet testnet only.</strong>
         TzEL is research-grade code. Do not use it for real value. The wallet, rollup, and proving service may reset, break, or change without notice. Your wallet data in <code class="ic-plain">~/.tzel-wallet</code> is not backed up by any server &mdash; if you lose it, there is no recovery. Back it up yourself.
       </div>
     </div>
@@ -1046,7 +1072,7 @@
           </div>
         </div>
         <div class="cta-actions">
-          <a href="https://github.com/trilitech/tzel/blob/main/docs/ushuaianet_tutorial.md" class="btn btn-primary" target="_blank" rel="noreferrer">Full tutorial</a>
+          <a href="https://github.com/trilitech/tzel/blob/main/docs/shadownet_tutorial.md" class="btn btn-primary" target="_blank" rel="noreferrer">Full tutorial</a>
           <a href="https://github.com/trilitech/tzel" class="btn btn-outline" target="_blank" rel="noreferrer">View on GitHub</a>
         </div>
       </div>

@@ -174,6 +174,7 @@ fn commit_for_address_asset(address: &PaymentAddress, v: u64, rseed: &F, asset: 
     commit(&address.d_j, v, asset, &rcm, &otag)
 }
 
+#[cfg(test)]
 fn commit_for_address(address: &PaymentAddress, v: u64, rseed: &F) -> F {
     commit_for_address_asset(address, v, rseed, &ASSET_TEZ)
 }
@@ -288,6 +289,7 @@ pub fn generate_interop_scenario() -> InteropScenario {
 
     tree.append(transfer_cm_1);
     tree.append(transfer_cm_2);
+    tree.append(ZERO);
     tree.append(transfer_cm_3);
     let root_after_transfer = tree.root();
 
@@ -359,7 +361,7 @@ pub fn generate_interop_scenario() -> InteropScenario {
                 recipient: INTEROP_L1_RECIPIENT.into(),
                 amount: 99_999,
             }],
-            tree_size: 6,
+            tree_size: 7,
             nullifier_count: 2,
         },
         fa2: Some(fa2),
@@ -527,7 +529,8 @@ mod tests {
         assert_eq!(scenario.transfer.fee, MIN_TX_FEE);
         tree.append(scenario.transfer.cm_1);
         tree.append(scenario.transfer.cm_2);
-        // slot 3 (change_2) is empty; producer-fee is slot 4
+        // slot 3 (change_2) is empty (ZERO), appended by the rollup kernel; producer-fee is slot 4
+        tree.append(scenario.transfer.cm_3);
         tree.append(scenario.transfer.cm_4);
         assert_eq!(scenario.unshield.root, tree.root());
         assert_eq!(
@@ -593,7 +596,7 @@ mod tests {
                 amount: 99_999,
             }]
         );
-        assert_eq!(reparsed.expected.tree_size, 6);
+        assert_eq!(reparsed.expected.tree_size, 7);
         assert_eq!(reparsed.expected.nullifier_count, 2);
 
         // The FA2 flow round-trips through JSON with its non-tez asset_id.

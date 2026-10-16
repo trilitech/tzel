@@ -1,22 +1,11 @@
 mod bundle;
-mod verify_meta_codec;
-
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::PathBuf;
 
 use tzel_core::{
     kernel_wire::{kernel_proof_to_host, KernelStarkProof, KernelVerifierConfig},
     validate_single_task_program_hash, CircuitKind, ProgramHashes, Proof,
 };
 
-pub use bundle::ProofBundle;
-
-#[cfg(not(target_arch = "wasm32"))]
-use cairo_program_runner_lib::hints::compute_program_hash_chain;
-#[cfg(not(target_arch = "wasm32"))]
-use cairo_program_runner_lib::tasks::create_cairo1_program_task;
-#[cfg(not(target_arch = "wasm32"))]
-use cairo_program_runner_lib::types::HashFunc;
+pub use bundle::{ProofBundle, LEANVM_PROOF_MAGIC};
 
 #[derive(Debug, Clone)]
 pub struct DirectProofVerifier {
@@ -44,15 +33,16 @@ impl DirectProofVerifier {
         }
     }
 
-    pub fn from_executables_dir(
-        allow_trust_me_bro: bool,
-        executables_dir: &str,
-    ) -> Result<Self, String> {
-        let program_hashes = load_program_hashes(executables_dir)?;
-        Ok(Self::verified(allow_trust_me_bro, program_hashes))
+    pub fn verified_leanvm(allow_trust_me_bro: bool) -> Self {
+        Self::verified(allow_trust_me_bro, leanvm_program_hashes())
     }
 
     pub fn from_kernel_config(config: &KernelVerifierConfig) -> Result<Self, String> {
+        if config.verified_program_hashes != leanvm_program_hashes() {
+            return Err(
+                "verified_program_hashes do not match canonical leanVM program hashes".into(),
+            );
+        }
         Ok(Self::verified(
             false,
             config.verified_program_hashes.clone(),
@@ -161,42 +151,20 @@ fn stringify_bundle_verify_error(e: anyhow::Error) -> String {
     e.to_string()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn compute_executable_program_hash(executable_path: &PathBuf) -> Result<tzel_core::F, String> {
-    let task =
-        create_cairo1_program_task(executable_path, None, None).map_err(|e| e.to_string())?;
-    let program = task.get_program().map_err(|e| e.to_string())?;
-    compute_program_hash_chain(&program, 0, HashFunc::Blake)
-        .map(|felt| felt.to_bytes_le())
-        .map_err(|e| e.to_string())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn load_program_hashes(executables_dir: &str) -> Result<ProgramHashes, String> {
-    let base = PathBuf::from(executables_dir);
-    let shield = base.join(CircuitKind::Shield.executable_filename());
-    let transfer = base.join(CircuitKind::Transfer.executable_filename());
-    let unshield = base.join(CircuitKind::Unshield.executable_filename());
-
-    for path in [&shield, &transfer, &unshield] {
-        if !path.exists() {
-            return Err(format!(
-                "missing Cairo executable required for verified mode: {}",
-                path.display()
-            ));
-        }
+pub fn leanvm_program_hashes() -> ProgramHashes {
+    ProgramHashes {
+        shield: tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_SHIELD),
+        transfer: tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_TRANSFER),
+        unshield: tzel_host::felt_to_bytes_le(&tzel_host::PROGRAM_HASH_UNSHIELD),
     }
-
-    Ok(ProgramHashes {
-        shield: compute_executable_program_hash(&shield)?,
-        transfer: compute_executable_program_hash(&transfer)?,
-        unshield: compute_executable_program_hash(&unshield)?,
-    })
 }
 
-#[cfg(target_arch = "wasm32")]
-pub fn load_program_hashes(_executables_dir: &str) -> Result<ProgramHashes, String> {
-    Err("load_program_hashes is not available on wasm targets".into())
+pub fn compute_executable_program_hash(
+    executable_path: &std::path::Path,
+) -> Result<tzel_core::F, String> {
+    let kind = CircuitKind::from_executable_path(executable_path)?;
+    let hashes = leanvm_program_hashes();
+    Ok(*kind.expected_program_hash(&hashes))
 }
 
 #[cfg(test)]
@@ -204,9 +172,7 @@ mod tests {
     use std::sync::OnceLock;
 
     use serde::Deserialize;
-    use tzel_core::{u64_to_felt, F, ZERO};
-
-    use crate::bundle::{canonical_verify_meta, validate_canonical_verify_meta};
+    use tzel_core::{u64_to_felt, F};
 
     use super::*;
 
@@ -245,6 +211,11 @@ mod tests {
             proof_bytes: vec![1, 2, 3],
             output_preimage,
         }
+    }
+
+    #[test]
+    fn test_core_program_hashes_leanvm_matches_host_constants() {
+        assert_eq!(ProgramHashes::leanvm(), leanvm_program_hashes());
     }
 
     #[test]
@@ -335,9 +306,10 @@ mod tests {
 
     #[test]
     fn test_direct_verifier_validate_kernel_uses_host_conversion() {
+        let hashes = leanvm_program_hashes();
         let verifier = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
             auth_domain: f(77),
-            verified_program_hashes: sample_hashes(),
+            verified_program_hashes: hashes.clone(),
         })
         .unwrap();
 
@@ -345,7 +317,7 @@ mod tests {
             .validate_kernel(
                 &KernelStarkProof {
                     proof_bytes: vec![1, 2, 3],
-                    output_preimage: vec![f(1), f(4), f(22), f(99), f(100)],
+                    output_preimage: vec![f(1), f(4), hashes.transfer, f(99), f(100)],
                 },
                 CircuitKind::Transfer,
             )
@@ -357,7 +329,7 @@ mod tests {
     fn test_from_kernel_config_disables_trust_me_bro() {
         let verifier = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
             auth_domain: f(77),
-            verified_program_hashes: sample_hashes(),
+            verified_program_hashes: leanvm_program_hashes(),
         })
         .unwrap();
 
@@ -368,10 +340,41 @@ mod tests {
     }
 
     #[test]
-    fn test_load_program_hashes_reports_missing_executables() {
-        let err = load_program_hashes("/definitely/missing/tzel-executables").unwrap_err();
-        assert!(err.contains("missing Cairo executable required for verified mode"));
-        assert!(err.contains("run_shield.executable.json"));
+    fn test_from_kernel_config_rejects_mismatched_program_hashes() {
+        let err = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
+            auth_domain: f(77),
+            verified_program_hashes: sample_hashes(),
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("verified_program_hashes do not match canonical leanVM program hashes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_compute_executable_program_hash_requires_canonical_name() {
+        let hashes = leanvm_program_hashes();
+        assert_eq!(
+            compute_executable_program_hash(std::path::Path::new(
+                "tzel_run_shield.executable.json"
+            ))
+            .unwrap(),
+            hashes.shield
+        );
+        assert_eq!(
+            compute_executable_program_hash(std::path::Path::new("run_transfer.executable.json"))
+                .unwrap(),
+            hashes.transfer
+        );
+        assert_eq!(
+            compute_executable_program_hash(std::path::Path::new("unshield")).unwrap(),
+            hashes.unshield
+        );
+        assert!(
+            compute_executable_program_hash(std::path::Path::new("/nonexistent/foo_shield_v0.json"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -388,13 +391,6 @@ mod tests {
         verifier
             .validate(&fixture.unshield.proof, CircuitKind::Unshield)
             .unwrap();
-    }
-
-    #[test]
-    fn test_embedded_verify_meta_matches_canonical_template() {
-        let meta = canonical_verify_meta().unwrap();
-        validate_canonical_verify_meta(&meta).unwrap();
-        assert!(!meta.public_output_values.is_empty());
     }
 
     #[test]
@@ -448,5 +444,85 @@ mod tests {
 
         let err = verify_stark_bundle(&proof).unwrap_err();
         assert!(err.contains("circuit verification FAILED"));
+    }
+
+    #[test]
+    fn test_leanvm_zk_stark_proof_validates_through_direct_verifier() {
+        let program = leanvm::Program::from_elf(tzel_host::ELF).expect("valid tzel.elf");
+        let (hdr, inputs, run) = tzel_host::build_exact_transfer(2, true);
+        let proven = leanvm::Prover::new(leanvm::Rate::MIN)
+            .zero_knowledge(leanvm::Randomness::Os)
+            .prove(&program, &run.advice)
+            .expect("leanVM ZK proof succeeds");
+        assert_eq!(proven.output, run.expected);
+
+        let pub_outputs = tzel_host::transfer_public_outputs(&hdr, &inputs);
+        let preimage_felts = tzel_host::wrap_bootloader_output_preimage(
+            tzel_host::PROGRAM_HASH_TRANSFER,
+            &pub_outputs,
+        );
+        let output_preimage: Vec<F> = preimage_felts
+            .iter()
+            .map(tzel_host::felt_to_bytes_le)
+            .collect();
+        let proof_bytes =
+            ProofBundle::encode_leanvm_proof_bytes(&proven.proof.to_bytes()).unwrap();
+
+        let proof = Proof::Stark {
+            proof_bytes,
+            output_preimage: output_preimage.clone(),
+        };
+        let verifier = DirectProofVerifier::verified_leanvm(false);
+        verifier
+            .validate(&proof, CircuitKind::Transfer)
+            .expect("leanVM ZK STARK transfer proof should validate");
+
+        // Wrong circuit must be rejected.
+        assert!(verifier.validate(&proof, CircuitKind::Unshield).is_err());
+
+        // Non-ZK (plain STARK) proof must be rejected by DirectProofVerifier.
+        let plain_proven = leanvm::Prover::new(leanvm::Rate::MIN)
+            .prove(&program, &run.advice)
+            .expect("leanVM plain proof succeeds");
+        let plain_proof = Proof::Stark {
+            proof_bytes: ProofBundle::encode_leanvm_proof_bytes(&plain_proven.proof.to_bytes())
+                .unwrap(),
+            output_preimage,
+        };
+        let err = verifier
+            .validate(&plain_proof, CircuitKind::Transfer)
+            .unwrap_err();
+        assert!(
+            err.contains("non-ZK STARK proof rejected"),
+            "non-ZK proof must be rejected, got: {err}"
+        );
+
+        // Tampered output_preimage must be rejected.
+        let mut tampered = proof.clone();
+        if let Proof::Stark {
+            output_preimage, ..
+        } = &mut tampered
+        {
+            output_preimage[4] = f(999);
+        }
+        let err = verifier.validate(&tampered, CircuitKind::Transfer).unwrap_err();
+        assert!(err.contains("circuit verification FAILED"), "{err}");
+    }
+
+    #[test]
+    fn test_proof_bundle_rejects_oversized_zstd_payload() {
+        let oversized = vec![0u8; bundle::MAX_DECOMPRESSED_PROOF_BYTES + 1024];
+        let compressed = zstd::encode_all(&oversized[..], 3).expect("zstd compress");
+        // Tiny compressed payload (~hundreds of bytes) that expands past MAX_DECOMPRESSED_PROOF_BYTES.
+        assert!(compressed.len() < 4096);
+        let bundle = ProofBundle {
+            proof_bytes: compressed,
+            output_preimage: vec![],
+        };
+        let err = bundle.verify().unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds maximum size"),
+            "expected size limit error, got: {err}"
+        );
     }
 }

@@ -215,14 +215,8 @@ fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     assert_eq!(transfer_resp.index_3, 4);
     assert_eq!(transfer_resp.index_4, 5);
 
-    // Phase C: transfer appended a 4th note (the zero-value change_2
-    // placeholder) so the current tree root no longer matches the
-    // scenario's pre-recorded `unshield.root`. Use the live root so the
-    // unshield's Merkle inclusion check works against the actual tree.
-    let mut adjusted_unshield = scenario.unshield.clone();
-    adjusted_unshield.root = ledger.tree.root();
     let unshield_resp = ledger
-        .unshield(&unshield_req(&adjusted_unshield, &scenario.auth_domain))
+        .unshield(&unshield_req(&scenario.unshield, &scenario.auth_domain))
         .expect("unshield");
     assert_eq!(unshield_resp.change_index, None);
     // Producer note appears after the 6 prior notes
@@ -232,9 +226,7 @@ fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     // Pool drained.
     assert!(ledger.deposit_balances.get(&pubkey_hash).is_none());
     assert_eq!(ledger.withdrawals, scenario.expected.withdrawals.clone());
-    // Phase C: tree size = scenario.expected + 1 zero-value change_2 + 1
-    // producer = +1 vs the pre-Phase-C count.
-    assert_eq!(ledger.tree.leaves.len(), scenario.expected.tree_size + 1);
+    assert_eq!(ledger.tree.leaves.len(), scenario.expected.tree_size);
     assert_eq!(ledger.nullifiers.len(), scenario.expected.nullifier_count);
 }
 
@@ -252,18 +244,18 @@ fn test_ocaml_fa2_flow_applies_on_rust_ledger() {
 
     let mut ledger = Ledger::with_auth_domain(scenario.auth_domain);
 
-    // Dual-pool funding: the (fa2, pubkey) pool covers v + fee; the
-    // (ASSET_TEZ, pubkey) pool covers producer_fee (producer fees are
-    // permanently tez).
+    // Dual-pool funding: the (fa2, pubkey) pool covers v; the
+    // (ASSET_TEZ, pubkey) pool covers fee + producer_fee (rollup fees
+    // and producer fees are permanently tez).
     let (pubkey_hash, shield_req_built) =
         shield_req(&fa2.shield, &fa2.asset_id, &scenario.auth_domain);
     let recipient = deposit_recipient_string(&pubkey_hash);
     ledger
-        .deposit_asset(&fa2.asset_id, &recipient, fa2.shield.v + fa2.shield.fee)
+        .deposit_asset(&fa2.asset_id, &recipient, fa2.shield.v)
         .expect("fa2 pool");
     ledger
-        .deposit(&recipient, fa2.shield.producer_fee)
-        .expect("tez pool for producer fee");
+        .deposit(&recipient, fa2.shield.fee + fa2.shield.producer_fee)
+        .expect("tez pool for fee + producer fee");
 
     let shield_resp = ledger.shield(&shield_req_built).expect("fa2 shield");
     assert_eq!(shield_resp.cm, fa2.shield.cm);

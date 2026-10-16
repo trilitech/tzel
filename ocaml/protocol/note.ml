@@ -26,7 +26,7 @@ let create ?(asset = Asset_registry.asset_tez) (addr : Keys.address) (v : int64)
   let rcm = Hash.derive_rcm rseed in
   let owner_tag = Keys.owner_tag addr in
   let cm =
-    Hash.hash_commit addr.d_j (Felt.of_u64 (Int64.to_int v)) asset rcm owner_tag
+    Hash.hash_commit addr.d_j (Felt.of_int64 v) asset rcm owner_tag
   in
   { d_j = addr.d_j; v; asset; rseed; rcm; owner_tag; cm }
 
@@ -35,7 +35,7 @@ let create_from_parts ?(asset = Asset_registry.asset_tez) ~d_j ~auth_root
   let rcm = Hash.derive_rcm rseed in
   let owner_tag = Hash.hash_owner auth_root auth_pub_seed nk_tag in
   let cm =
-    Hash.hash_commit d_j (Felt.of_u64 (Int64.to_int v)) asset rcm owner_tag
+    Hash.hash_commit d_j (Felt.of_int64 v) asset rcm owner_tag
   in
   { d_j; v; asset; rseed; rcm; owner_tag; cm }
 

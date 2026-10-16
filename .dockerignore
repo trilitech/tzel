@@ -1,12 +1,10 @@
-# Build artifacts — both the workspace target/ and the separate
-# apps/prover crate's target/ are built fresh inside the image.
+# Build artifacts — built fresh inside the image.
 target/
-apps/prover/target/
-cairo/target/
+third_party/leanvm/target/
+third_party/leanvm/programs/tzel/guest/target/
 ocaml/_build/
 ocaml/vendor/mlkem-native/test/build/
 fuzz/target/
-services/reprover/target/
 tools/wasm-opscan/target/
 
 # Git metadata — revision info is passed via --build-arg, so the

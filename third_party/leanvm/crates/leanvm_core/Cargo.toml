@@ -1,0 +1,34 @@
+[package]
+name = "leanvm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+parallel.workspace = true
+primitives.workspace = true
+fiat_shamir.workspace = true
+pcs.workspace = true
+flock.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+zk.workspace = true
+rand_core.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+leanvm_guest.workspace = true
+bench.workspace = true
+primitives = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "class_witness"
+harness = false
+
+[[bench]]
+name = "class_batch"
+harness = false

@@ -3,13 +3,58 @@ resolver = "2"
 members = [
   "apps/demo",
   "apps/ledger",
+  "apps/prover",
   "apps/wallet",
   "core",
   "services/tzel",
   "tezos/rollup-kernel",
+  "third_party/leanvm/programs/tzel/host",
   "verifier",
 ]
+exclude = [
+  "third_party/leanvm",
+  "third_party/leanvm/programs/tzel/guest",
+]
 
-[patch.crates-io]
-starknet-ff = { path = "third_party/patched-crates/starknet-ff-0.3.7" }
-lambdaworks-math = { path = "third_party/patched-crates/lambdaworks-math-0.13.0" }
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+semicolon_if_nothing_returned = "warn"
+match_bool = "warn"
+needless_pass_by_value = "warn"
+redundant_pub_crate = "allow"
+too_long_first_doc_paragraph = "allow"
+unused_peekable = "allow"
+tuple_array_conversions = "allow"
+transmute_undefined_repr = "allow"
+cognitive_complexity = "allow"
+
+[workspace.dependencies]
+bench = { path = "third_party/leanvm/crates/bench" }
+leanvm = { path = "third_party/leanvm/crates/leanvm_core" }
+primitives = { path = "third_party/leanvm/crates/primitives" }
+fiat_shamir = { path = "third_party/leanvm/crates/fiat_shamir" }
+pcs = { path = "third_party/leanvm/crates/pcs" }
+flock = { path = "third_party/leanvm/crates/flock" }
+parallel = { path = "third_party/leanvm/crates/parallel" }
+zk = { path = "third_party/leanvm/crates/zk" }
+leanvm_guest = { path = "third_party/leanvm/sdk" }
+tzel-host = { path = "third_party/leanvm/programs/tzel/host" }
+libc = "0.2"
+proptest = { version = "1", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+rand = "0.9"
+rand_chacha = "0.9"
+rand_core = { version = "0.9", default-features = false }
+thiserror = { version = "2", default-features = false }
+tikv-jemallocator = "0.7"
+tracing = "0.1.26"
+tracing-forest = { version = "0.3.0", features = ["ansi", "smallvec"] }
+tracing-subscriber = { version = "0.3.23", features = ["std", "env-filter"] }
+

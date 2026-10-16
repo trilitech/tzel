@@ -1,0 +1,61 @@
+//! The generic class witness: the gate list walked one instance at a time, against 64 at a time.
+//! Both existing witness paths use exactly 16 pool threads including the dispatcher.
+//!
+//! ```text
+//! BENCH_REPEAT=5 BENCH_COOLDOWN=0 cargo bench -p leanvm --bench class_witness
+//! ```
+
+use bench::Plan;
+use leanvm::{Fill, TableId};
+use primitives::test_util::Rng;
+use std::num::NonZeroUsize;
+
+#[global_allocator]
+static ALLOCATOR: bench::Counting<bench::Jemalloc> = bench::Counting(bench::Jemalloc);
+
+fn main() {
+    parallel::init_with_threads(NonZeroUsize::new(16).unwrap()).expect("initialize exact 16-thread benchmark pool");
+    // One batch of 2^16 instances per class, the size of a mid-sized run's table.
+    let n_log = bench::env_usize("WITNESS_N_LOG", 16);
+    let plan = Plan::from_env();
+    println!("Class witness: {} threads", parallel::num_threads());
+
+    println!(
+        "{:<6} {:>5} {:>10} {:>10} {:>8}",
+        "class", "k_log", "walk", "64 lanes", "speedup"
+    );
+    // Every class with a circuit and no word-level witness of its own.
+    for spec in TableId::ALL.map(TableId::spec).into_iter().filter(|spec| {
+        spec.circuit
+            .as_ref()
+            .is_some_and(|c| !matches!(c.fill, Fill::Instance(_)))
+    }) {
+        let circuit = spec.class.circuit();
+
+        // Random input words: the walk costs the same on any input.
+        let mut rng = Rng::new(0xC1A55);
+        let rows: Vec<Vec<u64>> = (0..1 << n_log)
+            .map(|_| (0..circuit.n_input_words()).map(|_| rng.next_u64()).collect())
+            .collect();
+
+        let (_, walk) = plan.warm_then_measure(|_| {
+            circuit.witness_by_instance(&rows, &rows[0], n_log, |row, z, az, bz| {
+                circuit.witness_instance(row, z, az, bz);
+            });
+        });
+        let (_, sliced) = plan.warm_then_measure(|_| {
+            circuit.witness_by_walk(&rows, &rows[0], n_log, |row, words| words.copy_from_slice(row));
+        });
+
+        // Wall time per instance, all threads.
+        let per_instance = |secs: f64| secs * 1e9 / (1 << n_log) as f64;
+        println!(
+            "{:<6} {:>5} {:>7.1} ns {:>7.1} ns {:>7.1}x",
+            spec.name,
+            circuit.k_log(),
+            per_instance(walk.mean()),
+            per_instance(sliced.mean()),
+            walk.mean() / sliced.mean(),
+        );
+    }
+}

@@ -25,10 +25,10 @@ by the rest of the DAL network. In practice that means:
 - `systemd/*.service`
   - systemd unit templates for the long-running rollup processes and optional detection service
 - `../prover/`
-  - standard prover deployment paths plus preflight for `reprove` and the Cairo executables
+  - standard prover deployment paths plus preflight for `reprove`
 - `../../scripts/install_tzel_binaries.sh`
   - installs `tzel-operator`, `tzel-wallet`, `tzel-detect`, `sp-client`, `octez_kernel_message`,
-    `verified_bridge_fixture_message`, `submit_rollup_config`, `reprove`, and the Cairo executable JSON files
+    `verified_bridge_fixture_message`, `submit_rollup_config`, and `reprove`
   - installs `rollup-config-admin-{runtime,build}.env` and wraps `octez_kernel_message` so
     config messages stay usable after install
 - `../../scripts/shadownet_operator_preflight.sh`
@@ -44,7 +44,7 @@ by the rest of the DAL network. In practice that means:
 2. Build TzEL release artifacts as your normal user.
    - `./scripts/install_tzel_binaries.sh --build-only`
 3. Install TzEL release artifacts.
-   - `sudo ./scripts/install_tzel_binaries.sh --skip-build --prefix /usr/local --executables-dir /opt/tzel/cairo/target/dev`
+   - `sudo ./scripts/install_tzel_binaries.sh --skip-build --prefix /usr/local`
 4. Copy the env template.
    - `sudo mkdir -p /etc/tzel`
    - `sudo cp ops/shadownet/shadownet.env.example /etc/tzel/shadownet.env`

@@ -18,6 +18,11 @@ let of_bytes_raw b =
 
 let to_bytes t = Bytes.copy t
 
+let of_int64 v =
+  let b = Bytes.make 32 '\x00' in
+  Bytes.set_int64_le b 0 v;
+  b
+
 let of_u64 v =
   let b = Bytes.make 32 '\x00' in
   Bytes.set_uint8 b 0 (v land 0xFF);

@@ -103,10 +103,10 @@ TzEL binaries:
 
 ```bash
 ./scripts/install_tzel_binaries.sh --build-only
-sudo ./scripts/install_tzel_binaries.sh --skip-build --prefix /usr/local --executables-dir /opt/tzel/cairo/target/dev
+sudo ./scripts/install_tzel_binaries.sh --skip-build --prefix /usr/local
 ```
 
-On the public Ushuaianet ops host, the optional systemd unit is:
+On the public Shadownet ops host, the optional systemd unit is:
 
 - `ops/shadownet/systemd/tzel-detect.service`
 

@@ -41,9 +41,9 @@ const MAX_ENCODED_PROOF_WIRE_BYTES: usize =
     MAX_PROOF_BYTES + (MAX_OUTPUT_PREIMAGE_ITEMS * 64) + 4096;
 const MAX_ENCODED_NULLIFIER_LIST_BYTES: usize = 256 * 1024;
 const MAX_TRANSFER_PAYLOAD_BYTES: usize =
-    (5 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + (3 * MAX_ENCODED_NOTE_WIRE_BYTES) + 65536;
+    (5 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + (4 * MAX_ENCODED_NOTE_WIRE_BYTES) + 65536;
 const MAX_UNSHIELD_PAYLOAD_BYTES: usize =
-    (4 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + (2 * MAX_ENCODED_NOTE_WIRE_BYTES) + 65536;
+    (5 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + (3 * MAX_ENCODED_NOTE_WIRE_BYTES) + 65536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelVerifierConfig {
@@ -84,10 +84,10 @@ pub struct KernelStarkProof {
 /// Shield message: drains the deposit pool keyed by `(asset_id,
 /// pubkey_hash)`. For tez shields the single asset pool is debited
 /// `v + fee + producer_fee`. For FA2 shields the FA2 pool is debited
-/// `v + fee` and the `(ASSET_TEZ, pubkey_hash)` pool at the same
-/// pubkey_hash is debited `producer_fee` — the producer-fee output note
-/// is permanently tez (bug-#2 fix, commit aff523a), so FA2 shields
-/// require BOTH an FA2 pool AND a tez pool at the same pubkey_hash.
+/// `v` and the `(ASSET_TEZ, pubkey_hash)` pool at the same
+/// pubkey_hash is debited `fee + producer_fee` — both the rollup burn
+/// fee and the producer-fee output note are permanently tez, so FA2
+/// shields require BOTH an FA2 pool AND a tez pool at the same pubkey_hash.
 /// Both notes are fully constructed client-side and the server has no
 /// role in fabricating them. The shield's STARK proof includes an
 /// in-circuit WOTS+ signature under the recipient's auth tree
@@ -96,10 +96,6 @@ pub struct KernelStarkProof {
 #[derive(Debug, Clone)]
 pub struct KernelShieldReq {
     /// L2 asset_id this shield is draining. Mirror of `ShieldReq::asset_id`.
-    /// The kernel-wire encoding gets a tagged-version byte so older
-    /// pre-multiasset messages (which had no asset field) decode to
-    /// ASSET_TEZ — but since the multiasset branch has no production
-    /// users, the canonical encoding from now on includes it.
     pub asset_id: F,
     pub pubkey_hash: F,
     pub fee: u64,
@@ -1716,6 +1712,7 @@ mod tests {
     proptest! {
         #[test]
         fn prop_kernel_shield_roundtrip_preserves_fields(
+            asset_id in arb_felt(),
             pubkey_hash in arb_felt(),
             fee in any::<u64>(),
             v in any::<u64>(),
@@ -1727,7 +1724,7 @@ mod tests {
             producer_enc in arb_encrypted_note(),
         ) {
             let message = KernelInboxMessage::Shield(KernelShieldReq {
-                asset_id: ASSET_TEZ,
+                asset_id,
                 pubkey_hash,
                 fee,
                 v,
@@ -1744,6 +1741,7 @@ mod tests {
             let KernelInboxMessage::Shield(req) = decoded else {
                 panic!("decoded wrong kernel message variant");
             };
+            prop_assert_eq!(req.asset_id, asset_id);
             prop_assert_eq!(req.pubkey_hash, pubkey_hash);
             prop_assert_eq!(req.fee, fee);
             prop_assert_eq!(req.v, v);
@@ -1762,14 +1760,16 @@ mod tests {
         #[test]
         fn prop_kernel_transfer_roundtrip_preserves_fields(
             root in arb_felt(),
-            nullifiers in prop::collection::vec(arb_felt(), 0..8),
+            nullifiers in prop::collection::vec(arb_felt(), 0..=5),
             fee in any::<u64>(),
             cm_1 in arb_felt(),
             cm_2 in arb_felt(),
             cm_3 in arb_felt(),
+            cm_4 in arb_felt(),
             enc_1 in arb_encrypted_note(),
             enc_2 in arb_encrypted_note(),
             enc_3 in arb_encrypted_note(),
+            enc_4 in arb_encrypted_note(),
             proof in arb_kernel_stark_proof(),
         ) {
             let req = KernelTransferReq {
@@ -1779,11 +1779,11 @@ mod tests {
                 cm_1,
                 cm_2,
                 cm_3,
+                cm_4,
                 enc_1: enc_1.clone(),
                 enc_2: enc_2.clone(),
                 enc_3: enc_3.clone(),
-                cm_4: ZERO, // Phase C placeholder
-                enc_4: enc_3.clone(),
+                enc_4: enc_4.clone(),
                 proof: proof.clone(),
             };
 
@@ -1795,6 +1795,7 @@ mod tests {
             prop_assert_eq!(decoded.cm_1, cm_1);
             prop_assert_eq!(decoded.cm_2, cm_2);
             prop_assert_eq!(decoded.cm_3, cm_3);
+            prop_assert_eq!(decoded.cm_4, cm_4);
             prop_assert_eq!(decoded.enc_1.ct_d, enc_1.ct_d);
             prop_assert_eq!(decoded.enc_1.tag, enc_1.tag);
             prop_assert_eq!(decoded.enc_1.ct_v, enc_1.ct_v);
@@ -1807,6 +1808,10 @@ mod tests {
             prop_assert_eq!(decoded.enc_3.tag, enc_3.tag);
             prop_assert_eq!(decoded.enc_3.ct_v, enc_3.ct_v);
             prop_assert_eq!(decoded.enc_3.encrypted_data, enc_3.encrypted_data);
+            prop_assert_eq!(decoded.enc_4.ct_d, enc_4.ct_d);
+            prop_assert_eq!(decoded.enc_4.tag, enc_4.tag);
+            prop_assert_eq!(decoded.enc_4.ct_v, enc_4.ct_v);
+            prop_assert_eq!(decoded.enc_4.encrypted_data, enc_4.encrypted_data);
             prop_assert_eq!(decoded.proof.proof_bytes, proof.proof_bytes);
             prop_assert_eq!(decoded.proof.output_preimage, proof.output_preimage);
         }
@@ -1814,12 +1819,14 @@ mod tests {
         #[test]
         fn prop_kernel_unshield_roundtrip_preserves_fields(
             root in arb_felt(),
-            nullifiers in prop::collection::vec(arb_felt(), 0..8),
+            nullifiers in prop::collection::vec(arb_felt(), 0..=5),
             v_pub in any::<u64>(),
             fee in any::<u64>(),
             recipient in small_string(32),
             cm_change in arb_felt(),
             enc_change in prop::option::of(arb_encrypted_note()),
+            cm_change_2 in arb_felt(),
+            enc_change_2 in prop::option::of(arb_encrypted_note()),
             cm_fee in arb_felt(),
             enc_fee in arb_encrypted_note(),
             proof in arb_kernel_stark_proof(),
@@ -1832,8 +1839,8 @@ mod tests {
                 recipient: recipient.clone(),
                 cm_change,
                 enc_change: enc_change.clone(),
-                cm_change_2: ZERO,
-                enc_change_2: None,
+                cm_change_2,
+                enc_change_2: enc_change_2.clone(),
                 cm_fee,
                 enc_fee: enc_fee.clone(),
                 proof: proof.clone(),
@@ -1847,9 +1854,17 @@ mod tests {
             prop_assert_eq!(decoded.fee, fee);
             prop_assert_eq!(decoded.recipient, recipient);
             prop_assert_eq!(decoded.cm_change, cm_change);
+            prop_assert_eq!(decoded.cm_change_2, cm_change_2);
             prop_assert_eq!(decoded.cm_fee, cm_fee);
             prop_assert_eq!(decoded.enc_change.is_some(), enc_change.is_some());
             if let (Some(actual), Some(expected)) = (decoded.enc_change.as_ref(), enc_change.as_ref()) {
+                prop_assert_eq!(&actual.ct_d, &expected.ct_d);
+                prop_assert_eq!(actual.tag, expected.tag);
+                prop_assert_eq!(&actual.ct_v, &expected.ct_v);
+                prop_assert_eq!(&actual.encrypted_data, &expected.encrypted_data);
+            }
+            prop_assert_eq!(decoded.enc_change_2.is_some(), enc_change_2.is_some());
+            if let (Some(actual), Some(expected)) = (decoded.enc_change_2.as_ref(), enc_change_2.as_ref()) {
                 prop_assert_eq!(&actual.ct_d, &expected.ct_d);
                 prop_assert_eq!(actual.tag, expected.tag);
                 prop_assert_eq!(&actual.ct_v, &expected.ct_v);
@@ -1872,7 +1887,9 @@ mod tests {
             transfer_index_1 in 0u64..10_000,
             transfer_index_2 in 0u64..10_000,
             transfer_index_3 in 0u64..10_000,
+            transfer_index_4 in 0u64..10_000,
             change_index in prop::option::of(0u64..10_000),
+            change_index_2 in prop::option::of(0u64..10_000),
             producer_note_index in 0u64..10_000,
             message in small_string(64),
         ) {
@@ -1889,11 +1906,11 @@ mod tests {
                     index_1: transfer_index_1 as usize,
                     index_2: transfer_index_2 as usize,
                     index_3: transfer_index_3 as usize,
-                    index_4: transfer_index_3.wrapping_add(1) as usize,
+                    index_4: transfer_index_4 as usize,
                 }),
                 KernelResult::Unshield(UnshieldResp {
                     change_index: change_index.map(|x| x as usize),
-                    change_index_2: None,
+                    change_index_2: change_index_2.map(|x| x as usize),
                     producer_index: producer_note_index as usize,
                 }),
                 KernelResult::Error { message: message.clone() },
@@ -1915,9 +1932,11 @@ mod tests {
                         prop_assert_eq!(actual.index_1, expected.index_1);
                         prop_assert_eq!(actual.index_2, expected.index_2);
                         prop_assert_eq!(actual.index_3, expected.index_3);
+                        prop_assert_eq!(actual.index_4, expected.index_4);
                     }
                     (KernelResult::Unshield(actual), KernelResult::Unshield(expected)) => {
                         prop_assert_eq!(actual.change_index, expected.change_index);
+                        prop_assert_eq!(actual.change_index_2, expected.change_index_2);
                         prop_assert_eq!(actual.producer_index, expected.producer_index);
                     }
                     (KernelResult::Error { message: actual }, KernelResult::Error { message: expected }) => {

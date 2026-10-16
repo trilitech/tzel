@@ -1,0 +1,16 @@
+# A leanVM guest: `riscv64im-unknown-none-elf` custom target spec with `build-std`.
+[build]
+target = "../../../sdk/riscv64im-unknown-none-elf.json"
+
+[unstable]
+build-std = ["core"]
+json-target-spec = true
+
+[target.riscv64im-unknown-none-elf]
+rustflags = ["-C", "link-arg=-T../../../sdk/link.ld"]
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = true
+codegen-units = 1

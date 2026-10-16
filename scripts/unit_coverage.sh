@@ -38,14 +38,13 @@ export TZEL_TRAP_FULL_XMSS_REBUILDS=1
 # slow tests out of the default coverage/CI path.
 COMPONENTS=(
   "core|cargo test -p tzel-core --lib --no-run --message-format=json|$ROOT/core/src||measure"
-  "verifier|cargo +nightly-2025-07-14 test -p tzel-verifier --lib --no-run --message-format=json|$ROOT/verifier/src|+nightly-2025-07-14|measure"
+  "verifier|cargo test -p tzel-verifier --lib --no-run --message-format=json|$ROOT/verifier/src||measure"
   "services|cargo test --lib -p tzel-services --no-run --message-format=json|$ROOT/services/tzel/src||measure"
   "wallet|cargo test -p tzel-wallet-app --bin sp-client --no-run --message-format=json|$ROOT/apps/wallet/src||measure"
   "ledger|cargo test -p tzel-ledger-app --bin sp-ledger --no-run --message-format=json|$ROOT/apps/ledger/src||measure"
   "demo|cargo test -p tzel-demo --no-run --message-format=json|$ROOT/apps/demo/src||measure"
-  "rollup-kernel|cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --lib --no-run --message-format=json|$ROOT/tezos/rollup-kernel/src|+nightly-2025-07-14|measure"
-  "reprover||$ROOT/services/reprover/src|+nightly-2025-07-14|no-unit-tests"
-  "prover-app||$ROOT/apps/prover/src|+nightly-2025-07-14|no-unit-tests"
+  "rollup-kernel|cargo test -p tzel-rollup-kernel --lib --no-run --message-format=json|$ROOT/tezos/rollup-kernel/src||measure"
+  "prover-app|cargo test -p tzel-prover-app --bin reprove --no-run --message-format=json|$ROOT/apps/prover/src||measure"
 )
 
 RUST_SUMMARY_JSON="$WORKDIR/rust-summary.jsonl"

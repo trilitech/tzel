@@ -23,6 +23,14 @@ path = "src/bin/tzel_operator.rs"
 name = "derive_asset_id_cli"
 path = "src/bin/derive_asset_id_cli.rs"
 
+[[bin]]
+name = "gen-proof-bench-args"
+path = "src/bin/gen_proof_bench_args.rs"
+
+[[bin]]
+name = "gen_rollup_verified_bridge_fixture"
+path = "src/bin/gen_rollup_verified_bridge_fixture.rs"
+
 [dependencies]
 tzel-core = { path = "../../core" }
 tzel-verifier = { path = "../../verifier" }

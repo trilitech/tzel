@@ -15,27 +15,13 @@ env:
 jobs:
   ignored-proof-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Set up Rust stable
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-04-30
-
-      - name: Set up Rust nightly for prover/reprover
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master @ 2026-04-30
-        with:
-          toolchain: nightly-2025-07-14
-
-      - name: Set up Scarb
-        uses: software-mansion/setup-scarb@2a96b748888e3329ee44ac9ac073d930e692b3cd  # v1
-        with:
-          scarb-version: "2.16.1"
-
-      - name: Build Cairo executables
-        working-directory: cairo
-        run: scarb build
 
       - name: Run ignored real-proof roundtrip tests
         run: cargo test --test integration -p tzel-services -- --ignored --nocapture

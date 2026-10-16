@@ -1,0 +1,7 @@
+# The stacked opening observes none of its claims: a call is sound only where they are bound before it.
+disallowed-methods = [
+    { path = "pcs::stack::CommittedStack::open", reason = "every claim's value must be a prover message or part of the instance, its point an earlier challenge or public; expect this lint where that holds and say where" },
+    { path = "pcs::stack::StackCommitment::verify", reason = "every claim's value must be a prover message or part of the instance, its point an earlier challenge or public; expect this lint where that holds and say where" },
+    { path = "pcs::stack::CommittedStack::open_weighted", reason = "the claim's value must be a prover message or part of the instance, its weight public or drawn from earlier challenges; expect this lint where that holds and say where" },
+    { path = "pcs::stack::StackCommitment::verify_weighted", reason = "the claim's value must be a prover message or part of the instance, its weight public or drawn from earlier challenges; expect this lint where that holds and say where" },
+]
