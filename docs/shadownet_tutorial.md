@@ -88,8 +88,7 @@ From the repo root:
 
 sudo ./scripts/install_tzel_binaries.sh \
   --skip-build \
-  --prefix /usr/local \
-  --executables-dir /opt/tzel/cairo/target/dev
+  --prefix /usr/local
 ```
 
 The wallet commands below assume:
@@ -99,7 +98,6 @@ The wallet commands below assume:
 - `/usr/local/bin/octez_kernel_message`
 - `/usr/local/bin/submit_rollup_config`
 - `/usr/local/bin/verified_bridge_fixture_message`
-- Cairo executables in `/opt/tzel/cairo/target/dev`
 - rollup config admin env files in `/usr/local/etc/tzel/rollup-config-admin-{runtime,build}.env`
 
 ## 2. Bring Up The Public Operator Box
@@ -398,10 +396,9 @@ Shield into a self-address first:
 /usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
   --reprove-bin /usr/local/bin/reprove \
-  --executables-dir /opt/tzel/cairo/target/dev \
   shield \
   --pubkey-hash "$PUBKEY_HASH" \
-  --amount 300000
+  --amount 200000
 ```
 
 The wallet picks `fee = required_tx_fee_now` and `producer_fee` from the profile, signs the shield sighash with the next available WOTS+ key index in Alice's auth tree, generates the proof, and submits.
@@ -454,7 +451,6 @@ cat bob-address.json
 /usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
   --reprove-bin /usr/local/bin/reprove \
-  --executables-dir /opt/tzel/cairo/target/dev \
   send \
   --to bob-address.json \
   --amount 50000
@@ -501,9 +497,8 @@ export L1_RECIPIENT=tz1REPLACE_ME
 /usr/local/bin/tzel-wallet \
   --wallet bob.wallet \
   --reprove-bin /usr/local/bin/reprove \
-  --executables-dir /opt/tzel/cairo/target/dev \
   unshield \
-  --to "$L1_RECIPIENT" \
+  --recipient "$L1_RECIPIENT" \
   --amount 30000
 ```
 
@@ -604,18 +599,19 @@ difference: the rollup's producer-fee output is permanently tez. Concretely:
   `%transfer` and L2 ticket emission.
 
 - **FA2 shield**: requires the user to have BOTH an FA2 pool AND a tez pool
-  at the same `pubkey_hash`. The wallet debits `v + tx_fee` from the FA2
-  pool and `producer_fee` from the tez pool (because the producer-fee output
-  note is permanently tez, regardless of which asset the shield moved). If
-  the user only has an FA2 pool, the shield rejects with a clear error
-  pointing at the missing tez pool. The wallet's `cmd_shield_rollup` enforces
-  this client-side; the kernel re-enforces it on prepare-shield.
+  at the same `pubkey_hash`. The wallet debits `v` from the FA2 pool and
+  `tx_fee + producer_fee` from the tez pool (because both the burned rollup fee
+  and the producer-fee output note are permanently tez, regardless of which
+  asset the shield moved). If the user only has an FA2 pool, the shield rejects
+  with a clear error pointing at the missing tez pool. The wallet's
+  `cmd_shield_rollup` enforces this client-side; the kernel re-enforces it on
+  prepare-shield.
 
 - **FA2 send / transfer**: any transfer that moves an FA2 amount must ALSO
   spend some tez (to pay the burned `fee` and the producer fee). The wallet's
   `select_notes_of_asset` picks both an FA2 input set covering the recipient
   amount and a tez input set covering the fees. Combined input count must be
-  ≤ 7 (the circuit's input cap); if the user's notes can't be packed under
+  ≤ 5 (the circuit's input cap); if the user's notes can't be packed under
   that limit, the wallet asks them to consolidate first.
 
 - **FA2 unshield**: dispatches the L1 burn via the FA2 ticketer registered

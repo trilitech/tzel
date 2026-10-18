@@ -1,5 +1,7 @@
 # Shadownet Ops Host
 
+> For deploying on Nomadic Labs' PQPark quantum testnet (`pqnet-10-16`), see [`../pqnet/README.md`](../pqnet/README.md).
+
 This directory contains the minimum deployment assets for a public Shadownet
 host that runs:
 

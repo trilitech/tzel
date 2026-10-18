@@ -44,8 +44,11 @@ This directory is the entry point for the project documentation.
 
 ## Deployment Docs
 
+- [../ops/pqnet/README.md](../ops/pqnet/README.md)
+  - PQPark (`pqnet-10-16`) operator & multi-asset deployment runbook
+    (required infrastructure, ZODA DAL config, bridge + rollup origination)
 - [../ops/shadownet/README.md](../ops/shadownet/README.md)
-  - public ops host setup (rollup node + DAL node + `tzel-operator`)
+  - public Shadownet ops host setup (rollup node + DAL node + `tzel-operator`)
 - [../ops/prover/README.md](../ops/prover/README.md)
   - prover deployment layout
 

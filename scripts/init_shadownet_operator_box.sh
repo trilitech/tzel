@@ -86,10 +86,11 @@ chown "$TOKEN_OWNER_UID:$SERVICE_GROUP" "$TZEL_OPERATOR_BEARER_TOKEN_FILE"
 chmod 640 "$TZEL_OPERATOR_BEARER_TOKEN_FILE"
 
 if [[ ! -f "$TZEL_OCTEZ_NODE_DATA_DIR/config.json" ]]; then
-  echo "initializing octez-node config for shadownet"
+  OCTEZ_NETWORK="${TZEL_OCTEZ_NETWORK:-shadownet}"
+  echo "initializing octez-node config for $OCTEZ_NETWORK"
   "$TZEL_OCTEZ_NODE_BIN" config init \
     --data-dir "$TZEL_OCTEZ_NODE_DATA_DIR" \
-    --network shadownet \
+    --network "$OCTEZ_NETWORK" \
     --rpc-addr "$TZEL_OCTEZ_NODE_RPC_ADDR" \
     --net-addr "$TZEL_OCTEZ_NODE_NET_ADDR"
 fi

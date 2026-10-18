@@ -2069,13 +2069,18 @@ fn resolve_rollup_unshield_recipient(
 }
 
 fn effective_octez_protocol(profile: &WalletNetworkProfile) -> Option<&str> {
-    profile.octez_protocol.as_deref().or_else(|| {
-        if profile.network == "shadownet" {
-            Some(default_shadownet_octez_protocol())
-        } else {
+    match profile.octez_protocol.as_deref().map(str::trim) {
+        Some(value)
+            if value.is_empty()
+                || value.eq_ignore_ascii_case("auto")
+                || value.eq_ignore_ascii_case("none") =>
+        {
             None
         }
-    })
+        Some(value) => Some(value),
+        None if profile.network == "shadownet" => Some(default_shadownet_octez_protocol()),
+        None => None,
+    }
 }
 
 #[derive(Clone)]
@@ -16332,5 +16337,23 @@ mod network_profile_tests {
         // Cursor advance.
         assert_eq!(wallet_seq.scanned, total);
         assert_eq!(wallet_par.scanned, total);
+    }
+
+    #[test]
+    fn effective_octez_protocol_supports_default_explicit_and_auto_modes() {
+        let mut profile = crate::tests::rollup_profile_for_url("http://127.0.0.1:28944");
+        assert_eq!(effective_octez_protocol(&profile), Some("PtTALLiN"));
+
+        profile.octez_protocol =
+            Some("ProtoALphaALphaALphaALphaALphaALphaALphaALphaDdp3zK".to_string());
+        assert_eq!(
+            effective_octez_protocol(&profile),
+            Some("ProtoALphaALphaALphaALphaALphaALphaALphaALphaDdp3zK")
+        );
+
+        for auto_value in ["auto", "AUTO", "none", "NONE", "", "   "] {
+            profile.octez_protocol = Some(auto_value.to_string());
+            assert_eq!(effective_octez_protocol(&profile), None);
+        }
     }
 }
