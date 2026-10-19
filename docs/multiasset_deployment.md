@@ -157,7 +157,7 @@ deliberate:
 
 - **Same governance surface as any other circuit change.** Adding
   an asset goes through the same kernel-upgrade signoff as adding a
-  new instruction to the Cairo circuit. No "registrar" privileged
+  new instruction to the `leanVM` circuit. No "registrar" privileged
   inbox message.
 - **No DoS vector on registration.** A live runtime registration
   endpoint would have to accept signed messages from a privileged

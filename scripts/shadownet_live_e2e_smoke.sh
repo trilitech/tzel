@@ -12,13 +12,16 @@ source "$ENV_FILE"
 
 TZEL_WALLET_BIN="${TZEL_WALLET_BIN:-/usr/local/bin/tzel-wallet}"
 TZEL_REPROVE_BIN="${TZEL_REPROVE_BIN:-/usr/local/bin/reprove}"
-TZEL_EXECUTABLES_DIR="${TZEL_EXECUTABLES_DIR:-/opt/tzel/cairo/target/dev}"
 TZEL_SMOKE_WORKDIR="${TZEL_SMOKE_WORKDIR:-$(mktemp -d /tmp/tzel-shadownet-smoke.XXXXXX)}"
-TZEL_SMOKE_DEPOSIT_AMOUNT="${TZEL_SMOKE_DEPOSIT_AMOUNT:-300000}"
-TZEL_SMOKE_SEND_AMOUNT="${TZEL_SMOKE_SEND_AMOUNT:-50000}"
+TZEL_SMOKE_DEPOSIT_AMOUNT="${TZEL_SMOKE_DEPOSIT_AMOUNT:-600000}"
+TZEL_SMOKE_SEND_AMOUNT="${TZEL_SMOKE_SEND_AMOUNT:-250000}"
 TZEL_SMOKE_UNSHIELD_AMOUNT="${TZEL_SMOKE_UNSHIELD_AMOUNT:-20000}"
 TZEL_SMOKE_POLL_SECS="${TZEL_SMOKE_POLL_SECS:-5}"
 TZEL_SMOKE_MAX_POLLS="${TZEL_SMOKE_MAX_POLLS:-120}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TZEL_OPERATOR_REQUIRED_DAL_FEE="${TZEL_OPERATOR_REQUIRED_DAL_FEE:-1}"
+TZEL_OPERATOR_DAL_FEE_ADDRESS_FILE="${TZEL_OPERATOR_DAL_FEE_ADDRESS_FILE:-${REPO_ROOT}/docs/shadownet/operator-fee-address.json}"
 
 required_vars=(
   TZEL_ROLLUP_ADDRESS
@@ -46,6 +49,10 @@ if [[ -z "${TZEL_SMOKE_L1_RECIPIENT:-}" ]]; then
 fi
 if [[ ! -f "${TZEL_OPERATOR_BEARER_TOKEN_FILE}" ]]; then
   echo "missing operator bearer token file: ${TZEL_OPERATOR_BEARER_TOKEN_FILE}" >&2
+  exit 1
+fi
+if [[ ! -f "${TZEL_OPERATOR_DAL_FEE_ADDRESS_FILE}" ]]; then
+  echo "missing operator DAL fee address file: ${TZEL_OPERATOR_DAL_FEE_ADDRESS_FILE}" >&2
   exit 1
 fi
 
@@ -83,7 +90,6 @@ wallet_prove_cmd() {
   "${TZEL_WALLET_BIN}" \
     --wallet "${wallet}" \
     --reprove-bin "${TZEL_REPROVE_BIN}" \
-    --executables-dir "${TZEL_EXECUTABLES_DIR}" \
     "$@"
 }
 
@@ -92,7 +98,7 @@ extract_submission_id() {
 }
 
 extract_secret_deposit_balance() {
-  sed -n 's/^Secret-bound deposit balance: \([0-9][0-9]*\) across .*$/\1/p' | tail -n1
+  sed -n 's/^Deposit pools: [0-9][0-9]* funded, total balance \([0-9][0-9]*\) mutez.*$/\1/p' | tail -n1
 }
 
 extract_private_available() {
@@ -132,7 +138,7 @@ wait_for_secret_deposit_balance_at_least() {
     fi
     sleep "${TZEL_SMOKE_POLL_SECS}"
   done
-  echo "timed out waiting for secret-bound deposit balance >= ${expected}" >&2
+  echo "timed out waiting for deposit pool balance >= ${expected}" >&2
   return 1
 }
 
@@ -157,17 +163,24 @@ wait_for_private_available_at_least() {
 init_profile() {
   local wallet="$1"
   local public_account="$2"
+  local extra_args=()
+  if [[ -n "${TZEL_OCTEZ_PROTOCOL:-}" ]]; then
+    extra_args+=(--octez-protocol "${TZEL_OCTEZ_PROTOCOL}")
+  fi
   wallet_cmd "${wallet}" profile init-shadownet \
     --rollup-node-url "${ROLLUP_NODE_URL}" \
     --rollup-address "${TZEL_ROLLUP_ADDRESS}" \
     --bridge-ticketer "${TZEL_BRIDGE_TICKETER}" \
+    --dal-fee "${TZEL_OPERATOR_REQUIRED_DAL_FEE}" \
+    --dal-fee-address "${TZEL_OPERATOR_DAL_FEE_ADDRESS_FILE}" \
     --operator-url "${OPERATOR_URL}" \
     --operator-bearer-token "$(cat "${TZEL_OPERATOR_BEARER_TOKEN_FILE}")" \
     --source-alias "${TZEL_SOURCE_ALIAS}" \
     --public-account "${public_account}" \
     --octez-client-bin "${TZEL_OCTEZ_CLIENT_BIN}" \
     --octez-client-dir "${TZEL_OCTEZ_CLIENT_DIR}" \
-    --octez-node-endpoint "${TZEL_L1_RPC_URL}"
+    --octez-node-endpoint "${TZEL_L1_RPC_URL}" \
+    "${extra_args[@]}"
 }
 
 require_cmd "${TZEL_WALLET_BIN}"
@@ -188,14 +201,14 @@ wallet_cmd "${BOB_WALLET}" check
 
 deposit_output="$(wallet_cmd "${ALICE_WALLET}" deposit --amount "${TZEL_SMOKE_DEPOSIT_AMOUNT}")"
 printf '%s\n' "${deposit_output}"
-deposit_id="$(awk '/Submitted L1 bridge deposit/ {print $NF}' <<<"${deposit_output}")"
-if [[ -z "${deposit_id}" ]]; then
-  echo "failed to extract deposit id" >&2
+pubkey_hash="$(awk '/Submitted L1 bridge deposit/ {print $NF}' <<<"${deposit_output}")"
+if [[ -z "${pubkey_hash}" ]]; then
+  echo "failed to extract deposit pool pubkey_hash" >&2
   exit 1
 fi
 wait_for_secret_deposit_balance_at_least "${ALICE_WALLET}" "${TZEL_SMOKE_DEPOSIT_AMOUNT}"
 
-shield_output="$(wallet_prove_cmd "${ALICE_WALLET}" shield --deposit-id "${deposit_id}")"
+shield_output="$(wallet_prove_cmd "${ALICE_WALLET}" shield --pubkey-hash "${pubkey_hash}")"
 printf '%s\n' "${shield_output}"
 shield_submission_id="$(extract_submission_id <<<"${shield_output}")"
 if [[ -z "${shield_submission_id}" ]]; then
@@ -203,7 +216,7 @@ if [[ -z "${shield_submission_id}" ]]; then
   exit 1
 fi
 wait_for_submission_terminal "${ALICE_WALLET}" "${shield_submission_id}"
-wait_for_private_available_at_least "${ALICE_WALLET}" "${TZEL_SMOKE_DEPOSIT_AMOUNT}"
+wait_for_private_available_at_least "${ALICE_WALLET}" "${TZEL_SMOKE_SEND_AMOUNT}"
 
 send_output="$(wallet_prove_cmd "${ALICE_WALLET}" send --to "${BOB_ADDRESS_JSON}" --amount "${TZEL_SMOKE_SEND_AMOUNT}")"
 printf '%s\n' "${send_output}"

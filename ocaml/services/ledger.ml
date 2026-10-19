@@ -293,6 +293,20 @@ let check_and_insert_nullifiers ledger nullifiers =
     insert_nullifiers ledger nullifiers;
     Ok ()
 
+(* Checked addition over non-negative signed int64 amounts ([0, Int64.max_int]).
+   The OCaml ledger mirror represents note/pool amounts as non-negative signed
+   [int64] (matching OCaml's standard integer type and Tezos mutez); any
+   negative operand or signed overflow is rejected. *)
+let checked_add_nonneg a b =
+  if Int64.compare a 0L < 0 || Int64.compare b 0L < 0 then
+    Error "shield debit overflow"
+  else
+    let sum = Int64.add a b in
+    if Int64.compare sum 0L < 0 then
+      Error "shield debit overflow"
+    else
+      Ok sum
+
 (* Pool-bound shield. The shield message names a `pubkey_hash` identifying
    a deposit-balance pool; the kernel decrements it by `v + fee +
    producer_fee` and appends both notes. The in-circuit WOTS+ signature
@@ -309,74 +323,90 @@ let apply_shield ledger ~(pub : Transaction.shield_public)
     Error "producer_memo_ct_hash mismatch"
   else if Int64.compare pub.producer_fee 0L <= 0 then
     Error "producer_fee must be positive"
+  else if Int64.compare pub.v_pub 0L < 0 || Int64.compare pub.fee 0L < 0 then
+    Error "shield debit overflow"
   else begin
     let cm_key = Felt.to_hex pub.cm_new in
     if Hashtbl.mem ledger.applied_shield_cms cm_key then
       Error (Printf.sprintf "shield replay: cm %s already applied" cm_key)
     else begin
       (* Dual-pool debit (mirrors core::{prepare,commit_prepared}_shield):
-         the (asset_new, pubkey) pool funds the recipient note + kernel
-         fee (v + fee); the (ASSET_TEZ, pubkey) pool funds producer_fee,
-         which is PERMANENTLY a tez output regardless of asset_new. For a
-         tez shield both debits collapse onto the one tez pool. We
-         validate every pool balance BEFORE mutating so a partial debit
-         can never strand funds. *)
+         the (asset_new, pubkey) pool funds the recipient note (v);
+         the (ASSET_TEZ, pubkey) pool funds the burned rollup fee +
+         producer_fee (fee + producer_fee), both of which are permanently tez
+         regardless of asset_new. For a tez shield both debits collapse onto
+         the one tez pool. We validate every pool balance BEFORE mutating so
+         a partial debit can never strand funds. *)
       let asset_new = pub.asset_new in
-      let asset_debit = Int64.add pub.v_pub pub.fee in
-      let producer_fee = pub.producer_fee in
       let is_tez = Felt.equal asset_new Asset_registry.asset_tez in
-      let validation =
-        if is_tez then begin
-          let required = Int64.add asset_debit producer_fee in
-          match deposit_balance ledger ~asset_id:asset_new ~pubkey_hash:pub.pubkey_hash () with
-          | None ->
-              Error (Printf.sprintf "no deposit pool for pubkey_hash %s; submit an L1 bridge deposit first"
-                       (Felt.to_hex pub.pubkey_hash))
-          | Some bal when Int64.compare bal required < 0 ->
-              Error (Printf.sprintf "deposit pool balance (%Ld) too small for v + fee + producer_fee (%Ld)"
-                       bal required)
-          | Some _ -> Ok ()
-        end else begin
-          (* FA2: the asset pool must cover v + fee, and a SEPARATE tez
-             pool at the same pubkey_hash must cover producer_fee. *)
-          match deposit_balance ledger ~asset_id:asset_new ~pubkey_hash:pub.pubkey_hash () with
-          | None ->
-              Error (Printf.sprintf "no deposit pool for (asset_id %s, pubkey_hash %s); submit an L1 bridge deposit first"
-                       (Felt.to_hex asset_new) (Felt.to_hex pub.pubkey_hash))
-          | Some bal when Int64.compare bal asset_debit < 0 ->
-              Error (Printf.sprintf "deposit pool balance (%Ld) too small for v + fee (%Ld)" bal asset_debit)
-          | Some _ ->
-            match deposit_balance ledger ~asset_id:Asset_registry.asset_tez ~pubkey_hash:pub.pubkey_hash () with
-            | None ->
-                Error (Printf.sprintf "no tez deposit pool at pubkey_hash %s — non-tez shields require a separate tez pool to fund producer_fee (%Ld)"
-                         (Felt.to_hex pub.pubkey_hash) producer_fee)
-            | Some tez_bal when Int64.compare tez_bal producer_fee < 0 ->
-                Error (Printf.sprintf "tez deposit pool balance (%Ld) too small for producer_fee (%Ld) — required because producer fees are permanently tez"
-                         tez_bal producer_fee)
-            | Some _ -> Ok ()
-        end
+      let debits_res =
+        if is_tez then
+          match checked_add_nonneg pub.v_pub pub.fee with
+          | Error e -> Error e
+          | Ok asset_debit ->
+            match checked_add_nonneg asset_debit pub.producer_fee with
+            | Error e -> Error e
+            | Ok total_debit -> Ok (asset_debit, pub.producer_fee, total_debit)
+        else
+          match checked_add_nonneg pub.fee pub.producer_fee with
+          | Error e -> Error e
+          | Ok tez_debit -> Ok (pub.v_pub, tez_debit, tez_debit)
       in
-      match validation with
+      match debits_res with
       | Error e -> Error e
-      | Ok () ->
-        (* Balances validated above; these debits cannot fail. *)
-        (if is_tez then
-           ignore (debit_deposit ledger ~asset_id:asset_new ~pubkey_hash:pub.pubkey_hash
-                     ~amount:(Int64.add asset_debit producer_fee) ())
-         else begin
-           ignore (debit_deposit ledger ~asset_id:asset_new ~pubkey_hash:pub.pubkey_hash
-                     ~amount:asset_debit ());
-           ignore (debit_deposit ledger ~asset_id:Asset_registry.asset_tez ~pubkey_hash:pub.pubkey_hash
-                     ~amount:producer_fee ())
-         end);
-        Hashtbl.replace ledger.applied_shield_cms cm_key ();
-        append_commitment ledger pub.cm_new;
-        append_commitment ledger pub.cm_producer;
-        Ok ()
+      | Ok (asset_debit, tez_debit, required_tez_total) ->
+        let validation =
+          if is_tez then begin
+            match deposit_balance ledger ~asset_id:asset_new ~pubkey_hash:pub.pubkey_hash () with
+            | None ->
+                Error (Printf.sprintf "no deposit pool for pubkey_hash %s; submit an L1 bridge deposit first"
+                         (Felt.to_hex pub.pubkey_hash))
+            | Some bal when Int64.compare bal required_tez_total < 0 ->
+                Error (Printf.sprintf "deposit pool balance (%Ld) too small for v + fee + producer_fee (%Ld)"
+                         bal required_tez_total)
+            | Some _ -> Ok ()
+          end else begin
+            (* FA2: the asset pool must cover v, and a SEPARATE tez
+               pool at the same pubkey_hash must cover fee + producer_fee. *)
+            match deposit_balance ledger ~asset_id:asset_new ~pubkey_hash:pub.pubkey_hash () with
+            | None ->
+                Error (Printf.sprintf "no deposit pool for (asset_id %s, pubkey_hash %s); submit an L1 bridge deposit first"
+                         (Felt.to_hex asset_new) (Felt.to_hex pub.pubkey_hash))
+            | Some bal when Int64.compare bal asset_debit < 0 ->
+                Error (Printf.sprintf "deposit pool balance (%Ld) too small for v (%Ld)" bal asset_debit)
+            | Some _ ->
+              match deposit_balance ledger ~asset_id:Asset_registry.asset_tez ~pubkey_hash:pub.pubkey_hash () with
+              | None ->
+                  Error (Printf.sprintf "no tez deposit pool at pubkey_hash %s — non-tez shields require a separate tez pool to fund fee + producer_fee (%Ld)"
+                           (Felt.to_hex pub.pubkey_hash) tez_debit)
+              | Some tez_bal when Int64.compare tez_bal tez_debit < 0 ->
+                  Error (Printf.sprintf "tez deposit pool balance (%Ld) too small for fee + producer_fee (%Ld) — required because rollup fees and producer fees are permanently tez"
+                           tez_bal tez_debit)
+              | Some _ -> Ok ()
+          end
+        in
+        match validation with
+        | Error e -> Error e
+        | Ok () ->
+          (* Balances validated above; these debits cannot fail. *)
+          (if is_tez then
+             ignore (debit_deposit ledger ~asset_id:asset_new ~pubkey_hash:pub.pubkey_hash
+                       ~amount:required_tez_total ())
+           else begin
+             ignore (debit_deposit ledger ~asset_id:asset_new ~pubkey_hash:pub.pubkey_hash
+                       ~amount:asset_debit ());
+             ignore (debit_deposit ledger ~asset_id:Asset_registry.asset_tez ~pubkey_hash:pub.pubkey_hash
+                       ~amount:tez_debit ())
+           end);
+          Hashtbl.replace ledger.applied_shield_cms cm_key ();
+          append_commitment ledger pub.cm_new;
+          append_commitment ledger pub.cm_producer;
+          Ok ()
     end
   end
 
-let apply_transfer ledger (pub : Transaction.transfer_public)
+let apply_transfer ledger ~memo_ct_hash_change_2
+    (pub : Transaction.transfer_public)
     ~memo_ct_hash_1 ~memo_ct_hash_2 ~memo_ct_hash_3 =
   if not (Felt.equal pub.auth_domain ledger.auth_domain) then
     Error "auth_domain mismatch"
@@ -386,6 +416,8 @@ let apply_transfer ledger (pub : Transaction.transfer_public)
     Error "memo_ct_hash_1 mismatch"
   else if not (Felt.equal memo_ct_hash_2 pub.memo_ct_hash_2) then
     Error "memo_ct_hash_2 mismatch"
+  else if not (Felt.equal memo_ct_hash_change_2 pub.memo_ct_hash_3) then
+    Error "memo_ct_hash_change_2 mismatch"
   (* Multiasset slot layout: slot 1 = recipient, 2 = change_1,
      3 = change_2 (the second-asset change, unused by single-asset
      transfers), 4 = producer-fee. The caller's [memo_ct_hash_3] is the
@@ -398,13 +430,19 @@ let apply_transfer ledger (pub : Transaction.transfer_public)
     | Ok () ->
       append_commitment ledger pub.cm_1;
       append_commitment ledger pub.cm_2;
-      (* slot 3 (change_2) is empty for single-asset transfers; skip the
-         zero leaf. (cm_3 is always Felt.zero here.) *)
+      append_commitment ledger pub.cm_3;
       append_commitment ledger pub.cm_4;
       Ok ()
 
-let apply_unshield ledger ~recipient_string (pub : Transaction.unshield_public)
-    ~memo_ct_hash_change ~memo_ct_hash_fee =
+(* Apply an unshield transaction. Amounts in the OCaml ledger mirror are
+   represented as positive signed [int64] values in [1, Int64.max_int]. *)
+let apply_unshield ledger ~recipient_string ~memo_ct_hash_change_2
+    (pub : Transaction.unshield_public) ~memo_ct_hash_change ~memo_ct_hash_fee =
+  if Int64.compare pub.v_pub 0L <= 0 then
+    Error "v_pub must be positive"
+  else if Int64.compare pub.fee 0L < 0 then
+    Error "fee must be non-negative"
+  else
   match normalize_l1_withdrawal_recipient recipient_string with
   | Error e -> Error e
   | Ok recipient_string ->
@@ -422,21 +460,27 @@ let apply_unshield ledger ~recipient_string (pub : Transaction.unshield_public)
       match validate_nullifiers ledger pub.nullifiers with
       | Error e -> Error e
       | Ok () ->
-        if not (Felt.is_zero pub.cm_change) then begin
-          if not (Felt.equal memo_ct_hash_change pub.memo_ct_hash_change) then
-            Error "memo_ct_hash_change mismatch"
-          else begin
-            insert_nullifiers ledger pub.nullifiers;
-            append_commitment ledger pub.cm_change;
-            append_commitment ledger pub.cm_fee;
-            (* The withdrawal is routed at the L1 outbox by asset_pub: the
-               matching ticketer burns it (ASSET_TEZ for tez). *)
-            Queue.push (pub.asset_pub, recipient_string, pub.v_pub) ledger.withdrawals;
-            Ok ()
-          end
-        end else begin
+        if Felt.is_zero pub.cm_change
+           && not (Felt.is_zero memo_ct_hash_change && Felt.is_zero pub.memo_ct_hash_change) then
+          Error "memo_ct_hash_change must be zero when cm_change is zero"
+        else if not (Felt.is_zero pub.cm_change)
+           && not (Felt.equal memo_ct_hash_change pub.memo_ct_hash_change) then
+          Error "memo_ct_hash_change mismatch"
+        else if Felt.is_zero pub.cm_change_2
+           && not (Felt.is_zero memo_ct_hash_change_2 && Felt.is_zero pub.memo_ct_hash_change_2) then
+          Error "memo_ct_hash_change_2 must be zero when cm_change_2 is zero"
+        else if not (Felt.is_zero pub.cm_change_2)
+           && not (Felt.equal memo_ct_hash_change_2 pub.memo_ct_hash_change_2) then
+          Error "memo_ct_hash_change_2 mismatch"
+        else begin
           insert_nullifiers ledger pub.nullifiers;
+          if not (Felt.is_zero pub.cm_change) then
+            append_commitment ledger pub.cm_change;
+          if not (Felt.is_zero pub.cm_change_2) then
+            append_commitment ledger pub.cm_change_2;
           append_commitment ledger pub.cm_fee;
+          (* The withdrawal is routed at the L1 outbox by asset_pub: the
+             matching ticketer burns it (ASSET_TEZ for tez). *)
           Queue.push (pub.asset_pub, recipient_string, pub.v_pub) ledger.withdrawals;
           Ok ()
         end

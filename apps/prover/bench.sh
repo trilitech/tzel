@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Usage: ./apps/prover/bench.sh [--depth 16|32|48] [--debug-single-level]
+# Usage: ./apps/prover/bench.sh [--depth 48] [--debug-single-level]
 DEPTH=48
 RECURSIVE=1
 while [[ $# -gt 0 ]]; do
@@ -13,46 +13,35 @@ while [[ $# -gt 0 ]]; do
 done
 
 case $DEPTH in
-    16|32|48) ;;
-    *) echo "ERROR: unsupported depth $DEPTH (use 16, 32, or 48)"; exit 1 ;;
+    48) ;;
+    *) echo "ERROR: unsupported depth $DEPTH (leanVM tzel guest uses depth 48)"; exit 1 ;;
 esac
 
-echo "=== TzEL Proof Benchmark (depth=$DEPTH) ==="
+echo "=== TzEL leanVM Proof Benchmark (depth=$DEPTH) ==="
 echo ""
 
 # Run from repo root
 cd "$(dirname "$0")/../.."
 
-# Build Cairo executables
-echo "Building Cairo executables..."
-(
-  cd cairo
-  scarb build --no-default-features --features "depth${DEPTH}" 2>&1 | tail -1
-)
-
 # Build reprover if needed
-if [ ! -f apps/prover/target/release/reprove ]; then
-    echo "Building reprover (first time, may take a few minutes)..."
-    (
-      cd apps/prover
-      cargo build --release 2>&1 | tail -1
-    )
+if [ ! -f target/release/reprove ]; then
+    echo "Building reprover..."
+    cargo build --release -p tzel-prover-app --bin reprove 2>&1 | tail -1
 fi
 
 echo "Building bench witness generator..."
-(
-  cargo build --release -p tzel-services --bin gen_proof_bench_args 2>&1 | tail -1
-)
+cargo build --release -p tzel-services --bin gen-proof-bench-args 2>&1 | tail -1
 
-GEN_ARGS_BIN="target/release/gen_proof_bench_args"
+REPROVE_BIN="target/release/reprove"
+GEN_ARGS_BIN="target/release/gen-proof-bench-args"
 
 CASES=(
-  "Shield|run_shield.executable.json|shield|"
-  "Unshield (N=1)|run_unshield.executable.json|unshield|1"
-  "Unshield (N=7)|run_unshield.executable.json|unshield|7"
-  "Join (N=2)|run_transfer.executable.json|transfer|2"
-  "Split (N=1)|run_transfer.executable.json|transfer|1"
-  "Consolidate (N=7)|run_transfer.executable.json|transfer|7"
+  "Shield|tzel_run_shield.executable.json|shield|"
+  "Unshield (N=1)|tzel_run_unshield.executable.json|unshield|1"
+  "Unshield (N=5)|tzel_run_unshield.executable.json|unshield|5"
+  "Join (N=2)|tzel_run_transfer.executable.json|transfer|2"
+  "Split (N=1)|tzel_run_transfer.executable.json|transfer|1"
+  "Consolidate (N=5)|tzel_run_transfer.executable.json|transfer|5"
 )
 
 # Format bytes as KB (integer)
@@ -62,7 +51,7 @@ fmt_gb() { echo "$(( $1 / 1048576 )).$(( ($1 % 1048576) * 10 / 1048576 ))"; }
 
 if [ "$RECURSIVE" = "1" ]; then
     echo ""
-    echo "--- Recursive mode (Stwo + circuit reprover, zero-knowledge) ---"
+    echo "--- ZK STARK mode (leanVM zero-knowledge) ---"
     echo ""
 
     declare -a CAIRO_PROVES CIRCUIT_PROVES TOTAL_PROVES VERIFY_TIMES PROOF_SIZES PEAK_MEMS
@@ -78,7 +67,7 @@ if [ "$RECURSIVE" = "1" ]; then
             "$GEN_ARGS_BIN" "$kind" > "$args_file"
         fi
 
-        OUTPUT=$(./apps/prover/target/release/reprove "cairo/target/dev/${executable}" --arguments-file "$args_file" 2>&1)
+        OUTPUT=$("$REPROVE_BIN" "$executable" --arguments-file "$args_file" 2>&1)
         CAIRO_PROVES[$i]=$(echo "$OUTPUT" | grep "^cairo_prove_ms=" | cut -d= -f2)
         CIRCUIT_PROVES[$i]=$(echo "$OUTPUT" | grep "^circuit_prove_ms=" | cut -d= -f2)
         TOTAL_PROVES[$i]=$(echo "$OUTPUT" | grep "^prove_ms=" | cut -d= -f2)
@@ -89,12 +78,12 @@ if [ "$RECURSIVE" = "1" ]; then
     done
 
     echo ""
-    echo "=== Results (depth=$DEPTH, recursive) ==="
+    echo "=== Results (depth=$DEPTH, ZK STARK) ==="
     echo ""
-    printf "  %-14s %10s %12s %10s %8s %10s %10s\n" \
+    printf "  %-18s %10s %12s %10s %8s %10s %10s\n" \
         "Operation" "Cairo" "Circuit" "Total" "Verify" "Proof" "Peak RSS"
     for i in "${!CASES[@]}"; do
-        printf "  %-14s %8sms %10sms %8sms %6sms %7sKB %7sGB\n" \
+        printf "  %-18s %8sms %10sms %8sms %6sms %7sKB %7sGB\n" \
             "$(echo "${CASES[$i]}" | cut -d'|' -f1)" "${CAIRO_PROVES[$i]}" "${CIRCUIT_PROVES[$i]}" \
             "${TOTAL_PROVES[$i]}" "${VERIFY_TIMES[$i]}" \
             "$(fmt_kb ${PROOF_SIZES[$i]})" "$(fmt_gb ${PEAK_MEMS[$i]})"
@@ -117,7 +106,7 @@ else
             "$GEN_ARGS_BIN" "$kind" > "$args_file"
         fi
 
-        OUTPUT=$(./apps/prover/target/release/reprove "cairo/target/dev/${executable}" --arguments-file "$args_file" --debug-single-level 2>&1)
+        OUTPUT=$("$REPROVE_BIN" "$executable" --arguments-file "$args_file" --debug-single-level 2>&1)
         PROVES[$i]=$(echo "$OUTPUT" | grep "^prove_ms=" | cut -d= -f2)
         PROOF_SIZES[$i]=$(echo "$OUTPUT" | grep "^proof_zstd_bytes=" | cut -d= -f2)
         PEAK_MEMS[$i]=$(echo "$OUTPUT" | grep "^peak_rss_kb=" | cut -d= -f2)
@@ -127,9 +116,9 @@ else
     echo ""
     echo "=== Results (depth=$DEPTH, single-level, NOT zero-knowledge) ==="
     echo ""
-    printf "  %-14s %10s %10s %10s\n" "Operation" "Prove" "Proof" "Peak RSS"
+    printf "  %-18s %10s %10s %10s\n" "Operation" "Prove" "Proof" "Peak RSS"
     for i in "${!CASES[@]}"; do
-        printf "  %-14s %8sms %7sKB %7sGB\n" \
+        printf "  %-18s %8sms %7sKB %7sGB\n" \
             "$(echo "${CASES[$i]}" | cut -d'|' -f1)" "${PROVES[$i]}" \
             "$(fmt_kb ${PROOF_SIZES[$i]})" "$(fmt_gb ${PEAK_MEMS[$i]})"
     done

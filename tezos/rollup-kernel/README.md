@@ -23,8 +23,8 @@ Supported message kinds:
   string and `asset_id` is determined by the ticketer KT1 that emitted
   the L1 ticket; multiple tickets from the same ticketer to the same
   recipient aggregate)
-- `shield` (debit the asset pool by `v + fee` and, for FA2 shields,
-  ALSO debit the user's `(ASSET_TEZ, pubkey_hash)` pool by `producer_fee`;
+- `shield` (debit the asset pool by `v` and, for FA2 shields,
+  ALSO debit the user's `(ASSET_TEZ, pubkey_hash)` pool by `fee + producer_fee`;
   for tez shields the same asset pool is debited the full
   `v + fee + producer_fee`. Appends the recipient note plus a
   DAL-producer fee note (always tez). The proof verifies an in-circuit

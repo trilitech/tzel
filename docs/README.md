@@ -18,8 +18,8 @@ This directory is the entry point for the project documentation.
 
 ## Tutorials And Guides
 
-- [ushuaianet_tutorial.md](./ushuaianet_tutorial.md)
-  - step-by-step `tzel-wallet` tutorial for the Ushuaianet
+- [shadownet_tutorial.md](./shadownet_tutorial.md)
+  - step-by-step `tzel-wallet` tutorial for the Shadownet
     `deposit -> shield -> send -> unshield` flow, with the current burned
     `100000` mutez rollup fee plus a private DAL-producer fee note;
     includes a `Multiasset / FA2 Flows` section covering the `--asset`
@@ -44,8 +44,11 @@ This directory is the entry point for the project documentation.
 
 ## Deployment Docs
 
+- [../ops/pqnet/README.md](../ops/pqnet/README.md)
+  - PQPark (`pqnet-10-16`) operator & multi-asset deployment runbook
+    (required infrastructure, ZODA DAL config, bridge + rollup origination)
 - [../ops/shadownet/README.md](../ops/shadownet/README.md)
-  - public ops host setup (rollup node + DAL node + `tzel-operator`)
+  - public Shadownet ops host setup (rollup node + DAL node + `tzel-operator`)
 - [../ops/prover/README.md](../ops/prover/README.md)
   - prover deployment layout
 
@@ -65,6 +68,6 @@ This directory is the entry point for the project documentation.
 
 1. [../README.md](../README.md)
 2. [../specs/spec.md](../specs/spec.md)
-3. [ushuaianet_tutorial.md](./ushuaianet_tutorial.md)
+3. [shadownet_tutorial.md](./shadownet_tutorial.md)
 4. [../ops/shadownet/README.md](../ops/shadownet/README.md)
 5. [wallet_detection_service.md](./wallet_detection_service.md)

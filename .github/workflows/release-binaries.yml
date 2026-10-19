@@ -105,15 +105,15 @@ jobs:
           build-args: |
             TZEL_REVISION=${{ github.sha }}
             TZEL_BUILD_TIMESTAMP=${{ steps.tags.outputs.timestamp }}
-          # GHA cache keeps the Stwo + ML-KEM + WOTS+ dep graph hot
-          # across runs — cold build is ~15-20 min; warm builds reuse
+          # GHA cache keeps the leanVM + ML-KEM + WOTS+ dep graph hot
+          # across runs — cold build is ~5-10 min; warm builds reuse
           # ~everything.
           cache-from: type=gha,scope=tzel-binaries
           cache-to: type=gha,mode=max,scope=tzel-binaries
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.description=tzel runtime binaries (tzel-wallet, tzel-detect, tzel-operator, reprove, gen-proof-bench-args, cairo executables) for downstream image consumption
+            org.opencontainers.image.description=tzel runtime binaries (tzel-wallet, tzel-detect, tzel-operator, reprove, gen-proof-bench-args) for downstream image consumption
 
       - name: Smoke binaries
         env:
@@ -153,6 +153,5 @@ jobs:
             echo "FROM \${TZEL_BINARIES} AS tzel-bins"
             echo "..."
             echo "COPY --from=tzel-bins /usr/local/bin/reprove /usr/local/bin/reprove"
-            echo "COPY --from=tzel-bins /opt/tzel/executables/ /opt/tzel/executables/"
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"

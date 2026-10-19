@@ -5,26 +5,21 @@ run TzEL proving locally or provide prebuilt proving artifacts for wallets.
 
 Unlike `tzel-operator`, the prover is not a daemon. The deployed surface is:
 
-- `reprove`
-- the Cairo executable JSON files:
-  - `run_shield.executable.json`
-  - `run_transfer.executable.json`
-  - `run_unshield.executable.json`
+- `reprove` (embeds the compiled `leanVM` guest ELF for all three circuits)
+- `tzel-wallet`
 
 The simplest standard layout is:
 
 - `/usr/local/bin/reprove`
 - `/usr/local/bin/tzel-wallet`
-- `/opt/tzel/cairo/target/dev/*.executable.json`
 
 ## Files
 
 - `prover.env.example`
-  - standard installed paths for prover-related binaries and executables
+  - standard installed paths for prover-related binaries
 - `../../scripts/install_tzel_binaries.sh`
   - builds and installs `tzel-operator`, `tzel-wallet`, `sp-client`,
-    `octez_kernel_message`, `verified_bridge_fixture_message`, `reprove`, and
-    the Cairo executable JSON files
+    `octez_kernel_message`, `verified_bridge_fixture_message`, and `reprove`
 - `../../scripts/prover_preflight.sh`
   - verifies the installed prover layout and checks that `reprove` can compute
     program hashes for all three deployed circuits
@@ -34,7 +29,7 @@ The simplest standard layout is:
 1. Build release artifacts as your normal user.
    - `./scripts/install_tzel_binaries.sh --build-only`
 2. Install them into standard paths.
-   - `sudo ./scripts/install_tzel_binaries.sh --skip-build --prefix /usr/local --executables-dir /opt/tzel/cairo/target/dev`
+   - `sudo ./scripts/install_tzel_binaries.sh --skip-build --prefix /usr/local`
 3. Copy the env template.
    - `sudo mkdir -p /etc/tzel`
    - `sudo cp ops/prover/prover.env.example /etc/tzel/prover.env`
@@ -46,16 +41,15 @@ The simplest standard layout is:
 
 - prover binary: `/usr/local/bin/reprove`
 - wallet binary: `/usr/local/bin/tzel-wallet`
-- Cairo executables: `/opt/tzel/cairo/target/dev`
 
 ## Smoke Checks
 
 Compute the authenticated program hashes directly:
 
 ```bash
-/usr/local/bin/reprove /opt/tzel/cairo/target/dev/run_shield.executable.json --program-hash
-/usr/local/bin/reprove /opt/tzel/cairo/target/dev/run_transfer.executable.json --program-hash
-/usr/local/bin/reprove /opt/tzel/cairo/target/dev/run_unshield.executable.json --program-hash
+/usr/local/bin/reprove tzel_run_shield.executable.json --program-hash
+/usr/local/bin/reprove tzel_run_transfer.executable.json --program-hash
+/usr/local/bin/reprove tzel_run_unshield.executable.json --program-hash
 ```
 
 Wallet help should work without a workspace checkout:

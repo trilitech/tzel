@@ -120,7 +120,9 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     memo_ct_hash_3 = felt_of_hex (json_string (json_field "memo_ct_hash_3" transfer));
     memo_ct_hash_4 = felt_of_hex (json_string (json_field "memo_ct_hash_4" transfer));
   } in
-  begin match Tzel.Ledger.apply_transfer ledger transfer_pub
+  begin match Tzel.Ledger.apply_transfer ledger
+                ~memo_ct_hash_change_2:transfer_pub.memo_ct_hash_3
+                transfer_pub
                 ~memo_ct_hash_1:transfer_pub.memo_ct_hash_1
                 ~memo_ct_hash_2:transfer_pub.memo_ct_hash_2
                 (* caller's slot-3 memo is the producer (record slot 4) *)
@@ -149,7 +151,9 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     memo_ct_hash_fee = felt_of_hex (json_string (json_field "memo_ct_hash_fee" unshield));
   } in
   begin match Tzel.Ledger.apply_unshield ledger
-                ~recipient_string:recipient unshield_pub
+                ~recipient_string:recipient
+                ~memo_ct_hash_change_2:unshield_pub.memo_ct_hash_change_2
+                unshield_pub
                 ~memo_ct_hash_change:unshield_pub.memo_ct_hash_change
                 ~memo_ct_hash_fee:unshield_pub.memo_ct_hash_fee with
   | Ok () -> ()
@@ -206,11 +210,11 @@ let test_rust_fa2_flow_applies_on_ocaml_ledger () =
     cm_new = shield_cm; cm_producer = shield_producer_cm;
     memo_ct_hash = shield_mch; producer_memo_ct_hash = shield_prod_mch;
   } in
-  (* Dual-pool funding: FA2 pool covers v+fee; tez pool covers producer_fee. *)
+  (* Dual-pool funding: FA2 pool covers v; tez pool covers fee + producer_fee. *)
   Tzel.Ledger.credit_deposit ledger ~asset_id ~pubkey_hash:shield_pubkey_hash
-    ~amount:(Int64.add shield_v shield_fee) ();
+    ~amount:shield_v ();
   Tzel.Ledger.credit_deposit ledger ~pubkey_hash:shield_pubkey_hash
-    ~amount:shield_producer_fee ();
+    ~amount:(Int64.add shield_fee shield_producer_fee) ();
   begin match Tzel.Ledger.apply_shield ledger ~pub:shield_pub
                 ~memo_ct_hash:shield_mch ~producer_memo_ct_hash:shield_prod_mch with
   | Ok () -> ()
@@ -242,7 +246,9 @@ let test_rust_fa2_flow_applies_on_ocaml_ledger () =
     memo_ct_hash_fee = felt_of_hex (json_string (json_field "memo_ct_hash_fee" unshield));
   } in
   begin match Tzel.Ledger.apply_unshield ledger
-                ~recipient_string:recipient unshield_pub
+                ~recipient_string:recipient
+                ~memo_ct_hash_change_2:unshield_pub.memo_ct_hash_change_2
+                unshield_pub
                 ~memo_ct_hash_change:unshield_pub.memo_ct_hash_change
                 ~memo_ct_hash_fee:unshield_pub.memo_ct_hash_fee with
   | Ok () -> ()

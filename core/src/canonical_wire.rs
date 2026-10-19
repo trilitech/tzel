@@ -2,6 +2,7 @@ use crate::{
     EncryptedNote, NoteMemo, PaymentAddress, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES,
     NOTE_AEAD_NONCE_BYTES, OUTGOING_RECOVERY_CT_BYTES,
 };
+#[cfg(any(test, not(target_arch = "wasm32")))]
 use ml_kem::KeyExport;
 #[cfg(not(target_arch = "wasm32"))]
 use serde_json::json;

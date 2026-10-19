@@ -1,0 +1,30 @@
+[Unit]
+Description=TzEL Rollup Operator (PQNet)
+After=network-online.target octez-dal-node.service octez-rollup-node.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tzel
+EnvironmentFile=/etc/tzel/pqnet.env
+EnvironmentFile=-/usr/local/etc/tzel/rollup-config-admin-build.env
+ExecStart=${TZEL_OPERATOR_BIN} \
+  --listen=${TZEL_OPERATOR_LISTEN} \
+  --source-alias=${TZEL_SOURCE_ALIAS} \
+  --state-dir=${TZEL_OPERATOR_STATE_DIR} \
+  --bearer-token-file=${TZEL_OPERATOR_BEARER_TOKEN_FILE} \
+  --required-dal-fee=${TZEL_OPERATOR_REQUIRED_DAL_FEE} \
+  --dal-fee-view-material=${TZEL_OPERATOR_DAL_FEE_VIEW_MATERIAL} \
+  --dal-fee-address-index=${TZEL_OPERATOR_DAL_FEE_ADDRESS_INDEX} \
+  --dal-slot-range=${TZEL_OPERATOR_DAL_SLOT_RANGE} \
+  --octez-client-bin=${TZEL_OCTEZ_CLIENT_BIN} \
+  --octez-client-dir=${TZEL_OCTEZ_CLIENT_DIR} \
+  --octez-node-endpoint=${TZEL_L1_RPC_URL} \
+  --dal-node-endpoint=http://${TZEL_DAL_RPC_ADDR} \
+  --reconcile-interval-secs=${TZEL_OPERATOR_RECONCILE_INTERVAL_SECS}
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

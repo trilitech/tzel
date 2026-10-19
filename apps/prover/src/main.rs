@@ -1,30 +1,27 @@
-//! TzEL proof generator.
+//! TzEL proof generator (`leanVM` ZK STARK prover by default).
 //!
 //! Modes:
-//!   reprove <executable.json>                       — generate ZK proof, write bundle to --output
-//!   reprove <executable.json> --debug-single-level  — single-level proof (NOT ZK, debug only)
+//!   reprove <executable.json>                       — generate ZK STARK proof via leanVM, write bundle to --output
+//!   reprove <executable.json> --debug-single-level  — non-ZK plain STARK proof (debug only)
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use leanvm::{Program, Proof as LeanProof, Prover, Randomness, Rate};
 use tracing_subscriber::fmt;
-use tzel_core::F;
-use tzel_reprover::{
-    compute_executable_program_hash, prove_single_level, prove_single_level_with_args_file,
-    prove_with_args_file,
-};
-use tzel_verifier::ProofBundle;
+use tzel_core::{CircuitKind, F};
+use tzel_verifier::{compute_executable_program_hash, ProofBundle};
 
 #[derive(Parser)]
 #[command(
     name = "reprove",
-    about = "Generate privacy proofs for TzEL executables"
+    about = "Generate privacy proofs for TzEL circuits using leanVM ZK STARKs"
 )]
 struct Cli {
-    /// Path to a .executable.json file
+    /// Path to a circuit executable (.executable.json or circuit name)
     executable: PathBuf,
 
     /// Write proof bundle (JSON) to this file
@@ -35,7 +32,11 @@ struct Cli {
     #[arg(long)]
     arguments_file: Option<PathBuf>,
 
-    /// DEBUG ONLY: single-level proof (NOT zero-knowledge)
+    /// Prove a built-in synthetic sample transaction when --arguments-file is omitted
+    #[arg(long)]
+    sample: bool,
+
+    /// DEBUG ONLY: non-ZK plain STARK proof
     #[arg(long)]
     debug_single_level: bool,
 
@@ -60,6 +61,70 @@ fn get_peak_memory_kb() -> Option<u64> {
         })
 }
 
+fn infer_circuit_kind(executable: &Path) -> Result<CircuitKind> {
+    CircuitKind::from_executable_path(executable).map_err(|e| anyhow!("{e}"))
+}
+
+fn build_leanvm_run(
+    executable: &Path,
+    args_file: Option<&Path>,
+    allow_sample: bool,
+) -> Result<(Vec<F>, tzel_host::Run)> {
+    let circuit = infer_circuit_kind(executable)?;
+    let (preimage_felts, run) = if let Some(path) = args_file {
+        let content = fs::read_to_string(path)?;
+        let args: Vec<String> = serde_json::from_str(&content)?;
+        match circuit {
+            CircuitKind::Shield => tzel_host::parse_cairo_shield_args(&args)
+                .map_err(|e| anyhow!("{e}"))?,
+            CircuitKind::Transfer => tzel_host::parse_cairo_transfer_args(&args)
+                .map_err(|e| anyhow!("{e}"))?,
+            CircuitKind::Unshield => tzel_host::parse_cairo_unshield_args(&args)
+                .map_err(|e| anyhow!("{e}"))?,
+        }
+    } else if allow_sample {
+        match circuit {
+            CircuitKind::Shield => {
+                let (tx, run) = tzel_host::build_exact_shield(tzel_host::ASSET_TEZ);
+                let out = tx.verify().map_err(|e| anyhow!("{e}"))?;
+                let pre = tzel_host::wrap_bootloader_output_preimage(
+                    tzel_host::PROGRAM_HASH_SHIELD,
+                    &out,
+                );
+                (pre, run)
+            }
+            CircuitKind::Transfer => {
+                let (hdr, inputs, run) = tzel_host::build_exact_transfer(1, false);
+                let pub_outputs = tzel_host::transfer_public_outputs(&hdr, &inputs);
+                let pre = tzel_host::wrap_bootloader_output_preimage(
+                    tzel_host::PROGRAM_HASH_TRANSFER,
+                    &pub_outputs,
+                );
+                (pre, run)
+            }
+            CircuitKind::Unshield => {
+                let (hdr, inputs, run) = tzel_host::build_exact_unshield(1, false);
+                let cms = hdr.verify(&inputs).map_err(|e| anyhow!("{e}"))?;
+                let pub_outputs = tzel_host::unshield_public_outputs(&hdr, &inputs, cms);
+                let pre = tzel_host::wrap_bootloader_output_preimage(
+                    tzel_host::PROGRAM_HASH_UNSHIELD,
+                    &pub_outputs,
+                );
+                (pre, run)
+            }
+        }
+    } else {
+        return Err(anyhow!(
+            "--arguments-file is required (or pass --sample to prove a built-in sample transaction)"
+        ));
+    };
+    let output_preimage = preimage_felts
+        .iter()
+        .map(tzel_host::felt_to_bytes_le)
+        .collect();
+    Ok((output_preimage, run))
+}
+
 fn verify_bundle_for_program_hash(bundle: &ProofBundle, expected_program_hash: &F) -> Result<()> {
     tzel_core::validate_single_task_program_hash(&bundle.output_preimage, expected_program_hash)
         .map_err(|e| anyhow!("proof bundle executable mismatch: {e}"))?;
@@ -75,8 +140,8 @@ fn main() -> Result<()> {
         eprintln!("Verifying proof bundle: {:?}", bundle_path);
         let bundle_json = std::fs::read_to_string(bundle_path)?;
         let bundle: ProofBundle = serde_json::from_str(&bundle_json)?;
-        let program_hash = compute_executable_program_hash(&cli.executable)?;
-        let expected_program_hash = program_hash.to_bytes_le();
+        let expected_program_hash =
+            compute_executable_program_hash(&cli.executable).map_err(|e| anyhow!("{e}"))?;
         match verify_bundle_for_program_hash(&bundle, &expected_program_hash) {
             Ok(()) => {
                 eprintln!("Proof VALID ✓");
@@ -91,30 +156,29 @@ fn main() -> Result<()> {
     }
 
     if cli.program_hash {
-        let program_hash = compute_executable_program_hash(&cli.executable)?;
-        println!("{}", hex::encode(program_hash.to_bytes_le()));
+        let program_hash =
+            compute_executable_program_hash(&cli.executable).map_err(|e| anyhow!("{e}"))?;
+        println!("{}", hex::encode(program_hash));
         return Ok(());
     }
 
-    eprintln!("Loading executable from {:?}", cli.executable);
+    eprintln!("Loading circuit from {:?}", cli.executable);
     let t_total = Instant::now();
 
-    let args_file = cli.arguments_file.clone();
+    let (output_preimage, run) = build_leanvm_run(
+        &cli.executable,
+        cli.arguments_file.as_deref(),
+        cli.sample,
+    )?;
 
     // INSECURE SANDBOX/CI ONLY (gated by --cfg tzel_insecure_sandbox; no
-    // prod build sets it). Skip the ~15 GB / ~50 s STARK proving: run only
-    // the bootloader to get the real `output_preimage` (so note-crediting
-    // works), and emit the `kernel-test-skip-verify` magic-byte proof a
-    // tzel_insecure_sandbox kernel accepts. ~0.4 s / ~130 MB. A prod
-    // reprove physically lacks this branch.
+    // prod build sets it).
     #[cfg(tzel_insecure_sandbox)]
     if std::env::var("TZEL_PROVE_MODE").as_deref() == Ok("stub") {
-        eprintln!("INSECURE SANDBOX stub: bootloader only, no proving");
-        let (_prover_input, output_preimage) =
-            tzel_reprover::run_privacy_bootloader(&cli.executable, None, args_file.clone())?;
+        eprintln!("INSECURE SANDBOX stub: witness check only, no proving");
         let bundle = ProofBundle::from_proof_parts(
             b"kernel-test-skip-verify".to_vec(),
-            output_preimage.iter().map(|felt| felt.to_bytes_le()).collect(),
+            output_preimage,
         );
         if let Some(path) = &cli.output {
             fs::write(path, serde_json::to_string(&bundle)?)?;
@@ -123,77 +187,97 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if cli.debug_single_level {
-        eprintln!("WARNING: single-level mode is NOT zero-knowledge");
-        let t_prove = Instant::now();
-        let (compressed, _output_preimage) = if args_file.is_some() {
-            prove_single_level_with_args_file(&cli.executable, args_file)?
-        } else {
-            prove_single_level(&cli.executable)?
-        };
-        let prove_ms = t_prove.elapsed().as_millis();
-        let peak_mem_kb = get_peak_memory_kb();
-        eprintln!("Prove: {}ms, Proof: {} bytes", prove_ms, compressed.len());
-        if let Some(mem) = peak_mem_kb {
-            eprintln!("Peak RSS: {:.1} MB", mem as f64 / 1024.0);
-        }
-        println!("prove_ms={}", prove_ms);
-        println!("proof_zstd_bytes={}", compressed.len());
-        if let Some(mem) = peak_mem_kb {
-            println!("peak_rss_kb={}", mem);
-        }
-    } else {
-        eprintln!("Running recursive prove...");
-        let t_prove = Instant::now();
-        let proof_output = prove_with_args_file(&cli.executable, args_file)?;
-        let prove_ms = t_prove.elapsed().as_millis();
-        let proof_size = proof_output.proof.len();
-        let peak_mem_kb = get_peak_memory_kb();
+    let program = Program::from_elf(tzel_host::ELF).expect("compiled-in tzel.elf must be valid");
+    let (bundle, prove_ms, verify_ms, cycles) = prove_and_package(
+        &program,
+        &run,
+        output_preimage,
+        cli.debug_single_level,
+    )?;
 
-        eprintln!(
-            "Cairo: {}ms, Circuit: {}ms, Total: {}ms, Verify: {}ms",
-            proof_output.cairo_prove_ms,
-            proof_output.circuit_prove_ms,
-            prove_ms,
-            proof_output.verify_ms
-        );
-        eprintln!(
-            "Proof: {} bytes ({:.1} KB)",
-            proof_size,
-            proof_size as f64 / 1024.0
-        );
-        if let Some(mem) = peak_mem_kb {
-            eprintln!("Peak RSS: {:.1} MB", mem as f64 / 1024.0);
-        }
+    let proof_size = bundle.proof_bytes.len();
+    let peak_mem_kb = get_peak_memory_kb();
 
-        // Write proof bundle (JSON with proof + output_preimage)
-        if let Some(path) = cli.output {
-            let bundle = ProofBundle::from_proof_parts(
-                proof_output.proof.clone(),
-                proof_output
-                    .output_preimage
-                    .iter()
-                    .map(|felt| felt.to_bytes_le())
-                    .collect(),
-            );
-            let json = serde_json::to_string(&bundle)?;
-            fs::write(&path, &json)?;
-            eprintln!("Proof bundle written to {:?} ({} bytes)", path, json.len());
-        }
+    eprintln!(
+        "leanVM {} Prove: {}ms, Verify: {}ms, Cycles: {}",
+        if cli.debug_single_level { "Plain" } else { "ZK" },
+        prove_ms,
+        verify_ms,
+        cycles
+    );
+    eprintln!(
+        "Proof: {} bytes ({:.1} KB)",
+        proof_size,
+        proof_size as f64 / 1024.0
+    );
+    if let Some(mem) = peak_mem_kb {
+        eprintln!("Peak RSS: {:.1} MB", mem as f64 / 1024.0);
+    }
 
-        eprintln!("Total wall: {}ms", t_total.elapsed().as_millis());
-        println!("cairo_prove_ms={}", proof_output.cairo_prove_ms);
-        println!("circuit_prove_ms={}", proof_output.circuit_prove_ms);
-        println!("prove_ms={}", prove_ms);
-        println!("verify_ms={}", proof_output.verify_ms);
-        println!("proof_bytes={}", proof_size);
-        println!("output_preimage_len={}", proof_output.output_preimage.len());
-        if let Some(mem) = peak_mem_kb {
-            println!("peak_rss_kb={}", mem);
-        }
+    if let Some(path) = cli.output {
+        let json = serde_json::to_string(&bundle)?;
+        fs::write(&path, &json)?;
+        eprintln!("Proof bundle written to {:?} ({} bytes)", path, json.len());
+    }
+
+    eprintln!("Total wall: {}ms", t_total.elapsed().as_millis());
+    println!("cairo_prove_ms=0");
+    println!("circuit_prove_ms={}", prove_ms);
+    println!("prove_ms={}", prove_ms);
+    println!("verify_ms={}", verify_ms);
+    println!("proof_bytes={}", proof_size);
+    println!("proof_zstd_bytes={}", proof_size);
+    println!("output_preimage_len={}", bundle.output_preimage.len());
+    if let Some(mem) = peak_mem_kb {
+        println!("peak_rss_kb={}", mem);
     }
 
     Ok(())
+}
+
+fn prove_and_package(
+    program: &Program,
+    run: &tzel_host::Run,
+    output_preimage: Vec<F>,
+    debug_single_level: bool,
+) -> Result<(ProofBundle, u128, u128, usize)> {
+    let t_prove = Instant::now();
+    let proven = if debug_single_level {
+        eprintln!("WARNING: single-level mode is NOT zero-knowledge");
+        Prover::new(Rate::MIN)
+            .prove(program, &run.advice)
+            .map_err(|e| anyhow!("leanVM prove failed: {e}"))?
+    } else {
+        eprintln!("Running leanVM ZK STARK prove...");
+        Prover::new(Rate::MIN)
+            .zero_knowledge(Randomness::Os)
+            .prove(program, &run.advice)
+            .map_err(|e| anyhow!("leanVM ZK prove failed: {e}"))?
+    };
+    if proven.output != run.expected {
+        return Err(anyhow!(
+            "leanVM guest output digest did not match host expected digest"
+        ));
+    }
+    let prove_ms = t_prove.elapsed().as_millis();
+
+    let raw_proof_bytes = proven.proof.to_bytes();
+    let compressed = ProofBundle::encode_leanvm_proof_bytes(&raw_proof_bytes)?;
+    let bundle = ProofBundle::from_proof_parts(compressed, output_preimage);
+
+    let t_verify = Instant::now();
+    if debug_single_level {
+        let decoded = LeanProof::from_bytes(&raw_proof_bytes)
+            .map_err(|e| anyhow!("decode leanVM proof: {e}"))?;
+        program
+            .verify(proven.output, &decoded)
+            .map_err(|e| anyhow!("leanVM verify failed: {e}"))?;
+    } else {
+        bundle.verify()?;
+    }
+    let verify_ms = t_verify.elapsed().as_millis();
+
+    Ok((bundle, prove_ms, verify_ms, proven.stats.cycles()))
 }
 
 #[cfg(test)]
@@ -221,6 +305,36 @@ mod tests {
         assert!(
             err.contains("unexpected circuit program hash"),
             "wrong executable should fail before proof verification, got: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_arguments_file_without_sample_flag_is_rejected() {
+        let executable = Path::new("tzel_run_shield.executable.json");
+        let err = build_leanvm_run(executable, None, false)
+            .err()
+            .expect("missing --arguments-file without --sample should fail")
+            .to_string();
+        assert!(
+            err.contains("--arguments-file is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn debug_single_level_bundle_is_rejected_by_zk_verifier() {
+        let executable = Path::new("tzel_run_shield.executable.json");
+        let (output_preimage, run) = build_leanvm_run(executable, None, true).unwrap();
+        let program = Program::from_elf(tzel_host::ELF).unwrap();
+        let (bundle, _, _, _) =
+            prove_and_package(&program, &run, output_preimage, true).unwrap();
+        let expected_hash = compute_executable_program_hash(executable).unwrap();
+        let err = verify_bundle_for_program_hash(&bundle, &expected_hash)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-ZK STARK proof rejected"),
+            "non-ZK debug bundle must be rejected by ProofBundle::verify, got: {err}"
         );
     }
 }

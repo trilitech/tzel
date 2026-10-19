@@ -22,13 +22,15 @@ CONTAINER="${TZEL_WALLET_CONTAINER_NAME:-tzel-wallet}"
 HOST_PORT="${TZEL_WALLET_HOST_PORT:-8080}"
 DATA_DIR="${TZEL_DATA_DIR:-$HOME/.tzel-wallet}"
 
-# Ushuaianet defaults — override via env to target a different network.
-TZEL_NETWORK="${TZEL_NETWORK:-ushuaianet}"
+# Shadownet defaults — override via env to target a different network.
+# rollup/proving URLs are hostnames (rollup.tzel.tezos.com on the reserved IP,
+# proving on OVH) so they're unchanged by the network switch.
+TZEL_NETWORK="${TZEL_NETWORK:-shadownet}"
 TZEL_ROLLUP_RPC_URL="${TZEL_ROLLUP_RPC_URL:-http://rollup.tzel.tezos.com:8932}"
-TZEL_PROVING_SERVICE_URL="${TZEL_PROVING_SERVICE_URL:-http://proving.tzel.tezos.com:9000}"
-TZEL_NETWORK_NAME="${TZEL_NETWORK_NAME:-tzel-ushuaianet}"
-TZEL_NETWORK_LABEL="${TZEL_NETWORK_LABEL:-Ushuaianet}"
-TZEL_TZKT_BASE_URL="${TZEL_TZKT_BASE_URL:-https://ushuaianet.tzkt.io}"
+TZEL_PROVING_SERVICE_URL="${TZEL_PROVING_SERVICE_URL:-https://proving.tzel.tezos.com}"
+TZEL_NETWORK_NAME="${TZEL_NETWORK_NAME:-tzel-shadownet}"
+TZEL_NETWORK_LABEL="${TZEL_NETWORK_LABEL:-Shadownet}"
+TZEL_TZKT_BASE_URL="${TZEL_TZKT_BASE_URL:-https://shadownet.tzkt.io}"
 
 # ---- helpers -----------------------------------------------------------
 

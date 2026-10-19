@@ -12,7 +12,6 @@ source "$ENV_FILE"
 
 required_vars=(
   TZEL_REPROVE_BIN
-  TZEL_EXECUTABLES_DIR
 )
 
 for var in "${required_vars[@]}"; do
@@ -21,16 +20,6 @@ for var in "${required_vars[@]}"; do
     exit 1
   fi
 done
-
-check_path() {
-  local label="$1"
-  local path="$2"
-  if [[ ! -e "$path" ]]; then
-    echo "missing $label: $path" >&2
-    exit 1
-  fi
-  echo "ok: $label -> $path"
-}
 
 check_exec() {
   local label="$1"
@@ -48,19 +37,11 @@ if [[ -n "${TZEL_WALLET_BIN:-}" ]]; then
 fi
 
 for executable in \
-  run_shield.executable.json \
-  run_transfer.executable.json \
-  run_unshield.executable.json
+  tzel_run_shield.executable.json \
+  tzel_run_transfer.executable.json \
+  tzel_run_unshield.executable.json
 do
-  check_path "$executable" "$TZEL_EXECUTABLES_DIR/$executable"
-done
-
-for executable in \
-  run_shield.executable.json \
-  run_transfer.executable.json \
-  run_unshield.executable.json
-do
-  hash="$("$TZEL_REPROVE_BIN" "$TZEL_EXECUTABLES_DIR/$executable" --program-hash)"
+  hash="$("$TZEL_REPROVE_BIN" "$executable" --program-hash)"
   if [[ -z "$hash" ]]; then
     echo "reprove returned empty program hash for $executable" >&2
     exit 1

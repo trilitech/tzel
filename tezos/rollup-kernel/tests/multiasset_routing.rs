@@ -159,11 +159,7 @@ fn signed_verifier_message(config: KernelVerifierConfig) -> KernelInboxMessage {
 }
 
 fn sample_program_hashes() -> ProgramHashes {
-    ProgramHashes {
-        shield: hash(b"tzel-test-shield"),
-        transfer: hash(b"tzel-test-transfer"),
-        unshield: hash(b"tzel-test-unshield"),
-    }
+    ProgramHashes::leanvm()
 }
 
 fn default_verifier_config() -> KernelVerifierConfig {

@@ -1,0 +1,23 @@
+[Unit]
+Description=Octez Node (PQNet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tzel
+EnvironmentFile=/etc/tzel/pqnet.env
+ExecStart=${TZEL_OCTEZ_NODE_BIN} run \
+  --data-dir=${TZEL_OCTEZ_NODE_DATA_DIR} \
+  --network=${TZEL_OCTEZ_NETWORK} \
+  --rpc-addr=${TZEL_OCTEZ_NODE_RPC_ADDR} \
+  --net-addr=${TZEL_OCTEZ_NODE_NET_ADDR} \
+  --expected-pow=26 \
+  --synchronisation-threshold=0 \
+  --history-mode=rolling
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

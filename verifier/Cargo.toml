@@ -10,24 +10,11 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1"
 hex = "0.4"
-indexmap = { version = "2.13.1", default-features = false, features = ["std"] }
+leanvm = { path = "../third_party/leanvm/crates/leanvm_core" }
 serde = { version = "1", features = ["derive"] }
-starknet-types-core = { version = "=0.2.4", default-features = false, features = ["hash"] }
 tzel-core = { path = "../core" }
+tzel-host = { path = "../third_party/leanvm/programs/tzel/host" }
 zstd = "0.13"
-
-stwo = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c", default-features = false }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "aeceb74c", default-features = false }
-circuit-air = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuit-serialize = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuits = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-circuits-stark-verifier = { git = "https://github.com/starkware-libs/stwo-circuits", rev = "2591775" }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-cairo-program-runner-lib = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.2.17", features = ["custom"] }
 
 [dev-dependencies]
 serde_json = "1"

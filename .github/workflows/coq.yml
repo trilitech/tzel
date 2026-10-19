@@ -30,13 +30,13 @@ on:
     branches: [main, coq-model]
     paths:
       - "coq/**"
-      - "cairo/src/**.cairo"
+      - "third_party/leanvm/programs/tzel/guest/src/**"
       - "ocaml/coq_driver/**"
       - ".github/workflows/coq.yml"
   pull_request:
     paths:
       - "coq/**"
-      - "cairo/src/**.cairo"
+      - "third_party/leanvm/programs/tzel/guest/src/**"
       - "ocaml/coq_driver/**"
       - ".github/workflows/coq.yml"
   workflow_dispatch:
@@ -55,7 +55,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - name: Drift check (Cairo SHAs vs MANIFEST.toml)
+      - name: Drift check (circuit SHAs vs MANIFEST.toml)
         run: ./coq/Drift/check.sh
 
   build:
