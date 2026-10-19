@@ -220,4 +220,5 @@ See `specs/security.md` for the full security notes and operational caveats. Key
 
 ## License
 
-Copyright (c) 2026 Arthur Breitman. All rights reserved.
+MIT License — see [LICENSE](LICENSE).
+Copyright (c) 2026 Arthur Breitman.
